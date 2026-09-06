@@ -6510,6 +6510,27 @@ impl RedbStateMachine {
                 StubEdit::DeleteById { id } => {
                     engine.delete_stub_by_id(port, id).await?;
                 }
+                // D-69: the engine half of a space teardown's stub delete.
+                StubEdit::DeleteBySpace { space } => {
+                    let imposter = engine.get_imposter(port)?;
+                    let doomed: Vec<usize> = imposter
+                        .get_stubs()
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, stub)| stub.space.as_deref() == Some(space.as_str()))
+                        .map(|(index, _)| index)
+                        .collect();
+                    // Descending: each delete re-indexes everything after it, so ascending order
+                    // would delete the wrong stubs after the first removal.
+                    //
+                    // Per-index rather than `replace_stubs(kept)`: `delete_stub` resets the
+                    // sequencer scope for *that stub only*, while `replace_stubs` resets the whole
+                    // port's — which would discard sequencing state belonging to stubs that have
+                    // nothing to do with the space being torn down.
+                    for index in doomed.into_iter().rev() {
+                        engine.delete_stub(port, index).await?;
+                    }
+                }
                 StubEdit::Move { from, to } => {
                     engine.move_stub(port, *from, *to).await?;
                 }

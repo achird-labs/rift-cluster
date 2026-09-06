@@ -2800,6 +2800,7 @@ dependencies = [
  "crossbeam",
  "futures",
  "http-body-util",
+ "httparse",
  "hyper",
  "hyper-rustls",
  "hyper-util",

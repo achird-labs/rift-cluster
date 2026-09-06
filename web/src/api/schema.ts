@@ -476,10 +476,20 @@ export interface paths {
             };
             cookie?: never;
         };
-        /** List stubs scoped to a space (upstream) */
+        /**
+         * List stubs scoped to a space (upstream)
+         * @description Proxied to the answering node's engine, which is correct because the stubs themselves replicate (see `addSpaceStub`): every node renders the same space from the same committed config, so any node's answer is the fleet's answer.
+         */
         get: operations["listSpaceStubs"];
         put?: never;
-        /** Add a stub scoped to a space (upstream) */
+        /**
+         * Add a stub scoped to a space
+         * @description Terminates (issue #537): committed as an ordinary stub edit on the imposter's replicated config, so the stub **replicates to every node and survives a config reconcile**.
+         *
+         *     Before this it was proxied to the receiving node's engine and never reached replicated state, so it existed on that node alone and the next reconcile — triggered by any committed write, on any imposter — deleted it as a stub the replicated layer had never heard of. Both behind a `201`. A space stub is an ordinary imposter-config stub distinguished only by `space`, so it needed no new replicated shape.
+         *
+         *     The path's `flowId` is the source of truth for the scope: a `space` in the body is ignored, exactly as the upstream handler did it. The body is the **bare stub**, not the `{"stub": …}` envelope that `POST /imposters/{port}/stubs` takes — sending that envelope here is a `400` naming the mistake, because every field it carries would otherwise be discarded and leave a stub that matches everything in the space.
+         */
         post: operations["addSpaceStub"];
         delete?: never;
         options?: never;
@@ -1677,6 +1687,13 @@ export interface components {
             truncated?: boolean;
             /** @description Wall-clock milliseconds for the exchange, measured at the server. Includes connect and the body read; excludes admin-side authorization. */
             elapsedMs: number;
+        };
+        /** @description One correlated-isolation space and the stubs scoped to it. Both the read and the write answer this shape. */
+        SpaceStubs: {
+            /** @description The `flowId` from the path, echoed. */
+            space: string;
+            /** @description Only the stubs scoped to this space. An imposter's unscoped stubs (no `space`) match every space and are not listed here. */
+            stubs: components["schemas"]["Stub"][];
         };
         RouteTable: {
             routes?: components["schemas"]["Route"][];
@@ -4033,9 +4050,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": {
-                        stubs?: components["schemas"]["Stub"][];
-                    };
+                    "application/json": components["schemas"]["SpaceStubs"];
                 };
             };
             401: components["responses"]["Unauthorized"];
@@ -4069,15 +4084,18 @@ export interface operations {
             };
         };
         responses: {
-            /** @description The stub added. */
-            200: {
+            /** @description The space and its stubs, including the one just added. */
+            201: {
                 headers: {
+                    "Rift-Cluster-Op-Id": components["headers"]["RiftClusterOpId"];
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["Stub"];
+                    "application/json": components["schemas"]["SpaceStubs"];
                 };
             };
+            202: components["responses"]["AcceptedParked"];
+            400: components["responses"]["BadData"];
             401: components["responses"]["Unauthorized"];
             403: components["responses"]["Forbidden"];
             /** @description No such imposter for this tenant, or owned by another tenant. */
@@ -4090,6 +4108,9 @@ export interface operations {
                 };
             };
             413: components["responses"]["PayloadTooLarge"];
+            500: components["responses"]["InternalError"];
+            503: components["responses"]["Unavailable"];
+            504: components["responses"]["WriteTimeout"];
         };
     };
     tryImposter: {

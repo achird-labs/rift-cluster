@@ -90,8 +90,8 @@ use rift_cluster::{
 use rift_cluster_base::seams::{
     ErrorKind, ImposterConfig, RecordedRequest, RiftScriptConfig, RouteTable, SCOPE_HEADER,
     ScriptBaseDir, Stub, classify as classify_upstream, config_uses_script_surface,
-    error_response_typed, resolve_scripts, resolve_stub_scripts, tcp_fault_carrier, validate_stub,
-    validate_stubs,
+    error_response_typed, not_a_stub_reason, resolve_scripts, resolve_stub_scripts,
+    tcp_fault_carrier, validate_stub, validate_stubs,
 };
 // The compiler crate (RFC-004 S2, issue #278): the front compiles specs on the accepting node
 // (PUT, deploy, edit-time warnings). `serde_json::Value` stays fully-qualified below, matching
@@ -536,6 +536,20 @@ pub(crate) enum Terminated {
     /// `ClearSavedRequests` commit above. Not routed through `build_mutation` — there is no
     /// loopback path to `FetchAfter`/`Captured` render from; the response is the proxy's own.
     SpaceTeardown(u16, String),
+    /// `POST /imposters/{port}/spaces/{flow}/stubs` (issue #537, D-69): a stub scoped to one
+    /// correlated-isolation space, committed as an ordinary `ControlOp::PatchStubs` instead of
+    /// being proxied.
+    ///
+    /// Proxied, it reached only the receiving node's engine and never `sm_configs` — so it existed
+    /// on one node, and the next `EngineAction::Sync` (any committed op, on any port) re-rendered
+    /// that imposter from replicated state and deleted it as a stale stub. Both halves behind a
+    /// `201`. A space stub is already an imposter-config stub distinguished only by `space`
+    /// (upstream's `Stub::space`), so committing it needs no new replicated shape — the same
+    /// `StubEdit::Add` the imposter-level route uses, with `space` set from the path.
+    ///
+    /// Reads on this shape stay proxied: they are upstream's own surface, and correct once the
+    /// data replicates.
+    AddSpaceStub(u16, String),
     /// `GET /imposters/{port}/spaces` (issue #374): every correlated-isolation space this imposter
     /// currently holds live flow-KV entries under, fleet-wide, with each row's live entry count
     /// and owning node plus the imposter's resolved `durability` on the envelope.
@@ -666,6 +680,7 @@ fn addressed_port(kind: &Terminated) -> Option<u16> {
         | Terminated::ClearSavedRequests(port)
         | Terminated::ClearSavedProxyResponses(port)
         | Terminated::SpaceTeardown(port, _)
+        | Terminated::AddSpaceStub(port, _)
         | Terminated::SpacesList(port)
         // Issue #335: this is not merely *a* tenant check for the try endpoint, it is the **only**
         // one. Returning the port here is what makes an unknown port and another tenant's port
@@ -728,6 +743,7 @@ fn scope_for(kind: &Terminated) -> Option<TenantId> {
         | Terminated::ClearSavedRequests(_)
         | Terminated::ClearSavedProxyResponses(_)
         | Terminated::SpaceTeardown(_, _)
+        | Terminated::AddSpaceStub(_, _)
         | Terminated::SpacesList(_)
         | Terminated::TryImposter(_)
         | Terminated::PutRoutes
@@ -986,12 +1002,22 @@ pub(crate) fn classify(method: &Method, path: &str, query: Option<&str>) -> Opti
             Some(Terminated::ClearSavedProxyResponses(port))
         }
         // `DELETE /imposters/{port}/spaces/{flow}` (issue #224): exactly the two-segment shape
-        // upstream's own router matches for `ImposterRoute::Space` (`["spaces", flow_id]` —
-        // `SpaceStubs`'s three-segment `["spaces", flow_id, "stubs"]` is a different route and a
-        // write, not a delete, so it falls through here untouched). Every other method on this
-        // shape stays proxied exactly as before — only the delete gets a journal half to commit.
+        // upstream's own router matches for `ImposterRoute::Space` (`["spaces", flow_id]`). Every
+        // other method on this shape stays proxied exactly as before — only the delete gets a
+        // journal half, and (issue #537) a stub half, to commit.
         [_, "spaces", flow] if *method == Method::DELETE && !flow.is_empty() => {
             Some(Terminated::SpaceTeardown(port, (*flow).to_owned()))
+        }
+        // `POST /imposters/{port}/spaces/{flow}/stubs` (issue #537): the three-segment shape,
+        // which used to fall through to the proxy. It terminated nowhere, so the stub reached
+        // only the receiving node's engine and the next config reconcile — any committed op, on
+        // any port — deleted it as a stale stub `sm_configs` had never heard of. Committing it as
+        // an ordinary `PatchStubs` is what makes it replicate and survive; a space stub is already
+        // an imposter-config stub distinguished only by `space`, so nothing else has to change.
+        //
+        // Only the POST. The reads on this shape stay proxied — correct once the data replicates.
+        [_, "spaces", flow, "stubs"] if *method == Method::POST && !flow.is_empty() => {
+            Some(Terminated::AddSpaceStub(port, (*flow).to_owned()))
         }
         [_, "stubs"] => match *method {
             Method::POST => Some(Terminated::AddStub(port)),
@@ -1116,6 +1142,12 @@ fn action_for(kind: &Terminated) -> Action {
         // this terminated): a space teardown is the Operator-tier "disturb" sibling of
         // `FlowStateClear`, distinguished by the canonical (non-`/admin/imposters/`) prefix.
         Terminated::SpaceTeardown(_, _) => Action::SpaceTeardown,
+        // Exactly what the proxied path was gated as before #537 terminated it: `map_action`'s
+        // `IMPOSTER_WRITE` + `has_space` arm, whose own comment names this route. Not
+        // `ImposterWrite` — that would quietly move a redefine-a-space's-behaviour call off the
+        // Editor tier RFC-002 §4.1 puts it on, and terminating must never rename what the same
+        // call is gated and audited as.
+        Terminated::AddSpaceStub(_, _) => Action::SpaceStubWrite,
         // Exactly upstream's own mapping for a space *read* (`principal::map_action`'s
         // `IMPOSTER_READ` arm folds every route onto `ImposterRead` regardless of `has_space`):
         // the single-space `GET .../spaces/{flowId}` already carries this action via the proxied
@@ -4203,28 +4235,78 @@ async fn terminate_space_teardown(
     if !response.status().is_success() {
         return response;
     }
-    let op = ControlOp::JournalClearGen {
-        tenant: tenant.clone(),
-        port,
-        space: Some(flow),
-    };
+    // Two committed halves, in this order. The journal clear is #224's; the stub delete is #537's
+    // and exists because that issue made space stubs *replicated*: a teardown that only tore down
+    // the local engine would be undone by the next `EngineAction::Sync`, which re-renders every
+    // imposter from `sm_configs` — so the stubs would come back fleet-wide, which is worse than
+    // the node-local staleness #537 set out to fix.
+    //
+    // Committed op-by-op rather than atomically, which is what `run_mutation` already does for
+    // every multi-op mutation. A partial (journal cleared, stubs not) is surfaced as an error by
+    // the helper rather than hidden behind the proxy's 200, the same doctrine this function
+    // already applies to the proxied half.
+    for (op, what) in [
+        (
+            ControlOp::JournalClearGen {
+                tenant: tenant.clone(),
+                port,
+                space: Some(flow.clone()),
+            },
+            "journal clear",
+        ),
+        (
+            ControlOp::PatchStubs {
+                tenant: tenant.clone(),
+                port,
+                edit: StubEditScript(vec![StubEdit::DeleteBySpace {
+                    space: flow.clone(),
+                }]),
+            },
+            "space-stub delete",
+        ),
+    ] {
+        if let Err(error) = commit_teardown_half(node, op, what, principal_id.clone()).await {
+            return error;
+        }
+    }
+    response
+}
+
+/// Commit one half of a space teardown, after its proxied flow-state half already succeeded.
+///
+/// `what` names the half in every failure message, because the caller commits more than one and
+/// "the teardown failed" would not say which — and the halves fail for different reasons and are
+/// recovered differently.
+///
+/// The reverse failure — proxy succeeded, this did not — is answered as an error rather than
+/// swallowed (this file's production rule: a failed commit must surface, never a silent 200), even
+/// though the flow-state half has by then already torn down. There is no atomic way to straddle a
+/// proxied side effect and a Raft write, and reporting the honest partial is better than hiding it.
+// A rendered refusal in the error channel, as everywhere else on this front.
+#[allow(clippy::result_large_err)]
+async fn commit_teardown_half(
+    node: &Arc<RaftNode>,
+    op: ControlOp,
+    what: &str,
+    principal_id: Option<String>,
+) -> Result<(), Response<FrontBody>> {
     // `validate` first, like every other write on this front — a refusal here would be this
     // function's own bug (the op is built from an already-authorized, already-proxied request),
     // but the R4 order (validate, park durably, submit) is kept uniform rather than special-cased
     // away for the one write that "shouldn't" need it.
     if let Err(reason) = control::validate(&op) {
-        return refusal_response(&reason);
+        return Err(refusal_response(&reason));
     }
     let op_id = Uuid::new_v4();
     let request = mint(op_id, op, None, principal_id);
     if let Err(e) = node.park_intent(&request) {
-        return typed_error(
+        return Err(typed_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             ErrorKind::InternalError,
             &format!(
-                "flow-state teardown succeeded but the journal clear could not be durably accepted: {e}"
+                "flow-state teardown succeeded but the {what} could not be durably accepted: {e}"
             ),
-        );
+        ));
     }
     let committed = match tokio::time::timeout(WRITE_DEADLINE, node.submit(request)).await {
         Err(_) => {
@@ -4232,11 +4314,13 @@ async fn terminate_space_teardown(
             let mut error = typed_error(
                 StatusCode::GATEWAY_TIMEOUT,
                 ErrorKind::Timeout,
-                "flow-state teardown succeeded but the journal clear did not commit within the \
-                 deadline; parked for replay",
+                &format!(
+                    "flow-state teardown succeeded but the {what} did not commit within the \
+                     deadline; parked for replay"
+                ),
             );
             set_header(&mut error, HEADER_OP_ID, &op_id.to_string());
-            return error;
+            return Err(error);
         }
         Ok(Err(NodeError::Unavailable(detail))) => {
             node.request_replay();
@@ -4244,22 +4328,22 @@ async fn terminate_space_teardown(
                 StatusCode::SERVICE_UNAVAILABLE,
                 ErrorKind::Unavailable,
                 &format!(
-                    "flow-state teardown succeeded but the journal clear found no quorum/leader \
+                    "flow-state teardown succeeded but the {what} found no quorum/leader \
                      (parked for replay): {detail}"
                 ),
             );
             set_header(&mut error, HEADER_OP_ID, &op_id.to_string());
-            return error;
+            return Err(error);
         }
         Ok(Err(e)) => {
             node.request_replay();
             let mut error = typed_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 ErrorKind::InternalError,
-                &format!("flow-state teardown succeeded but the journal clear failed: {e}"),
+                &format!("flow-state teardown succeeded but the {what} failed: {e}"),
             );
             set_header(&mut error, HEADER_OP_ID, &op_id.to_string());
-            return error;
+            return Err(error);
         }
         Ok(Ok(response)) => response,
     };
@@ -4267,9 +4351,9 @@ async fn terminate_space_teardown(
         tracing::error!(%op_id, error = %e, "op terminal but could not unpark");
     }
     if let ControlOutcome::Failed { reason } = &committed.outcome {
-        return refusal_response(reason);
+        return Err(refusal_response(reason));
     }
-    response
+    Ok(())
 }
 
 /// Whether `bindings` carries a `FleetAdmin` grant (issue #288) — the one predicate both the fleet
@@ -7074,6 +7158,42 @@ async fn build_mutation(
                 },
             })
         }
+        Terminated::AddSpaceStub(port, flow) => {
+            // The shape guard upstream's handler ran (#336) — through the seam, so there is one
+            // `STUB_FIELD_NAMES` and not a copy here that goes stale when upstream adds a field.
+            // It must run *before* deserialization: `Stub` comes from `StubRaw`, where every field
+            // is `#[serde(default)]` and unknown keys are discarded, so any object parses — an
+            // object of only unrecognised keys becomes the vacuous stub that matches everything in
+            // its space. The two sibling routes disagree about their envelope (`POST
+            // .../stubs` takes `{"stub": …}`, this one the bare stub), which is how the mistake is
+            // actually reached.
+            let payload: serde_json::Value = parse(body)?;
+            if let Some(reason) = not_a_stub_reason(&payload) {
+                return Err(typed_error(
+                    StatusCode::BAD_REQUEST,
+                    ErrorKind::BadData,
+                    &reason,
+                ));
+            }
+            let mut stub: Stub = parse_pinned(body, node, tenant)?;
+            // The path names the space, not the body — exactly as upstream's handler does it, so a
+            // caller cannot file a stub into a space the URL never mentioned.
+            stub.space = Some(flow.clone());
+            Ok(Mutation {
+                ops: vec![ControlOp::PatchStubs {
+                    tenant: tenant.clone(),
+                    port,
+                    edit: StubEditScript(vec![StubEdit::Add { stub, index: None }]),
+                }],
+                port: Some(port),
+                // Upstream's own GET, looped back to, so the body is byte-for-byte the
+                // `{"space", "stubs"}` shape this route has always answered.
+                render: Render::FetchAfter {
+                    path: format!("/imposters/{port}/spaces/{flow}/stubs"),
+                    status: StatusCode::CREATED,
+                },
+            })
+        }
         Terminated::ReplaceStubs(port) => {
             let replace: ReplaceStubsBody = parse_pinned(body, node, tenant)?;
             let mut config = stored_config(node, tenant, port)?;
@@ -7546,7 +7666,9 @@ fn op_uses_script_surface(op: &ControlOp) -> bool {
                     StubEdit::Add { stub, .. } | StubEdit::ReplaceById { stub, .. } => {
                         Some(stub.clone())
                     }
-                    StubEdit::DeleteById { .. } | StubEdit::Move { .. } => None,
+                    StubEdit::DeleteById { .. }
+                    | StubEdit::DeleteBySpace { .. }
+                    | StubEdit::Move { .. } => None,
                 })
                 .collect();
             if stubs.is_empty() {
@@ -7701,7 +7823,9 @@ fn validate_op_scripts(
                 let result = match step {
                     StubEdit::Add { stub, index } => validate_stub(stub, index.unwrap_or(0)),
                     StubEdit::ReplaceById { stub, .. } => validate_stub(stub, 0),
-                    StubEdit::DeleteById { .. } | StubEdit::Move { .. } => continue,
+                    StubEdit::DeleteById { .. }
+                    | StubEdit::DeleteBySpace { .. }
+                    | StubEdit::Move { .. } => continue,
                 };
                 if !result.is_valid() {
                     let detail = result.into_error_message().unwrap_or_default();

@@ -1177,6 +1177,16 @@ pub enum StubEdit {
     DeleteById {
         id: String,
     },
+    /// Every stub scoped to `space` (issue #537, D-69). Set-addressed, not id-addressed, because a
+    /// space stub is not required to carry an `id` — `DeleteById` cannot express this at all.
+    ///
+    /// Committed by a space teardown alongside its journal clear. Once space stubs replicate, a
+    /// teardown that only tore down the local engine would be undone by the next
+    /// `EngineAction::Sync`, which re-renders every imposter from `sm_configs` and would
+    /// resurrect them fleet-wide.
+    DeleteBySpace {
+        space: String,
+    },
     Move {
         from: usize,
         to: usize,
@@ -2924,6 +2934,14 @@ pub(crate) fn apply_edit(stubs: &mut Vec<Stub>, script: &StubEditScript) -> Resu
                     return Err(format!("delete: no stub with id {id:?}"));
                 };
                 next.remove(i);
+            }
+            // Idempotent, unlike every by-id step above. Those address one named thing the caller
+            // asserted exists, so a miss is the caller being wrong; this addresses a *set*, and an
+            // empty set is a legitimate answer. A space teardown commits this unconditionally
+            // after the flow-state half succeeds, and a space carrying flow state but no stubs is
+            // ordinary — erroring here would turn that into a 500.
+            StubEdit::DeleteBySpace { space } => {
+                next.retain(|s| s.space.as_deref() != Some(space.as_str()));
             }
             StubEdit::Move { from, to } => {
                 let len = next.len();
