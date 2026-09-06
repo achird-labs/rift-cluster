@@ -2247,3 +2247,46 @@ fan-out, now in every state rather than only the failing ones.
 *Rejected:* folding an absent flag to `false` so the banner is never missed. That trades a missing
 true statement for a confident false one, on the screen whose whole design premise is that a zero
 and an unknown are different claims.
+
+---
+
+### D-71 — The cluster is the distributed core: membership, replicated configuration and the router; everything else is Rift's own or removed
+
+- **Status:** pending
+- **Decided:** 2026-09-06 · RFC-007 · #544
+- **Implemented by:** #544 (open) — children #545–#555
+- **Code:** crates/rift-cluster/src/control.rs, crates/rift-cluster-server/src/admin_front.rs, crates/rift-cluster/src/raft/node.rs
+
+RiftCluster is **a replicated fleet of Rift nodes that forms and heals itself, replicates
+imposters, stubs and the route table through Raft, and routes a request arriving at any node to
+the local imposter the route table names.** That, the admin API and console to add and manage
+imposters and stubs (with a one-shot OpenAPI import), the probes and fleet reads, and the
+deployment path are the whole product. RFC-007 §3 draws the boundary; §2 is the measurement
+behind it.
+
+**Removed, not flagged off.** Tenancy and RBAC, the audit projection and its exporter, the MCP
+server, the cluster metric families and dashboards, per-route hit counters, tracking sources and
+datasets and stored specs with the blob store that carried them, the owner-authoritative
+flow-state tier with its ring, sequencer and proxyOnce claims, and the fleet journal merge. Each
+removal is a child of #544; each child marks the decisions it retires `superseded` by this entry
+in the same PR (RFC-007 Appendix A lists them), so the register never describes code that is gone.
+
+**What replaces the removed state tiers is upstream's.** Scenario and flow state live behind
+`rift-mock-core`'s `FlowStore`: per node with the in-memory backend, fleet-wide with
+`_rift.flowState.backend: "redis"` (`rift-store-redis`). The request journal and proxy recording
+are per node, as in open-source Rift. The "no external datastore" promise narrows to membership,
+configuration and routing — the promise Raft keeps on its own.
+
+**Verified live, before and after.** No removal merges until the surface being removed has been
+driven on a running fleet and recorded, and every kept surface has been re-driven afterwards
+(RFC-007 §5). The baseline on the day of decision was 57/57 on the compose fleet.
+
+*Rejected:* freezing the peripheral surfaces in place. Frozen code still compiles, still tests,
+still cites decisions, and still leaks — D-68 exists because tenancy reached the router.
+
+*Rejected:* keeping the flow-state tier because it is stronger than a shared Redis. It is; it is
+also a second distributed system inside the first, and no user has asked for its guarantees by
+name. If Rift itself grows a stronger backend, every deployment shape gets it.
+
+*Rejected:* sharding imposters across nodes. The fleet stays replicated (D-20's core claim); the
+router routes to the local imposter, never across nodes.
