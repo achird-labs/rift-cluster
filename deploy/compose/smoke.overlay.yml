@@ -1,0 +1,77 @@
+# Overlay for `smoke.sh` (issue #555, RFC-007 §5): the three things the core smoke
+# check needs that the reference deployment leaves off on purpose, plus a fourth
+# node that only exists to prove a join.
+#
+#     docker compose -f docker-compose.yml -f smoke.overlay.yml up -d
+#     docker compose -f docker-compose.yml -f smoke.overlay.yml --profile join up -d rift-4
+#
+# 1. MB_APIKEY — the admin credential. The reference file leaves the admin plane
+#    open, which is right for a reference and wrong for a check that must prove
+#    the same key is accepted on every node.
+# 2. RIFT_FRONT_DOOR — the router's listener. It dispatches to whatever the
+#    replicated route table names, so it is an operator choice, not a default;
+#    the smoke check is *about* routing, so it is on here.
+# 3. Published router ports, one per node. Imposter ports are deliberately NOT
+#    published: the router reaches an imposter in-process, so one port per node
+#    fronts every imposter, and a port Docker has never heard of is reachable
+#    the moment a route names it. That is the property being checked.
+#
+# Ports follow the base file's convention (rift-N = Nxxxx over the container
+# port): router on 12527 / 22527 / 32527 / 42527.
+#
+# rift-4 is behind the `join` profile so a plain `up -d` still starts exactly
+# the three-node fleet the base file describes. smoke.sh starts it from a seed,
+# waits for it to serve the same imposters, then stops it and asserts the fleet
+# is back to three voters.
+
+x-smoke-env: &smoke-env
+  MB_APIKEY: "${RIFT_SMOKE_KEY:-rift-smoke-key}"
+  RIFT_FRONT_DOOR: "0.0.0.0:2527"
+
+services:
+  rift-1:
+    environment: *smoke-env
+    ports:
+      - "12527:2527"
+  rift-2:
+    environment: *smoke-env
+    ports:
+      - "22527:2527"
+  rift-3:
+    environment: *smoke-env
+    ports:
+      - "32527:2527"
+
+  rift-4:
+    profiles: ["join"]
+    image: "${RIFT_CLUSTER_IMAGE:-rift-cluster-server:local}"
+    container_name: rift-4
+    hostname: rift-4
+    networks:
+      rift:
+        ipv4_address: 172.28.7.14
+    environment:
+      RIFT_CLUSTER: "true"
+      RIFT_CLUSTER_SECRET: "local-development-cluster-secret"
+      RIFT_CLUSTER_PROBE_BIND: "0.0.0.0:2526"
+      RIFT_CLUSTER_LEAVE_TIMEOUT: "5"
+      RIFT_CLUSTER_STATE_DIR: "/var/lib/rift/_cluster"
+      MB_DATADIR: "/var/lib/rift/data"
+      RIFT_CLUSTER_BIND: "0.0.0.0:4790"
+      RIFT_CLUSTER_BIND_PUBLIC_OK: "true"
+      RIFT_CLUSTER_ADVERTISE: "172.28.7.14:4790"
+      RIFT_CLUSTER_NODE_NAME: "rift-4"
+      # Seeds are the whole point of this node: it knows nothing but one address.
+      RIFT_CLUSTER_SEEDS: "172.28.7.11:4790"
+      <<: *smoke-env
+    ports:
+      - "42525:2525"
+      - "42526:2526"
+      - "42527:2527"
+    stop_grace_period: 15s
+    healthcheck:
+      test: ["CMD", "rift-cluster-server", "healthcheck", "--url", "http://127.0.0.1:2526/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
