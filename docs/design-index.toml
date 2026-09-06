@@ -59,6 +59,13 @@ verified_sha = ""
 verified_on = ""
 code = ["web/src/**", "crates/rift-cluster-server/src/console.rs", "crates/rift-cluster-server/src/session.rs", "crates/rift-cluster-server/src/fleet.rs", "crates/rift-cluster-server/src/mcp/**"]
 
+["docs/rfc/RFC-007-distributed-core.md"]
+status = "current"
+verified_sha = ""
+verified_on = ""
+code = []
+note = "Scope decision D-71: the distributed core. Progress table in §9 is updated as #544's children merge."
+
 ["docs/architecture/01-overview.md"]
 status = "current"
 verified_sha = ""
