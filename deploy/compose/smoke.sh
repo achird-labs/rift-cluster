@@ -11,12 +11,13 @@
 # written on one node answers on every node through the router; a route table
 # written on one node is installed on every node; a stopped node catches up; a
 # stopped leader is replaced and writes keep landing; a new node joins from a
-# seed and serves the same imposters; a departed node leaves the voter set.
+# seed and serves the same imposters; a departed node leaves the voter set; and
+# a scenario's state written on one node gates the next request on another.
 #
 # Every removal under epic #544 runs this before and after (RFC-007 §5.2). It
 # asserts only what the core promises, so it must keep passing as the
 # peripheral surfaces leave — a section here that depends on one of them is a
-# bug in this script.
+# bug in this script. Flow state is core (D-17, D-20): its section stays.
 #
 # A script rather than a `cargo test` for the same reason `verify.sh` is: it
 # needs a container runtime, so it cannot run in the workspace's `cargo test`
@@ -96,7 +97,7 @@ eq "3/3 nodes ready" "3" "$(until_eq 120 3 ready_count 1 2 3)"
 
 # Whatever a previous --keep run left behind. Deleting an imposter that does not
 # exist is a 404 and fine; the route table is replaced wholesale below.
-for p in 7101 7102 7103 7104; do curl -s -o /dev/null -X DELETE "$(admin 1)/imposters/$p" -H "Authorization: $K"; done
+for p in 7101 7102 7103 7104 7105; do curl -s -o /dev/null -X DELETE "$(admin 1)/imposters/$p" -H "Authorization: $K"; done
 curl -s -o /dev/null -X PUT "$(admin 1)/front-door/routes" -H "Authorization: $K" -H 'Content-Type: application/json' -d '{"routes":[]}'
 
 # -------------------------------------------------------------------- cluster
@@ -195,6 +196,25 @@ eq "proxyTransparent forwards every call (origin cycles)" "live #1|live #2|live 
    "$(for i in 1 2 3; do body "$(router 1)/proxy/x"; echo; done | paste -sd'|' -)"
 eq "proxyOnce records once and replays on the node that recorded" "1" \
    "$(for i in 1 2; do body "$(router 2)/once/replay"; echo; done | sort -u | wc -l | tr -d ' ')"
+
+# ----------------------------------------------------------------- flow state
+echo
+echo "== flow state is cluster-wide: a scenario written on one node gates on every node =="
+eq "POST /imposters 7105 (scenario) on node 3" "201" "$(acode -X POST "$(admin 3)/imposters" -H 'Content-Type: application/json' -d '{
+  "port": 7105, "protocol": "http", "name": "checkout",
+  "stubs": [
+    {"scenarioName":"checkout","requiredScenarioState":"Started","newScenarioState":"paid",
+     "predicates":[{"equals":{"path":"/pay"}}],"responses":[{"is":{"statusCode":200,"body":"payment accepted"}}]},
+    {"scenarioName":"checkout","requiredScenarioState":"paid",
+     "predicates":[{"equals":{"path":"/pay"}}],"responses":[{"is":{"statusCode":409,"body":"already paid"}}]}
+  ]}')"
+# Append a route for it: the table is replaced wholesale, so read, extend, write.
+with_checkout="$(auth "$(admin 1)/front-door/routes" | jq -c '{routes: (.routes + [{"id":"checkout","priority":50,"enabled":true,"match":{"path_prefix":"/checkout"},"target":{"port":7105,"strip_prefix":true}}])}')"
+eq "PUT the table with a checkout route (node 1)" "200" "$(acode -X PUT "$(admin 1)/front-door/routes" -H 'Content-Type: application/json' -d "$with_checkout")"
+eq "first /pay on node 1  -> accepted"                           "200" "$(until_eq 10 200 code "$(router 1)/checkout/pay")"
+eq "second /pay on node 2 -> already paid (state crossed nodes)" "409" "$(code "$(router 2)/checkout/pay")"
+eq "third /pay on node 3  -> still paid"                           "409" "$(code "$(router 3)/checkout/pay")"
+eq "scenario state reads back on node 2 as paid" "paid" "$(auth "$(admin 2)/imposters/7105/scenarios" | jq -r '[(.scenarios // .)[] | select(.name=="checkout") | .state][0]' 2>/dev/null)"
 
 # -------------------------------------------------------- restart a follower
 echo
