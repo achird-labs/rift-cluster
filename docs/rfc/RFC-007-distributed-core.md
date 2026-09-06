@@ -2,11 +2,11 @@
 
 | | |
 |---|---|
-| **Status** | v1 — decided as **D-71**; removals in progress |
+| **Status** | v1.1 — decided as **D-71**; removals in progress. **Amended 2026-09-06:** the cluster-wide flow-state tier stays (§3.1); #551 withdrawn |
 | **Tracking issue** | [achird-labs/rift-cluster#544](https://github.com/achird-labs/rift-cluster/issues/544) (epic) |
 | **Canonical location** | `rift-cluster:docs/rfc/RFC-007-distributed-core.md` |
 | **Depends on** | **ADR-001** (the Raft control plane stays exactly as decided) |
-| **Retires, as its children land** | RFC-002 (tenancy and RBAC), RFC-005 (data sources and state), RFC-001 §7.2 / §7.5 and phases 2–5, RFC-004 §3.4–§3.6, RFC-006 §8 |
+| **Retires, as its children land** | RFC-002 (tenancy and RBAC), RFC-005 (data sources and state), RFC-001 §7.5 and phase 4, RFC-004 §3.4–§3.6, RFC-006 §8 |
 | **Ground truth** | `rift-cluster@5c8dbfb`, `vendor/rift@de0ab0f` (v0.17.0-42); live fleet baseline 57/57 on 2026-09-06 |
 | **Author** | Mohsen Zainalpour |
 | **Date** | 2026-09-06 |
@@ -19,10 +19,10 @@ RiftCluster set out to make a fleet of Rift nodes behave like one. Along the way
 multi-tenant admin plane with roles and quotas, an audit projection with an export loop, an MCP
 server, a thousand lines of metric families, per-route hit counters, three cloud source providers
 with a fleet-wide poller, a content-addressed blob store with eleven decisions about its
-replication, an owner-authoritative flow-state tier with a ring, a fencing scheme and a sequencer,
-and a distributed request journal with vector cursors. Each was defensible on its own. Together
-they are most of the code, half of the admin API, and the part of the system that has produced
-the open bugs — while the thing the fleet exists to do is comparatively small and already works.
+replication, and a distributed request journal with vector cursors. Each was defensible on its
+own. Together they are much of the code, half of the admin API, and the part of the system that
+has produced the open bugs — while the thing the fleet exists to do is comparatively small and
+already works.
 
 This RFC narrows the project to **the distributed core** and records the narrowing as **D-71**:
 
@@ -31,11 +31,14 @@ This RFC narrows the project to **the distributed core** and records the narrowi
   read-after-write and a revision the client can pin;
 - a **router** on every node that dispatches a request to the local imposter the replicated route
   table names;
+- **cluster-wide flow state** — owner-authoritative scenarios and flow KV, the sequencer,
+  proxyOnce claims and spaces, so a stateful mock behaves as one across the fleet without an
+  external store;
 - the **admin API and console to add and manage imposters and stubs**, including a one-shot
   OpenAPI import.
 
 Everything else is either open-source Rift's own feature, used as shipped, or removed. The
-removals are eleven tracked issues (§4). Each is verified before merge against a running fleet,
+removals are ten tracked issues (§4). Each is verified before merge against a running fleet,
 by driving both the surface that leaves and the surfaces that stay (§5).
 
 ## 2. Why — what the measurement showed
@@ -53,17 +56,19 @@ Numbers are `wc -l` over `master@5c8dbfb`, first-party code only (`crates/`, `we
 | Shared console infrastructure (generated API client, app shell) | 14,481 | 3,959 | 15 % |
 | **Total** | **94,606** | **98,794** | |
 
-Inside "cluster core", the two subsystems this RFC removes are themselves large:
+Inside "cluster core", one subsystem this RFC removes is itself large:
 
 | Subsystem | Source | Test |
 |---|---|---|
-| Flow state, shard, sequencer, proxyOnce claims, ring, bridge (`stores/{flow,shard,flow_config,sequencer,proxy}.rs`, `raft/ring.rs`, `bridge.rs`) | ~6,100 | ~5,700 in-file + `tests/{flow_store,proxy_claims,sequencer,flow_shard}.rs` 4,784 |
 | Journal shards and merge-on-read (`stores/{journal,journal_net,journal_seq}.rs`, `pull_on_miss.rs`) | ~4,000 | ~4,200 in-file + `tests/fleet_journal.rs` 1,519 |
 
+The flow-state tier (`stores/{flow,shard,flow_config,sequencer,proxy}.rs`, `raft/ring.rs`,
+`bridge.rs`; ~6,100 source, ~10,500 test) **stays** — see §3.1 and the 2026-09-06 amendment.
+
 What remains after every removal is the Raft store and node (~13,800 source), the RPC layer
-(~1,600), the control-op set, the admin front's dispatch and CRUD proxying, the router
-installation, probes, fleet reads, the CLI, the spec compiler (1,750) and four console screens —
-on the order of a quarter of today's source.
+(~1,600), the flow-state tier, the control-op set, the admin front's dispatch and CRUD proxying,
+the router installation, probes, fleet reads, the CLI, the spec compiler (1,750) and five console
+screens — on the order of a third of today's source.
 
 ### 2.2 Where the API is
 
@@ -87,7 +92,8 @@ lines across five tabs (tenants, principals, bindings, audit, audit sink). The S
 ### 2.4 What is broken, and where
 
 - The only open issue labelled `bug` is **#537**: space-scoped stubs answer `201`, are node-local,
-  and are erased by the next reconcile. It sits in the flow-state and spaces surface.
+  and are erased by the next reconcile. It sits in the flow-state and spaces surface, which stays —
+  so it is a core bug to fix (PR #541), not a surface to remove.
 - **D-68** exists because only the *default* tenant's route table is ever compiled into the
   listener; a tenant's `PUT` is stored, replicated, read back, and never dispatches. Tenancy
   leaked into router correctness, and the fix so far is to say so in the response.
@@ -140,7 +146,10 @@ Read at `vendor/rift@de0ab0f`:
 - **The metrics server is upstream's** (`rift-http-proxy`'s `ServerBuilder`).
 - **The admin credential is upstream's**: `--api-key` / `MB_APIKEY`.
 
-The cluster re-implemented the last four at fleet scale. That is the surface this RFC removes.
+The cluster re-implemented the journal, the metrics and the credential at fleet scale; that is
+surface this RFC removes. It also built a flow-state tier stronger than upstream's Redis backend
+(owner-authoritative reads, fencing, durability modes, no external store) — that one stays
+(§3.1), because a Redis in the path is exactly the external dependency the fleet exists to avoid.
 
 ## 3. The core, defined
 
@@ -153,7 +162,8 @@ The cluster re-implemented the last four at fleet scale. That is the surface thi
 | Bootstrap, seeds, join, leave, `departed`, voter floor, promotion sweep | `raft/{node,network,identity}.rs`, `config.rs`, D-21, D-25, D-26, D-27, D-28, D-59 | A fleet that cannot form and heal is not a fleet |
 | Raft log and snapshots on `redb` | `raft/store.rs`, D-15, D-16, D-24 | The one source of truth for configuration |
 | Replicated imposters, stubs, route table; `op_id` dedup; read-after-write barrier; `Rift-Cluster-Revision` | `control.rs`, `admin_front.rs`, `compose.rs`, D-5 | R1–R4 for configuration |
-| The router: replicated route table installed on every node, in-process dispatch to the local imposter, `installed` reported | upstream U-11 + `control.rs` (`routes_installed_for`), D-11, D-54, D-68 | The cluster's one data-plane contribution: a request reaching any node reaches the right imposter |
+| The router: replicated route table installed on every node, in-process dispatch to the local imposter, `installed` reported | upstream U-11 + `control.rs` (`routes_installed_for`), D-11, D-54, D-68 | A request reaching any node reaches the right imposter |
+| Cluster-wide flow state: owner-authoritative scenarios and flow KV on the HRW ring, fencing, the durable flow shard, the sequencer, proxyOnce claims, spaces | `stores/{flow,shard,flow_config,sequencer,proxy}.rs`, `raft/ring.rs`, `bridge.rs`, D-3, D-7–D-10, D-13, D-17, D-20, D-36, D-40, D-47, D-57, D-63, D-65, D-66 | A stateful mock behaves as one across the fleet, with no external store. **Kept on 2026-09-06 after review** — Rift's own Redis-backed flow store is not the model this project wants for distributed state |
 | Admin API and console for imposters and stubs; recording; one-shot OpenAPI import (compile → `PUT /imposters`) | `admin_front.rs`, `crates/rift-cluster-spec`, console Imposters/detail/editor | What a user does with a mock server |
 | Readiness and liveness probes, `/_fleet/*`, `/_cluster/*`, the Fleet screen | `probes.rs`, `readiness.rs`, `fleet.rs`, `cluster_api.rs`, D-22, D-61 | Operating the fleet |
 | Compose, Helm, image, the chaos tier's membership and replication scenarios | `deploy/`, `tests/cluster-chaos`, D-33, D-35, D-41, D-58 | Shipping and proving the fleet |
@@ -169,34 +179,31 @@ The cluster re-implemented the last four at fleet scale. That is the surface thi
 | Cluster metric families, observability overlay, dashboards, rule tests | Upstream's metrics server, untouched; `/_fleet/members` for tests | RFC-001 metrics section retired | #548 |
 | Tracking sources (`git+`, `s3:`, `registry:`, scheduler, `auth_ref`), datasets, stored specs with drift and validation, the blob store | Upstream `file:`/`https:` sources; stateless `POST /specs/compile` | D-18, D-19, D-23, D-29, D-30, D-31, D-34, D-48, D-49, D-50, D-51, D-52, D-53, D-55, D-56; RFC-005; RFC-004 §3.4–§3.6 | #549 |
 | Tenants, principals, bindings, roles, quotas, `X-Rift-Tenant`, the tenant half of every key and of the revision header | One API key; `POST /session` exchanges it | D-44, D-45, D-46; RFC-002 | #550 |
-| Owner-authoritative flow state, HRW ring, fencing, isolation window, durable flow shard, sequencer, proxyOnce claims, spaces, `ContextScope` | Upstream `FlowStore` (in-memory per node, or `redis` per imposter); upstream per-node proxy recording | D-3, D-6, D-7, D-8, D-9, D-10, D-13, D-17, D-36, D-40, D-47, D-57, D-63, D-65, D-66; D-20 amended (nothing has an owner); RFC-001 §7.2 | #551 |
 | Journal shards, merge-on-read, anti-entropy, generation clears, vector cursors, fleet request tail | Upstream per-node journal | D-32, D-37, D-38, D-39; RFC-001 §7.5 | #552 |
 | Console: Admin, Sources, Scenarios screens; planned Specs entry | Four screens: Imposters, Requests, Routes, Cluster | RFC-006 §4 amended | #553 |
 
 ### 3.3 The trade, stated once
 
-- **Stateful mocks across nodes are Rift's feature, not the cluster's.** With the default
-  in-memory store, a scenario is per node — what open-source Rift behind a load balancer does
-  today, and what WireMock OSS does. With `_rift.flowState.backend: "redis"` it spans nodes. The
-  README's "no external datastore" promise narrows to *membership, configuration and routing*,
-  which is the promise Raft can actually keep without a second system.
+- **Stateful mocks stay cluster-wide.** Scenarios, flow KV, sequencing and proxyOnce keep their
+  owner-routed semantics and the "no external datastore" promise stands in full. (v1 of this RFC
+  proposed handing this to upstream's Redis-backed store; withdrawn 2026-09-06 — a Redis in the
+  path is the dependency the fleet exists to avoid, and the cluster's tier is the stronger one.)
 - **Verification is per node.** `GET /imposters/:port/requests` answers for the node you reached.
   A test that needs fleet-wide verification pins a node or reads all of them. If Rift ever grows a
   shared journal, it grows it in the engine, once, for every deployment shape.
-- **proxyOnce is per node.** Duplicate upstream calls are bounded by the node count, as in
-  open-source Rift.
 - **One credential.** Everyone who can administer the fleet can administer all of it. Isolation
   between teams is a deployment (two fleets), not a feature.
 
 These are losses. They are accepted because each of the removed subsystems was a second
-distributed system riding inside the first, and the first one is the product.
+distributed system riding inside the first, and the first one — configuration, routing, and the
+state a mock needs to be one mock — is the product.
 
 ## 4. Removal plan
 
-Eleven issues under epic **#544**, in landing order. 1–5 are independent. 6 needs 2 and 5 (audit
-rows and datasets are per tenant). 7 needs 6 (`ContextScope` carries the tenant). 8 is independent
-of 7 but simpler after 6. 9 needs 6 and 8. 10 closes the epic. 11 lands first so every later
-child has an in-repo before/after check.
+Ten issues under epic **#544**, in landing order (an eleventh, #551, was withdrawn on 2026-09-06 —
+see §3.1). 1–5 are independent. 6 needs 2 and 5 (audit rows and datasets are per tenant) and drops
+the tenant component of `ContextScope`. 8 is simpler after 6. 9 needs 6 and 8. 10 closes the
+epic. 0 lands first so every later child has an in-repo before/after check.
 
 | Order | Issue | Surface | Depends on |
 |---|---|---|---|
@@ -207,7 +214,7 @@ child has an in-repo before/after check.
 | 4 | #548 | Cluster metrics, observability overlay | — |
 | 5 | #549 | Tracking sources, datasets, stored specs, blob store | — |
 | 6 | #550 | Tenancy, RBAC, principals | #546, #549 |
-| 7 | #551 | Clustered flow state, sequencer, proxyOnce claims, spaces | #550 |
+| 7 | ~~#551~~ | ~~Clustered flow state~~ — withdrawn, stays | — |
 | 8 | #552 | Fleet journal merge | (#550) |
 | 9 | #553 | Console trimmed to four screens | #550, #552 |
 | 10 | #554 | Design docs retired; the router named | all |
@@ -232,14 +239,14 @@ was re-seeded and checked with the vault harness
 |---|---|---|
 | cluster — one leader, three voters, same applied index, console on every node, no imposter port published | 8 | **keep** |
 | imposter through the front door on all three nodes; predicates; 401/200/404 | 8 | **keep** (router) |
-| proxy — proxyOnce replays on another node; proxyTransparent; generated predicate | 4 | keep proxying; cross-node proxyOnce **goes** (#551) |
+| proxy — proxyOnce replays on another node; proxyTransparent; generated predicate | 4 | **keep** |
 | front door — host, prefix, strip, priority, method, proxy target, replicated to node 3, `installed` | 10 | **keep**; the tenant-table assertion **goes** (#550) |
-| scenarios — state crossed nodes | 2 | **goes** as a cluster feature (#551); re-asserted per node and once with a Redis-backed imposter |
-| spaces — node-local space stubs, erased on reconcile, flow KV across nodes | 5 | **goes** (#551) |
+| scenarios — state crossed nodes | 2 | **keep** (added to the smoke check) |
+| spaces — node-local space stubs, erased on reconcile, flow KV across nodes | 5 | **keep**; the node-local assertions describe bug #537, fixed by PR #541 |
 | tenancy — cross-tenant 404, header borrowing refused, data plane not isolated | 5 | **goes** (#550) |
 | console session — bootstrap key refused, minted principal accepted, cookie on node 3 | 6 | **goes**; replaced by "the API key holds a session on every node" |
 | RBAC ladder | 6 | **goes** (#550) |
-| observability — journal records the serving node; audit has entries; one proxyOnce claim | 3 | journal per node **keep**; audit **goes** (#546); claim **goes** (#551) |
+| observability — journal records the serving node; audit has entries; one proxyOnce claim | 3 | journal per node **keep**; audit **goes** (#546); claim **keep** |
 
 ### 5.2 Per child
 
@@ -268,8 +275,8 @@ taken once the API has stopped shrinking (#554).
 ## 7. Explicit non-goals
 
 - **Sharding.** The fleet stays replicated: every node binds every imposter and serves every
-  request locally. D-20's core claim — imposters, stubs and config own nothing — survives; what
-  changes is that *nothing* has an owner, because flows are no longer the cluster's.
+  request locally. D-20 stands unchanged: only a flow has an owner; imposters, stubs and config
+  own nothing.
 - **Re-adding any removed surface behind a feature flag.** A flag keeps the code, the tests, the
   decisions and the maintenance. Removed means removed; it can be re-proposed as a new RFC.
 - **Changing the upstream repository.** Everything here is subtraction on this side of the
@@ -304,7 +311,7 @@ Updated as PRs merge. Status is one of `open`, `in progress`, `merged`.
 | #548 | Metrics and observability | open | — |
 | #549 | Sources, datasets, specs, blobs | open | — |
 | #550 | Tenancy and RBAC | open | — |
-| #551 | Flow state, sequencer, proxyOnce, spaces | open | — |
+| ~~#551~~ | Flow state, sequencer, proxyOnce, spaces | withdrawn 2026-09-06 — stays | — |
 | #552 | Journal merge | open | — |
 | #553 | Console | open | — |
 | #554 | Docs and naming | open | — |
@@ -314,10 +321,11 @@ Closed as out of scope on 2026-09-06, with the reason on each: #148, #149, #151,
 
 ## Appendix A — every decision, by fate
 
-**Keep (unchanged):** D-4, D-5, D-11, D-14, D-15, D-16, D-21, D-22, D-24, D-25, D-26, D-27,
-D-28, D-33, D-35, D-41, D-42, D-43, D-54, D-58, D-59, D-60, D-61, D-62, D-64, D-67.
+**Keep (unchanged):** D-3, D-4, D-5, D-6, D-7, D-8, D-9, D-10, D-11, D-13, D-14, D-15, D-16,
+D-17, D-20, D-21, D-22, D-24, D-25, D-26, D-27, D-28, D-33, D-35, D-36, D-40, D-41, D-42, D-43,
+D-47, D-54, D-57, D-58, D-59, D-60, D-61, D-62, D-63, D-64, D-65, D-66, D-67.
 
-**Amend:** D-20 (nothing has an owner), D-68 (`installed` from the route-table endpoints only).
+**Amend:** D-68 (`installed` from the route-table endpoints only).
 
 **Supersede, by the child that removes the code:**
 
@@ -326,7 +334,6 @@ D-28, D-33, D-35, D-41, D-42, D-43, D-54, D-58, D-59, D-60, D-61, D-62, D-64, D-
 | #545 | D-70 |
 | #549 | D-18, D-19, D-23, D-29, D-30, D-31, D-34, D-48, D-49, D-50, D-51, D-52, D-53, D-55, D-56 |
 | #550 | D-44, D-45, D-46 |
-| #551 | D-3, D-6, D-7, D-8, D-9, D-10, D-13, D-17, D-36, D-40, D-47, D-57, D-63, D-65, D-66 |
 | #552 | D-32, D-37, D-38, D-39 |
 
 Already superseded before this RFC: D-1, D-2, D-12. The register skips number 69.
