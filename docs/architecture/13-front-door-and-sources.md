@@ -12,8 +12,10 @@ proxy, its glue scripts, its config drift — stops existing. Tracked as issues
 > **Amended by D-68** (2026-09-01, #536): the "Tenancy-aware" bullet below said only that the
 > default tenant's routes are compiled into the listener. It is now also *published*: both
 > `PUT` and `GET /front-door/routes` answer `installed: <bool>` beside the table, so a tenant
-> writing a table that can never dispatch learns it on the write rather than from
-> `/front-door/route-hits`.
+> writing a table that can never dispatch learns it on the write. Since #545 (D-71, RFC-007
+> §3.2) those two endpoints are the only place the flag appears: the per-route dispatch counters
+> this chapter once described are gone, the request log being what answers "is this route taking
+> traffic".
 
 Chapter 2's gateway mode asks the *client* to name the target imposter
 (the `/__rift/8080` path prefix — the header and subdomain forms were withdrawn
@@ -68,34 +70,9 @@ Design points that carry weight (full spec in #19):
   rule. **Both route endpoints publish that fact** (#536, D-68): `PUT` and
   `GET /front-door/routes` answer `installed: <bool>` beside the table, from
   that same function, so a tenant that writes a table which can never dispatch
-  learns it at the moment it writes rather than by reading
-  `/front-door/route-hits` it has no reason to suspect it needs. The flag is a
-  read-only decoration on the response — it is not part of the stored table,
-  and a `PUT` body claiming `installed: true` is ignored.
-- **Dispatches are counted** (#368): upstream calls a `RouteObserver` once per
-  request a route *claims*, before its target answers, so a route that only
-  ever 404s still counts — a route claiming traffic and failing is exactly
-  what an operator needs to see. The counts are per node and in memory, summed
-  across the fleet by `GET /front-door/route-hits` and stamped
-  `Rift-Cluster-Partial` when a peer could not be reached. The figure that
-  matters most is a zero — but a zero only means "wrong or dead" for a route
-  that *could* have taken a request, and three states where it could not are
-  reported rather than collapsed into it: a tenant whose routes are never
-  compiled in (`installed: false`, above), a route switched off, and a fleet
-  where no node binds a listener at all.
-- **Listener presence is published too** (#403): `--front-door` is optional,
-  so a whole fleet can run without one — and then every route reports an
-  honest zero that reads exactly like a misconfigured route. Each node states
-  its own listener on `GET /_cluster/route-hits`, and the admin read folds
-  those into `front_door: bound | none | unknown` on the same body as the
-  counts. `none` is *proven* absence and is the only value that explains the
-  zeros: it is claimable only when every voter answered and every one of them
-  denied binding a listener, which is what makes it mutually exclusive with
-  `Rift-Cluster-Partial` by construction. A peer that could not be asked, or
-  one running a build from before the field existed, yields `unknown` — the
-  counts still stand, but absence is not inferred from silence. The fold is a
-  pure function beside the count merge, because every wire test here runs a
-  solo node and would never execute the peer arms.
+  learns it at the moment it writes rather than discovering it later. The flag
+  is a read-only decoration on the response — it is not part of the stored
+  table, and a `PUT` body claiming `installed: true` is ignored.
 
 ## Imposter sources: mocks come from somewhere
 

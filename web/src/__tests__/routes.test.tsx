@@ -8,10 +8,6 @@ import { RouteTableScreen } from "../screens/Routes.tsx";
 import { renderInApp, stubFetch, whoamiWith } from "./harness.tsx";
 
 const ROUTES = "/front-door/routes";
-const ROUTE_HITS = "/front-door/route-hits";
-
-/** Every id in `TABLE`, installed and counted — the shape the screen sees in the ordinary case. */
-const HITS = { installed: true, hits: { alpha: 0, beta: 0 } };
 
 function route(id: string, overrides: Record<string, unknown> = {}): Record<string, unknown> {
   return {
@@ -25,6 +21,9 @@ function route(id: string, overrides: Record<string, unknown> = {}): Record<stri
 }
 
 const TABLE = { routes: [route("alpha"), route("beta", { priority: 5 })] };
+/** The same table as a non-default tenant reads it back: stored, but never compiled in (D-68). */
+const TABLE_NOT_INSTALLED = { ...TABLE, installed: false };
+const TABLE_INSTALLED = { ...TABLE, installed: true };
 
 /** The calls a test needs to assert against: method, path and parsed body. */
 type Call = { method: string; path: string; body: unknown };
@@ -47,11 +46,7 @@ function stubSequence(replies: {
       const body = typeof init?.body === "string" ? JSON.parse(init.body) : undefined;
       calls.push({ method, path, body });
       if (method === "GET") {
-        // The Hits column reads its own endpoint (#368). These tests are about the editor, not
-        // the counts, so it answers a constant — but it has to answer, since an unstubbed path is
-        // a hard failure in this harness.
-        const json = path.startsWith(ROUTE_HITS) ? HITS : replies.get();
-        return Promise.resolve(new Response(JSON.stringify(json), { status: 200 }));
+        return Promise.resolve(new Response(JSON.stringify(replies.get()), { status: 200 }));
       }
       if (method === "PUT") {
         const reply = replies.put?.() ?? { status: 200, json: replies.get() };
@@ -70,7 +65,7 @@ afterEach(() => {
 
 describe("effective order on screen", () => {
   it("lists routes in the order the front door evaluates them, not authoring order", async () => {
-    stubFetch({ [ROUTES]: { json: TABLE }, [ROUTE_HITS]: { json: HITS } });
+    stubFetch({ [ROUTES]: { json: TABLE } });
     renderInApp(<RouteTableScreen />, { whoami: whoamiWith("editor") });
 
     await waitFor(() => expect(screen.getAllByTestId("route-row").length).toBe(2));
@@ -82,7 +77,6 @@ describe("effective order on screen", () => {
   it("shows a disabled route with no rank, because it is never dispatched", async () => {
     stubFetch({
       [ROUTES]: { json: { routes: [route("on"), route("off", { enabled: false })] } },
-      [ROUTE_HITS]: { json: { installed: true, hits: { on: 0, off: 0 } } },
     });
     renderInApp(<RouteTableScreen />, { whoami: whoamiWith("editor") });
 
@@ -319,7 +313,7 @@ describe("validation", () => {
 
 describe("read-only principals", () => {
   it("offers no write control to a viewer", async () => {
-    stubFetch({ [ROUTES]: { json: TABLE }, [ROUTE_HITS]: { json: HITS } });
+    stubFetch({ [ROUTES]: { json: TABLE } });
     renderInApp(<RouteTableScreen />, { whoami: whoamiWith("viewer") });
 
     await waitFor(() => expect(screen.getAllByTestId("route-row").length).toBe(2));
@@ -331,14 +325,13 @@ describe("read-only principals", () => {
 /**
  * A non-default tenant's routes are stored and read back, but `desired_routes` compiles only the
  * default tenant's into the shared front door — so this table is structurally incapable of taking
- * a request. #404 fixed the Hits *cell*; every other column on the screen still described a live
- * dispatch chain. These tests pin the rest of the screen to the same fact.
+ * a request. The server says so with `installed: false` beside the table on `GET` and
+ * `PUT /front-door/routes` (D-68), and since #545 nowhere else; every column on the screen that
+ * would otherwise describe a live dispatch chain is pinned to that one fact.
  */
 describe("a tenant whose table is never installed (#400)", () => {
-  const NOT_INSTALLED = { installed: false, hits: null };
-
   it("states once that the table is stored but never compiled into the front door", async () => {
-    stubFetch({ [ROUTES]: { json: TABLE }, [ROUTE_HITS]: { json: NOT_INSTALLED } });
+    stubFetch({ [ROUTES]: { json: TABLE_NOT_INSTALLED } });
     renderInApp(<RouteTableScreen />, { whoami: whoamiWith("editor") });
 
     const banner = await screen.findByTestId("routes-not-installed");
@@ -351,7 +344,7 @@ describe("a tenant whose table is never installed (#400)", () => {
 
   // A rank is a claim about position within a chain. There is no chain here.
   it("gives no route a rank, because there is no dispatch chain to rank within", async () => {
-    stubFetch({ [ROUTES]: { json: TABLE }, [ROUTE_HITS]: { json: NOT_INSTALLED } });
+    stubFetch({ [ROUTES]: { json: TABLE_NOT_INSTALLED } });
     renderInApp(<RouteTableScreen />, { whoami: whoamiWith("editor") });
 
     await waitFor(() => expect(screen.getAllByTestId("route-row").length).toBe(2));
@@ -370,7 +363,7 @@ describe("a tenant whose table is never installed (#400)", () => {
   // `effectiveOrder` ranks by priority, which would put `beta` (priority 5) first — a fabricated
   // order under a label promising the stored one.
   it("lists the rows in stored order, which is what the header now claims", async () => {
-    stubFetch({ [ROUTES]: { json: TABLE }, [ROUTE_HITS]: { json: NOT_INSTALLED } });
+    stubFetch({ [ROUTES]: { json: TABLE_NOT_INSTALLED } });
     renderInApp(<RouteTableScreen />, { whoami: whoamiWith("editor") });
 
     await waitFor(() => expect(screen.getAllByTestId("route-row").length).toBe(2));
@@ -383,7 +376,7 @@ describe("a tenant whose table is never installed (#400)", () => {
   });
 
   it("states the fact above the table rather than after it", async () => {
-    stubFetch({ [ROUTES]: { json: TABLE }, [ROUTE_HITS]: { json: NOT_INSTALLED } });
+    stubFetch({ [ROUTES]: { json: TABLE_NOT_INSTALLED } });
     const { container } = renderInApp(<RouteTableScreen />, { whoami: whoamiWith("editor") });
 
     const banner = await screen.findByTestId("routes-not-installed");
@@ -396,7 +389,7 @@ describe("a tenant whose table is never installed (#400)", () => {
 
   // Otherwise the rail names a winning route on a table the banner has just called inert.
   it("stops the route tester presenting a dispatch this tenant can never get", async () => {
-    stubFetch({ [ROUTES]: { json: TABLE }, [ROUTE_HITS]: { json: NOT_INSTALLED } });
+    stubFetch({ [ROUTES]: { json: TABLE_NOT_INSTALLED } });
     renderInApp(<RouteTableScreen />, { whoami: whoamiWith("editor") });
 
     await waitFor(() => expect(screen.getAllByTestId("route-row").length).toBe(2));
@@ -408,7 +401,7 @@ describe("a tenant whose table is never installed (#400)", () => {
   // `orderReason` prose ("priority 5 → no host clause → id beta") is exactly the live-chain
   // implication being removed, so the assertion is that it is absent, not merely overridden.
   it("does not explain an evaluation order that does not exist", async () => {
-    stubFetch({ [ROUTES]: { json: TABLE }, [ROUTE_HITS]: { json: NOT_INSTALLED } });
+    stubFetch({ [ROUTES]: { json: TABLE_NOT_INSTALLED } });
     renderInApp(<RouteTableScreen />, { whoami: whoamiWith("editor") });
 
     await waitFor(() => expect(screen.getAllByTestId("route-row").length).toBe(2));
@@ -424,7 +417,7 @@ describe("a tenant whose table is never installed (#400)", () => {
   });
 
   it("stops the screen's header claiming the front door evaluates this table", async () => {
-    stubFetch({ [ROUTES]: { json: TABLE }, [ROUTE_HITS]: { json: NOT_INSTALLED } });
+    stubFetch({ [ROUTES]: { json: TABLE_NOT_INSTALLED } });
     renderInApp(<RouteTableScreen />, { whoami: whoamiWith("editor") });
 
     await waitFor(() => expect(screen.getAllByTestId("route-row").length).toBe(2));
@@ -436,7 +429,7 @@ describe("a tenant whose table is never installed (#400)", () => {
   // The stored table is real replicated state and writes to it are legitimate. Muting the *chain*
   // must not read as a read-only screen.
   it("still offers every write control, because the stored table is real", async () => {
-    stubFetch({ [ROUTES]: { json: TABLE }, [ROUTE_HITS]: { json: NOT_INSTALLED } });
+    stubFetch({ [ROUTES]: { json: TABLE_NOT_INSTALLED } });
     renderInApp(<RouteTableScreen />, { whoami: whoamiWith("editor") });
 
     await waitFor(() => expect(screen.getAllByTestId("route-row").length).toBe(2));
@@ -451,8 +444,7 @@ describe("a tenant whose table is never installed (#400)", () => {
   // would explain a route's absence from a chain that does not exist in the first place.
   it("says not installed for a disabled route too, rather than calling it disabled", async () => {
     stubFetch({
-      [ROUTES]: { json: { routes: [route("on"), route("off", { enabled: false })] } },
-      [ROUTE_HITS]: { json: NOT_INSTALLED },
+      [ROUTES]: { json: { routes: [route("on"), route("off", { enabled: false })], installed: false } },
     });
     renderInApp(<RouteTableScreen />, { whoami: whoamiWith("editor") });
 
@@ -467,30 +459,15 @@ describe("a tenant whose table is never installed (#400)", () => {
 
   // The fact is about the tenant's table, not about the rows in it.
   it("names the fact even for a tenant that has stored no routes at all", async () => {
-    stubFetch({ [ROUTES]: { json: { routes: [] } }, [ROUTE_HITS]: { json: NOT_INSTALLED } });
+    stubFetch({ [ROUTES]: { json: { routes: [], installed: false } } });
     renderInApp(<RouteTableScreen />, { whoami: whoamiWith("editor") });
 
     expect(await screen.findByTestId("routes-not-installed")).toBeTruthy();
   });
 
-  /*
-   * `/front-door/route-hits` is a cluster-wide fan-out. Two components needing the flag is not a
-   * licence to observe it twice: `Editor` mounts only after the table resolves, so at `staleTime: 0`
-   * a second observer refetches on mount rather than reading the cache — one screen load, two
-   * fan-outs. The flag is read once at the top and passed down, and this counts it.
-   */
-  it("issues one route-hits fan-out per load, however many components need the flag", async () => {
-    const { calls } = stubFetch({ [ROUTES]: { json: TABLE }, [ROUTE_HITS]: { json: HITS } });
-    renderInApp(<RouteTableScreen />, { whoami: whoamiWith("editor") });
-
-    await waitFor(() => expect(screen.getAllByTestId("route-row").length).toBe(2));
-    await waitFor(() => expect(screen.getAllByTestId("route-hits")[0]?.textContent).toBe("0"));
-    expect(calls.filter((path) => path.startsWith(ROUTE_HITS)).length).toBe(1);
-  });
-
   // The default-tenant path is the one that must not regress: its chain is real.
   it("leaves the installed tenant's chain exactly as it was", async () => {
-    stubFetch({ [ROUTES]: { json: TABLE }, [ROUTE_HITS]: { json: HITS } });
+    stubFetch({ [ROUTES]: { json: TABLE_INSTALLED } });
     renderInApp(<RouteTableScreen />, { whoami: whoamiWith("editor") });
 
     await waitFor(() => expect(screen.getAllByTestId("route-row").length).toBe(2));
@@ -508,176 +485,40 @@ describe("a tenant whose table is never installed (#400)", () => {
   });
 });
 
+
 /**
  * The same bound-versus-unknown rule #369 established, one level up: a flag the console could not
  * read is not a flag that came back false. Folding the two together would put a confident
- * structural claim — "this table can never take a request" — behind a failed HTTP call.
+ * structural claim — "this table can never take a request" — behind a body that merely did not
+ * say. A routes body with no flag is what a pre-D-68 node looks like mid-rolling-upgrade.
+ *
+ * Pins D-68 (amended, #545): with the route-table endpoints the only source of the flag, an absent
+ * flag has no fallback and is still read as unknown — `installed === false`, never `!installed`.
  */
-describe("an unreadable installed flag is not a not-installed table (#400)", () => {
-  /*
-   * A genuinely in-flight read, not a failed one. The 503 and missing-flag cases below both reach
-   * `data === undefined` through `isError`; this is the third route to the same undefined, and it
-   * is the one a future `hits.isPending` special-case would break without any other test noticing.
-   */
-  it("does not banner or mute while the hits read is still in flight", async () => {
-    vi.stubGlobal(
-      "fetch",
-      vi.fn((input: RequestInfo | URL) => {
-        const path = typeof input === "string" ? input : input.toString();
-        if (path.startsWith(ROUTE_HITS)) return new Promise<Response>(() => {});
-        if (path.startsWith(ROUTES)) {
-          return Promise.resolve(new Response(JSON.stringify(TABLE), { status: 200 }));
-        }
-        return Promise.reject(new Error(`test stub has no reply for ${path}`));
-      }),
-    );
-    renderInApp(<RouteTableScreen />, { whoami: whoamiWith("editor") });
-
-    await waitFor(() => expect(screen.getAllByTestId("route-row").length).toBe(2));
-    expect(screen.queryByTestId("routes-not-installed")).toBeNull();
-    expect(screen.getAllByTestId("route-id").map((n) => n.textContent)).toEqual(["beta", "alpha"]);
-    expect(screen.getAllByTestId("route-rank").map((n) => n.textContent)).toEqual(["1", "2"]);
-    expect(screen.getAllByTestId("route-why")[0]?.textContent).toMatch(/priority 5/);
-    expect(screen.getByText(/the order the front door evaluates them/i)).toBeTruthy();
-    // Unknown, and said as unknown — not as a zero and not as "not installed".
-    expect(screen.getAllByTestId("route-hits").map((n) => n.textContent)).toEqual(["—", "—"]);
-  });
-
-  // Pins D-70's other half: unknown does not weaken as sources are added. Neither body carried the
-  // flag, and "neither said" stays unknown rather than becoming a majority of silence.
-  it("does not banner or mute when the hits read failed outright", async () => {
-    stubFetch({
-      [ROUTES]: { json: TABLE },
-      [ROUTE_HITS]: { status: 503, json: { message: "cluster node is shutting down" } },
-    });
-    renderInApp(<RouteTableScreen />, { whoami: whoamiWith("editor") });
-
-    await waitFor(() => expect(screen.getAllByTestId("route-row").length).toBe(2));
-    await waitFor(() =>
-      expect(screen.getAllByTestId("route-hits").map((n) => n.textContent)).toEqual(["—", "—"]),
-    );
-    expect(screen.queryByTestId("routes-not-installed")).toBeNull();
-    expect(screen.getAllByTestId("route-rank").map((n) => n.textContent)).toEqual(["1", "2"]);
-    expect(screen.getAllByTestId("route-why")[0]?.textContent).toMatch(/priority 5/);
-    expect(screen.getByText(/the order the front door evaluates them/i)).toBeTruthy();
-  });
-
+describe("an absent installed flag is not a not-installed table (#400)", () => {
   it("does not banner or mute when the body carried no installed flag", async () => {
-    stubFetch({
-      [ROUTES]: { json: TABLE },
-      [ROUTE_HITS]: { json: { hits: { alpha: 1, beta: 2 } } },
-    });
+    stubFetch({ [ROUTES]: { json: TABLE } });
     renderInApp(<RouteTableScreen />, { whoami: whoamiWith("editor") });
 
     await waitFor(() => expect(screen.getAllByTestId("route-row").length).toBe(2));
-    await waitFor(() =>
-      expect(screen.getAllByTestId("route-hits").map((n) => n.textContent)).toEqual(["—", "—"]),
-    );
     expect(screen.queryByTestId("routes-not-installed")).toBeNull();
     expect(screen.getAllByTestId("route-rank").map((n) => n.textContent)).toEqual(["1", "2"]);
+    expect(screen.getAllByTestId("route-why")[0]?.textContent).toMatch(/priority 5/);
+    expect(screen.getByText(/the order the front door evaluates them/i)).toBeTruthy();
   });
 });
 
 /**
- * The console derives a structural claim from the cheapest source that carries it — here the local
- * route-table read rather than the cluster-wide hits fan-out (D-70).
- *
- * `/front-door/routes` answers `installed` beside the routes, from the same server function
- * `/front-door/route-hits` reports it from (D-68) — so the two cannot disagree, and the only thing
- * that differs is which one is *available*. The hits endpoint is a fan-out and the table read is
- * local, which made the banner disappear in precisely the states an operator is most likely to be
- * debugging in (#539). Reading the table's copy first is what closes that.
- *
- * D-70's other half — absence from *every* source is still unknown — is pinned in the `#400` block
- * above, whose fixtures are deliberate: a routes body with no flag beside a hits body that has one
- * is a pre-D-68 node mid-rolling-upgrade.
+ * `installed` is published on `GET` and `PUT /front-door/routes` and nowhere else (D-68, amended
+ * by #545). What these pin is the write half: the answer to an operator's own `PUT` is what tells
+ * them a non-default tenant's table will never dispatch, and the flag is a property of the tenant,
+ * so it must not read as a change to the table.
  */
 describe("the routes body's own installed flag (#539)", () => {
-  const TABLE_NOT_INSTALLED = { ...TABLE, installed: false };
-  const TABLE_INSTALLED = { ...TABLE, installed: true };
-  const HITS_DOWN = { status: 503, json: { message: "cluster node is shutting down" } };
-
-  // Pins D-70: the claim is derived from the cheapest source that carries it — the local table
-  // read — so a failed cluster-wide fan-out no longer takes the whole treatment down with it.
-  it("states the fact from the routes body when the hits fan-out failed outright", async () => {
-    stubFetch({ [ROUTES]: { json: TABLE_NOT_INSTALLED }, [ROUTE_HITS]: HITS_DOWN });
-    renderInApp(<RouteTableScreen />, { whoami: whoamiWith("editor") });
-
-    expect(await screen.findByTestId("routes-not-installed")).toBeTruthy();
-    await waitFor(() => expect(screen.getAllByTestId("route-row").length).toBe(2));
-    // Every column that describes a dispatch chain, not just the banner.
-    expect(screen.getAllByTestId("route-rank").map((n) => n.textContent)).toEqual(["—", "—"]);
-    expect(screen.getAllByTestId("route-why").map((n) => n.textContent)).toEqual([
-      "not installed",
-      "not installed",
-    ]);
-    // Stored order, matching the header — not the priority chain `effectiveOrder` would compute.
-    expect(screen.getAllByTestId("route-id").map((n) => n.textContent)).toEqual(["alpha", "beta"]);
-    /*
-     * The cell says the stronger fact, not the dash. A failed hits read leaves the *count*
-     * unknown, but the table body has already established that this route can take no dispatch at
-     * all — so the unavailable-count branch must not run before the not-installed one.
-     */
-    expect(screen.getAllByTestId("route-hits").map((n) => n.textContent)).toEqual([
-      "not installed",
-      "not installed",
-    ]);
-  });
-
-  it("states the fact from the routes body while the hits fan-out is still in flight", async () => {
-    vi.stubGlobal(
-      "fetch",
-      vi.fn((input: RequestInfo | URL) => {
-        const path = typeof input === "string" ? input : input.toString();
-        if (path.startsWith(ROUTE_HITS)) return new Promise<Response>(() => {});
-        if (path.startsWith(ROUTES)) {
-          return Promise.resolve(
-            new Response(JSON.stringify(TABLE_NOT_INSTALLED), { status: 200 }),
-          );
-        }
-        return Promise.reject(new Error(`test stub has no reply for ${path}`));
-      }),
-    );
-    renderInApp(<RouteTableScreen />, { whoami: whoamiWith("editor") });
-
-    expect(await screen.findByTestId("routes-not-installed")).toBeTruthy();
-    await waitFor(() => expect(screen.getAllByTestId("route-row").length).toBe(2));
-    expect(screen.getAllByTestId("route-rank").map((n) => n.textContent)).toEqual(["—", "—"]);
-    expect(screen.getByTestId("probe-hint").textContent).toMatch(/never installed/i);
-    expect(screen.getByText(/stored order/i)).toBeTruthy();
-  });
-
-  // The fact is about the tenant, so it does not need a row to hang off.
-  it("names the fact for an empty table with no hits read at all", async () => {
-    stubFetch({
-      [ROUTES]: { json: { routes: [], installed: false } },
-      [ROUTE_HITS]: HITS_DOWN,
-    });
-    renderInApp(<RouteTableScreen />, { whoami: whoamiWith("editor") });
-
-    expect(await screen.findByTestId("routes-not-installed")).toBeTruthy();
-  });
-
-  // The direction that must not regress: a failed fan-out is still not evidence of anything.
-  it("leaves an installed tenant's chain alone when the hits fan-out failed", async () => {
-    stubFetch({ [ROUTES]: { json: TABLE_INSTALLED }, [ROUTE_HITS]: HITS_DOWN });
-    renderInApp(<RouteTableScreen />, { whoami: whoamiWith("editor") });
-
-    await waitFor(() => expect(screen.getAllByTestId("route-row").length).toBe(2));
-    await waitFor(() =>
-      expect(screen.getAllByTestId("route-hits").map((n) => n.textContent)).toEqual(["—", "—"]),
-    );
-    expect(screen.queryByTestId("routes-not-installed")).toBeNull();
-    expect(screen.getAllByTestId("route-id").map((n) => n.textContent)).toEqual(["beta", "alpha"]);
-    expect(screen.getAllByTestId("route-rank").map((n) => n.textContent)).toEqual(["1", "2"]);
-    expect(screen.getAllByTestId("route-why")[0]?.textContent).toMatch(/priority 5/);
-    expect(screen.getByText(/the order the front door evaluates them/i)).toBeTruthy();
-  });
-
   /*
    * The write is the one moment a caller could act on this (`admin_front.rs`, D-68): an operator
    * saving a table under a non-default tenant learns from their own `PUT` that it will never
-   * dispatch, rather than waiting on a poll of a fan-out that may not answer.
+   * dispatch, rather than waiting on the next poll.
    *
    * The re-read that `onSettled` invalidates into is left hanging deliberately: with it resolving,
    * the banner would arrive on the refetch whatever the write had done with the flag, and the test
@@ -688,12 +529,8 @@ describe("the routes body's own installed flag (#539)", () => {
     let written = false;
     vi.stubGlobal(
       "fetch",
-      vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
-        const path = typeof input === "string" ? input : input.toString();
+      vi.fn((_input: RequestInfo | URL, init?: RequestInit) => {
         const method = init?.method ?? "GET";
-        if (path.startsWith(ROUTE_HITS)) {
-          return Promise.resolve(new Response(JSON.stringify(HITS_DOWN.json), { status: 503 }));
-        }
         if (method === "PUT") {
           written = true;
           return Promise.resolve(
@@ -716,9 +553,9 @@ describe("the routes body's own installed flag (#539)", () => {
   });
 
   /*
-   * Pins D-70: `installed` is a property of the tenant, not of the table — which is why the server
-   * keeps it off `RouteTable` entirely (D-68). Letting it into the optimistic-concurrency
-   * comparison would make a save report a phantom conflict against a table nobody touched.
+   * Pins D-68: `installed` is a property of the tenant, not of the table — which is why the server
+   * keeps it off `RouteTable` entirely. Letting it into the optimistic-concurrency comparison
+   * would make a save report a phantom conflict against a table nobody touched.
    *
    * The flag has to *differ* between the load and `usePutRoutes`'s own pre-write re-read, or the
    * test proves nothing: holding it constant, a comparison that wrongly included `installed` would
@@ -742,199 +579,6 @@ describe("the routes body's own installed flag (#539)", () => {
 
     await waitFor(() => expect(calls.some((c) => c.method === "PUT")).toBe(true));
     expect(screen.queryByTestId("route-conflict")).toBeNull();
-  });
-
-  /*
-   * The contract-impossible case, tested precisely because it is impossible.
-   *
-   * Since #539 the two inert-fact banners source `installed` from *different* endpoints. D-68 makes
-   * them one server function, so this state cannot arise from a correct fleet — but if it ever did,
-   * the screen would state two things at once that deny each other: "these routes are never
-   * compiled in" directly above "these routes are installed and would be evaluated". The
-   * `!notInstalled` guard on `noFrontDoor` exists for exactly that, and without this test deleting
-   * it would fail nothing: every other no-front-door test uses a routes body with no flag, so
-   * `notInstalled` is false there and the guard never runs.
-   */
-  it("shows only the stronger banner if the two endpoints ever contradict each other", async () => {
-    stubFetch({
-      [ROUTES]: { json: TABLE_NOT_INSTALLED },
-      [ROUTE_HITS]: { json: { installed: true, hits: { alpha: 0, beta: 0 }, front_door: "none" } },
-    });
-    renderInApp(<RouteTableScreen />, { whoami: whoamiWith("editor") });
-
-    expect(await screen.findByTestId("routes-not-installed")).toBeTruthy();
-    /*
-     * `findBy…`, not `queryBy…`. The not-installed banner comes from the *table* read, which
-     * resolves first, so a synchronous absence check here would pass simply because the hits
-     * fan-out had not landed yet — and would go on passing with the guard deleted. Polling until
-     * the timeout is what makes this a statement about the guard rather than about arrival order.
-     */
-    await expect(screen.findByTestId("routes-no-front-door")).rejects.toThrow();
-  });
-});
-
-/**
- * A fleet where no node was started with `--front-door` reports an honest zero for every route.
- * The Hits column reads a zero as "took nothing" — the state an operator investigates as a broken
- * route — when the truth is that nothing could have dispatched at all. Same distinction as
- * not-installed, one level below the tenant. `scripts/e2e-console.sh` reaches this state in-repo.
- */
-describe("a fleet with no front-door listener anywhere (#403)", () => {
-  const NO_DOOR = { installed: true, hits: { alpha: 0, beta: 0 }, front_door: "none" };
-
-  it("states that nothing is listening, rather than leaving every zero to be read as a fault", async () => {
-    stubFetch({ [ROUTES]: { json: TABLE }, [ROUTE_HITS]: { json: NO_DOOR } });
-    renderInApp(<RouteTableScreen />, { whoami: whoamiWith("editor") });
-
-    const banner = await screen.findByTestId("routes-no-front-door");
-    expect(banner.getAttribute("role")).toBe("status");
-    expect(banner.textContent).toMatch(/no node/i);
-    expect(banner.textContent).toMatch(/--front-door/);
-  });
-
-  // Flagging every row at once is the false diagnosis this issue exists to remove.
-  it("stops flagging the zeros it has just explained", async () => {
-    stubFetch({ [ROUTES]: { json: TABLE }, [ROUTE_HITS]: { json: NO_DOOR } });
-    renderInApp(<RouteTableScreen />, { whoami: whoamiWith("editor") });
-
-    await waitFor(() => expect(screen.getAllByTestId("route-row").length).toBe(2));
-    await waitFor(() =>
-      expect(screen.getAllByTestId("route-hits").map((n) => n.textContent)).toEqual(["0", "0"]),
-    );
-    for (const cell of screen.getAllByTestId("route-hits")) {
-      expect(cell.className).not.toContain("warn");
-      expect(cell.className).toContain("muted");
-      expect(cell.getAttribute("title")).toMatch(/no front-door listener is bound anywhere/i);
-    }
-  });
-
-  // The count is a fact about traffic already taken; losing the last listener does not erase it.
-  it("still shows what a route took before the last listener went away", async () => {
-    stubFetch({
-      [ROUTES]: { json: TABLE },
-      [ROUTE_HITS]: { json: { installed: true, hits: { alpha: 40, beta: 0 }, front_door: "none" } },
-    });
-    renderInApp(<RouteTableScreen />, { whoami: whoamiWith("editor") });
-
-    await waitFor(() => expect(screen.getAllByTestId("route-row").length).toBe(2));
-    await waitFor(() =>
-      expect(screen.getAllByTestId("route-hits").map((n) => n.textContent)).toEqual(["0", "40"]),
-    );
-  });
-
-  it("leaves the ranks and the evaluation order alone — these routes are installed", async () => {
-    stubFetch({ [ROUTES]: { json: TABLE }, [ROUTE_HITS]: { json: NO_DOOR } });
-    renderInApp(<RouteTableScreen />, { whoami: whoamiWith("editor") });
-
-    await waitFor(() => expect(screen.getAllByTestId("route-row").length).toBe(2));
-    expect(screen.queryByTestId("routes-not-installed")).toBeNull();
-    expect(screen.getAllByTestId("route-rank").map((n) => n.textContent)).toEqual(["1", "2"]);
-    expect(screen.getByText(/the order the front door evaluates them/i)).toBeTruthy();
-  });
-});
-
-/**
- * The mirror of #400's rule, and the reason `front_door` is a tri-state rather than a boolean:
- * proven absence explains the zeros, unproven absence explains nothing. Diagnosing a listener-less
- * fleet off an unreachable peer is the same error as diagnosing a dead route off a zero.
- */
-describe("unproven absence of a listener is not absence (#403)", () => {
-  it("says nothing when the fleet could not establish it", async () => {
-    stubFetch({
-      [ROUTES]: { json: TABLE },
-      [ROUTE_HITS]: { json: { installed: true, hits: { alpha: 0, beta: 0 }, front_door: "unknown" } },
-    });
-    renderInApp(<RouteTableScreen />, { whoami: whoamiWith("editor") });
-
-    await waitFor(() => expect(screen.getAllByTestId("route-row").length).toBe(2));
-    // Wait for the counts themselves: the hits read is a separate query, and until it settles
-    // every cell is the unavailable dash, which would pass an "is not muted" check for the wrong
-    // reason.
-    await waitFor(() =>
-      expect(screen.getAllByTestId("route-hits").map((n) => n.textContent)).toEqual(["0", "0"]),
-    );
-    expect(screen.queryByTestId("routes-no-front-door")).toBeNull();
-    // Still flagged, exactly as before this change: the cause is not known.
-    for (const cell of screen.getAllByTestId("route-hits")) {
-      expect(cell.className).toContain("warn");
-    }
-  });
-
-  it("says nothing when a listener is bound somewhere", async () => {
-    stubFetch({
-      [ROUTES]: { json: TABLE },
-      [ROUTE_HITS]: { json: { installed: true, hits: { alpha: 0, beta: 0 }, front_door: "bound" } },
-    });
-    renderInApp(<RouteTableScreen />, { whoami: whoamiWith("editor") });
-
-    await waitFor(() => expect(screen.getAllByTestId("route-row").length).toBe(2));
-    await waitFor(() =>
-      expect(screen.getAllByTestId("route-hits").map((n) => n.textContent)).toEqual(["0", "0"]),
-    );
-    expect(screen.queryByTestId("routes-no-front-door")).toBeNull();
-    for (const cell of screen.getAllByTestId("route-hits")) {
-      expect(cell.className).toContain("warn");
-    }
-  });
-
-  // A node predating #403 answers a valid body with no `front_door`. Failing the read would blank
-  // the whole column mid-upgrade; folding it to `none` would put a diagnosis behind a missing field.
-  it("treats a body with no front_door field as unknown, not as proven absence", async () => {
-    stubFetch({
-      [ROUTES]: { json: TABLE },
-      [ROUTE_HITS]: { json: { installed: true, hits: { alpha: 0, beta: 0 } } },
-    });
-    renderInApp(<RouteTableScreen />, { whoami: whoamiWith("editor") });
-
-    await waitFor(() => expect(screen.getAllByTestId("route-row").length).toBe(2));
-    await waitFor(() =>
-      expect(screen.getAllByTestId("route-hits").map((n) => n.textContent)).toEqual(["0", "0"]),
-    );
-    expect(screen.queryByTestId("routes-no-front-door")).toBeNull();
-  });
-
-  // A correct server never sends both — `none` is unclaimable without full coverage. The console
-  // checks anyway, because the banner asserts something about every node in the fleet and should
-  // not make that claim over an answer that admits a node is missing.
-  it("does not banner on a proven-absence claim that arrives with a partial stamp", async () => {
-    stubFetch({
-      [ROUTES]: { json: TABLE },
-      [ROUTE_HITS]: {
-        json: { installed: true, hits: { alpha: 0, beta: 0 }, front_door: "none" },
-        headers: { "Rift-Cluster-Partial": "true" },
-      },
-    });
-    renderInApp(<RouteTableScreen />, { whoami: whoamiWith("editor") });
-
-    await waitFor(() => expect(screen.getAllByTestId("route-row").length).toBe(2));
-    await waitFor(() =>
-      expect(screen.getAllByTestId("route-hits").map((n) => n.textContent)).toEqual(["0", "0"]),
-    );
-    expect(screen.queryByTestId("routes-no-front-door")).toBeNull();
-  });
-
-  it("treats an unrecognized front_door value as unknown", async () => {
-    stubFetch({
-      [ROUTES]: { json: TABLE },
-      [ROUTE_HITS]: { json: { installed: true, hits: { alpha: 0, beta: 0 }, front_door: "maybe" } },
-    });
-    renderInApp(<RouteTableScreen />, { whoami: whoamiWith("editor") });
-
-    await waitFor(() => expect(screen.getAllByTestId("route-row").length).toBe(2));
-    expect(screen.queryByTestId("routes-no-front-door")).toBeNull();
-  });
-
-  // The two banners answer different questions and must not both appear. The server omits
-  // `front_door` on a not-installed body, so this is belt-and-braces on the console side.
-  it("shows only the not-installed banner for a tenant that is also on a listener-less fleet", async () => {
-    stubFetch({
-      [ROUTES]: { json: TABLE },
-      [ROUTE_HITS]: { json: { installed: false, hits: null, front_door: "none" } },
-    });
-    renderInApp(<RouteTableScreen />, { whoami: whoamiWith("editor") });
-
-    expect(await screen.findByTestId("routes-not-installed")).toBeTruthy();
-    expect(screen.queryByTestId("routes-no-front-door")).toBeNull();
   });
 });
 
@@ -1014,175 +658,6 @@ describe("a parked table write must not be undone by the next poll (#211)", () =
   });
 });
 
-describe("the HITS column (#368)", () => {
-  it("shows the fleet count for a route that has taken traffic", async () => {
-    stubFetch({
-      [ROUTES]: { json: TABLE },
-      [ROUTE_HITS]: { json: { installed: true, hits: { alpha: 12, beta: 4 } } },
-    });
-    renderInApp(<RouteTableScreen />, { whoami: whoamiWith("editor") });
-
-    await waitFor(() => expect(screen.getAllByTestId("route-row").length).toBe(2));
-    // Rendered in effective order, so `beta` (priority 5) is first. Awaited because the counts are
-    // a second, independent read — the table renders before they land.
-    await waitFor(() =>
-      expect(screen.getAllByTestId("route-hits").map((n) => n.textContent)).toEqual(["4", "12"]),
-    );
-  });
-
-  // The zero is the whole reason the column exists: a route that has never taken a request is
-  // either wrong or dead. It must read as a number, not as an empty cell or a dash.
-  it("shows an explicit zero for a route that has taken nothing", async () => {
-    stubFetch({
-      [ROUTES]: { json: TABLE },
-      [ROUTE_HITS]: { json: { installed: true, hits: { alpha: 0, beta: 7 } } },
-    });
-    renderInApp(<RouteTableScreen />, { whoami: whoamiWith("editor") });
-
-    await waitFor(() => expect(screen.getAllByTestId("route-row").length).toBe(2));
-    await waitFor(() =>
-      expect(screen.getAllByTestId("route-hits").map((n) => n.textContent)).toEqual(["7", "0"]),
-    );
-    // Flagged, not merely printed — an operator scanning the table should see the dead route.
-    const cells = screen.getAllByTestId("route-hits");
-    expect(cells[1]?.className).toContain("warn");
-    expect(cells[0]?.className).not.toContain("warn");
-  });
-
-  // A non-default tenant's routes are stored but never compiled into the shared front door, so a
-  // `0` would assert "took no traffic" where the truth is "cannot take traffic".
-  it("says not installed, never zero, for a tenant whose routes are not compiled in", async () => {
-    stubFetch({
-      [ROUTES]: { json: TABLE },
-      [ROUTE_HITS]: { json: { installed: false, hits: null } },
-    });
-    renderInApp(<RouteTableScreen />, { whoami: whoamiWith("editor") });
-
-    await waitFor(() => expect(screen.getAllByTestId("route-row").length).toBe(2));
-    await waitFor(() =>
-      expect(screen.getAllByTestId("route-hits").map((n) => n.textContent)).toEqual([
-        "not installed",
-        "not installed",
-      ]),
-    );
-    for (const cell of screen.getAllByTestId("route-hits")) {
-      expect(cell.textContent).not.toContain("0");
-    }
-  });
-
-  it("labels the counts as a floor when the fleet fan-out was partial", async () => {
-    stubFetch({
-      [ROUTES]: { json: TABLE },
-      [ROUTE_HITS]: {
-        json: { installed: true, hits: { alpha: 12, beta: 4 } },
-        headers: { "Rift-Cluster-Partial": "true" },
-      },
-    });
-    renderInApp(<RouteTableScreen />, { whoami: whoamiWith("editor") });
-
-    await waitFor(() => expect(screen.getAllByTestId("route-row").length).toBe(2));
-    expect(await screen.findByTestId("route-hits-partial")).toBeTruthy();
-  });
-
-  it("does not claim a floor when every node answered", async () => {
-    stubFetch({
-      [ROUTES]: { json: TABLE },
-      [ROUTE_HITS]: { json: { installed: true, hits: { alpha: 12, beta: 4 } } },
-    });
-    renderInApp(<RouteTableScreen />, { whoami: whoamiWith("editor") });
-
-    await waitFor(() => expect(screen.getAllByTestId("route-row").length).toBe(2));
-    expect(screen.queryByTestId("route-hits-partial")).toBeNull();
-  });
-
-  // The counts are a separate read from the table. If they fail, the operator still needs the
-  // table — and an unknown count must not render as a zero, which is a claim about traffic.
-  it("falls back to a dash, never a zero, when the hits read fails", async () => {
-    stubFetch({
-      [ROUTES]: { json: TABLE },
-      [ROUTE_HITS]: { status: 503, json: { message: "cluster node is shutting down" } },
-    });
-    renderInApp(<RouteTableScreen />, { whoami: whoamiWith("editor") });
-
-    await waitFor(() => expect(screen.getAllByTestId("route-row").length).toBe(2));
-    await waitFor(() =>
-      expect(screen.getAllByTestId("route-hits").map((n) => n.textContent)).toEqual(["—", "—"]),
-    );
-  });
-});
-
-describe("the HITS column refuses to guess", () => {
-  // A route the server did not report a count for is unknown, not idle. The server keys the map
-  // by every id in the table it read, so this means the table moved between the two reads.
-  it("dashes a route the hits response does not mention, rather than calling it zero", async () => {
-    stubFetch({
-      [ROUTES]: { json: TABLE },
-      [ROUTE_HITS]: { json: { installed: true, hits: { beta: 9 } } },
-    });
-    renderInApp(<RouteTableScreen />, { whoami: whoamiWith("editor") });
-
-    await waitFor(() => expect(screen.getAllByTestId("route-row").length).toBe(2));
-    await waitFor(() =>
-      expect(screen.getAllByTestId("route-hits").map((n) => n.textContent)).toEqual(["9", "—"]),
-    );
-  });
-
-  // `installed` is required by the contract. Defaulting a missing one to `false` would render the
-  // confident claim "not installed" — that this tenant's routes can never take a dispatch — off
-  // the back of a body the console simply could not read.
-  it("does not report not-installed when the body carried no installed flag", async () => {
-    stubFetch({
-      [ROUTES]: { json: TABLE },
-      [ROUTE_HITS]: { json: { hits: { alpha: 1, beta: 2 } } },
-    });
-    renderInApp(<RouteTableScreen />, { whoami: whoamiWith("editor") });
-
-    await waitFor(() => expect(screen.getAllByTestId("route-row").length).toBe(2));
-    await waitFor(() =>
-      expect(screen.getAllByTestId("route-hits").map((n) => n.textContent)).toEqual(["—", "—"]),
-    );
-    for (const cell of screen.getAllByTestId("route-hits")) {
-      expect(cell.textContent).not.toContain("not installed");
-    }
-  });
-});
-
-describe("a disabled route's zero is explained, not alarming", () => {
-  // `RouteTable::effective_order` filters disabled routes out of the dispatch chain upstream, so a
-  // disabled route is structurally incapable of claiming a request — the same "cannot" versus
-  // "did not" distinction the not-installed state exists for, one level down. Flagging its zero
-  // would tell an operator their route is broken seconds after they switched it off themselves.
-  it("does not flag the zero of a route that is switched off", async () => {
-    stubFetch({
-      [ROUTES]: { json: { routes: [route("on"), route("off", { enabled: false })] } },
-      [ROUTE_HITS]: { json: { installed: true, hits: { on: 0, off: 0 } } },
-    });
-    renderInApp(<RouteTableScreen />, { whoami: whoamiWith("editor") });
-
-    await waitFor(() => expect(screen.getAllByTestId("route-row").length).toBe(2));
-    await waitFor(() =>
-      expect(screen.getAllByTestId("route-hits").map((n) => n.textContent)).toEqual(["0", "0"]),
-    );
-    const [enabled, disabled] = screen.getAllByTestId("route-hits");
-    expect(enabled?.className).toContain("warn");
-    expect(disabled?.className).not.toContain("warn");
-  });
-
-  // The count is a fact about traffic already taken, so switching a route off does not erase it.
-  it("still shows what a route took before it was switched off", async () => {
-    stubFetch({
-      [ROUTES]: { json: { routes: [route("off", { enabled: false })] } },
-      [ROUTE_HITS]: { json: { installed: true, hits: { off: 40 } } },
-    });
-    renderInApp(<RouteTableScreen />, { whoami: whoamiWith("editor") });
-
-    await waitFor(() => expect(screen.getAllByTestId("route-row").length).toBe(1));
-    await waitFor(() =>
-      expect(screen.getAllByTestId("route-hits").map((n) => n.textContent)).toEqual(["40"]),
-    );
-  });
-});
-
 /**
  * Pins D-54: the gateway-fallback card once told operators a harness could target an imposter
  * with an `X-Rift-Port` header. That scheme was designed (chapter 02's addressing table) but never
@@ -1195,7 +670,7 @@ describe("the gateway-fallback card names only addressing that exists", () => {
   // Pins D-54: the console must not name an addressing scheme that was withdrawn rather than
   // merely unbuilt. This assertion is what fails if the card starts advertising it again.
   it("does not advertise the X-Rift-Port header, which D-54 withdrew", async () => {
-    stubFetch({ [ROUTES]: { json: TABLE }, [ROUTE_HITS]: { json: HITS } });
+    stubFetch({ [ROUTES]: { json: TABLE } });
     renderInApp(<RouteTableScreen />, { whoami: whoamiWith("editor") });
 
     await waitFor(() => expect(screen.getAllByTestId("route-row").length).toBe(2));
@@ -1205,7 +680,7 @@ describe("the gateway-fallback card names only addressing that exists", () => {
   });
 
   it("names the path prefix, which is the only addressing the gateway actually parses", async () => {
-    stubFetch({ [ROUTES]: { json: TABLE }, [ROUTE_HITS]: { json: HITS } });
+    stubFetch({ [ROUTES]: { json: TABLE } });
     renderInApp(<RouteTableScreen />, { whoami: whoamiWith("editor") });
 
     await waitFor(() => expect(screen.getAllByTestId("route-row").length).toBe(2));

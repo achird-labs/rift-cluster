@@ -305,7 +305,7 @@ Updated as PRs merge. Status is one of `open`, `in progress`, `merged`.
 |---|---|---|---|
 | #544 | Epic | open | — |
 | #555 | In-repo core smoke check | open | — |
-| #545 | Route hits | open | — |
+| #545 | Route hits | in progress | — |
 | #546 | Audit | open | — |
 | #547 | MCP | open | — |
 | #548 | Metrics and observability | open | — |
@@ -336,4 +336,4 @@ D-47, D-54, D-57, D-58, D-59, D-60, D-61, D-62, D-63, D-64, D-65, D-66, D-67.
 | #550 | D-44, D-45, D-46 |
 | #552 | D-32, D-37, D-38, D-39 |
 
-Already superseded before this RFC: D-1, D-2, D-12. The register skips number 69.
+Already superseded before this RFC: D-1, D-2, D-12. D-69 (space stubs replicate, #541) landed after v1 and is unaffected.

@@ -2153,7 +2153,7 @@ separate question of what the run actually measured underneath it.
 
 ### D-68 — Both front-door route endpoints publish `installed`; the write says what it cannot do
 
-- **Status:** active
+- **Status:** amended
 - **Decided:** 2026-09-01
 - **Refines:** D-54
 - **Amends:** docs/architecture/13-front-door-and-sources.md
@@ -2204,6 +2204,15 @@ signalling gap.
 *Rejected:* leaving it to documentation alone. The contract now says it too, and that half was
 never in question — but the fact is derivable per-request and cheap, and a caller acting on a
 `200` is not reading the spec at that moment.
+
+**Amendment (D-71, 2026-09-06, #545):** `GET /front-door/route-hits` no longer exists — per-route
+dispatch counters were removed with RFC-007 §3.2, the request log being the answer to "is this
+route taking traffic". `installed` is therefore published by `GET` and `PUT /front-door/routes`
+**only**, still derived from `routes_installed_for` through the one shared render helper, and the
+console derives the whole not-installed treatment from the table read alone. The sentence above
+comparing the word to what `route-hits` "already means by it" describes a second source that is
+gone; the rule it stated — one definition, no drift between write, read and compiler — is
+unchanged and now has fewer places to drift between.
 
 ### D-69 — A space-scoped stub is replicated config; a space teardown deletes it fleet-wide
 
@@ -2267,14 +2276,21 @@ that turned out to be cheap to close properly.
 variant — but it silently changes what an already-committed `JournalClearGen` entry means, so a log
 replay would start deleting stubs it never deleted when it was written.
 
-### D-70 — The console reads a structural claim from the cheapest source that carries it; absence from every source is still unknown
 
-- **Status:** active
+### ~~D-70 — The console reads a structural claim from the cheapest source that carries it; absence from every source is still unknown~~
+
+- **Status:** superseded
 - **Decided:** 2026-09-01
+- **Superseded by:** D-71
 - **Refines:** D-68
 - **Amends:** docs/design/console/README.md
 - **Implemented by:** #539
 - **Code:** web/src/screens/Routes.tsx, web/src/app/queries.ts
+
+Superseded by D-71 (#545): with the route-hits endpoint removed there is one source for
+`installed` and nothing to prefer between. The half of this entry that survives — a structural
+claim requires a source that *positively* reported it, and a body that omitted the flag is unknown,
+never `false` — is now stated in D-68's amendment and pinned there. Retained for history.
 
 D-68 put `installed` on both `/front-door/routes` and `/front-door/route-hits`, derived from one
 server function so the two cannot disagree. The console went on reading it only from `route-hits`

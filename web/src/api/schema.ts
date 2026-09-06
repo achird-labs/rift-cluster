@@ -633,34 +633,6 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/front-door/route-hits": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /**
-         * Read how many requests each of the tenant's routes has claimed
-         * @description Terminates: the dispatch count for every route id in the caller's tenant's current table, summed across the fleet. A separate path from `GET /front-door/routes` because that body is a config document a client `PUT`s back verbatim, and because this read pays a fleet fan-out a config read should not.
-         *
-         *     **A hit is a route *claiming* a request, not a request succeeding.** The count is taken the moment a route matches, before its target is dispatched to, so a route whose imposter is gone and which answers nothing but `404` still counts every one. That is deliberate: a route claiming traffic and failing is exactly what this figure exists to reveal.
-         *
-         *     **Counts are in memory, per node, since that node's process started.** They are observations a node made, not replicated state, so a restart resets that node's contribution and the fleet sum drops. Only unreachable peers are flagged, via `Rift-Cluster-Partial` — a restart is not, and cannot be, distinguished from quiet traffic.
-         *
-         *     **Only ids in the current table are reported.** A `PUT` that replaces the table, or a `DELETE`, strands the counters for ids the new table does not name; they are simply never read. An id deleted and later recreated resumes the count still held by any node that never restarted in between.
-         *
-         *     `installed: false` means this tenant's routes are stored, and readable through `GET /front-door/routes`, but are never compiled into the shared front door — so none of them can take a dispatch at all. `hits` is then `null` rather than a map of zeros, because a zero would assert the routes took no traffic when the truth is that they cannot take any. Only the default tenant's routes are installed today.
-         */
-        get: operations["getFrontDoorRouteHits"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
     "/front-door/routes/{routeId}": {
         parameters: {
             query?: never;
@@ -1700,25 +1672,8 @@ export interface components {
         };
         /** @description A route table as answered, which is the stored table plus whether this tenant's routes are compiled into the shared front door. Request bodies take a plain `RouteTable` — `installed` is derived server-side and any value sent for it is ignored, so a client cannot declare its own table installed. */
         RouteTableView: components["schemas"]["RouteTable"] & {
-            /** @description Whether this tenant's routes are compiled into the shared front door. **Only the default tenant's are.** A non-default tenant's table is validated, stored, replicated and served back unchanged, but is never compiled in and can therefore never take a dispatch — `false` here is the difference between "these routes took no traffic" and "these routes cannot take any". Same fact, same source function, and the same word `getFrontDoorRouteHits` reports it under. */
+            /** @description Whether this tenant's routes are compiled into the shared front door. **Only the default tenant's are.** A non-default tenant's table is validated, stored, replicated and served back unchanged, but is never compiled in and can therefore never take a dispatch — `false` here is the difference between "these routes took no traffic" and "these routes cannot take any". Published here, on the write and the read, and nowhere else (D-68). */
             installed: boolean;
-        };
-        RouteHits: {
-            /** @description Whether this tenant's routes are compiled into the shared front door. False means they are stored but can never take a dispatch. */
-            installed: boolean;
-            /** @description One entry per route id in the tenant's current table — including `0` for a route that has taken nothing, which is the figure this endpoint exists to publish. `null` when `installed` is false: a zero there would claim the route took no traffic, when the truth is that it cannot take any. */
-            hits: {
-                [key: string]: number;
-            } | null;
-            /**
-             * @description Whether any node in the fleet binds a front-door listener. Present only when `installed` is true; `installed: false` already says the routes cannot take a dispatch, so listener presence adds nothing.
-             *
-             *     `bound` — some node binds one. `none` — **proven** absence: every voter answered and every one of them binds none, so no route here can take a request and the zeros above reflect that rather than a routing fault. `unknown` — not established, because a node could not be reached or answered without this field; the counts stand, but absence must not be inferred from them.
-             *
-             *     `none` is only claimable on full coverage, so it never appears together with `Rift-Cluster-Partial`.
-             * @enum {string}
-             */
-            front_door?: "bound" | "none" | "unknown";
         };
         Route: {
             /** @description Unique and stable; how the admin API addresses one route. */
@@ -4450,43 +4405,6 @@ export interface operations {
             500: components["responses"]["InternalError"];
             503: components["responses"]["Unavailable"];
             504: components["responses"]["WriteTimeout"];
-        };
-    };
-    getFrontDoorRouteHits: {
-        parameters: {
-            query?: never;
-            header?: {
-                /** @description Selects which of the caller's existing tenant bindings this request acts under; it never grants a binding the caller does not already hold. Absent, requests act as the default tenant. Ignored on tenancy routes, where the path segment names the tenant being administered instead. */
-                "X-Rift-Tenant"?: components["parameters"]["TenantHeader"];
-            };
-            path?: never;
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Per-route dispatch counts, or `installed: false` for a tenant whose routes are not compiled into the front door. */
-            200: {
-                headers: {
-                    "Rift-Cluster-Partial": components["headers"]["RiftClusterPartial"];
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["RouteHits"];
-                };
-            };
-            401: components["responses"]["Unauthorized"];
-            403: components["responses"]["Forbidden"];
-            /** @description Caller is not bound to the tenant named (`X-Rift-Tenant` or default) — indistinguishable from that tenant not existing (RFC-002 §8.4). */
-            404: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Error"];
-                };
-            };
-            500: components["responses"]["InternalError"];
-            503: components["responses"]["Unavailable"];
         };
     };
     deleteFrontDoorRoute: {

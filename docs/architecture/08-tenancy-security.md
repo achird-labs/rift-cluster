@@ -603,19 +603,18 @@ sees what it wrote; they are simply not compiled into the shared front door.
 That is a real remaining limit of this slice, recorded here rather than left to
 be discovered.
 
-**Where that limit becomes visible to an operator: `GET /front-door/route-hits`**
-(issue #368). The per-route dispatch count answers `installed: false` with a
-`null` count map for any tenant whose routes are not compiled in, rather than the
-zeros it reports for an installed route that has taken no traffic. The two are
-different facts — "took none" versus "cannot take any" — and a zero for the
-second would be a claim about traffic where the truth is about installation.
-`routes_installed_for` is the single definition of that rule: `desired_routes`
-filters on it and the hit read reports it, so the table the front door compiles
-and the state the console displays cannot drift apart. When the front door grows
-a tenant dimension, that one function is what changes.
+**Where that limit becomes visible to an operator: `installed` on `GET` and
+`PUT /front-door/routes`** (D-68). Both answer `installed: false` beside the
+table for any tenant whose routes are not compiled in — "cannot take any" is a
+fact about installation, stated as such rather than left to be inferred from
+the absence of traffic. `routes_installed_for` is the single definition of that
+rule: `desired_routes` filters on it and both route endpoints report it, so the
+table the front door compiles and the state the console displays cannot drift
+apart. When the front door grows a tenant dimension, that one function is what
+changes.
 
-The console spends that flag across the whole route screen, not just the count
-column (issue #400). On `installed: false` it states the fact once above the
+The console spends that flag across the whole route screen (issue #400). On
+`installed: false` it states the fact once above the
 table — stored and replicated, editable, but never compiled in — and then stops
 the rows contradicting it: no route is given a rank, and the "why this order"
 column reads `not installed` rather than the tie-break prose, because both are

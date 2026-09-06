@@ -143,16 +143,7 @@ async fn start_with(admin_credential_configured: bool) -> Fixture {
         data_dir: dir.path().to_path_buf(),
         secret: Some(SECRET.to_owned()),
         routes: sources::routes(
-            cluster_api::routes(
-                rift_cluster::Router::new(),
-                slot.clone(),
-                readiness.clone(),
-                // This suite is about the source surface; nothing here dispatches through a front
-                // door, so the counter exists only to satisfy the signature.
-                Arc::new(rift_cluster_server::route_hits::RouteHitCounter::default()),
-                // No front-door listener in this fixture either, for the same reason.
-                false,
-            ),
+            cluster_api::routes(rift_cluster::Router::new(), slot.clone(), readiness.clone()),
             Arc::clone(&puller),
         ),
         // Tables-only: this suite is about the control surface, not about
