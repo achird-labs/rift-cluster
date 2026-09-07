@@ -1364,19 +1364,19 @@ export function useClearFlowState(): UseMutationResult<
  * All three states of `installed` carry weight: `false` is a tenant whose table can never take a
  * dispatch, `true` is the default tenant's, and `undefined` is a node that did not say — a
  * pre-D-68 body, which is what a rolling upgrade looks like from here. Absent is deliberately not
- * `false` (D-70): the screen renders that as a confident structural claim, and a fact the console
- * could not read is not a fact that came back negative.
+ * `false`: the screen renders that as a confident structural claim, and a fact the console could
+ * not read is not a fact that came back negative. Since #545 this read (and the `PUT` echo) is the
+ * only place the flag is published (D-68, amended), so there is no second source to fall back on
+ * and nothing to prefer between.
  */
 export type RouteTableRead = { routes: Route[]; installed: boolean | undefined };
 
 /**
  * The wire body as the screen reads it.
  *
- * A missing flag folds to `undefined` rather than failing the query — the opposite of
- * {@link useRouteHits}, and deliberately so. That endpoint answers the flag and the counts and
- * nothing else, so refusing a body without it costs one column a dash; refusing this one would
- * blank the whole screen for the length of every rolling upgrade. `typeof` rather than a plain
- * read because the generated type calls `installed` required, which a pre-D-68 node is not
+ * A missing flag folds to `undefined` rather than failing the query: refusing a body without it
+ * would blank the whole screen for the length of every rolling upgrade. `typeof` rather than a
+ * plain read because the generated type calls `installed` required, which a pre-D-68 node is not
  * obliged to have known.
  */
 function readRouteTable(body: RouteTableView | null | undefined): RouteTableRead {
@@ -1392,81 +1392,6 @@ export function useRouteTable(): UseQueryResult<RouteTableRead> {
     queryKey: key(["front-door-routes"], tenant),
     queryFn: async (): Promise<RouteTableRead> =>
       readRouteTable(await apiGet<RouteTableView>(API_PATHS.frontDoorRoutes, { tenant })),
-    ...POLLED,
-  });
-}
-
-/**
- * How many requests each of the tenant's routes has claimed, fleet-wide (#368).
- *
- * `hits` is `null` exactly when `installed` is false — this tenant's routes are stored but never
- * compiled into the shared front door, so they cannot take a dispatch and a zero would be a false
- * claim about traffic. `partial` means a node could not be reached, so the counts are floors.
- */
-/**
- * Whether anything in the fleet binds a front-door listener (#403).
- *
- * `none` is *proven* absence — every voter answered and every one binds none — which is why it is
- * safe to explain the zeros with. `unknown` is the same absence unproven, and must read as today.
- */
-export type FrontDoorPresence = "bound" | "none" | "unknown";
-
-export type RouteHits = {
-  installed: boolean;
-  hits: Record<string, number> | null;
-  partial: boolean;
-  /** `null` when `installed` is false: the server omits it, because it says nothing there. */
-  frontDoor: FrontDoorPresence | null;
-};
-
-/** Anything the console does not positively recognize is `unknown` — never `none`. */
-function asFrontDoorPresence(raw: string | undefined): FrontDoorPresence {
-  return raw === "bound" || raw === "none" ? raw : "unknown";
-}
-
-/**
- * Deliberately its own query, not folded into {@link useRouteTable}: the counts are a fleet
- * fan-out and the table is a local read, so a fan-out that degrades must not take the table's
- * rendering down with it. A failure here leaves the Hits column unknown and the table intact.
- */
-export function useRouteHits(options: { enabled?: boolean } = {}): UseQueryResult<RouteHits> {
-  const { tenant } = useSession();
-  return useQuery({
-    queryKey: key(["front-door-route-hits"], tenant),
-    queryFn: async (): Promise<RouteHits> => {
-      const read = await apiGetMerged<{
-        installed?: boolean;
-        hits?: Record<string, number> | null;
-        front_door?: string;
-      }>(API_PATHS.frontDoorRouteHits, { tenant });
-      // `installed` is **required** by the contract, so an absent one is a broken read, not a
-      // domain value — and defaulting it to `false` would be the worst available guess: the screen
-      // renders that as "not installed", a specific and confident claim that this tenant's routes
-      // can never take a dispatch. Failing the query instead leaves the column an honest dash.
-      // Same reasoning as `useSources` above, and the same distinction this whole endpoint exists
-      // to preserve: unknown is not a state you may substitute a definite answer for.
-      if (typeof read.data.installed !== "boolean") {
-        throw new Error("front-door route hits: the response carried no `installed` flag");
-      }
-      return {
-        installed: read.data.installed,
-        // Absent counts stay absent rather than becoming zeros; `HitsCell` renders an unreported
-        // id as a dash, because a zero is a claim about traffic.
-        hits: read.data.hits ?? null,
-        partial: read.partial,
-        // Unlike `installed`, a missing or unrecognized `front_door` is NOT a broken read: a
-        // pre-#403 node answers a perfectly good body without it, and failing the query there
-        // would blank the whole Hits column for the length of every rolling upgrade. It folds to
-        // `unknown`, which is both its true meaning and the safe direction — `unknown` renders
-        // exactly as today, whereas `none` is the state that puts a diagnosis on screen. The
-        // asymmetry with `installed` is the point: defaulting that one asserts something, and
-        // defaulting this one asserts nothing.
-        frontDoor: read.data.installed ? asFrontDoorPresence(read.data.front_door) : null,
-      };
-    },
-    // The screen this serves has nothing to show when the route table itself failed to read, so
-    // the caller gates it off rather than leaving a cluster-wide fan-out polling behind an error.
-    enabled: options.enabled ?? true,
     ...POLLED,
   });
 }

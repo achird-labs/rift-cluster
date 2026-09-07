@@ -9,7 +9,6 @@ use rift_cluster::rpc::{AlwaysHealthy, RpcClient, RpcClientConfig, Signer};
 use rift_cluster::{NodeConfig, RaftNode};
 use rift_cluster_server::cluster_api;
 use rift_cluster_server::readiness::{GATE_JOINED, Readiness};
-use rift_cluster_server::route_hits::RouteHitCounter;
 use tempfile::TempDir;
 
 const SECRET: &str = "cluster-api-test-secret";
@@ -17,7 +16,6 @@ const SECRET: &str = "cluster-api-test-secret";
 struct Fixture {
     node: Arc<RaftNode>,
     addr: SocketAddr,
-    route_hits: Arc<RouteHitCounter>,
     _dir: TempDir,
 }
 
@@ -25,21 +23,13 @@ async fn start() -> Fixture {
     let dir = TempDir::new().expect("tempdir");
     let readiness = Arc::new(Readiness::awaiting([GATE_JOINED]));
     let slot = cluster_api::NodeSlot::default();
-    let route_hits = Arc::new(RouteHitCounter::default());
     let config = NodeConfig {
         node_id: 1,
         bind: "127.0.0.1:0".parse().expect("bind addr"),
         advertise: None,
         data_dir: dir.path().to_path_buf(),
         secret: Some(SECRET.to_owned()),
-        routes: cluster_api::routes(
-            rift_cluster::Router::new(),
-            slot.clone(),
-            readiness.clone(),
-            Arc::clone(&route_hits),
-            // This fixture's node binds a front door, so the cluster-port body must say so (#403).
-            true,
-        ),
+        routes: cluster_api::routes(rift_cluster::Router::new(), slot.clone(), readiness.clone()),
         engine: None,
         audit_retention_secs: rift_cluster::DEFAULT_AUDIT_RETENTION_SECS,
         snapshot_log_entries: None,
@@ -57,7 +47,6 @@ async fn start() -> Fixture {
     Fixture {
         node,
         addr,
-        route_hits,
         _dir: dir,
     }
 }
@@ -300,31 +289,4 @@ async fn ops_endpoint_reports_applied_pending_and_unknown() {
         .await
         .expect_err("unknown op must not answer 200");
     assert!(format!("{err}").contains("route"), "{err}");
-}
-
-/// Issue #368: this node's own dispatch counts, unjoined against any table and unmerged with any
-/// peer. It is the target of the admin port's fan-out, so it stays deliberately node-local —
-/// making it fleet-wide would have every peer ask every other peer.
-#[tokio::test]
-async fn route_hits_reports_this_nodes_own_dispatch_counts() {
-    let fixture = start().await;
-    let client = client(Some(SECRET));
-
-    let empty = get(&client, fixture.addr, "/_cluster/route-hits").await;
-    assert_eq!(
-        empty,
-        serde_json::json!({ "hits": {}, "front_door": true }),
-        "a node that has dispatched nothing reports an empty map, not an absent key"
-    );
-
-    fixture.route_hits.note_dispatch("svc");
-    fixture.route_hits.note_dispatch("svc");
-    fixture.route_hits.note_dispatch("other");
-
-    let counted = get(&client, fixture.addr, "/_cluster/route-hits").await;
-    assert_eq!(
-        counted,
-        serde_json::json!({ "hits": { "svc": 2, "other": 1 }, "front_door": true }),
-        "raw per-id counts, exactly as this node holds them"
-    );
 }

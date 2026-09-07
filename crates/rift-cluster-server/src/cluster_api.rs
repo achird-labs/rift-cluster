@@ -13,7 +13,6 @@ use rift_cluster::rpc::{HandlerFuture, RpcError};
 use rift_cluster::{RaftNode, Router};
 
 use crate::readiness::Readiness;
-use crate::route_hits::{CLUSTER_ROUTE_HITS_PATH, RouteHitCounter};
 
 /// Binding an already-bound [`NodeSlot`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -60,20 +59,8 @@ impl NodeSlot {
 }
 
 /// Register the operator endpoints onto `base`.
-///
-/// `route_hits` is passed directly rather than through a [`NodeSlot`] because, unlike the node, it
-/// exists before the router is built — it is handed to the front-door listener at the same moment.
-///
-/// `front_door` is this node's own listener state (issue #403), passed as a plain `bool` for the
-/// same reason and resolved by the caller so that one derivation of the fact serves every consumer.
 #[must_use]
-pub fn routes(
-    base: Router,
-    slot: NodeSlot,
-    readiness: Arc<Readiness>,
-    route_hits: Arc<RouteHitCounter>,
-    front_door: bool,
-) -> Router {
+pub fn routes(base: Router, slot: NodeSlot, readiness: Arc<Readiness>) -> Router {
     let members = slot.clone();
     let config = slot.clone();
     let imposters = slot.clone();
@@ -222,13 +209,6 @@ pub fn routes(
         "GET",
         "/_cluster/health",
         json_handler(move || Ok(health_body(health.node()?.as_ref(), &readiness))),
-    )
-    // Issue #368. No `NodeSlot`: this answers from a counter, not from committed state, so it is
-    // servable from the moment the port opens and has nothing to wait for the node to provide.
-    .route(
-        "GET",
-        CLUSTER_ROUTE_HITS_PATH,
-        json_handler(move || Ok(route_hits.body(front_door))),
     )
 }
 

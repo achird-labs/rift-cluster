@@ -1,15 +1,7 @@
-import type { UseQueryResult } from "@tanstack/react-query";
 import { type FormEvent, type ReactNode, useEffect, useState } from "react";
 
 import { ApiError } from "../api/client.ts";
-import {
-  type RouteHits,
-  RouteTableConflict,
-  useDeleteRoute,
-  usePutRoutes,
-  useRouteHits,
-  useRouteTable,
-} from "../app/queries.ts";
+import { RouteTableConflict, useDeleteRoute, usePutRoutes, useRouteTable } from "../app/queries.ts";
 import { useSession } from "../app/session.tsx";
 import { Card, Empty, ErrorNote, Ident, Status, UnconfirmedNote } from "../components/primitives.tsx";
 import type { Route } from "../features/routes/order.ts";
@@ -20,56 +12,21 @@ import { useToast } from "../components/toast.tsx";
 /**
  * Is this tenant's table *known* to be uninstalled?
  *
- * D-70: two endpoints report this, and D-68 derives both from one server function — so they cannot
- * disagree, and the only thing that differs between them is which one answered. The table read is
- * local and the hits read is a cluster-wide fan-out, so the table's copy is asked first: deriving
- * the banner from the fan-out alone made it vanish whenever that query was slow, degraded or
- * failed, which is precisely when an operator is most likely to be looking for it (#539).
- *
- * The `undefined` case — neither body carried the flag — is deliberately not `true`. Everything
- * this predicate gates is a confident structural claim ("these routes can never take a request"),
- * and putting that behind a read the console could not complete would be the same
- * bound-versus-unknown error #369 exists to prevent, one level up. Unknown does not weaken as
- * sources are added: "neither said" is unknown, never a majority of silence. One definition, used
- * by every call site, so the rule cannot drift between them.
+ * `installed` is published beside the table on `GET` and `PUT /front-door/routes` and nowhere else
+ * (D-68, amended by #545), so this is a read of one field — but a strict one. The `undefined` case,
+ * a body that did not carry the flag, is deliberately not `true`: everything this predicate gates
+ * is a confident structural claim ("these routes can never take a request"), and putting that
+ * behind a read that merely failed to say would be the same bound-versus-unknown error #369 exists
+ * to prevent, one level up. One definition, used by every call site, so the rule cannot drift.
  */
-function isNotInstalled(
-  fromTable: boolean | undefined,
-  hits: RouteHits | undefined,
-): boolean {
-  return (fromTable ?? hits?.installed) === false;
-}
-
-/**
- * Is it *established* that no node in the fleet binds a front-door listener (#403)?
- *
- * The sibling of {@link isNotInstalled}, one level down and with the same discipline. Only the
- * server's proven `none` counts — it is claimable solely on full fleet coverage, so it can never
- * arrive alongside a partial answer. `unknown` is the same absence unproven and deliberately reads
- * as today: diagnosing "nothing can dispatch" off an unreachable peer is the identical error to
- * diagnosing "this route is dead" off a zero, which is the whole reason this issue exists.
- */
-function hasNoFrontDoorAnywhere(hits: RouteHits | undefined): boolean {
-  // `partial === false` is redundant against a correct server — `none` is unclaimable without full
-  // coverage, so the two can never both be set — and it is here precisely because it is redundant.
-  // The banner asserts something about every node in the fleet; making that claim conditional on
-  // the console's own view of coverage costs one comparison and stops a server-side regression in
-  // the fold from becoming a confident wrong statement on screen.
-  return hits?.installed === true && hits.frontDoor === "none" && !hits.partial;
+function isNotInstalled(fromTable: boolean | undefined): boolean {
+  return fromTable === false;
 }
 
 export function RouteTableScreen(): ReactNode {
   const { can } = useSession();
   const table = useRouteTable();
-  /*
-   * Read once here and passed down, rather than read again inside `Editor`. Two observers of one
-   * query key is not one cache read: `Editor` mounts only after the table resolves, and at
-   * `staleTime: 0` the later observer refetches on mount — so the screen issued the cluster-wide
-   * fan-out twice per load. Gated on the table read because the error branch below renders no
-   * table at all, and a fan-out polling behind that screen buys nothing.
-   */
-  const hits = useRouteHits({ enabled: table.isSuccess });
-  const notInstalled = isNotInstalled(table.data?.installed, hits.data);
+  const notInstalled = isNotInstalled(table.data?.installed);
   const mayWrite = can("imposter.write");
 
   if (table.isError) {
@@ -95,12 +52,7 @@ export function RouteTableScreen(): ReactNode {
       {table.isSuccess ? (
         <div className="screen-split">
           <div className="screen-main">
-            <Editor
-              loaded={table.data.routes}
-              mayWrite={mayWrite}
-              hits={hits}
-              notInstalled={notInstalled}
-            />
+            <Editor loaded={table.data.routes} mayWrite={mayWrite} notInstalled={notInstalled} />
             <FrontDoorNotes />
           </div>
           <RouteTester routes={table.data.routes} notInstalled={notInstalled} />
@@ -113,24 +65,13 @@ export function RouteTableScreen(): ReactNode {
 function Editor({
   loaded,
   mayWrite,
-  hits,
   notInstalled,
 }: {
   loaded: Route[];
   mayWrite: boolean;
-  hits: UseQueryResult<RouteHits>;
   /** Resolved once by the screen and passed down, so no component re-derives the rule. */
   notInstalled: boolean;
 }): ReactNode {
-  /*
-   * The `!notInstalled` is the same deliberate redundancy as the `!hits.partial` inside
-   * `hasNoFrontDoorAnywhere`, and it is new surface rather than belt-and-braces: since #539 the two
-   * inert-fact banners read `installed` from *different* endpoints, so a server that ever
-   * contradicted itself between them could put both on screen at once, each stating something the
-   * other denies. D-68 makes that unrepresentable; this keeps the exclusion a property of this
-   * component rather than of a remote invariant.
-   */
-  const noFrontDoor = hasNoFrontDoorAnywhere(hits.data) && !notInstalled;
   const [draft, setDraft] = useState<Route[]>(loaded);
   const [adding, setAdding] = useState(false);
   const [base, setBase] = useState<Route[]>(loaded);
@@ -337,49 +278,8 @@ function Editor({
         </div>
       ) : null}
 
-      {/*
-       * The sibling of the not-installed banner, one level down: these routes ARE compiled into
-       * the shared table, but nothing in the fleet is listening on it. Same inert-fact family, and
-       * mutually exclusive with the banner above — that one renders only on `installed: false`,
-       * and the server omits `front_door` entirely there. `noFrontDoor` is guarded against the
-       * two-source case at its declaration; see the note there.
-       */}
-      {noFrontDoor ? (
-        <div className="banner info" data-testid="routes-no-front-door" role="status">
-          <span className="b-glyph" aria-hidden="true">
-            &#x25c8;
-          </span>
-          <div>
-            <strong>No node in this fleet binds a front-door listener.</strong>
-            <p>
-              These routes are installed and would be evaluated, but there is nothing listening for
-              a request to evaluate them against — so the counts below are zero because nothing
-              could arrive, not because the routes are wrong.
-            </p>
-            <p>
-              Start a node with <code>--front-door</code> to serve this table.
-            </p>
-          </div>
-        </div>
-      ) : null}
-
       <section className="card">
         <div className="scroll-x">
-      {hits.data?.partial ? (
-        <div className="scope" data-testid="route-hits-partial" role="status">
-          <span className="eyebrow">Hits</span>
-          <span className="pill accent">
-            <span className="g" aria-hidden="true">
-              &#x25c8;
-            </span>
-            partial merge
-          </span>
-          <span className="coverage">
-            A node could not be reached, so each count is a floor — at least this many, possibly
-            more.
-          </span>
-        </div>
-      ) : null}
       <table className="dense">
         <thead>
           <tr>
@@ -387,9 +287,6 @@ function Editor({
             <th>Id</th>
             <th>Match</th>
             <th>Target</th>
-            <th style={{ width: "12ch" }} className="numeric">
-              Hits
-            </th>
             <th>Why this order</th>
             {mayWrite ? <th>Actions</th> : null}
           </tr>
@@ -426,13 +323,6 @@ function Editor({
                 <Ident>{route.target.port}</Ident>
                 {route.target.strip_prefix ? " · strips prefix" : ""}
               </td>
-              <HitsCell
-                id={route.id}
-                enabled={route.enabled}
-                hits={hits.data}
-                unavailable={hits.isError}
-                notInstalled={notInstalled}
-              />
               <td className="muted" data-testid="route-why">
                 {routeWhy(route, notInstalled)}
               </td>
@@ -818,117 +708,3 @@ function RouteTester({
   );
 }
 
-/**
- * One route's HITS figure, in the five states it can honestly be in.
- *
- * The zero is the reason this column exists — a route that could have taken a request and did not
- * is either wrong or dead — so it is rendered as a number and flagged, never as an empty cell. The
- * other four states exist to keep that flag honest, by never printing a number the fleet did not
- * report and never flagging a zero the fleet has already explained:
- *
- * - "not installed" — this tenant's routes are never compiled into the shared front door, so a
- *   zero would be a claim about traffic where the truth is about installation. Tested first,
- *   because it outranks the dash: it is knowable from the table read alone (#539), and it stays
- *   true whether or not a count was ever obtained;
- * - a muted zero for a **disabled** route, which is excluded from dispatch;
- * - a muted zero when **no node in the fleet binds a listener** (#403) — nothing could have
- *   arrived, and flagging every row at once is a diagnosis rather than a warning;
- * - a dash while the count is unknown.
- */
-function HitsCell({
-  id,
-  enabled,
-  hits,
-  unavailable,
-  notInstalled,
-}: {
-  id: string;
-  enabled: boolean;
-  hits: RouteHits | undefined;
-  unavailable: boolean;
-  notInstalled: boolean;
-}): ReactNode {
-  /*
-   * D-70's corollary: ahead of the unavailable branch, not behind it. A failed or in-flight
-   * fan-out leaves the *count* unknown, but when the table body has already established that this
-   * tenant's routes are never compiled in, "not installed" is both stronger and still true — and a
-   * dash there would hide the very fact #539 exists to surface, in the state that made it worth
-   * surfacing.
-   */
-  if (notInstalled) {
-    return (
-      <td
-        className="numeric muted"
-        data-testid="route-hits"
-        title="Stored, but never compiled into the shared front door — only the default tenant's routes are installed, so this route cannot take a dispatch at all."
-      >
-        not installed
-      </td>
-    );
-  }
-  if (unavailable || hits === undefined) {
-    return (
-      <td className="numeric muted" data-testid="route-hits" title="Dispatch counts unavailable">
-        &#x2014;
-      </td>
-    );
-  }
-  const count = hits.hits?.[id];
-  if (count === undefined) {
-    // The server keys the map by every id in the table it read, so this means the table moved
-    // between the two reads. Unknown, not zero.
-    return (
-      <td className="numeric muted" data-testid="route-hits" title="No count reported for this route">
-        &#x2014;
-      </td>
-    );
-  }
-  // A disabled route is filtered out of the dispatch chain by `effective_order`, so its zero is
-  // explained rather than alarming — flagging it would tell an operator their route is broken
-  // seconds after they switched it off with the button in the next column. The count itself still
-  // shows: a route disabled after taking 40 requests really did take 40.
-  if (count === 0 && !enabled) {
-    return (
-      <td
-        className="numeric muted"
-        data-testid="route-hits"
-        title="Disabled, so it is excluded from dispatch and can claim nothing."
-      >
-        {count}
-      </td>
-    );
-  }
-  // The fleet binds no listener anywhere, so this zero is explained for the same reason a disabled
-  // route's is: nothing could have arrived. Flagging it would put a warning on every row at once,
-  // which is the false diagnosis #403 exists to remove — and the banner above already states the
-  // cause once, where it belongs. The count still shows; a route that took 40 before the last
-  // listener went away really did take 40.
-  if (count === 0 && hasNoFrontDoorAnywhere(hits)) {
-    return (
-      <td
-        className="numeric muted"
-        data-testid="route-hits"
-        title="No front-door listener is bound anywhere in the fleet, so no route can take a request."
-      >
-        {count}
-      </td>
-    );
-  }
-  return (
-    <td
-      className={count === 0 ? "numeric warn-text" : "numeric"}
-      data-testid="route-hits"
-      // A statement of fact, not a diagnosis. "Wrong or dead" is the usual explanation and the
-      // reason this column exists, but it is not the only one — and where the fleet has told us
-      // the cause (no listener bound anywhere, handled above) the cell says so instead of
-      // asserting a cause it cannot know.
-      title={
-        count === 0
-          ? "No request has reached this route since the fleet started."
-          : undefined
-      }
-    >
-      {count}
-    </td>
-  );
-}

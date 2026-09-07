@@ -36,7 +36,6 @@ pub mod openapi;
 pub mod principal;
 pub mod probes;
 pub mod readiness;
-pub mod route_hits;
 pub mod session;
 mod tenancy;
 

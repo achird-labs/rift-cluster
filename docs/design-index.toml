@@ -142,7 +142,7 @@ code = ["tests/cluster-chaos/**", "crates/rift-cluster/tests/**"]
 status = "current"
 verified_sha = "9e0433dd0"
 verified_on = "2026-08-25"
-code = ["crates/rift-cluster-server/src/route_hits.rs", "crates/rift-cluster/src/sources/**"]
+code = ["crates/rift-cluster/src/sources/**"]
 
 ["docs/architecture/14-cloud-deployment.md"]
 status = "current"
