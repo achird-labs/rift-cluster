@@ -353,6 +353,8 @@ front, so console work needs no Rust rebuild at all; the generated client
 
 ## 8. MCP server design
 
+> **Retired by D-71** (RFC-007 §3.2, #547): the MCP server was removed. The section stays as the record of what was built; nothing below is served.
+
 ### 8.1 Shape: a subcommand, not a second binary
 
 **`rift-cluster-server mcp` speaking stdio.** Rejected alternative: a standalone

@@ -12,7 +12,6 @@ publish = false
 [dependencies]
 rift-mock-core.workspace = true
 rift-types.workspace = true
-rift-lint.workspace = true
 rift-http-proxy.workspace = true
 tokio.workspace = true
 tracing.workspace = true

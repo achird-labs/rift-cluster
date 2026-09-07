@@ -1,8 +1,8 @@
 //! The published OpenAPI 3.1 contract (RFC-006 §5.1, issue #184) and the machinery that keeps it
 //! honest.
 //!
-//! One contract, three consumers: the docs, the console's generated TypeScript client, and the MCP
-//! server's tool input schemas (RFC-006 §8.2). The schema is **hand-authored** because the front's
+//! One contract, two consumers: the docs and the console's generated TypeScript client. The schema
+//! is **hand-authored** because the front's
 //! router is hand-rolled hyper — [`crate::admin_front`]'s `classify` is a wildcard-free `match`, not
 //! a framework with derive-based schema extraction, so annotation tooling (utoipa et al.) has no
 //! shape to attach to.

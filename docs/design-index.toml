@@ -57,7 +57,7 @@ note = "§3.2 'the bytes ride the log' reversed by D-18/D-23; prose revision tra
 status = "current"
 verified_sha = ""
 verified_on = ""
-code = ["web/src/**", "crates/rift-cluster-server/src/console.rs", "crates/rift-cluster-server/src/session.rs", "crates/rift-cluster-server/src/fleet.rs", "crates/rift-cluster-server/src/mcp/**"]
+code = ["web/src/**", "crates/rift-cluster-server/src/console.rs", "crates/rift-cluster-server/src/session.rs", "crates/rift-cluster-server/src/fleet.rs"]
 
 ["docs/rfc/RFC-007-distributed-core.md"]
 status = "current"
