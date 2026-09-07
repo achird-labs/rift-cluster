@@ -154,9 +154,10 @@ jobs:
           # partition possible at all.
           - scenario: c25_key_revocation_survives_a_partition
             iterations: 80
-          # One full-fleet stop/start on top of a four-write session — measured
+          # A lagged follower caught up by a real snapshot install, then one
+          # full-fleet stop/start, on top of eighteen imposter writes — measured
           # at ~40s/iteration, identical to C18/C22, so the same 80 (~53 min).
-          - scenario: c26_audit_chain_survives_a_full_cluster_restart
+          - scenario: c26_replicated_imposters_survive_a_full_cluster_restart_by_snapshot_install
             iterations: 80
           # Stack up, two tenants, two principals, two imposters, a handful of
           # refusal probes and six data-plane reads, no restart — measured at

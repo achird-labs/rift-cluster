@@ -10,7 +10,6 @@ import { renderInApp, stubFetch, whoamiWith } from "./harness.tsx";
 const TENANTS = "/admin/tenants";
 const ACME = "/admin/tenants/acme";
 const ACME_PRINCIPALS = "/admin/tenants/acme/principals";
-const AUDIT = "/admin/audit?since=0&limit=100";
 
 const NOT_FOUND = {
   status: 404,
@@ -37,20 +36,6 @@ const PRINCIPAL_ROWS = [
   { id: "p-2", displayName: "old", auth: "apiKey", disabled: true, role: "viewer" },
   { id: KEY_ID, displayName: "keyed", auth: "apiKey", disabled: false, role: "operator" },
 ];
-
-function auditRow(revision: number, overrides: Record<string, unknown> = {}) {
-  return {
-    tsSecs: 1700000000 + revision,
-    principal: "p-1",
-    tenant: "acme",
-    action: "imposter.write",
-    resource: String(4540 + revision),
-    opId: `op-${revision}`,
-    revision,
-    outcome: "applied",
-    ...overrides,
-  };
-}
 
 afterEach(() => {
   vi.unstubAllGlobals();
@@ -569,91 +554,6 @@ describe("quota fields refuse a half-typed value", () => {
     await waitFor(() => expect(screen.getAllByTestId("tenant-row").length).toBe(1));
 
     expect(screen.getByTestId("quota-flow-entries").querySelector(".badge")).toBeNull();
-  });
-});
-
-describe("audit viewer", () => {
-  it("renders the bare array, oldest first, and shows a refusal as a committed row", async () => {
-    stubFetch({
-      [AUDIT]: {
-        json: [
-          auditRow(1),
-          auditRow(2, { outcome: { failed: { reason: "quota exceeded" } } }),
-        ],
-      },
-    });
-    renderInApp(<Admin tab="audit" tenant="acme" />, {
-      whoami: whoamiWith("tenant-admin", ["acme"]),
-      tenant: "acme",
-    });
-
-    await waitFor(() => expect(screen.getAllByTestId("audit-row").length).toBe(2));
-    const revisions = screen.getAllByTestId("audit-revision").map((n) => n.textContent);
-    expect(revisions).toEqual(["1", "2"]);
-    expect(screen.getByTestId("audit-row-2").textContent).toContain("quota exceeded");
-  });
-
-  it("pages with since one past the highest revision, because since is inclusive", async () => {
-    const calls: string[] = [];
-    // A FULL first page — a short page is the end of the journal and correctly retires the pager,
-    // so a two-row fixture could never exercise paging at all.
-    const firstPage = Array.from({ length: 100 }, (_, i) => auditRow(i + 1));
-    vi.stubGlobal(
-      "fetch",
-      vi.fn((input: RequestInfo | URL) => {
-        const path = typeof input === "string" ? input : input.toString();
-        calls.push(path);
-        const body = path.includes("since=0") ? firstPage : [auditRow(200)];
-        return Promise.resolve(new Response(JSON.stringify(body), { status: 200 }));
-      }),
-    );
-    renderInApp(<Admin tab="audit" tenant="acme" />, {
-      whoami: whoamiWith("tenant-admin", ["acme"]),
-      tenant: "acme",
-    });
-    await waitFor(() => expect(screen.getAllByTestId("audit-row").length).toBe(100));
-
-    // Highest revision on the page is 100, so the next request must ask for 101 — `since=100` would
-    // re-serve the row the page ended on.
-    await userEvent.setup().click(screen.getByTestId("audit-next"));
-    await waitFor(() => expect(calls.some((p) => p.includes("since=101"))).toBe(true));
-  });
-
-  // Gating on the cursor alone left this live forever: clicking past the end rendered an empty
-  // table under a header, which reads as "the trail stops here".
-  it("retires the pager on a short final page", async () => {
-    stubFetch({ [AUDIT]: { json: [auditRow(1), auditRow(2)] } });
-    renderInApp(<Admin tab="audit" tenant="acme" />, {
-      whoami: whoamiWith("tenant-admin", ["acme"]),
-      tenant: "acme",
-    });
-
-    await waitFor(() => expect(screen.getAllByTestId("audit-row").length).toBe(2));
-    expect((screen.getByTestId("audit-next") as HTMLButtonElement).disabled).toBe(true);
-  });
-
-  // `resource` and `principal` are attacker-influenceable — a port or id an attacker chose.
-  it("renders resource and principal as text", async () => {
-    stubFetch({
-      [AUDIT]: {
-        json: [
-          auditRow(1, {
-            resource: "<script>alert(1)</script>",
-            principal: '<img src=x onerror="alert(1)">',
-          }),
-        ],
-      },
-    });
-    const { container } = renderInApp(<Admin tab="audit" tenant="acme" />, {
-      whoami: whoamiWith("tenant-admin", ["acme"]),
-      tenant: "acme",
-    });
-
-    await waitFor(() => expect(screen.getAllByTestId("audit-row").length).toBe(1));
-    expect(container.querySelector("script")).toBeNull();
-    expect(container.querySelector("img")).toBeNull();
-    expect(container.textContent).toContain("<script>alert(1)</script>");
-    expect(container.textContent).toContain('<img src=x onerror="alert(1)">');
   });
 });
 

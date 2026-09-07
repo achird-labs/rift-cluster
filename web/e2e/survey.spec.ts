@@ -24,9 +24,7 @@ const SCREENS: { hash: string; name: string }[] = [
   { hash: "/routes", name: "routes" },
   { hash: "/admin/principals/default", name: "admin-principals" },
   { hash: "/admin/bindings/default", name: "admin-bindings" },
-  { hash: "/admin/audit/default", name: "admin-audit" },
   { hash: "/admin/tenants/default", name: "admin-tenants" },
-  { hash: "/admin/sink", name: "admin-sink" },
 ];
 
 const ROLES: RoleKey[] = ["viewer", "operator", "editor", "tenant-admin", "fleet-admin"];

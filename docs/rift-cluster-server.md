@@ -231,7 +231,6 @@ it, so a stray flag on a single node is not an error.
 | `--cluster-admin-async` | Answer admin writes with an immediate `202` + op id after durably parking them; poll `GET /_cluster/ops/:id` for the outcome |
 | `--cluster-flow-fsync-interval-ms <MILLIS>` | Group-fsync cadence for `durability: "async"` flow-state writes (default `50`) — the bound on what a whole-fleet crash can lose for imposters that did not choose `"sync"` or `"none"` |
 | `--cluster-legacy-key-is-fleet-admin <true\|false>` | Whether the legacy `--api-key`'s synthetic principal also gets `FleetAdmin` on the fleet scope, on top of its `TenantAdmin` binding on `default` (RFC-002 §3.4). **Default `true`** — see below |
-| `--cluster-audit-retention <SECONDS>` | How long audit rows are kept (default `2592000`, i.e. 30 d; `0` = forever). **Give every node in a fleet the same value** — see "The audit stream" below |
 
 Each flag also has an environment-variable spelling (`RIFT_CLUSTER_BIND`,
 `RIFT_CLUSTER_SECRET_FILE`, …), which is the intended vehicle for the secret.
@@ -265,7 +264,7 @@ into a deprecation rather than a breaking change:
 If a fleet has **no principal defined at all and no `--api-key` configured**,
 the admin plane stays fully open — the pre-#161 behavior, so an upgrade never
 starts denying a fleet that never set up authorization. `GET /metrics` reports
-this as `rift_cluster_no_principals` (see below), so it is something to audit
+this as `rift_cluster_no_principals` (see below), so it is something to check
 for rather than discover.
 
 ### The tenancy admin surface (issue #162)
@@ -391,155 +390,11 @@ A credential that matches no principal is refused having performed **zero**
 argon2id work, so an unauthenticated caller cannot use the admin port as a
 memory-amplification lever.
 
-### The audit stream (issue #163)
-
-```sh
-curl -s "http://$ADMIN/admin/audit?since=0&limit=100" \
-  -H "authorization: $KEY" -H "x-rift-tenant: acme"
-# [{"tsSecs":1700000000,"principal":"acme/ci-runner","tenant":"acme",
-#   "action":"imposter.write","resource":"8080",
-#   "opId":"3f2a…","revision":42,"outcome":"applied"}]
-```
-
-**Any node answers, and every node answers the same.** The row is derived at
-apply from the committed log entry, so all replicas compute identical rows and
-the read needs no fan-out — unlike `/_cluster/*` operator reads, you do not have
-to reach a particular node, and you never get a partial view.
-
-| Parameter | Meaning |
-|---|---|
-| `since` | First revision to return, inclusive. Default `0`. This is a **revision**, not a timestamp — page by taking the last row's `revision + 1` |
-| `limit` | Rows to return. Default `500`, capped at `5000` |
-
-`x-rift-tenant` names the tenant you are acting as, exactly as on every other
-tenant-scoped route; the path carries no tenant, so there is nothing else to go
-on. It defaults to `default`.
-
-**Visibility.** `audit.read` is its own action and is **not** part of
-`tenant.manage`: reading who did what and changing who may do what are different
-powers. A `FleetAdmin` sees the whole fleet; a `TenantAdmin` sees exactly the
-tenant it is acting as; `Editor` and below get `403`. The narrowing happens on
-the server — a tenant admin is never sent another tenant's rows.
-
-**What is and is not in the stream.**
-
-- Every replicated **write** — including one that was **refused**. A refusal is a
-  committed decision, and its row is often the one you want.
-- **Reads are not audited.** Neither are the mutating operations served over the
-  *proxy* path (`POST /imposters/:port/scenarios/:id/reset`, flow-state
-  clears): they are forwarded to the embedded core admin and never become
-  replicated ops, so a log-derived stream cannot see them. This is a **known
-  gap** — auditing them means putting them on consensus, which is a future
-  slice. Do not read their absence as "it did not happen". `DELETE
-  …/savedRequests` moved out of this bucket in issue #223: it still commits no
-  `ControlOp` (so it is still unaudited, and still a gap), but it no longer
-  proxies — see *Merge-on-read: the fleet request journal* below for what it
-  does instead.
-- A fleet-wide delete records the **tenant whose imposters were destroyed** and
-  `"resource": "*"`.
-
-**Retention.** `--cluster-audit-retention` (default 30 d, `0` = forever). The
-sweep runs against the cluster's replicated logical clock, never a node's local
-wall clock, so a node whose clock is skewed drops exactly the rows its peers do.
-That is also why **every node must be given the same value**: the GC runs inside
-the replicated apply path, so nodes configured differently would drop different
-rows and their audit tables would permanently diverge. Expiry lags the write that
-crosses the retention boundary by one apply — the window is a floor on how long
-rows are kept, not a promise to delete at the instant it passes.
-
-Audit history survives a full-cluster restart and a node joining by snapshot
-install.
-
-### Exporting the audit stream (issue #164)
-
-Optional, **off by default**, and it adds no dependency to the binary — the HTTP
-client and SigV4 signing are the ones the `s3:` imposter-source provider already
-carries. With no sink declared no export task runs, nothing is read from the
-audit table, and nothing reaches the network.
-
-Declare a sink — fleet state, so you set it once and every node (including one
-that joins later) inherits it:
-
-```sh
-curl -s -X PUT "http://$ADMIN/admin/audit/sink" \
-  -H "X-Rift-Key: $FLEET_ADMIN_KEY" -H 'content-type: application/json' \
-  -d '{"uri":"s3://acme-audit/rift/","authRef":"audit-bucket","batchMaxRows":500}'
-
-curl -s "http://$ADMIN/admin/audit/sink" -H "X-Rift-Key: $FLEET_ADMIN_KEY"
-curl -s -X DELETE "http://$ADMIN/admin/audit/sink" -H "X-Rift-Key: $FLEET_ADMIN_KEY"
-```
-
-All three require the `cluster.admin` action, not `audit.read`: where the fleet's
-audit is shipped is a fleet-scoped decision. **There is one sink, fleet-wide** —
-per-tenant sinks are a stated non-goal (the resume checkpoint is a single
-revision).
-
-| Scheme | Shape | Wire format |
-|---|---|---|
-| `https://…` | webhook `POST` per batch | JSON Lines (`application/x-ndjson`) |
-| `s3://<bucket>/<prefix>` | one object `PUT` per batch, key `<prefix>/<20-digit revision>.jsonl` | JSON Lines |
-
-`http://` is refused **except** to a loopback host — a sidecar collector on the
-same machine puts no bytes on a network, which is the only thing the cleartext
-rule protects against. The S3 key is zero-padded so a lexicographic bucket
-listing is in revision order.
-
-**Credentials never enter the log.** The record carries `authRef` — the *name* of
-a credential — and a URI with credentials in its authority is refused at
-admission with the same error a source URI gets. Resolution is node-local at
-export time, through the same secrets directory the imposter sources use
-(`RIFT_SOURCE_SECRETS_DIR`); `RIFT_S3_ENDPOINT` / `RIFT_S3_REGION` apply to an
-`s3://` sink as they do to an `s3:` source. A named `authRef` that fails to
-resolve **fails the ship** — it never falls back to an unauthenticated request.
-An S3 credential is `<access-key-id>:<secret-access-key>`; a webhook credential
-is sent as `Authorization: Bearer <value>`.
-
-**Delivery is at-least-once, not exactly-once**, and the difference is
-operational, not academic. The leader ships a batch and *then* commits its
-checkpoint; a leader that dies in between re-ships that batch when its successor
-resumes. **Your consumer must dedup on `(revision, opId)`** — that is why both
-are on every row. Duplicates are bounded to one batch and appear only across a
-failover.
-
-**A dead sink cannot stall admin writes.** Export runs in a background task
-reading committed state, so nothing on the write path waits on it. Watch:
-
-| Metric | Meaning |
-|---|---|
-| `rift_cluster_audit_export_shipped_total` | Rows accepted by the sink (re-ships counted — at-least-once) |
-| `rift_cluster_audit_export_failures_total` | Failed ship attempts; rising while `shipped` is flat means the sink is down |
-| `rift_cluster_audit_export_lag_revisions` | Applied revision minus checkpoint, on the leader |
-| `rift_cluster_audit_export_skipped_revisions_total` | **Rows that aged out before they shipped** — see below |
-
-> **`skipped_revisions_total` moving is data loss, and it is permanent.** If a
-> sink stays down longer than `--cluster-audit-retention`, the GC removes rows the
-> exporter never shipped. Those rows are gone from every replica, so the gap
-> cannot be backfilled. The exporter counts the span and logs it at error level
-> rather than passing over it quietly — a silent hole in an exported audit trail
-> is the worst failure this feature could have. It is reported as a **revision
-> span**, an upper bound on rows lost: revisions are not one-to-one with audit
-> rows, and once the rows are GC'd there is nothing left to count exactly. Alert
-> on this counter, and size `--cluster-audit-retention` against how long you can
-> tolerate your collector being down.
-
-> **A badly skewed node clock can erase history early.** The replicated clock is
-> a running maximum over the `issued_at_secs` each submitting node stamps from
-> its *own* wall clock. One node whose clock is a year fast can therefore advance
-> the whole fleet's logical clock by a year with a single write, and the next GC
-> — deterministically, on every replica — drops everything older than the new
-> cutoff. The clock never goes backwards, so this is not recoverable. The same
-> exposure exists for the 24 h dedup GC, where it costs a day of replay collapse;
-> here it costs the retention window. **Keep cluster nodes on NTP**, and treat a
-> large unexplained jump in retained history as a clock incident rather than a
-> quota or storage one.
-
 ### Upgrading a fleet
 
-`--cluster-audit-retention` and quota enforcement both take effect **inside the
-replicated apply path**, which makes them upgrade-sensitive in two ways:
+Quota enforcement takes effect **inside the replicated apply path**, which makes
+it upgrade-sensitive:
 
-- **Give every node the same retention value.** Nodes configured differently drop
-  different rows from the same log and their audit tables diverge permanently.
 - **Finish rolling out a version before writing against its new rules.** This
   release adds two apply-time refusals (a quota ceiling, and a zero-valued quota
   at validation). A node still running the previous version applies the *same*
@@ -1512,11 +1367,11 @@ A source document may declare blocks that belong to other subsystems:
   front door's table is its own replicated object with its own op (`PUT
   /front-door/routes`, above).
 
-### Audit
+### The pull log line
 
-Every applied pull writes a structured `audit`-target log event naming the
-principal, the source id, the version and the applying revision — so "who moved
-the payment mocks to which commit, and when" is a log query.
+Every applied pull writes a structured `rift_cluster::sources`-target log event
+naming the principal, the source id, the version and the applying revision — so
+"who moved the payment mocks to which commit, and when" is a log query.
 
 Container-tier chaos coverage for sources is #137.
 
@@ -1654,7 +1509,7 @@ serving the wrong corpus. (This is a node-local check, like the unknown-scheme
 refusal: which schemes take a credential is per-node configuration, so it
 cannot live in the replicated op validation.)
 
-Secret material never reaches a log line, an audit row, or an error string: the
+Secret material never reaches a log line or an error string: the
 credential type has no `Display` and renders as `<redacted>` under `Debug`, the
 git token travels in the subprocess environment rather than in the remote URL
 (`git` echoes URLs on failure), the S3 secret key never leaves the signing
@@ -1884,7 +1739,7 @@ RFC-005 D3. Five routes, all EE-terminated — there is no upstream endpoint to 
 POST   /admin/tenants/:id/datasets                    upload a new version
 GET    /admin/tenants/:id/datasets                    list, with a bindings count per dataset
 GET    /admin/tenants/:id/datasets/:name              version history + bindings
-GET    /admin/tenants/:id/datasets/:name/:ver/content the bytes — AUDITED
+GET    /admin/tenants/:id/datasets/:name/:ver/content the bytes
 DELETE /admin/tenants/:id/datasets/:name              409 while bound
 ```
 
@@ -1903,33 +1758,9 @@ new table of rows redefines what every bound stub answers, which is the same lin
 on. A dataset in another tenant answers **404**, never 403, and the body is byte-identical to a
 dataset that does not exist: a distinguishable refusal would confirm the dataset is there.
 
-### The one audited read
-
-Reads are not audited (RFC-002 §9). `GET …/content` is the single exception, because it is a bulk
-export of whatever the operator uploaded and is routinely PII. The record carries the dataset name,
-the version and the **digest**, so "who exported which bytes" is a log query — a name outlives the
-version it pointed at, so the name alone would not answer it.
-
-Listings and version history are **not** audited. Keeping the exception to exactly one route is
-what keeps it defensible, and it is asserted in both directions.
-
-Three consequences worth knowing:
-
-- **A content read commits a Raft entry.** Audit rows are written inside apply and replicate with
-  everything else, so a trace that must survive a node dying has to be committed, not logged
-  locally. That is a write on the read path — deliberate, and the reason it is confined to this one
-  route.
-- **It fails closed.** The record commits *before* the bytes are served, and a read whose record
-  cannot commit is refused rather than served. Exporting unrecorded is the outcome the exception
-  exists to prevent.
-- **`Idempotency-Key` does not deduplicate it.** Every export is its own event and leaves its own
-  record. A deduplicated second read would return the bytes and record nothing, which is the same
-  failure wearing a retry's clothes.
-
 A dataset whose record is live but whose bytes are missing on the answering node is a `500`, not a
 `404`: the row proves the dataset exists, so absence of the blob is this node's integrity failure,
 not the operator's mistake.
-
 
 ## Clustered flow state (#120)
 
@@ -2187,7 +2018,7 @@ omission.
 Reads poll every 5 seconds while the tab is visible and **stop while it is
 hidden** (RFC-006 §6). SSE is deferred to v2 and will carry cache invalidation
 only. A 4xx is never retried: it is a decision the fleet has already made, and
-re-asking only doubles the audited denials.
+re-asking only repeats the denial.
 
 ## What lands later
 

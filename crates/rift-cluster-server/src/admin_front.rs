@@ -70,7 +70,6 @@ use hyper::{Method, Request, Response, StatusCode, Uri};
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use rand::RngCore;
-use rift_cluster::audit_export::ExportStatus;
 use rift_cluster::control::Role;
 use rift_cluster::control::{
     self, ControlOp, ControlRequest, PreconditionTarget, StubEdit, StubEditScript,
@@ -166,12 +165,6 @@ pub struct FrontConfig {
     /// `--cluster-admin-async`: answer 202 + op id right after parking, and
     /// let the submit run in the background.
     pub admin_async: bool,
-    /// This node's audit-exporter status (issue #164), for
-    /// `GET /admin/audit/sink`. `None` when the composition root never spawned
-    /// an `AuditExporter` — the route still answers, just without a status
-    /// attached, the same way it does for a follower (see
-    /// `tenancy::AuditSinkView`'s doc).
-    pub export_status: Option<Arc<ExportStatus>>,
     /// This node's startup-readiness latch, threaded through so `/_fleet/health` (RFC-006 §5.2,
     /// issue #185) can report the same state `/readyz` does without a second latch to keep in
     /// sync.
@@ -309,7 +302,6 @@ struct FrontState {
     barrier: WriteBarrier,
     barrier_timeout: Duration,
     admin_async: bool,
-    export_status: Option<Arc<ExportStatus>>,
     readiness: Arc<Readiness>,
     /// See [`FrontConfig::puller`].
     puller: Arc<SourcePuller>,
@@ -345,7 +337,6 @@ pub async fn bind(config: FrontConfig, node: &Arc<RaftNode>) -> std::io::Result<
         barrier: config.barrier,
         barrier_timeout: config.barrier_timeout,
         admin_async: config.admin_async,
-        export_status: config.export_status,
         readiness: config.readiness,
         puller: config.puller,
         journal_net: config.journal_net,
@@ -1104,7 +1095,7 @@ fn action_for(kind: &Terminated) -> Action {
         // Exactly upstream's own mapping for these two paths (`imposter_action` in the vendored
         // `authz.rs`, via `principal::map_action`): GET reads fold onto `ImposterRead` regardless
         // of route, and DELETE has its own action shared with `savedProxyResponses`. Reusing them
-        // rather than minting new ones keeps the audit action name identical to what the same
+        // rather than minting new ones keeps the action name identical to what the same
         // route was authorized under before it terminated here.
         Terminated::ReadSavedRequests(_) => Action::ImposterRead,
         // The same action the proxied stream already resolves to: upstream classifies the
@@ -1119,7 +1110,7 @@ fn action_for(kind: &Terminated) -> Action {
         Terminated::ClearSavedRequests(_) => Action::SavedRequestsClear,
         // The same action upstream authorizes the identical route under (see the comment
         // above): the proxied path already landed on `SavedRequestsClear`, and terminating
-        // must not rename what the same call is gated and audited as.
+        // must not rename what the same call is gated as.
         Terminated::ClearSavedProxyResponses(_) => Action::SavedRequestsClear,
         // Exactly upstream's own mapping for this shape (`principal::map_action`'s
         // `has_space && !is_flow_state` arm, the proxied path's identical route used before
@@ -1130,7 +1121,7 @@ fn action_for(kind: &Terminated) -> Action {
         // `IMPOSTER_WRITE` + `has_space` arm, whose own comment names this route. Not
         // `ImposterWrite` — that would quietly move a redefine-a-space's-behaviour call off the
         // Editor tier RFC-002 §4.1 puts it on, and terminating must never rename what the same
-        // call is gated and audited as.
+        // call is gated as.
         Terminated::AddSpaceStub(_, _) => Action::SpaceStubWrite,
         // Exactly upstream's own mapping for a space *read* (`principal::map_action`'s
         // `IMPOSTER_READ` arm folds every route onto `ImposterRead` regardless of `has_space`):
@@ -1153,19 +1144,12 @@ fn action_for(kind: &Terminated) -> Action {
         Terminated::Tenancy(route) => route.action(),
         Terminated::SourceList | Terminated::SourceRead(_) => Action::SourceRead,
         // Deliberately NOT `Action::SourceRead` and deliberately NOT a new
-        // `Action::SourceWrite` (issue #253's explicit design decision).
-        // `control.rs`'s own audit mapping already names these ops:
-        // `SourcePut`/`SourcePullResult` emit `imposter.write`, `SourceDelete`
-        // emits `imposter.delete` (`control::action_for`, ~line 919-920) — a
-        // pull commits as `SourcePullResult`, the same op a declare's
-        // `SourcePut` does not, but both land on the write action. Minting a
-        // `SourceWrite` action here would make the audit stream and this
-        // enforcement gate disagree about what the *same event* was called,
-        // which is worse than the asymmetry with the read side looks: a
-        // security reviewer correlating "who wrote this imposter" from the
-        // audit log by action name would find writes attributed to an action
-        // nothing ever authorized. The read/write split itself is
-        // deliberate too — reading a source is its own, lighter power (a
+        // `Action::SourceWrite` (issue #253's explicit design decision, D-29):
+        // a pull commits as `SourcePullResult`, which ultimately produces the
+        // same `PutImposter`-shaped change a declare does, so both land on the
+        // write action rather than on a name nothing else in the system uses.
+        // The read/write split itself is deliberate too — reading a source is
+        // its own, lighter power (a
         // Viewer may see what an imposter was built from, `role_allows`'s own
         // comment on `Action::SourceRead`), while writing one is exactly as
         // consequential as `PUT /imposters`, because that is what a pull
@@ -1343,7 +1327,7 @@ async fn handle(state: Arc<FrontState>, req: Request<Incoming>) -> Response<Fron
     //
     // Authenticated but **actionless**, the same posture as `/admin/whoami` above: the document
     // describes the shape of the admin surface, so serving it to an unauthenticated scanner would
-    // hand out a map of every tenancy and audit route for free. It carries no tenant data, so it
+    // hand out a map of every tenancy and fleet route for free. It carries no tenant data, so it
     // needs no action and no tenant resolution either — any authenticated principal reads the same
     // bytes.
     if req.method() == Method::GET && path == "/openapi.json" {
@@ -1605,10 +1589,9 @@ async fn read_routes(
 /// never a fallthrough to allow.
 /// What a passed authorization yields: the tenant the caller may act as, who
 /// they are (for U-10 attribution), and the bindings the decision was made
-/// against — the last so a route that must filter *rows* by tenant
-/// (`GET /admin/audit`) derives that filter from the same bindings the decision
-/// used, rather than re-resolving the credential and risking a second, subtly
-/// different answer.
+/// against — the last so a route that must narrow what it answers by tenant
+/// derives that filter from the same bindings the decision used, rather than
+/// re-resolving the credential and risking a second, subtly different answer.
 type Authorized = (TenantId, Option<String>, Vec<(TenantId, Role)>);
 
 /// `scope`, when given, is the tenant the *route itself* names (the tenancy
@@ -1647,9 +1630,9 @@ fn authorize_action(
         // request addresses, and answering `/admin/tenants/b/principals` from
         // tenant `default` would be wrong rather than merely conservative.
         // No bindings under the bypass: there is no principal, so there is
-        // nothing for a tenant filter to narrow to. A caller reading the audit
-        // stream on an unenforced fleet sees the fleet, which is the same thing
-        // every other route already gives them.
+        // nothing for a tenant filter to narrow to. A caller on an unenforced
+        // fleet sees the fleet, which is the same thing every other route
+        // already gives them.
         return Ok((scope.cloned().unwrap_or_default(), None, Vec::new()));
     };
     let requested = scope.cloned().unwrap_or_else(|| requested_tenant(req));
@@ -3141,8 +3124,7 @@ async fn terminate(
     // to condition an `If-Match` on, no `_rift.script` to resolve, and no
     // loopback route to re-read for the render.
     if let Terminated::Tenancy(route) = kind {
-        return terminate_tenancy(&state, &node, req, route, principal_id, &tenant, &bindings)
-            .await;
+        return terminate_tenancy(&state, &node, req, route, principal_id, &tenant).await;
     }
 
     // So does the whole source surface (issue #239 for the reads, #253 for
@@ -5755,11 +5737,9 @@ async fn terminate_tenancy(
     principal_id: Option<String>,
     // `authorized_tenant` is the tenant the authorization decision was actually
     // made against — the route's own scope where it has one, else the caller's
-    // `X-Rift-Tenant`. `GET /admin/audit` narrows its rows to exactly this, so
-    // the rows a caller receives and the tenant they were authorized as can
-    // never disagree.
+    // `X-Rift-Tenant` — so what a caller receives and the tenant they were
+    // authorized as can never disagree.
     authorized_tenant: &TenantId,
-    bindings: &[(TenantId, Role)],
 ) -> Response<FrontBody> {
     let idempotency = req
         .headers()
@@ -5793,19 +5773,6 @@ async fn terminate_tenancy(
              principal if both attempts committed.",
         );
     }
-
-    // An audited export must never be deduplicated (issue #287). `base_op_id` derives the op id
-    // from `Idempotency-Key`, and a replayed op id short-circuits in the state machine *above* the
-    // audit write — so a second keyed request would serve the bytes again and record nothing.
-    // Dedup keys on the op id alone, never on the op's content, so the replay need not even name
-    // the same dataset: one recorded read would buy `DEDUP_TTL_SECS` (24h) of unrecorded exports
-    // of everything the caller can reach.
-    //
-    // A fresh id per request instead of refusing the header: a read has no state to make
-    // idempotent, so there is no retry semantics worth preserving, and each export genuinely is a
-    // separate event that has to leave its own trace. Recording twice is harmless; recording once
-    // for two exports is the failure this op exists to prevent.
-    let is_audited_export = matches!(route, tenancy::Route::DatasetContent(..));
 
     // Parsed here, where both the headers and the query are in hand — `classify` sees only the
     // path and query, and `dispatch` sees neither.
@@ -5842,18 +5809,7 @@ async fn terminate_tenancy(
         }
     };
 
-    let outcome = match tenancy::dispatch(
-        node,
-        route,
-        &body,
-        authorized_tenant,
-        bindings,
-        upload,
-        state.export_status.as_deref(),
-        &state.flow_net,
-    )
-    .await
-    {
+    let outcome = match tenancy::dispatch(node, route, &body, upload, &state.flow_net).await {
         Ok(outcome) => outcome,
         Err(tenancy::TenancyError::BadRequest(reason)) => {
             return typed_error(StatusCode::BAD_REQUEST, ErrorKind::BadData, &reason);
@@ -5865,7 +5821,7 @@ async fn terminate_tenancy(
         Err(tenancy::TenancyError::Storage(reason)) => return internal(&reason),
     };
 
-    let (op, status, rendered, rendered_content_type) = match outcome {
+    let (op, status, rendered) = match outcome {
         tenancy::Outcome::Body {
             status,
             body,
@@ -5878,12 +5834,19 @@ async fn terminate_tenancy(
             }
             return response;
         }
-        tenancy::Outcome::Commit {
-            op,
+        tenancy::Outcome::Bytes {
             status,
-            then,
-            then_content_type,
-        } => (op, status, then, then_content_type),
+            body,
+            content_type,
+        } => {
+            return buffered_response(
+                status,
+                Bytes::from(body),
+                Some(HeaderValue::from_static(content_type)),
+            )
+            .unwrap_or_else(|response| response);
+        }
+        tenancy::Outcome::Commit { op, status, then } => (op, status, then),
     };
 
     // The same order every write on this front follows (R4): validate, park
@@ -5892,11 +5855,7 @@ async fn terminate_tenancy(
     if let Err(reason) = control::validate(&op) {
         return refusal_response(&reason);
     }
-    let op_id = if is_audited_export {
-        uuid::Uuid::new_v4()
-    } else {
-        base_op_id(idempotency.as_deref())
-    };
+    let op_id = base_op_id(idempotency.as_deref());
     let request = tenancy::mint_request(op, principal_id, op_id);
     if let Err(e) = node.park_intent(&request) {
         return typed_error(
@@ -6006,8 +5965,6 @@ async fn terminate_tenancy(
     // fail on a response that succeeded.
     let content_type = if body.is_empty() {
         None
-    } else if let Some(declared) = rendered_content_type {
-        HeaderValue::from_static(declared).into()
     } else {
         json_content_type()
     };
@@ -7409,8 +7366,8 @@ fn mint(
         // `with_principal_scope` seam does not survive the clustered write
         // path (the state-machine apply task is not the request task), so
         // this field is the one that does — populated here from
-        // `authorize_action`'s resolved principal (issue #161); #163 reads
-        // it back into the audit stream.
+        // `authorize_action`'s resolved principal (issue #161); apply reads it
+        // back for the engine's attribution scope and the committed-write log line.
         principal,
         issued_at_secs,
         expected_revision,
@@ -8775,7 +8732,6 @@ mod tests {
                 barrier: crate::cli::WriteBarrier::None,
                 barrier_timeout: Duration::from_secs(1),
                 admin_async: false,
-                export_status: None,
                 readiness: Arc::new(crate::readiness::Readiness::awaiting([])),
                 puller: Arc::new(SourcePuller::new(
                     rift_cluster_base::seams::SourceRegistry::default(),
@@ -9640,7 +9596,6 @@ mod tests {
             secret: Some("admin-front-test-secret".to_owned()),
             routes: rift_cluster::Router::new(),
             engine: None,
-            audit_retention_secs: rift_cluster::DEFAULT_AUDIT_RETENTION_SECS,
             snapshot_log_entries: None,
             advertise_as_digest_only_incapable: incapable,
         };
@@ -9683,7 +9638,6 @@ mod tests {
                 barrier: crate::cli::WriteBarrier::None,
                 barrier_timeout: Duration::from_secs(1),
                 admin_async: false,
-                export_status: None,
                 readiness: Arc::new(crate::readiness::Readiness::awaiting([])),
                 puller: Arc::new(SourcePuller::new(
                     rift_cluster_base::seams::SourceRegistry::default(),

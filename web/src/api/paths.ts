@@ -13,12 +13,6 @@ export const API_PATHS = {
   fleetHealth: "/_fleet/health",
   session: "/session",
   frontDoorRoutes: "/front-door/routes",
-  audit: "/admin/audit",
-  /**
-   * Where the fleet ships its audit rows. Fleet-scoped: a `TenantAdmin` trusted to read their own
-   * tenant's rows is not thereby trusted to see — or redirect — where every tenant's rows go.
-   */
-  auditSink: "/admin/audit/sink",
   /**
    * The tenant's declared imposter sources, with this node's poll status kept structurally apart.
    * No member-path builder: the screen has no per-source route, so `#/sources/mocks` falls back
@@ -66,8 +60,7 @@ export const savedProxyResponsesPath = (port: number): string =>
  * emits for a captured request (`vendor/rift/docs/mountebank/proxy.md:190-224`).
  *
  * Not a member of `API_PATHS`/`ApiPath`: the contract declares `GET /imposters/{port}` with no query
- * parameters at all, so a templated string is the only way to reach this projection, the same as
- * `auditPath` below.
+ * parameters at all, so a templated string is the only way to reach this projection.
  */
 export const recordedStubsPath = (port: number): string =>
   `${imposterPath(port)}?replayable=true&removeProxies=true`;
@@ -190,5 +183,3 @@ const PATH_SAFE_ID = /^[A-Za-z0-9\-._~:@!$&'()*+,;=%]+$/;
 
 export const isAddressablePrincipalId = (principalId: string): boolean =>
   PATH_SAFE_ID.test(principalId);
-export const auditPath = (since: number, limit: number): string =>
-  `${API_PATHS.audit}?since=${since}&limit=${limit}`;

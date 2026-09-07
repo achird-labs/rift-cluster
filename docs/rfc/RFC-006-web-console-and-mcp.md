@@ -100,6 +100,10 @@ Three rules, in priority order:
 
 ## 4. Information architecture
 
+> **Amended by D-71** (RFC-007 §3.2, #546): the audit projection, its export sink and the
+> console's `Audit` and `Audit sink` tabs were removed. Rows below that name them stay as
+> history; the admin screen ships tenants, principals and bindings.
+
 Tenant-scoped, one tenant in view at a time. A tenant switcher (top-level,
 persisted per browser) sets the `X-Rift-Tenant` header on every API call for
 multi-tenant principals — RFC-002 §8.1's rules apply unchanged; the console
@@ -352,6 +356,9 @@ front, so console work needs no Rust rebuild at all; the generated client
 (§5.1) keeps the two sides honest.
 
 ## 8. MCP server design
+
+> **Amended by D-71** (#546 removed the audit projection this section's attribution claims read
+> from; the MCP server itself was removed by #547). The section stays as history.
 
 > **Retired by D-71** (RFC-007 §3.2, #547): the MCP server was removed. The section stays as the record of what was built; nothing below is served.
 

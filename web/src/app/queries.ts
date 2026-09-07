@@ -15,7 +15,6 @@ import { type CommitOutcome, applied, settle } from "../features/writes/commit.t
 import { keyedAttempt } from "../features/writes/idempotency.ts";
 import {
   API_PATHS,
-  auditPath,
   bindingPath,
   frontDoorRoutePath,
   imposterPath,
@@ -39,7 +38,6 @@ import {
   tryImposterPath,
 } from "../api/paths.ts";
 import type { components } from "../api/schema.ts";
-import { type AuditRow, auditPage, readAuditRows } from "../features/admin/audit.ts";
 import { stripApiKey } from "../features/admin/key.ts";
 import {
   type Coverage,
@@ -74,8 +72,6 @@ type RouteTableView = components["schemas"]["RouteTableView"];
 type Tenant = components["schemas"]["Tenant"];
 type TenantWrite = components["schemas"]["TenantWrite"];
 type Principal = components["schemas"]["Principal"];
-type AuditSink = components["schemas"]["AuditSink"];
-type AuditSinkWrite = components["schemas"]["AuditSinkWrite"];
 type PrincipalCreate = components["schemas"]["PrincipalCreate"];
 type PrincipalUpdate = components["schemas"]["PrincipalUpdate"];
 type IssuedPrincipal = components["schemas"]["IssuedPrincipal"];
@@ -163,8 +159,8 @@ export function useSources(options: { enabled?: boolean } = {}): UseQueryResult<
  * already declared is replaced in place and a new one is created, which is why the console offers
  * one form for both rather than two (`Sources.tsx`'s `SourceForm`).
  *
- * Field casing follows every other admin-plane write body in this file (`AuditSinkWrite`,
- * `TenantWrite`, …): camelCase, matching `SourceRecord`'s own read-side fields — and matching the
+ * Field casing follows every other admin-plane write body in this file (`TenantWrite`,
+ * `PrincipalCreate`, …): camelCase, matching `SourceRecord`'s own read-side fields — and matching the
  * vocabulary `control.rs::validate`'s own refusals already use on the wire (its poll-interval
  * refusal reads `"pollSecs {secs} is below the {MIN_POLL_SECS}s floor"`, camelCase, even though the
  * Rust field behind it is `poll_secs`). This route lands in parallel with this change; if it ships
@@ -892,63 +888,6 @@ export function useDeleteImposter(): UseMutationResult<CommitOutcome, Error, { p
  * Per-node like the log itself. Clearing here empties what *this* node recorded; another node's log
  * is untouched, which is the same scope caveat the screen already keeps in front of the reader.
  */
-/**
- * The fleet's declared audit export sink.
- *
- * `404` is **not** an error here: the contract uses it for "no sink is declared" as well as for
- * "caller lacks fleet-scoped access" (RFC-002 §8.4, where the two must be indistinguishable). The
- * screen is only reachable by a principal that holds `cluster.admin`, so it resolves the absent case
- * to `null` and lets every other status reject — folding a genuine `503` into "no sink" would report
- * an unreachable node as a fleet that ships nowhere.
- */
-export function useAuditSink(options: { enabled?: boolean } = {}) {
-  return useQuery({
-    queryKey: ["audit-sink"],
-    queryFn: async (): Promise<AuditSink | null> => {
-      try {
-        return await apiGet<AuditSink>(API_PATHS.auditSink);
-      } catch (cause) {
-        if (cause instanceof ApiError && cause.status === 404) return null;
-        throw cause;
-      }
-    },
-    enabled: options.enabled ?? true,
-    ...POLLED,
-  });
-}
-
-export function usePutAuditSink(): UseMutationResult<CommitOutcome, Error, AuditSinkWrite> {
-  const client = useQueryClient();
-  const keyed = keyedAttempt();
-  return useMutation({
-    mutationFn: async (body) => {
-      const sent = await keyed((idempotencyKey) =>
-        apiSend("PUT", API_PATHS.auditSink, body, { idempotencyKey }),
-      );
-      const outcome = await settle(sent, { tenant: null });
-      if (outcome.kind === "failed") throw new Error(outcome.detail);
-      return outcome;
-    },
-    onSettled: () => client.invalidateQueries({ queryKey: ["audit-sink"] }),
-  });
-}
-
-export function useDeleteAuditSink(): UseMutationResult<CommitOutcome, Error, void> {
-  const client = useQueryClient();
-  const keyed = keyedAttempt();
-  return useMutation({
-    mutationFn: async () => {
-      const sent = await keyed((idempotencyKey) =>
-        apiSend("DELETE", API_PATHS.auditSink, undefined, { idempotencyKey }),
-      );
-      const outcome = await settle(sent, { tenant: null });
-      if (outcome.kind === "failed") throw new Error(outcome.detail);
-      return outcome;
-    },
-    onSettled: () => client.invalidateQueries({ queryKey: ["audit-sink"] }),
-  });
-}
-
 export function useClearRequests(): UseMutationResult<CommitOutcome, Error, { port: number }> {
   const { tenant } = useSession();
   const client = useQueryClient();
@@ -1504,8 +1443,7 @@ export function useDeleteRoute(): UseMutationResult<CommitOutcome, Error, { rout
 /**
  * The admin plane (RFC-002). Every one of these routes addresses its tenant through the URL path,
  * never `X-Rift-Tenant` — see `paths.ts` — so, unlike the hooks above, none of these pass `tenant`
- * to `apiGet`/`apiSend`. `getAudit` is the one exception: it has no tenant path segment, so the
- * header is how a non-fleet-admin's rows are scoped at all.
+ * to `apiGet`/`apiSend`.
  */
 
 const ADMIN_TENANTS_KEY = ["admin-tenants"];
@@ -1718,22 +1656,5 @@ export function useDeleteBinding(): UseMutationResult<
       ).then(applied),
     onSettled: (_data, _error, vars) =>
       client.invalidateQueries({ queryKey: adminPrincipalsKey(vars.tenantId) }),
-  });
-}
-
-/**
- * `since` is caller-owned state (RFC-002 §8's cursor is client-driven), not derived here — the
- * screen advances it with `nextSince` once a page has rendered, and that decision does not belong
- * inside the hook that reads one page.
- */
-/** The page size the audit viewer asks for. Exported so the pager can tell a short page from a full one. */
-export const AUDIT_PAGE_SIZE = 100;
-
-export function useAuditRows(tenant: string | null, since: number): UseQueryResult<AuditRow[]> {
-  return useQuery({
-    queryKey: ["admin-audit", tenant, since],
-    queryFn: async () =>
-      auditPage(readAuditRows(await apiGet<unknown>(auditPath(since, AUDIT_PAGE_SIZE), { tenant }))),
-    ...POLLED,
   });
 }

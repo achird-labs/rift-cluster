@@ -718,7 +718,6 @@ export interface paths {
         /**
          * List this tenant's datasets
          * @description One row per dataset *name* — every version of a name is one table — carrying the latest live version and how many live stubs bind it. A non-zero `bindings` count means a delete will be refused with `409`.
-         *     Not audited. Only the content read is (see that route): keeping the deviation from RFC-002 §9 narrow is what keeps it defensible.
          *     `Rift-Cluster-Partial: true` means a stored config would not parse, so the binding tally is short — the count is advisory, but a short one would promise a delete that then `409`s, so it is reported rather than hidden.
          */
         get: operations["listDatasets"];
@@ -751,7 +750,7 @@ export interface paths {
         };
         /**
          * One dataset's version history
-         * @description Every live version, newest first, plus how many live stubs bind the dataset. Not audited.
+         * @description Every live version, newest first, plus how many live stubs bind the dataset.
          *     A dataset this tenant does not have answers `404` — byte-identical to a cross-tenant probe, so a caller cannot tell "no such dataset" from "not yours" (RFC-002 §8.4).
          */
         get: operations["readDatasetHistory"];
@@ -783,8 +782,7 @@ export interface paths {
         };
         /**
          * Download a dataset version's bytes
-         * @description **The one audited read.** RFC-002 §9 says reads are not audited; this is its single named exception, because these bytes are a bulk export of whatever the operator uploaded and are routinely PII. The audit record carries the dataset name, the version and the digest, so "who exported which bytes" is a log query (§8.3). Listings and version history are *not* audited — the exception is deliberately this route alone.
-         *     The record commits before the bytes are served, and a read whose record cannot commit is refused rather than served: exporting unrecorded is the outcome this exception exists to prevent.
+         * @description The stored bytes of one dataset version, exactly as uploaded. Listings and version history describe a dataset; this is the one route that hands back its content, which is a bulk export of whatever the operator uploaded and is routinely PII.
          */
         get: operations["readDatasetContent"];
         put?: never;
@@ -877,54 +875,6 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/admin/audit": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /**
-         * Read the audit journal
-         * @description Terminates. Answers a **bare JSON array** of audit rows, not an envelope. `since` and `limit` are pure pagination: an unparseable or absent value takes its default rather than refusing (domain- optional parse, not a swallow — both parameters have a safe default and there is no failure worth hiding behind a 400). A `FleetAdmin` sees the whole fleet's rows; every other caller sees exactly the tenant they were authorized as, filtered server-side so the rows returned and the authorization decision that allowed them can never disagree.
-         */
-        get: operations["getAudit"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/admin/audit/sink": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /**
-         * Read the fleet's declared audit export sink
-         * @description Terminates. Fleet-scoped (`ClusterAdmin` / FleetAdmin only) — a `TenantAdmin` trusted to read their own tenant's audit rows is not thereby trusted to see where the whole fleet's rows ship to. Export status is included only on the leader (only it runs the exporter); a follower reports the sink with no status attached rather than a fabricated all-zero one.
-         */
-        get: operations["getAuditSink"];
-        /**
-         * Declare or replace the fleet's audit export sink
-         * @description Terminates. Fleet-scoped (`ClusterAdmin` / FleetAdmin only). The sink's own `revision` is what a re-declared sink resumes exporting from.
-         */
-        put: operations["putAuditSink"];
-        post?: never;
-        /**
-         * Stop exporting the audit stream (keeps the checkpoint)
-         * @description Terminates. Fleet-scoped. The stored checkpoint (`revision`) survives this delete — a later `putAuditSink` resumes from it rather than re-shipping the whole journal.
-         */
-        delete: operations["deleteAuditSink"];
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
     "/admin/requests": {
         parameters: {
             query?: never;
@@ -989,7 +939,7 @@ export interface paths {
         put?: never;
         /**
          * Declare (upsert by id) an imposter source
-         * @description Terminates: commits a `SourcePut` op and answers `200` with the stored record. An upsert, not a create-vs-replace distinction — the same `id` re-declared replaces the prior declaration. Requires `imposter.write` (Editor and up) — deliberately not a dedicated `source.write`: the audit stream already names this op `imposter.write` (it is exactly as consequential as `PUT /imposters`, because that is what a pull ultimately produces), and the read side above is the lighter, separately-gated `source.read`. A `uri` carrying embedded userinfo (`user:pass@host`) is refused before the write reaches the replicated log — name a credential with `authRef` instead. No `If-Match`: a source row has no revision surface of its own to condition on, and this is an idempotent upsert, not a read-modify-write.
+         * @description Terminates: commits a `SourcePut` op and answers `200` with the stored record. An upsert, not a create-vs-replace distinction — the same `id` re-declared replaces the prior declaration. Requires `imposter.write` (Editor and up) — deliberately not a dedicated `source.write`: it is exactly as consequential as `PUT /imposters`, because that is what a pull ultimately produces, and the read side above is the lighter, separately-gated `source.read`. A `uri` carrying embedded userinfo (`user:pass@host`) is refused before the write reaches the replicated log — name a credential with `authRef` instead. No `If-Match`: a source row has no revision surface of its own to condition on, and this is an idempotent upsert, not a read-modify-write.
          */
         post: operations["putSource"];
         delete?: never;
@@ -1167,7 +1117,7 @@ export interface paths {
         };
         /**
          * This hand-authored OpenAPI contract, served as JSON
-         * @description Terminates. Authenticated but actionless, the same posture as `getWhoAmI` — the document describes the shape of the whole admin surface, so serving it unauthenticated would hand a scanner a map of every tenancy and audit route for free. Carries no tenant data, so any authenticated principal reads the same bytes.
+         * @description Terminates. Authenticated but actionless, the same posture as `getWhoAmI` — the document describes the shape of the whole admin surface, so serving it unauthenticated would hand a scanner a map of every tenancy and fleet route for free. Carries no tenant data, so any authenticated principal reads the same bytes.
          */
         get: operations["getOpenApiContract"];
         put?: never;
@@ -1188,7 +1138,7 @@ export interface paths {
         get?: never;
         /**
          * Set or rename the fleet's operator-set name
-         * @description Terminates. Fleet-scoped (`ClusterAdmin` / FleetAdmin only) — same tier as `putAuditSink`, for the same reason: this is a fleet-wide rename, not a tenant-scoped one. Replicated via a new `ControlOp` rather than a per-node command-line flag, so every node — and every console session, regardless of which node it happens to be talking to — agrees on one name. Setting the first name and renaming are the same write: the new value replaces whatever was there.
+         * @description Terminates. Fleet-scoped (`ClusterAdmin` / FleetAdmin only), because this is a fleet-wide rename, not a tenant-scoped one. Replicated via a new `ControlOp` rather than a per-node command-line flag, so every node — and every console session, regardless of which node it happens to be talking to — agrees on one name. Setting the first name and renaming are the same write: the new value replaces whatever was there.
          */
         put: operations["putFleetName"];
         post?: never;
@@ -1278,7 +1228,7 @@ export interface paths {
         post: operations["createSession"];
         /**
          * Clear the session cookie
-         * @description Terminates. Acts on the cookie the caller already holds, so it is exempt from `apiKeyAuth` the same way `createSession` is — there is no credential to check before clearing a cookie. Not a Raft write and not audited as a principal action: the server only ever mints this cookie at `POST /session`, never adopts a client-presented one, so there is no session-fixation case to guard against here.
+         * @description Terminates. Acts on the cookie the caller already holds, so it is exempt from `apiKeyAuth` the same way `createSession` is — there is no credential to check before clearing a cookie. Not a Raft write: the server only ever mints this cookie at `POST /session`, never adopts a client-presented one, so there is no session-fixation case to guard against here.
          */
         delete: operations["deleteSession"];
         options?: never;
@@ -1819,60 +1769,9 @@ export interface components {
         Binding: {
             role: components["schemas"]["Role"];
         };
-        AuditRow: {
-            /**
-             * Format: int64
-             * @description The applying entry's replicated clock — identical on every replica.
-             */
-            tsSecs: number;
-            /** @description Who issued the op; null for an unattributed (open-admin-plane) submission. */
-            principal?: string | null;
-            /** @description The tenant the op acted on. Never null — every op names exactly one. */
-            tenant: string;
-            /** @description The RFC-002 §4.1 action slug (matches the authorization decision's own action string). */
-            action: string;
-            /** @description What was acted on — a port, an id, or "*" for a whole-scope op. */
-            resource: string;
-            /** Format: uuid */
-            opId: string;
-            /**
-             * Format: int64
-             * @description The applying log index.
-             */
-            revision: number;
-            /** @description `ControlOutcome`, externally tagged and **snake_case** — `Applied` is a unit variant, so it is the bare string `"applied"`, NOT an object. A refusal is `{"failed": {"reason": "..."}}`. A refusal is a *committed* outcome: the op is in the log and deduped like any other, it just changed nothing. */
-            outcome: "applied" | {
-                failed: {
-                    reason: string;
-                };
-            };
-        };
         FleetNameWrite: {
             /** @description Required — an omitted field is refused, not defaulted to an empty name. Trimmed non-empty, at most 128 characters, and free of control characters; otherwise unconstrained, since this is chrome text a human reads rather than an id anything parses back. */
             name: string;
-        };
-        AuditSinkWrite: {
-            uri: string;
-            /** @description Name of a credential the fleet already holds; never a raw credential. */
-            authRef?: string;
-            /** @description Omitted takes the server default, not zero (which would ship nothing forever). */
-            batchMaxRows?: number;
-        };
-        AuditSink: components["schemas"]["AuditSinkWrite"] & {
-            batchMaxRows: number;
-            /**
-             * Format: int64
-             * @description The revision of the AuditSinkPut that produced this record.
-             */
-            revision: number;
-            /** @description Present only on the leader (only it runs the exporter). */
-            exportStatus?: {
-                running?: boolean;
-                lastError?: string | null;
-                /** Format: int64 */
-                shippedRows?: number;
-                consecutiveFailures?: number;
-            };
         };
         /** @description One imposter source as the fleet has agreed on it — the replicated projection, identical on every converged node. Deliberately carries nothing node-local, so two nodes' answers stay byte-comparable as a convergence check. */
         SourceRecord: {
@@ -2482,7 +2381,7 @@ export interface components {
         /**
          * @description Journal cursor: return only entries recorded after this position, as previously reported by this endpoint's x-rift-next-index response header. Absent means a baseline read of everything still retained.
          *     On the clustered merge-on-read path this is an **opaque vector cursor** (issue #225) — a string, not an integer: it encodes a position per writer shard plus the clear generation it was issued under, because a scalar index names a position in no shard in particular once more than one node is recording. Round-trip it verbatim; do not parse it, and do not construct one. A bare `u64` is still accepted during the upgrade window and read as this node's own shard position.
-         *     Unlike the audit journal's forgiving `since`, an unparseable value here answers 400 rather than taking a default — a cursor that silently restarted at zero would re-deliver the whole journal as if it were new traffic, and one that silently jumped to the end would hide everything recorded since it was issued.
+         *     An unparseable value here answers 400 rather than taking a default — a cursor that silently restarted at zero would re-deliver the whole journal as if it were new traffic, and one that silently jumped to the end would hide everything recorded since it was issued.
          */
         JournalSince: string;
         /**
@@ -3367,7 +3266,7 @@ export interface operations {
                 /**
                  * @description Journal cursor: return only entries recorded after this position, as previously reported by this endpoint's x-rift-next-index response header. Absent means a baseline read of everything still retained.
                  *     On the clustered merge-on-read path this is an **opaque vector cursor** (issue #225) — a string, not an integer: it encodes a position per writer shard plus the clear generation it was issued under, because a scalar index names a position in no shard in particular once more than one node is recording. Round-trip it verbatim; do not parse it, and do not construct one. A bare `u64` is still accepted during the upgrade window and read as this node's own shard position.
-                 *     Unlike the audit journal's forgiving `since`, an unparseable value here answers 400 rather than taking a default — a cursor that silently restarted at zero would re-deliver the whole journal as if it were new traffic, and one that silently jumped to the end would hide everything recorded since it was issued.
+                 *     An unparseable value here answers 400 rather than taking a default — a cursor that silently restarted at zero would re-deliver the whole journal as if it were new traffic, and one that silently jumped to the end would hide everything recorded since it was issued.
                  */
                 since?: components["parameters"]["JournalSince"];
                 /**
@@ -3509,7 +3408,7 @@ export interface operations {
                 /**
                  * @description Journal cursor: return only entries recorded after this position, as previously reported by this endpoint's x-rift-next-index response header. Absent means a baseline read of everything still retained.
                  *     On the clustered merge-on-read path this is an **opaque vector cursor** (issue #225) — a string, not an integer: it encodes a position per writer shard plus the clear generation it was issued under, because a scalar index names a position in no shard in particular once more than one node is recording. Round-trip it verbatim; do not parse it, and do not construct one. A bare `u64` is still accepted during the upgrade window and read as this node's own shard position.
-                 *     Unlike the audit journal's forgiving `since`, an unparseable value here answers 400 rather than taking a default — a cursor that silently restarted at zero would re-deliver the whole journal as if it were new traffic, and one that silently jumped to the end would hide everything recorded since it was issued.
+                 *     An unparseable value here answers 400 rather than taking a default — a cursor that silently restarted at zero would re-deliver the whole journal as if it were new traffic, and one that silently jumped to the end would hide everything recorded since it was issued.
                  */
                 since?: components["parameters"]["JournalSince"];
                 /**
@@ -5153,145 +5052,6 @@ export interface operations {
             504: components["responses"]["WriteTimeout"];
         };
     };
-    getAudit: {
-        parameters: {
-            query?: {
-                /** @description Journal cursor (a `revision`/log-index value): return rows applied at or after this point. Defaults to `0` (the start of the journal). An unparseable value is treated as absent rather than rejected. */
-                since?: number;
-                /** @description Maximum rows to return. Defaults to 500 and is clamped to a hard ceiling of 5000 — the audit table is a journal, so an unbounded read would be an unbounded response, and any tenant admin can reach this route. */
-                limit?: number;
-            };
-            header?: {
-                /** @description Selects which of the caller's existing tenant bindings this request acts under; it never grants a binding the caller does not already hold. Absent, requests act as the default tenant. Ignored on tenancy routes, where the path segment names the tenant being administered instead. */
-                "X-Rift-Tenant"?: components["parameters"]["TenantHeader"];
-            };
-            path?: never;
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Audit rows, constraints applied server-side (bare array, not an envelope). */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["AuditRow"][];
-                };
-            };
-            401: components["responses"]["Unauthorized"];
-            403: components["responses"]["Forbidden"];
-            500: components["responses"]["InternalError"];
-        };
-    };
-    getAuditSink: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description The declared sink, plus this node's export status when it has one. */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["AuditSink"];
-                };
-            };
-            401: components["responses"]["Unauthorized"];
-            /** @description No sink is declared, or caller lacks fleet-scoped access (RFC-002 §8.4). */
-            404: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Error"];
-                };
-            };
-        };
-    };
-    putAuditSink: {
-        parameters: {
-            query?: never;
-            header?: {
-                /** @description Client-chosen retry key for a mutating request. Mints a deterministic op id (a v5 derivation when the value is not itself a UUID) so a retried request with the same key dedups to the original committed response instead of re-applying. Explicitly refused with 400 on principal creation — not silently ignored: the key and principal id are minted per request before any op id exists, so a replayed request would commit nothing yet still answer 201 with a freshly minted key that was never stored. A client that sent the header believes its retry is safe, so the request is rejected rather than left to go on believing it. A keyed retry against an op that committed a `409` (revision conflict) dedups to that same `409` — the key does not make the conflict retryable. A client that wants to proceed after a `409` must rebase against the current state and retry with a *fresh* Idempotency-Key, not the one that produced the conflict. */
-                "Idempotency-Key"?: components["parameters"]["IdempotencyKey"];
-            };
-            path?: never;
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["AuditSinkWrite"];
-            };
-        };
-        responses: {
-            /** @description Sink stored; body is empty (`terminate_tenancy` renders no body — only principal creation returns one). */
-            200: {
-                headers: {
-                    "Rift-Cluster-Revision": components["headers"]["RiftClusterRevision"];
-                    "Rift-Cluster-Op-Id": components["headers"]["RiftClusterOpId"];
-                    [name: string]: unknown;
-                };
-                content?: never;
-            };
-            400: components["responses"]["BadData"];
-            401: components["responses"]["Unauthorized"];
-            /** @description Caller lacks fleet-scoped access (RFC-002 §8.4 — not a 403). */
-            404: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Error"];
-                };
-            };
-            413: components["responses"]["PayloadTooLarge"];
-            500: components["responses"]["InternalError"];
-            503: components["responses"]["Unavailable"];
-            504: components["responses"]["WriteTimeout"];
-        };
-    };
-    deleteAuditSink: {
-        parameters: {
-            query?: never;
-            header?: {
-                /** @description Client-chosen retry key for a mutating request. Mints a deterministic op id (a v5 derivation when the value is not itself a UUID) so a retried request with the same key dedups to the original committed response instead of re-applying. Explicitly refused with 400 on principal creation — not silently ignored: the key and principal id are minted per request before any op id exists, so a replayed request would commit nothing yet still answer 201 with a freshly minted key that was never stored. A client that sent the header believes its retry is safe, so the request is rejected rather than left to go on believing it. A keyed retry against an op that committed a `409` (revision conflict) dedups to that same `409` — the key does not make the conflict retryable. A client that wants to proceed after a `409` must rebase against the current state and retry with a *fresh* Idempotency-Key, not the one that produced the conflict. */
-                "Idempotency-Key"?: components["parameters"]["IdempotencyKey"];
-            };
-            path?: never;
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Export stopped; no body. */
-            204: {
-                headers: {
-                    "Rift-Cluster-Revision": components["headers"]["RiftClusterRevision"];
-                    "Rift-Cluster-Op-Id": components["headers"]["RiftClusterOpId"];
-                    [name: string]: unknown;
-                };
-                content?: never;
-            };
-            401: components["responses"]["Unauthorized"];
-            /** @description Caller lacks fleet-scoped access (RFC-002 §8.4 — not a 403). */
-            404: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Error"];
-                };
-            };
-            500: components["responses"]["InternalError"];
-            503: components["responses"]["Unavailable"];
-            504: components["responses"]["WriteTimeout"];
-        };
-    };
     readFleetRequests: {
         parameters: {
             query?: {
@@ -5991,7 +5751,7 @@ export interface operations {
                 };
             };
             401: components["responses"]["Unauthorized"];
-            /** @description Caller lacks fleet-scoped (`ClusterAdmin`) access — indistinguishable from a route that does not exist for this caller (RFC-002 §8.4), the same posture `listTenants` and `getAuditSink` already use for fleet-scoped denial. */
+            /** @description Caller lacks fleet-scoped (`ClusterAdmin`) access — indistinguishable from a route that does not exist for this caller (RFC-002 §8.4), the same posture `listTenants` already uses for fleet-scoped denial. */
             404: {
                 headers: {
                     [name: string]: unknown;

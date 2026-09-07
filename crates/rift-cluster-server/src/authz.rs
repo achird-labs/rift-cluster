@@ -64,15 +64,14 @@ pub enum Action {
     /// the request log and can trigger proxyOnce recording, which is the
     /// "disturb" shape that puts it in the Operator arm beside
     /// [`Action::ScenarioReset`]. And it is the first action under which the
-    /// server originates outbound HTTP on a caller's behalf, so an audit record
-    /// (`as_str`) has to be able to say that is what happened rather than
-    /// naming it as an ordinary read.
+    /// server originates outbound HTTP on a caller's behalf, so a refusal or a
+    /// log line (`as_str`) has to be able to say that is what happened rather
+    /// than naming it as an ordinary read.
     ImposterTry,
     SourceRead,
     VerifyRun,
     StreamSubscribe,
     TenantManage,
-    AuditRead,
     ClusterAdmin,
     /// List, read, or dry-run compile a spec (RFC-004 §4.3, issue #278) — landed with S2 because a
     /// terminated route cannot ship without its action.
@@ -101,7 +100,7 @@ impl Action {
     ///
     /// Kept beside the enum so the two cannot drift: `every_action_is_listed`
     /// fails if a variant is added without extending this.
-    pub const ALL: [Action; 27] = [
+    pub const ALL: [Action; 26] = [
         Action::ImposterRead,
         Action::ImposterWrite,
         Action::ImposterDelete,
@@ -121,7 +120,6 @@ impl Action {
         Action::VerifyRun,
         Action::StreamSubscribe,
         Action::TenantManage,
-        Action::AuditRead,
         Action::ClusterAdmin,
         Action::SpecRead,
         Action::SpecWrite,
@@ -131,7 +129,7 @@ impl Action {
         Action::DatasetDelete,
     ];
 
-    /// A stable string for audit records and logs (#163 consumes these).
+    /// A stable string for refusals and logs.
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
@@ -154,17 +152,13 @@ impl Action {
             Action::VerifyRun => "verify.run",
             Action::StreamSubscribe => "stream.subscribe",
             Action::TenantManage => "tenant.manage",
-            Action::AuditRead => "audit.read",
             Action::ClusterAdmin => "cluster.admin",
             Action::SpecRead => "spec.read",
             Action::SpecWrite => "spec.write",
             Action::SpecDelete => "spec.delete",
-            // `write`, not `put`, and not by accident: an action's RBAC string and its audit
-            // string are one namespace, and #285 already ships
-            // `ControlOp::DatasetPut.audit_action() == "dataset.write"`. Issue #287's prose asks
-            // for `"dataset.put"`, which would make this the only action in the system that
-            // disagrees with its own audit string — on the resource whose whole point here is
-            // that access to it be answerable as a log query.
+            // `write`, not `put`, and not by accident: every other resource's write action is
+            // `<resource>.write`. Issue #287's prose asks for `"dataset.put"`, which would make
+            // this the only action in the system spelled differently from its siblings.
             Action::DatasetRead => "dataset.read",
             Action::DatasetWrite => "dataset.write",
             Action::DatasetDelete => "dataset.delete",
@@ -180,15 +174,6 @@ impl Action {
 /// explicit per-role arms rather than as a numeric rank comparison: a rank
 /// makes "is X at least Y" cheap but makes *which* actions a role grants
 /// invisible, and this table is the thing a security reviewer reads.
-///
-/// Two deliberate placements worth stating, both from §4.1:
-///
-/// - **`AuditRead` is not a Viewer grant**, despite being a read. Reading who
-///   did what and changing who may do what are different powers; it starts at
-///   `TenantAdmin`. Bundling it with the other reads would make every viewer an
-///   auditor by accident.
-/// - **`AuditRead` is not part of `TenantManage`** either, for the mirror
-///   reason: collapsing them would make every principal-manager an auditor.
 #[must_use]
 pub fn role_allows(role: Role, action: Action) -> bool {
     // The `matches!` arms are exhaustive over `Action` by construction: each
@@ -215,9 +200,8 @@ pub fn role_allows(role: Role, action: Action) -> bool {
                 // reading the imposter it describes — a Viewer may see what a mock was built from.
                 | Action::SpecRead
                 // RFC-005 §5 (issue #287): a dataset is the table of rows a bound stub serves, so
-                // reading one is the same power as reading the stub it feeds. Note this covers the
-                // *content* read too — which is a bulk export, and is why that one read is the
-                // single named exception to reads-are-not-audited (RFC-002 §9).
+                // reading one is the same power as reading the stub it feeds, the content read
+                // included.
                 | Action::DatasetRead
         ),
         Role::Operator => {
@@ -258,8 +242,7 @@ pub fn role_allows(role: Role, action: Action) -> bool {
                 )
         }
         Role::TenantAdmin => {
-            role_allows(Role::Editor, action)
-                || matches!(action, Action::TenantManage | Action::AuditRead)
+            role_allows(Role::Editor, action) || matches!(action, Action::TenantManage)
         }
         // Everything, in every tenant, plus the cluster surface. The tenant
         // half is `decide`'s job, not this table's: this answers only "may this
@@ -385,9 +368,10 @@ mod tests {
     fn every_action_is_listed_in_all() {
         assert_eq!(
             Action::ALL.len(),
-            27,
-            "RFC-002 §4.1 defines 21 actions, RFC-004 §4.3 adds three (issue #278) and RFC-005 §5 \
-             adds three more (issue #287); ALL must carry every one"
+            26,
+            "RFC-002 §4.1 defines 21 actions less `AuditRead` (removed by D-71, #546), RFC-004 \
+             §4.3 adds three (issue #278) and RFC-005 §5 adds three more (issue #287); ALL must \
+             carry every one"
         );
         let unique: std::collections::BTreeSet<_> = Action::ALL.iter().collect();
         assert_eq!(unique.len(), Action::ALL.len(), "ALL contains a duplicate");
@@ -395,12 +379,12 @@ mod tests {
         assert_eq!(
             slugs.len(),
             Action::ALL.len(),
-            "two actions share an audit slug — #163 could not tell them apart"
+            "two actions share a slug — a refusal could not tell them apart"
         );
     }
 
-    /// The spec actions' audit slugs are part of the contract (#278): the audit stream and
-    /// `role {r:?} does not grant {slug}` refusals both name them.
+    /// The spec actions' slugs are part of the contract (#278): `role {r:?} does not grant
+    /// {slug}` refusals name them.
     #[test]
     fn spec_action_slugs_are_stable() {
         assert_eq!(Action::SpecRead.as_str(), "spec.read");
@@ -449,7 +433,7 @@ mod tests {
             Action::DatasetWrite,
             Action::DatasetDelete,
         ];
-        let tenant_admin_adds = [Action::TenantManage, Action::AuditRead];
+        let tenant_admin_adds = [Action::TenantManage];
 
         let expected = |role: Role| -> Vec<Action> {
             let mut granted: Vec<Action> = match role {
@@ -553,17 +537,6 @@ mod tests {
         assert!(role_allows(Role::FleetAdmin, Action::ClusterAdmin));
     }
 
-    /// Audit is not a Viewer read and not part of TenantManage — the two
-    /// placements §4.1 calls out explicitly.
-    #[test]
-    fn audit_read_is_neither_an_ordinary_read_nor_bundled_with_tenant_manage() {
-        assert!(!role_allows(Role::Viewer, Action::AuditRead));
-        assert!(!role_allows(Role::Operator, Action::AuditRead));
-        assert!(!role_allows(Role::Editor, Action::AuditRead));
-        assert!(role_allows(Role::TenantAdmin, Action::AuditRead));
-        assert!(role_allows(Role::FleetAdmin, Action::AuditRead));
-    }
-
     /// Issue #335: a try is an Operator power, not a Viewer one.
     ///
     /// Pinned on its own rather than left to the matrix above, because the
@@ -594,7 +567,7 @@ mod tests {
         assert_eq!(
             Action::ImposterTry.as_str(),
             "imposter.try",
-            "the audit slug is a published contract (#163 consumes it)"
+            "the slug is a published contract"
         );
     }
 
@@ -725,44 +698,14 @@ mod tests {
         }
     }
 
-    /// An action's RBAC string and its audit string are **one namespace**, and the verb is `write`.
-    ///
-    /// Every other resource holds this: `Action::SpecWrite` is `"spec.write"` and
-    /// `ControlOp::SpecPut`/`SpecBind`/`SpecUnbind` all audit as `"spec.write"`. #285 already ships
-    /// `ControlOp::DatasetPut.audit_action() == "dataset.write"`, so an `Action` spelled
-    /// `"dataset.put"` — as issue #287's prose asks for — would be the only action in the system
-    /// that disagrees with its own audit string, for the very resource whose point is that access
-    /// to it be answerable as a log query.
+    /// The dataset actions' verbs match every other resource's: `write`, not `put`. Issue #287's
+    /// prose asks for `"dataset.put"`, which would be the only action in the system spelled
+    /// differently from its siblings (`spec.write`, `imposter.write`).
     #[test]
-    fn dataset_action_strings_match_the_audit_namespace() {
+    fn dataset_action_strings_use_the_shared_verbs() {
         assert_eq!(Action::DatasetRead.as_str(), "dataset.read");
         assert_eq!(Action::DatasetWrite.as_str(), "dataset.write");
         assert_eq!(Action::DatasetDelete.as_str(), "dataset.delete");
-
-        assert_eq!(
-            Action::DatasetWrite.as_str(),
-            rift_cluster::ControlOp::DatasetPut {
-                tenant: rift_cluster::TenantId::default(),
-                record: dataset_record(),
-                csv: Some("id\n1\n".to_owned()),
-                origin: 0,
-            }
-            .audit_action()
-            .expect("a dataset write is audited"),
-            "the RBAC action and the audit action for the same operation must be the same string"
-        );
-    }
-
-    fn dataset_record() -> rift_cluster::control::DatasetRecord {
-        rift_cluster::control::DatasetRecord {
-            name: "customers".to_owned(),
-            digest: rift_cluster::control::Digest::new("0".repeat(64)),
-            key_columns: vec!["id".to_owned()],
-            delimiter: ',',
-            columns: vec!["id".to_owned()],
-            rows: 1,
-            bytes: 5,
-        }
     }
 
     /// All three join `Action::ALL`, which is what makes the role matrix exhaustive.

@@ -162,8 +162,7 @@ pub struct BlobStat {
 
 /// Node-local record of this store's GC sweeps, persisted at
 /// `<root>/gc-watermark.json` so a reader can tell "removed" from "never
-/// swept" across a restart — the same distinction `sm_audit_gc_watermark`
-/// preserves for the audit-log GC.
+/// swept" across a restart.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct GcWatermark {
     /// Wall-clock time (unix seconds) of the most recent sweep.
@@ -678,9 +677,8 @@ impl BlobStore {
     /// which is what `RaftNode::blob_gc_sweep` reports to its metric rather than re-deriving
     /// from `sm_blob_tombstones` by hand.
     ///
-    /// `grace_secs == 0` disables GC entirely — mirrors `gc_audit`'s
-    /// `retention_secs == 0` early return — and removes nothing, including
-    /// abandoned staging files.
+    /// `grace_secs == 0` disables GC entirely — an early return before any
+    /// sweep — and removes nothing, including abandoned staging files.
     ///
     /// The grace window exists because, until #438 proposes, a freshly
     /// fanned-out blob is referenced by nothing yet: without it, GC would
@@ -1751,7 +1749,7 @@ mod tests {
 
     #[test]
     fn gc_is_disabled_entirely_when_the_grace_is_zero() {
-        // Edge 18, matching `gc_audit`'s `retention_secs == 0` early return.
+        // Edge 18: a zero grace is the early return, not "expire immediately".
         let (store, _dir) = store();
         put_whole(&store, HELLO_DIGEST, b"hello");
 
@@ -1944,9 +1942,8 @@ mod tests {
 
     #[test]
     fn the_watermark_records_what_gc_removed_so_absence_can_be_explained() {
-        // The audit GC's watermark exists so a reader can tell "removed" from
-        // "never written" (see `SM_AUDIT_GC_WATERMARK_TABLE`). #439's
-        // fetch-on-apply needs the same distinction when a fetch 404s.
+        // The watermark exists so a reader can tell "removed" from "never
+        // written": #439's fetch-on-apply needs that distinction when a fetch 404s.
         let (store, _dir) = store();
         assert_eq!(store.watermark().expect("watermark").removed_total, 0);
 

@@ -47,14 +47,8 @@ describe("CAPABILITY_MATRIX — readable against RFC-002 §4.2", () => {
     }
   });
 
-  // Two deliberate placements the design note asks to keep visible, because both are easy to
-  // "tidy" into the wrong place.
-  it("starts audit.read at tenant-admin — not viewer, and not part of tenant.manage", () => {
-    expect(CAPABILITY_MATRIX.viewer).not.toContain("audit.read");
-    expect(CAPABILITY_MATRIX.editor).not.toContain("audit.read");
-    expect(CAPABILITY_MATRIX["tenant-admin"]).toContain("audit.read");
-  });
-
+  // A deliberate placement the design note asks to keep visible, because it is easy to "tidy"
+  // into the wrong place.
   it("gives lifecycle to operator but withholds imposter.write until editor", () => {
     expect(CAPABILITY_MATRIX.operator).toContain("imposter.lifecycle");
     expect(CAPABILITY_MATRIX.operator).not.toContain("imposter.write");

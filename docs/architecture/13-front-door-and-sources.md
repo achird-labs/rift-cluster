@@ -126,9 +126,9 @@ you asked has it".
 on **both** ports. They began on the cluster port under the node-to-node cluster
 credential, where they still are and still write the default tenant; #253
 promoted them to the RBAC'd admin front, where they are authorized as
-`imposter.write` / `imposter.delete` (the names the audit stream already emits
-for these ops, rather than a new `SourceWrite` the audit and the gate would
-disagree about) and write the **caller's resolved tenant**. Both ports run the
+`imposter.write` / `imposter.delete` (the names these ops already carry, rather
+than a new `SourceWrite` nothing else would recognise) and write the **caller's
+resolved tenant**. Both ports run the
 same `SourcePuller` methods, which is what keeps the two from drifting; the
 tenant is the only difference between them. The fleet follows within a replication round, which is what
 `c20_source_pull_converges_and_fetches_once` polls for rather than asserting at
@@ -192,9 +192,10 @@ survive a full-fleet restart; and a hand edit shows as drift on every node
 before the next pull overwrites it. Each was also shown red under a named
 mutant — see the chaos README's "C20–C23" section.
 
-Sources are tenant-owned, quota-counted, and audited like every other write:
-"who moved the payment mocks to which commit, when" is a log query, not a
-Slack archaeology session.
+Sources are tenant-owned and quota-counted like every other write, and a pull
+emits a structured `tracing` line naming the principal, the source and the
+resolved version: "who moved the payment mocks to which commit, when" is a log
+query, not a Slack archaeology session.
 
 ## What this buys, concretely
 
@@ -203,4 +204,4 @@ glue for GitHub/registry pulls, per environment — collapses to `rift-cluster-s
 with a route table and two source records. Same single exposed port, same
 pull-from-anywhere ergonomics, plus everything the wrapper never had: fleet
 HA, replicated routes and configs with read-after-write semantics, drift
-visibility, RBAC, and an audit trail.
+visibility, and RBAC.

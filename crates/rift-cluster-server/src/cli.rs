@@ -89,19 +89,6 @@ pub struct ClusterArgs {
     )]
     pub cluster_leave_timeout: u64,
 
-    /// How long audit rows are kept, in seconds (0 = forever).
-    ///
-    /// Give every node in a fleet the same value: retention GC runs inside
-    /// apply, so nodes configured differently drop different rows from the same
-    /// log and their audit tables diverge.
-    #[arg(
-        long,
-        value_name = "SECONDS",
-        default_value_t = rift_cluster::DEFAULT_AUDIT_RETENTION_SECS,
-        env = "RIFT_CLUSTER_AUDIT_RETENTION"
-    )]
-    pub cluster_audit_retention: u64,
-
     /// How many imposters one fleet request-journal answer may cover (issue #362).
     ///
     /// The fleet journal (`GET /admin/requests` and its stream) walks the caller's tenant's
@@ -109,8 +96,8 @@ pub struct ClusterArgs {
     /// **named** in the answer's `coverage` block, so raising or lowering this changes how much one
     /// answer covers, never whether a short answer admits to being short.
     ///
-    /// Node-local, unlike the audit retention above: it bounds the work and the token size of a
-    /// read this node serves, and nothing about it has to agree across the fleet.
+    /// Node-local: it bounds the work and the token size of a read this node serves, and
+    /// nothing about it has to agree across the fleet.
     #[arg(
         long,
         value_name = "PORTS",

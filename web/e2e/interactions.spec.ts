@@ -89,15 +89,6 @@ test.describe("bindings: granting and revoking a role", () => {
   });
 });
 
-test.describe("audit: the stream a tenant-admin may read", () => {
-  test("lists rows and pages without losing its place", async ({ page }) => {
-    await signIn(page, "tenant-admin");
-    await goToScreen(page, "/admin/audit/default");
-    // Everything above has written; the stream cannot be empty.
-    await expect(page.getByTestId("admin-screen")).toBeVisible();
-  });
-});
-
 test.describe("stubs: the conflict flow", () => {
   test("refuses a stale write and offers both sides rather than merging", async ({ page }) => {
     /*

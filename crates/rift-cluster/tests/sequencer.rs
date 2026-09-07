@@ -69,7 +69,6 @@ async fn spawn_member(id: NodeId, addr: SocketAddr, dir: &Path) -> Member {
         secret: Some(SECRET.to_owned()),
         routes: seq_routes(Arc::clone(&seq)),
         engine: None,
-        audit_retention_secs: rift_cluster::DEFAULT_AUDIT_RETENTION_SECS,
         snapshot_log_entries: None,
         advertise_as_digest_only_incapable: false,
     })

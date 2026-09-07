@@ -139,8 +139,7 @@ impl CredentialedSource for S3Source {
                 })?;
                 let host = host_header(&parsed);
                 // Unsigned-payload GET: the empty-body hash, computed the same
-                // way `sign`'s PUT caller (`audit_export::sink::S3Sink`) hashes
-                // its real body.
+                // way a PUT caller of `sign` would hash its real body.
                 let payload_hash = sha256_hex(b"");
                 let now = amz_date(SystemTime::now());
                 let signed = sign(&SigningRequest {
@@ -273,11 +272,11 @@ pub(crate) fn host_header(url: &reqwest::Url) -> String {
 
 /// The headers a signed request needs.
 ///
-/// `pub(crate)`, along with [`sign`] and the primitives below it: issue #164's
-/// `audit_export::sink::S3Sink` signs a `PUT` with the same SigV4 machinery
-/// this GET-only source built for issue #136, and duplicating a hand-rolled
-/// signer a second time is exactly the risk of the two silently drifting
-/// apart that sharing one avoids.
+/// `pub(crate)`, along with [`sign`] and the primitives below it: `sign` also
+/// covers a `PUT` against a real body hash with the same SigV4 machinery this
+/// GET-only source built for issue #136, so a second caller never has to
+/// duplicate a hand-rolled signer — which is exactly the two-silently-drift
+/// risk sharing one avoids.
 pub(crate) struct Signed {
     pub(crate) authorization: String,
     pub(crate) amz_date: String,
@@ -528,13 +527,13 @@ mod tests {
         );
     }
 
-    // -- issue #164 review: the PUT / real-payload-hash signing path ---------
+    // -- the PUT / real-payload-hash signing path ----------------------------
     //
     // Every test above this line only ever signs the GET/empty-payload shape
     // `S3Source::fetch_with_auth` builds. `sign`'s `SigningRequest` also
-    // serves `audit_export::sink::S3Sink`'s PUT, which signs the *real* body
-    // hash — and until now nothing here ever built a `SigningRequest` with a
-    // non-empty `payload_hash` to prove that half of the contract.
+    // covers a PUT, which signs the *real* body hash — and nothing above
+    // builds a `SigningRequest` with a non-empty `payload_hash` to prove that
+    // half of the contract.
     // `SigningRequest::payload_hash`'s own doc names the risk directly:
     // defaulting a PUT to the empty hash "would let a PUT's signature
     // validate against content that was never signed at all."
@@ -559,7 +558,7 @@ mod tests {
             secret_access_key: "wJalrXUtnFEMIsupersecret",
             region: "us-east-1",
             host: "bucket.s3.us-east-1.amazonaws.com",
-            canonical_uri: "/bucket/audit/00000000000000000042.jsonl",
+            canonical_uri: "/bucket/exports/00000000000000000042.jsonl",
             payload_hash: &empty_hash,
             amz_date: "20240101T000000Z",
         };
@@ -593,7 +592,7 @@ mod tests {
             secret_access_key: "wJalrXUtnFEMIsupersecret",
             region: "us-east-1",
             host: "bucket.s3.us-east-1.amazonaws.com",
-            canonical_uri: "/bucket/audit/00000000000000000001.jsonl",
+            canonical_uri: "/bucket/exports/00000000000000000001.jsonl",
             payload_hash: &hash_a,
             amz_date: "20240101T000000Z",
         };
@@ -628,7 +627,7 @@ mod tests {
             secret_access_key: "wJalrXUtnFEMIsupersecret",
             region: "us-east-1",
             host: "bucket.s3.us-east-1.amazonaws.com",
-            canonical_uri: "/bucket/audit/00000000000000000042.jsonl",
+            canonical_uri: "/bucket/exports/00000000000000000042.jsonl",
             payload_hash: &body_hash,
             amz_date: "20240101T000000Z",
         });
@@ -636,7 +635,7 @@ mod tests {
             signed.authorization,
             "AWS4-HMAC-SHA256 Credential=AKIAEXAMPLE/20240101/us-east-1/s3/aws4_request, \
              SignedHeaders=host;x-amz-content-sha256;x-amz-date, \
-             Signature=e93f084bf5b4101a99d74970ee6ce9cb0fbd0fc4af0bd8969c433bf9743ae0ca",
+             Signature=11309e788477b058abbee3a218d9bc9be8c0b4de026da958caaa3ef52d177901",
             "the PUT signing computation for a real payload hash must not silently change shape"
         );
     }

@@ -107,7 +107,7 @@ async fn openapi_json_endpoint_serves_the_contract() {
     for path in [
         "/imposters",
         "/admin/tenants",
-        "/admin/audit",
+        "/admin/fleet/name",
         "/admin/whoami",
         "/openapi.json",
     ] {
@@ -247,7 +247,7 @@ async fn the_contract_offers_no_membership_or_snapshot_operation() {
     server.shutdown().await;
 }
 
-/// The contract maps every tenancy and audit route, so it is authenticated — the same posture as
+/// The contract maps every tenancy and fleet route, so it is authenticated — the same posture as
 /// `/admin/whoami`. Without a configured key the node is in bootstrap bypass and answers anyone,
 /// which is why this test configures one: otherwise it would assert nothing.
 ///

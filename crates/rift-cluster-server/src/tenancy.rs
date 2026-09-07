@@ -25,13 +25,12 @@
 //! scans the on-disk redb bytes to prove it.
 
 use hyper::{Method, StatusCode};
-use rift_cluster::audit_export::{ExportStatus, ExportStatusSnapshot};
 use rift_cluster::control::{
     AuthSource, FLEET_SCOPE, Principal, PrincipalId, Quotas, Role, Tenant, TenantConfigUsage,
     api_key_principal_id, generate_api_key, hash_api_key,
 };
 use rift_cluster::stores::{FlowCounts, FlowNet};
-use rift_cluster::{ControlOp, ControlRequest, DEFAULT_AUDIT_BATCH_MAX_ROWS, RaftNode, TenantId};
+use rift_cluster::{ControlOp, ControlRequest, RaftNode, TenantId};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
@@ -44,32 +43,12 @@ use crate::principal::Resolved;
 /// The one route with no action to authorize (RFC-002 §4.1).
 pub(crate) const WHOAMI_PATH: &str = "/admin/whoami";
 
-const AUDIT_PATH: &str = "/admin/audit";
-
-/// Where the fleet's audit export sink (issue #164) is declared and read.
-///
-/// A prefix of neither `AUDIT_PATH` nor `TENANTS_PATH`, but checked ahead of
-/// both in [`classify`] anyway, defensively: `AUDIT_PATH` is matched by exact
-/// equality today, so `"/admin/audit/sink"` cannot already fall into
-/// [`Route::AuditRead`] by accident — but a later change to that comparison
-/// (a prefix match, say) must not be able to silently swallow this path and
-/// hand a `TenantAdmin` the fleet's sink under an `AuditRead` authorization.
-const AUDIT_SINK_PATH: &str = "/admin/audit/sink";
-
 /// Where the fleet's operator-set name (issue #373) is written.
 ///
 /// Checked with the other exact-path routes, ahead of the `/admin/tenants/`
-/// prefix strip below, for the same defensive reason [`AUDIT_SINK_PATH`] is:
-/// this path must never be reachable through a broader matcher's
-/// authorization tier by accident.
+/// prefix strip below, defensively: this path must never be reachable through
+/// a broader matcher's authorization tier by accident.
 const FLEET_NAME_PATH: &str = "/admin/fleet/name";
-
-/// Rows returned when the caller names no `limit`, and the ceiling on what they
-/// may ask for. A bound rather than an option: the audit table is a journal, so
-/// an unbounded read is an unbounded response, and the endpoint that answers it
-/// is one any tenant admin can reach.
-const AUDIT_DEFAULT_LIMIT: usize = 500;
-const AUDIT_MAX_LIMIT: usize = 5_000;
 
 /// Budget for the flow-entry usage fan-out on a tenants read (issue #372):
 /// this node's own owned count, plus every other ring member's, bounded so one
@@ -119,31 +98,10 @@ pub(crate) enum Route {
     DatasetList(TenantId),
     /// `GET /admin/tenants/:id/datasets/:name` — version history plus which imposters bind it.
     DatasetHistory(TenantId, String),
-    /// `GET /admin/tenants/:id/datasets/:name/:ver/content` — the bytes.
-    ///
-    /// The **one** audited read (RFC-002 §9's single named exception): this is a bulk export of
-    /// whatever the operator uploaded, which is routinely PII.
+    /// `GET /admin/tenants/:id/datasets/:name/:ver/content` — the bytes, exactly as uploaded.
     DatasetContent(TenantId, String, u64),
     /// `DELETE /admin/tenants/:id/datasets/:name` — refused while any live stub binds it.
     DatasetDelete(TenantId, String),
-    /// `GET /admin/audit?since=&limit=` (RFC-002 §9, issue #163).
-    ///
-    /// Carries the parsed query rather than the raw string so `dispatch` never
-    /// re-parses what `classify` already read.
-    ///
-    /// Carries no tenant of its own: the row filter is derived in `dispatch`
-    /// from the tenant the authorization decision was made against, never from
-    /// the route and never from anything the request body said.
-    AuditRead { since: u64, limit: usize },
-    /// `GET /admin/audit/sink` (issue #164): the fleet's declared export sink,
-    /// plus this node's own export status when it is reachable.
-    AuditSinkRead,
-    /// `PUT /admin/audit/sink`: declare or replace the sink.
-    AuditSinkPut,
-    /// `DELETE /admin/audit/sink`: stop exporting without losing the
-    /// checkpoint (`AuditSink::revision` is what a re-declared sink resumes
-    /// from, not this delete).
-    AuditSinkDelete,
     /// `PUT /admin/fleet/name` (issue #373): set or rename the fleet's
     /// operator-facing name. No `GET` here — the name is read on
     /// `/_cluster/members` and `/_fleet/members`, which every node already
@@ -167,17 +125,10 @@ impl Route {
         match self {
             Route::TenantCreate
             | Route::TenantList
-            // The sink is fleet state (one export, fleet-wide — see
-            // `ControlOp::AuditSinkPut`'s doc), never a tenant's own record, so
-            // it scopes the same way the tenant-record routes do: to the fleet
-            // scope, not to whatever tenant the caller's header happens to
-            // name. A `TenantAdmin` of `acme` sending `X-Rift-Tenant: acme`
-            // must not become eligible for a route this decision pins to `*`.
-            | Route::AuditSinkRead
-            | Route::AuditSinkPut
-            | Route::AuditSinkDelete
-            // The fleet name is fleet state for the identical reason: one name,
-            // fleet-wide, never a tenant's own record. A `TenantAdmin` of `acme`
+            // The fleet name is fleet state: one name, fleet-wide, never a
+            // tenant's own record, so it scopes the same way the tenant-record
+            // routes do — to the fleet scope, not to whatever tenant the
+            // caller's header happens to name. A `TenantAdmin` of `acme`
             // sending `X-Rift-Tenant: acme` must not become eligible to rename
             // the fleet every other tenant is also looking at.
             | Route::FleetNamePut => Some(TenantId::new(FLEET_SCOPE)),
@@ -195,20 +146,6 @@ impl Route {
             | Route::PrincipalDelete(tenant, _)
             | Route::BindingPut(tenant, _)
             | Route::BindingDelete(tenant, _) => Some(tenant.clone()),
-            // `None`, and the distinction matters: the path carries no tenant,
-            // so the caller's header names the tenant they are acting as, and
-            // the authorization decision is made against *that*.
-            //
-            // Returning a constant here instead — `default`, or `FLEET_SCOPE` —
-            // is the shape that looks harmless and is not. A route scope
-            // *replaces* the header (see `admin_front::authorize_action`), so a
-            // constant `default` authorizes every audit read against the default
-            // tenant: a `TenantAdmin` of any other tenant holds no binding there
-            // and is refused `NotBoundToTenant` → `404` on their own audit
-            // stream, which RFC-002 §9 explicitly grants them. `FLEET_SCOPE`
-            // fails the same way for the same reason. Only the header can name
-            // a tenant this route was not told about.
-            Route::AuditRead { .. } => None,
         }
     }
 
@@ -242,23 +179,10 @@ impl Route {
             | Route::TenantDelete(_)
             | Route::PrincipalPut(_, _)
             | Route::PrincipalDelete(_, _)
-            // Where the fleet's audit stream ships to is a fleet-scoped
-            // decision, not a tenant-scoped read — RFC-002 §4.1's ceiling for
-            // this surface. Deliberately NOT `AuditRead`: a `TenantAdmin`
-            // trusted to read their own tenant's audit rows is not thereby
-            // trusted to redirect where every tenant's rows are shipped.
-            | Route::AuditSinkRead
-            | Route::AuditSinkPut
-            | Route::AuditSinkDelete
-            // Same tier as the audit sink and for the same reason: a fleet-wide
-            // rename is a fleet-scoped decision, not a tenant-scoped one.
+            // A fleet-wide rename is a fleet-scoped decision, not a tenant-scoped
+            // one — RFC-002 §4.1's ceiling for this surface.
             | Route::FleetNamePut => Action::ClusterAdmin,
             Route::PrincipalCreate(_) | Route::PrincipalList(_) => Action::TenantManage,
-            // Deliberately NOT `TenantManage` (RFC-002 §4.1): reading who did
-            // what and changing who may do what are different powers, so a
-            // principal-manager is not automatically an auditor. `AuditRead`
-            // starts at `TenantAdmin`, which is why an `Editor` gets 403 here.
-            Route::AuditRead { .. } => Action::AuditRead,
             Route::BindingPut(tenant, _) | Route::BindingDelete(tenant, _) => {
                 if tenant.as_str() == FLEET_SCOPE {
                     Action::ClusterAdmin
@@ -266,9 +190,8 @@ impl Route {
                     Action::TenantManage
                 }
             }
-            // RFC-005 §5 (issue #287). The content read is a `DatasetRead` like the others —
-            // its exceptional treatment is that it is *audited*, not that it needs a higher
-            // role. A separate action would have implied a role boundary the RFC does not draw.
+            // RFC-005 §5 (issue #287). The content read is a `DatasetRead` like the others; a
+            // separate action would have implied a role boundary the RFC does not draw.
             Route::DatasetList(_) | Route::DatasetHistory(_, _) | Route::DatasetContent(_, _, _) => {
                 Action::DatasetRead
             }
@@ -283,28 +206,11 @@ impl Route {
 /// A recognized path with an unsupported method returns `None` too, which lets
 /// it fall through to the proxy and answer upstream's own 404/405 — the same
 /// thing `admin_front::classify` does for every other route it half-matches.
-pub(crate) fn classify(method: &Method, path: &str, query: Option<&str>) -> Option<Route> {
-    // Checked ahead of `AUDIT_PATH` (see `AUDIT_SINK_PATH`'s doc): this route
-    // must never be reachable through `Route::AuditRead`'s `TenantManage`-
-    // adjacent authorization tier.
-    if path == AUDIT_SINK_PATH {
-        return match *method {
-            Method::GET => Some(Route::AuditSinkRead),
-            Method::PUT => Some(Route::AuditSinkPut),
-            Method::DELETE => Some(Route::AuditSinkDelete),
-            _ => None,
-        };
-    }
-    if path == AUDIT_PATH {
-        return match *method {
-            Method::GET => Some(audit_route(query)),
-            _ => None,
-        };
-    }
-    // Checked ahead of the `/admin/tenants/` prefix strip below, for the same defensive reason
-    // `AUDIT_SINK_PATH` is: this route must never be reachable through a broader matcher by
-    // accident, and `None` here (rather than falling through) is what makes an unserved method
-    // a 404/405 instead of an accidental match further down.
+pub(crate) fn classify(method: &Method, path: &str, _query: Option<&str>) -> Option<Route> {
+    // Checked ahead of the `/admin/tenants/` prefix strip below, defensively: this route must
+    // never be reachable through a broader matcher by accident, and `None` here (rather than
+    // falling through) is what makes an unserved method a 404/405 instead of an accidental
+    // match further down.
     if path == FLEET_NAME_PATH {
         return match *method {
             Method::PUT => Some(Route::FleetNamePut),
@@ -393,36 +299,6 @@ pub(crate) fn classify(method: &Method, path: &str, query: Option<&str>) -> Opti
     }
 }
 
-/// Parse `?since=&limit=` into a [`Route::AuditRead`].
-///
-/// An unparseable or absent value takes the default rather than refusing. This
-/// is a **domain-optional parse**, not a swallow: both parameters are pure
-/// pagination with a safe default (`since=0` is the start of the journal, and
-/// the default limit is already the answer for a caller who named none), so
-/// there is no failure to hide — and a 400 on a malformed `since` would make
-/// the audit endpoint harder to reach in exactly the incident where someone is
-/// hand-typing the URL.
-///
-/// `limit` is clamped to [`AUDIT_MAX_LIMIT`]. A caller asking for more is given
-/// the ceiling rather than an error, for the same reason.
-fn audit_route(query: Option<&str>) -> Route {
-    let mut since = 0u64;
-    let mut limit = AUDIT_DEFAULT_LIMIT;
-    for pair in query.unwrap_or_default().split('&') {
-        match pair.split_once('=') {
-            Some(("since", value)) => since = value.parse().unwrap_or(0),
-            Some(("limit", value)) => {
-                limit = value
-                    .parse()
-                    .unwrap_or(AUDIT_DEFAULT_LIMIT)
-                    .min(AUDIT_MAX_LIMIT);
-            }
-            _ => {}
-        }
-    }
-    Route::AuditRead { since, limit }
-}
-
 // ---------------------------------------------------------------------------
 // Wire shapes
 // ---------------------------------------------------------------------------
@@ -473,21 +349,6 @@ pub(crate) struct BindingBody {
     pub role: Role,
 }
 
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct AuditSinkBody {
-    pub uri: String,
-    #[serde(default)]
-    pub auth_ref: Option<String>,
-    /// Optional: an omitted value takes [`DEFAULT_AUDIT_BATCH_MAX_ROWS`], not
-    /// `0` — `#[serde(default)]` on a bare `u32` would silently ship nothing
-    /// forever, which `control::validate` already refuses, but refusing a
-    /// caller who simply left the field out (the documented, supported shape)
-    /// would be the wrong way to enforce that.
-    #[serde(default)]
-    pub batch_max_rows: Option<u32>,
-}
-
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct FleetNameBody {
@@ -496,47 +357,6 @@ pub(crate) struct FleetNameBody {
     /// remove, not a neutral default to fall back to. A missing field is a `BadRequest`, same as
     /// any other malformed body.
     pub name: String,
-}
-
-/// The sink as the admin surface reports it: what `AuditSink` itself carries
-/// (a URI and a credential *name*, never a credential — see that type's doc),
-/// plus this node's own view of whether it is currently exporting.
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct AuditSinkView {
-    uri: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    auth_ref: Option<String>,
-    batch_max_rows: u32,
-    /// The revision of the `AuditSinkPut` that produced this record.
-    revision: u64,
-    /// `None` when this node cannot report export status — `audit_sink()`
-    /// answers from every replica's own applied state, but only the leader
-    /// runs the exporter, so a follower's `GET` still names the fleet's sink
-    /// with no status attached rather than fabricating one.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    export_status: Option<ExportStatusView>,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct ExportStatusView {
-    running: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    last_error: Option<String>,
-    shipped_rows: u64,
-    consecutive_failures: u32,
-}
-
-impl From<ExportStatusSnapshot> for ExportStatusView {
-    fn from(snapshot: ExportStatusSnapshot) -> Self {
-        Self {
-            running: snapshot.running,
-            last_error: snapshot.last_error,
-            shipped_rows: snapshot.shipped_rows,
-            consecutive_failures: snapshot.consecutive_failures,
-        }
-    }
 }
 
 #[derive(Serialize)]
@@ -722,18 +542,20 @@ pub(crate) enum Outcome {
         /// confidence in that data.
         partial: bool,
     },
+    /// A non-JSON body, answered from local applied state. Exists for the one route that answers
+    /// with something other than JSON: a dataset's content is the CSV the operator uploaded, and
+    /// it is uploaded as `text/csv`. Labelling those bytes `application/json` would be untrue and
+    /// would break any client that calls `.json()` on a response that succeeded.
+    Bytes {
+        status: StatusCode,
+        body: Vec<u8>,
+        content_type: &'static str,
+    },
     Commit {
         op: ControlOp,
         status: StatusCode,
         /// Rendered *after* the op commits and this node has applied it.
         then: Option<Vec<u8>>,
-        /// What `then` is, when it is not JSON. `None` takes the surface's default.
-        ///
-        /// Exists for the one route that answers with something else: a dataset's content is the
-        /// CSV the operator uploaded, and it is uploaded as `text/csv`. Labelling those bytes
-        /// `application/json` would be untrue and would break any client that calls `.json()` on
-        /// a response that succeeded.
-        then_content_type: Option<&'static str>,
     },
 }
 
@@ -866,28 +688,14 @@ fn json(value: &impl Serialize) -> Result<Vec<u8>, String> {
 /// `Err(reason)` is a client-shaped refusal message; the caller renders it as a
 /// `400`. Storage failures are `Err` too and render as `500` — never as an
 /// empty success.
-// Eight, one per thing a tenancy route can need. Bundling them into a context struct would move
-// the same arguments behind one name without removing a single caller obligation, and this has
-// exactly one call site.
-#[allow(clippy::too_many_arguments)]
 pub(crate) async fn dispatch(
     node: &Arc<RaftNode>,
     route: Route,
     body: &[u8],
-    // The tenant `authz::decide` allowed this call against; see
-    // `admin_front::terminate_tenancy`.
-    authorized_tenant: &TenantId,
-    bindings: &[(TenantId, Role)],
-    // This node's own exporter status (issue #164), when one is wired up.
-    // `None` on a build that never spawned an `AuditExporter` (a test harness,
-    // say) — [`Route::AuditSinkRead`] is the only arm that reads it, and it
-    // already treats a follower's own absent status as unremarkable, so a
-    // wholly absent exporter is unremarkable too.
     // The `name` / `keyColumns` / `delimiter` an upload carries beside its CSV body, already
     // parsed from the query string or the `X-Rift-Dataset-*` headers (issue #287). `None` for
     // every other route.
     upload: Option<DatasetUploadMeta>,
-    export_status: Option<&ExportStatus>,
     // The flow-state subsystem (issue #372): `Route::TenantList` and
     // `Route::TenantRead` are the only arms that reach it, to fan out
     // `numberOfFlowEntries`. This is why `dispatch` is `async` at all — every
@@ -995,21 +803,11 @@ pub(crate) async fn dispatch(
                          node"
                     ))
                 })?;
-            // The audit exception (RFC-002 §9, issue #287). Committed through the ordinary write
-            // path, which means the bytes are served only *after* the record commits — and if it
-            // cannot commit, the caller gets the write path's failure and no bytes at all.
-            // Exporting unrecorded is the outcome this whole op exists to prevent.
-            Ok(Outcome::Commit {
-                op: ControlOp::DatasetContentRead {
-                    tenant,
-                    name,
-                    version,
-                    digest: rift_cluster::control::Digest::new(summary.digest),
-                },
+            Ok(Outcome::Bytes {
                 status: StatusCode::OK,
-                then: Some(csv.into_bytes()),
+                body: csv.into_bytes(),
                 // The bytes are the CSV that was uploaded, and it was uploaded as `text/csv`.
-                then_content_type: Some("text/csv; charset=utf-8"),
+                content_type: "text/csv; charset=utf-8",
             })
         }
         Route::DatasetUpload(tenant) => {
@@ -1061,13 +859,12 @@ pub(crate) async fn dispatch(
                 },
                 status: StatusCode::CREATED,
                 then: Some(json(&uploaded).map_err(TenancyError::Storage)?),
-                then_content_type: None,
             })
         }
         Route::DatasetDelete(tenant, name) => {
             // Absence is a 404 here for the same reason the history read gives one, and it is
-            // checked before the commit so a delete of nothing does not append an audit row
-            // claiming something was deleted.
+            // checked before the commit so a delete of nothing does not put a log entry
+            // claiming something was deleted on consensus.
             let exists = node
                 .datasets(tenant.as_str())
                 .map_err(|e| TenancyError::Storage(e.to_string()))?
@@ -1084,128 +881,19 @@ pub(crate) async fn dispatch(
                 op: ControlOp::DatasetDelete { tenant, name },
                 status: StatusCode::NO_CONTENT,
                 then: None,
-                then_content_type: None,
             })
         }
-        Route::AuditRead { since, limit } => {
-            // Who sees what (RFC-002 §9). A `FleetAdmin` sees the fleet; anyone
-            // else sees exactly the tenant they were authorized as, and nothing
-            // else.
-            //
-            // Server-side, deliberately. Handing a tenant admin the fleet's
-            // rows and trusting a client to narrow them would mean the server
-            // had already sent another tenant's audit history — the same
-            // mistake §4.3 warns about for the event stream, and the reason
-            // `/events` is still fleet-admin-only.
-            //
-            // The narrowing key is `authorized_tenant` — the very tenant
-            // `authz::decide` allowed this call against — so the rows returned
-            // and the decision that permitted them cannot disagree. Deriving it
-            // instead by scanning `bindings` for the first tenant-admin binding
-            // would quietly serve the wrong tenant to a principal bound to more
-            // than one, and would do it while looking authorized.
-            //
-            // Empty bindings mean the RBAC **bypass** — no principals are
-            // configured on this fleet, so `authorize_action` never resolved a
-            // credential and there is no principal to scope to. That is
-            // fleet-wide, not `default`-wide: narrowing to `authorized_tenant`
-            // there would silently hide every non-default tenant's rows during
-            // exactly the window an operator uses to provision the first tenants
-            // and principals, and it would do it behind a normal `200`. On an
-            // unenforced fleet there is no authorization to respect, so hiding
-            // rows buys no isolation — only a wrong answer.
-            let fleet_wide = bindings.is_empty()
-                || bindings.iter().any(|(tenant, role)| {
-                    *role == Role::FleetAdmin && tenant.as_str() == FLEET_SCOPE
-                });
-            let filter = if fleet_wide {
-                None
-            } else {
-                Some(authorized_tenant.clone())
-            };
-            let rows = node
-                .audit_since(since, filter.as_ref().map(TenantId::as_str), limit)
-                .map_err(|e| TenancyError::Storage(e.to_string()))?;
-            Ok(Outcome::Body {
-                status: StatusCode::OK,
-                body: json(&rows).map_err(TenancyError::Storage)?,
-                partial: false,
-            })
-        }
-        Route::AuditSinkRead => {
-            let Some(sink) = node
-                .audit_sink()
-                .map_err(|e| TenancyError::Storage(e.to_string()))?
-            else {
-                return Err(TenancyError::NotFound);
-            };
-            let view = AuditSinkView {
-                uri: sink.uri,
-                auth_ref: sink.auth_ref,
-                batch_max_rows: sink.batch_max_rows,
-                revision: sink.revision,
-                // Only the leader exports, so only the leader has a status
-                // worth reporting. A follower's exporter sits parked with
-                // `running: false, shippedRows: 0, consecutiveFailures: 0` —
-                // which is byte-identical to a *leader* whose exporter is
-                // wedged and has shipped nothing. Omitting the field on a
-                // follower keeps "no status here" distinguishable from "status,
-                // and it is all zeroes", which is the whole question an
-                // operator is asking when they read this endpoint.
-                export_status: export_status
-                    .filter(|_| node.is_leader())
-                    .map(ExportStatus::snapshot)
-                    .map(Into::into),
-            };
-            Ok(Outcome::Body {
-                status: StatusCode::OK,
-                body: json(&view).map_err(TenancyError::Storage)?,
-                partial: false,
-            })
-        }
-        Route::AuditSinkPut => {
-            let parsed: AuditSinkBody = parse(body)?;
-            Ok(Outcome::Commit {
-                op: ControlOp::AuditSinkPut {
-                    // The fleet scope, not `TenantId::default()`. This op *is*
-                    // audited, and `AuditRow::tenant` means "the tenant the op
-                    // acted on" — a fleet-wide sink acts on the fleet. Writing
-                    // `default` here would file a fleet-scoped configuration
-                    // change under one ordinary tenant's name, in the very
-                    // stream this feature exists to produce.
-                    tenant: TenantId::new(FLEET_SCOPE),
-                    uri: parsed.uri,
-                    auth_ref: parsed.auth_ref,
-                    batch_max_rows: parsed
-                        .batch_max_rows
-                        .unwrap_or(DEFAULT_AUDIT_BATCH_MAX_ROWS),
-                },
-                status: StatusCode::OK,
-                then_content_type: None,
-                then: None,
-            })
-        }
-        Route::AuditSinkDelete => Ok(Outcome::Commit {
-            op: ControlOp::AuditSinkDelete {
-                tenant: TenantId::new(FLEET_SCOPE),
-            },
-            status: StatusCode::NO_CONTENT,
-            then_content_type: None,
-            then: None,
-        }),
         Route::FleetNamePut => {
             let parsed: FleetNameBody = parse(body)?;
             Ok(Outcome::Commit {
                 op: ControlOp::FleetNamePut {
-                    // The fleet scope, not `TenantId::default()` — same reasoning as
-                    // `AuditSinkPut` just above: this op is audited, and a fleet-wide rename
-                    // filed under one ordinary tenant's name would be a wrong audit row, not
-                    // just a wrong route.
+                    // The fleet scope, not `TenantId::default()`: `control::validate` refuses
+                    // a fleet-wide rename filed under an ordinary tenant's name, so this is
+                    // the only value that commits.
                     tenant: TenantId::new(FLEET_SCOPE),
                     name: parsed.name,
                 },
                 status: StatusCode::OK,
-                then_content_type: None,
                 then: None,
             })
         }
@@ -1237,7 +925,6 @@ pub(crate) async fn dispatch(
         Route::TenantDelete(tenant) => Ok(Outcome::Commit {
             op: ControlOp::TenantDelete { tenant },
             status: StatusCode::NO_CONTENT,
-            then_content_type: None,
             then: None,
         }),
         Route::TenantList => {
@@ -1353,7 +1040,6 @@ pub(crate) async fn dispatch(
                 },
                 status: StatusCode::CREATED,
                 then: Some(rendered),
-                then_content_type: None,
             })
         }
         Route::PrincipalList(tenant) => {
@@ -1392,7 +1078,6 @@ pub(crate) async fn dispatch(
                     },
                 },
                 status: StatusCode::OK,
-                then_content_type: None,
                 then: None,
             })
         }
@@ -1402,7 +1087,6 @@ pub(crate) async fn dispatch(
                 principal_id,
             },
             status: StatusCode::NO_CONTENT,
-            then_content_type: None,
             then: None,
         }),
         Route::BindingPut(tenant, principal_id) => {
@@ -1414,7 +1098,6 @@ pub(crate) async fn dispatch(
                     role: parsed.role,
                 },
                 status: StatusCode::OK,
-                then_content_type: None,
                 then: None,
             })
         }
@@ -1424,7 +1107,6 @@ pub(crate) async fn dispatch(
                 principal_id,
             },
             status: StatusCode::NO_CONTENT,
-            then_content_type: None,
             then: None,
         }),
     }
@@ -1443,7 +1125,6 @@ fn tenant_upsert(
             journal_retention_secs: parsed.journal_retention_secs,
         },
         status,
-        then_content_type: None,
         then: None,
     })
 }
@@ -1666,63 +1347,6 @@ mod tests {
         );
     }
 
-    /// `GET /admin/audit` names no tenant in its path, so it must defer to the
-    /// caller's `X-Rift-Tenant` rather than pin a constant. A route scope
-    /// *replaces* that header, so any `Some(..)` here would authorize every
-    /// audit read against one fixed tenant — and a `TenantAdmin` of any other
-    /// would get `404` on the stream RFC-002 §9 grants them.
-    #[test]
-    fn the_audit_route_defers_to_the_callers_tenant_rather_than_pinning_one() {
-        assert_eq!(
-            Route::AuditRead {
-                since: 0,
-                limit: 10,
-            }
-            .scope(),
-            None
-        );
-    }
-
-    /// `?since=&limit=` is parsed once, in `classify`, so `dispatch` never
-    /// re-parses it. The fallbacks are a domain-optional parse — both parameters
-    /// are pure pagination with a safe default — but "safe default" is a claim
-    /// worth checking, particularly the `limit` clamp: without it any caller
-    /// with `audit.read` could ask for the whole journal in one response.
-    #[test]
-    fn the_audit_query_is_parsed_clamped_and_defaulted() {
-        let route = |q: Option<&str>| match audit_route(q) {
-            Route::AuditRead { since, limit } => (since, limit),
-            other => panic!("audit_route must always classify as AuditRead, got {other:?}"),
-        };
-
-        assert_eq!(
-            route(None),
-            (0, AUDIT_DEFAULT_LIMIT),
-            "no query = the start of the journal, one default page"
-        );
-        assert_eq!(route(Some("since=42&limit=10")), (42, 10));
-        assert_eq!(
-            route(Some("limit=10&since=42")),
-            (42, 10),
-            "order is not significant"
-        );
-        assert_eq!(
-            route(Some("limit=999999")),
-            (0, AUDIT_MAX_LIMIT),
-            "an unbounded read is an unbounded response: limit must be clamped"
-        );
-        assert_eq!(
-            route(Some("since=notanumber")),
-            (0, AUDIT_DEFAULT_LIMIT),
-            "an unparseable page cursor falls back to the start rather than 400ing"
-        );
-        assert_eq!(
-            route(Some("unrelated=1")),
-            (0, AUDIT_DEFAULT_LIMIT),
-            "unknown parameters are ignored, not fatal"
-        );
-    }
-
     /// The type that renders a principal has no field a key could occupy.
     #[test]
     fn a_rendered_principal_carries_no_credential() {
@@ -1796,98 +1420,6 @@ mod tests {
         assert!(a.starts_with("rift_"), "{a}");
         assert_ne!(a, b, "two mints must not collide");
         assert!(a.len() > 40, "256 bits of entropy, base64: {a}");
-    }
-
-    // -- audit export sink admin surface (issue #164) -----------------------
-
-    #[test]
-    fn the_audit_sink_route_classifies_by_method() {
-        assert_eq!(
-            classify(&Method::GET, AUDIT_SINK_PATH, None),
-            Some(Route::AuditSinkRead)
-        );
-        assert_eq!(
-            classify(&Method::PUT, AUDIT_SINK_PATH, None),
-            Some(Route::AuditSinkPut)
-        );
-        assert_eq!(
-            classify(&Method::DELETE, AUDIT_SINK_PATH, None),
-            Some(Route::AuditSinkDelete)
-        );
-        // A recognized path with an unsupported method falls through to the
-        // proxy rather than being claimed and 405'd here — the same rule
-        // every other route on this surface follows.
-        assert_eq!(
-            classify(&Method::POST, AUDIT_SINK_PATH, None),
-            None,
-            "POST is not one of this route's supported methods"
-        );
-    }
-
-    /// The exact swallow `AUDIT_SINK_PATH`'s doc warns about: the sink path
-    /// must classify as its own route — with its own `ClusterAdmin` action —
-    /// never fall through to `Route::AuditRead`'s `AuditRead` (tenant-reader)
-    /// tier. A `TenantAdmin` must not gain fleet-sink visibility by that route
-    /// mixup.
-    #[test]
-    fn the_audit_sink_route_is_never_classified_as_audit_read() {
-        let classified = classify(&Method::GET, AUDIT_SINK_PATH, None);
-        assert_eq!(classified, Some(Route::AuditSinkRead));
-        assert_ne!(
-            classified,
-            Some(Route::AuditRead {
-                since: 0,
-                limit: AUDIT_DEFAULT_LIMIT,
-            }),
-            "the sink route must never be indistinguishable from a plain audit read"
-        );
-        assert_eq!(
-            classified.as_ref().map(Route::action),
-            Some(Action::ClusterAdmin),
-            "and it must carry the sink's own (fleet-tier) action, not AuditRead's"
-        );
-    }
-
-    /// RFC-002 §4.1: where the fleet's audit ships to is fleet business, so
-    /// every method on this route is `ClusterAdmin`, scoped to the fleet —
-    /// never `TenantManage` and never a tenant named by the caller's header.
-    #[test]
-    fn every_audit_sink_route_is_cluster_admin_scoped_to_the_fleet() {
-        for route in [
-            Route::AuditSinkRead,
-            Route::AuditSinkPut,
-            Route::AuditSinkDelete,
-        ] {
-            assert_eq!(route.action(), Action::ClusterAdmin, "{route:?}");
-            assert_eq!(
-                route.scope().as_ref().map(TenantId::as_str),
-                Some(FLEET_SCOPE),
-                "{route:?}"
-            );
-        }
-    }
-
-    /// A malformed `PUT` body is a client-shaped `400`, never a silent
-    /// default: the rule this repo learned the hard way (a serde failure that
-    /// becomes an empty `200 OK` is a shipped-bug shape here).
-    #[test]
-    fn a_malformed_audit_sink_put_body_is_refused_not_defaulted() {
-        let result: Result<AuditSinkBody, TenancyError> = parse(b"not json at all");
-        assert!(
-            matches!(result, Err(TenancyError::BadRequest(_))),
-            "a malformed body must produce a real refusal, not a defaulted success"
-        );
-    }
-
-    /// An absent `batchMaxRows` takes the documented default rather than the
-    /// bare-`u32` zero `#[serde(default)]` would otherwise produce — a `0`
-    /// would ship nothing forever, and `control::validate` already refuses it,
-    /// so a caller who simply omitted the field must not be refused for it.
-    #[test]
-    fn an_omitted_batch_max_rows_parses_as_none_not_zero() {
-        let parsed: AuditSinkBody =
-            parse(br#"{"uri":"https://collector.example/audit"}"#).expect("parses");
-        assert_eq!(parsed.batch_max_rows, None);
     }
 
     // -- issue #373: the fleet's operator-set name ----------------------------

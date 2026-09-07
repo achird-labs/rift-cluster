@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 
-/** The four admin screens (RFC-002 §4), one route each so a bookmark or a "back" reaches the tab it left. */
-export type AdminTab = "tenants" | "principals" | "bindings" | "audit" | "sink";
+/** The three admin screens (RFC-002 §4), one route each so a bookmark or a "back" reaches the tab it left. */
+export type AdminTab = "tenants" | "principals" | "bindings";
 
 /** The screens C4 ships. Everything else in the nav is a planned entry with no route (see `nav.ts`). */
 export type Route =
@@ -118,13 +118,7 @@ function parseAdmin(tail: string[]): Route {
 }
 
 function parseAdminTab(raw: string | undefined): AdminTab | null {
-  return raw === "tenants" ||
-    raw === "principals" ||
-    raw === "bindings" ||
-    raw === "audit" ||
-    raw === "sink"
-    ? raw
-    : null;
+  return raw === "tenants" || raw === "principals" || raw === "bindings" ? raw : null;
 }
 
 /** A port, or `null` — including for input that `Number()` would happily coerce (`""`, `"4545.5"`). */

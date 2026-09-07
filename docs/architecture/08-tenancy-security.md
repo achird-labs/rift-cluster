@@ -214,21 +214,22 @@ admin request task            openraft state-machine task
 `apply` is driven by openraft's own task, not by the task that opened the scope,
 so the task-local is out of scope by the time `emit` runs. **Every replicated
 write attributes `None`** — and replicated writes are the whole of the clustered
-write path, which is exactly what an audit trail is for. Followers are further
-still from any request: they apply entries no client ever spoke to them about.
+write path, which is exactly the path attribution has to cover. Followers are
+further still from any request: they apply entries no client ever spoke to them
+about.
 
 This is not a defect in U-10. A task-local is the right mechanism for the
 in-process path it was designed for, and no upstream seam could have carried a
 principal across a Raft log it knows nothing about. The clustered answer is the
 one the log format already anticipates: `ControlRequest.principal`
 (`crates/rift-cluster/src/control.rs`) is in the envelope today and `None` at
-every construction site. #161 populates it from `AuthzDecision::Allow`, and #163
-reads it at apply time. `EventContext` remains the attribution path for the
-embedded/single-node case.
+every construction site. #161 populates it from `AuthzDecision::Allow`, and the
+log entry carries it from then on. `EventContext` remains the attribution path
+for the embedded/single-node case.
 
-**T4 closes the event-path half of this too.** Reading the principal at apply
-fixes the *audit table*, but not `EventContext` — and M3's SSE and the #164
-export sink ride the event path, not the log. So `drive_engine` now **re-opens**
+**T4 closes the event-path half of this too.** An attributed log entry does not
+fix `EventContext` — and M3's SSE rides the event path, not the log. So
+`drive_engine` now **re-opens**
 the scope the request task could not carry across the task boundary: each engine
 action is paired with the `ControlRequest.principal` of the entry that produced
 it, and the engine call runs inside `with_principal_scope(principal, …)`. The
@@ -237,31 +238,26 @@ now yields the committing principal.
 
 Attribution is per action, not per apply batch: one batch can hold entries from
 several principals, and naming whichever came first would be worse than the
-`None` it replaced — wrong attribution in an audit-adjacent stream is not a
-smaller error than missing attribution. A drive with no single request behind it
+`None` it replaced — wrong attribution in an event stream is not a smaller error
+than missing attribution. A drive with no single request behind it
 (restart reconciliation, snapshot install) stays `None`, which is what
 `EventContext`'s own contract asks for: absent attribution is reported as absent,
 never guessed.
 
   ~~One gap neither mechanism closes: `AllDeleted` carries no port, therefore no
-  tenant. Its audit record gets `tenant: null, resource: "*"`.~~ **Superseded by
-  T1.** #159 put an explicit `tenant` on *every* `ControlOp`, so a fleet-wide
-  delete knows exactly whose imposters it destroyed. Recording `null` would hide
-  that in the row describing the most destructive operation in the set, so the
-  shipped row carries the **real tenant** and puts the wildcard in `resource`.
-  Asserted in `delete_all_is_audited_with_the_real_tenant_and_a_wildcard_resource`
-  so the decision is pinned rather than re-litigated as a bug.
+  tenant.~~ **Superseded by T1.** #159 put an explicit `tenant` on *every*
+  `ControlOp`, so a fleet-wide delete knows exactly whose imposters it destroyed.
 
 Quotas (max imposters, stubs per imposter, flow-KV entries) enforce at the one
 place that sees a tenant's entire write stream — the replicated apply path — plus
 the flow owner for KV counts. (Journal retention was originally listed here; T4
 moved it off `Quotas`, see below.)
 
-**Audit** falls out of machinery that already exists: the intent log (Chapter
-4) records *what was asked, when, with which op-id*; U-10 adds *by whom*.
-Every applied ControlOp emits
-`{ts, principal, tenant, action, resource, op_id, revision, outcome}` into a
-retained, queryable audit table. One stream, not a bolted-on second system.
+**Who changed what** falls out of machinery that already exists: the intent log
+(Chapter 4) records *what was asked, when, with which op-id*; U-10 adds *by
+whom*. The Raft log is that record — one stream, not a bolted-on second system.
+An in-app projection of it, an export loop and a sink shipped in T4 and were
+removed by D-71 (#546); RFC-002 §9 stays as history.
 
 ### What T2 ships — enforcement, and its two deliberate over-restrictions
 
@@ -296,7 +292,7 @@ without a redesign:
    would hand a viewer of one tenant every other tenant's recorded request
    bodies, which is worse than the 403-vs-404 oracle this slice closes. Only a
    fleet admin — entitled to all of it anyway — may subscribe until server-side
-   filtering lands (#163 shipped the audit stream without it), at which point the
+   filtering lands (#163 shipped the stream without it), at which point the
    route returns to `StreamSubscribe`.
 2. **Resource operations are servable only for the `default` tenant.** T1 made
    the state machine *store* by tenant but not *serve* by tenant:
@@ -418,12 +414,12 @@ surface for exactly the tenants it exists to administer, and T2/T3 carved out
 an exemption for it.
 
   T3 originally keyed that exemption on "routes that name their own tenant"
-  (`scope.is_some()`), which coincided with "tenancy surface" until T4 added
-  `GET /admin/audit` — a tenancy route whose path names no tenant, because the
-  caller's `X-Rift-Tenant` names it. Under the old inference it 404'd every
-  tenant admin reading their own audit stream, from a guard whose stated subject
-  is config data the audit read never touches. T3/T4 fixed it by asking the
-  route directly (`serves_any_tenant`), which is what the exemption always meant.
+  (`scope.is_some()`), which coincided with "tenancy surface" until T4 added a
+  tenancy route whose path names no tenant, because the caller's `X-Rift-Tenant`
+  names it. Under the old inference it 404'd every tenant admin reading it, from
+  a guard whose stated subject is config data that route never touches. T3/T4
+  fixed it by asking the route directly (`serves_any_tenant`), which is what the
+  exemption always meant.
 
   Issue #182 (see Q5) replaced the guard itself with the narrower ownership
   gate, so `serves_any_tenant` and the exemption it backed are gone rather than
@@ -447,69 +443,22 @@ constraint for a console or an API client, the state-machine-invalidated cache
 described in §11 is the shape to build, and it should land as its own slice with
 its own revocation test.
 
-### What T4 ships — the audit stream, and quotas as committed decisions
+### What T4 ships — quotas as committed decisions
 
-Slice T4 (issue #163) makes the audit trail real and turns quotas from a stored
-shape into an enforced one.
+Slice T4 (issue #163) turns quotas from a stored shape into an enforced one. It
+also shipped an in-app audit projection, an export loop and a sink; **D-71
+(#546) removed all three**, and RFC-002 §9 stays as history. The Raft log is the
+record of every configuration change, and a structured `tracing` line at apply on
+the leader is the operator-facing trail.
 
-**The audit row is a projection of the log, not a second log.** It is derived at
-**apply**, from the committed entry the replica already holds — never written by
-the handler that accepted the request. Everything the row needs is already in the
-envelope: `ControlRequest` carries `principal`, `issued_at_secs` and `op_id`, the
-op carries its tenant, and the response carries the outcome and revision. An
-audit log that can disagree with the thing it audits is worse than none, and
-deriving it from the log is what makes disagreement unrepresentable.
-
-That yields a property worth stating because it is unusual in this system:
-**`GET /admin/audit` needs no fan-out.** Every replica applies the same log and
-therefore derives byte-identical rows, so any node answers for the fleet from
-local state. (Contrast the M3 request journal, Chapter 7, which is genuinely
-per-node and needs merge-on-read — that machinery does not belong here.) The
-claim is asserted rather than narrated: `the_audit_stream_is_identical_on_every_node`
-writes on the leader and compares all three nodes' streams.
-
-The projection sits **below** the dedup short-circuit in `apply`. A replayed
-`op_id` returns the original response and changes nothing, so it must not append
-a second row — "exactly once per write" is that ordering, not a separate check.
-Refusals are recorded too: a `Failed` outcome is a committed decision, and *who
-tried to do what and was refused* is the half of an audit log that matters most.
-
-**Reads are not audited in v1** (RFC-002 §9, on log volume). One consequence is
-worth stating plainly rather than discovering later: the reads-that-mutate served
-over the **proxy** path — `ScenarioReset`, `SavedRequestsClear`, `FlowStateClear`
-— are forwarded to the loopback core admin and never become a `ControlOp`, so a
-log-derived projection cannot see them. RFC-002 §9 asks for a `ScenarioReset`
-row; producing one would mean recording at the front door, i.e. a second,
-per-node audit path that can disagree with the log — the one thing this design
-refuses. Auditing them properly means putting them on consensus, which is its own
-slice. **This is a known gap, not an oversight.**
-
-**Retention runs on the replicated clock.** `--cluster-audit-retention` (default
-30 d, `0` = keep forever) is swept inside `apply` against
-`SnapshotPayload.logical_clock_secs` — never a replica's `SystemTime::now()`, for
-the same reason the dedup GC already documents: replicas would disagree about
-which rows had expired and their audit tables would permanently diverge, which
-would destroy the any-node-can-answer property above. The sweep uses the clock as
-it stood *before* the batch, so expiry lags the boundary-crossing write by one
-apply — identically on every replica, and a retention window is a floor on how
-long rows are kept rather than a promise to delete them the instant it passes.
-Because the value feeds a GC inside `apply`, **every node in a fleet must be
-given the same one**; it is node configuration rather than replicated state
-because it is an operator's storage budget, not a tenant's policy.
-
-`sm_audit` is in `SnapshotPayload` with `#[serde(default)]`, the #134/#137
-lesson: a table omitted from that payload is a table that vanishes the next time
-a follower catches up by snapshot install, and for an audit stream that failure
-is silent and permanent.
-
-**Who sees what.** `AuditRead` is its own action, deliberately *not* folded into
-`TenantManage`: reading who did what and changing who may do what are different
-powers, so a principal-manager is not automatically an auditor, and an `Editor`
-gets `403`. A `FleetAdmin` sees the fleet; anyone else sees exactly the tenant
-they were authorized as. The narrowing is **server-side**, keyed on the tenant
-the authorization decision was made against — handing a tenant admin the fleet's
-rows and trusting a client to hide the rest would mean the server had already
-sent another tenant's audit history.
+The removal is worth one sentence of rationale, because the projection's
+weakness was structural rather than incidental: it could only see what became a
+`ControlOp`, and the reads-that-mutate served over the **proxy** path —
+`ScenarioReset`, `SavedRequestsClear`, `FlowStateClear` — are forwarded to the
+loopback core admin and never become one. Closing that would have meant
+recording at the front door, i.e. a second, per-node path that can disagree with
+the log. A projection with a permanent hole in it is worse than pointing at the
+log itself.
 
 **Quotas are enforced at apply, and a refusal is a committed decision.** RFC-002
 §4.4 says "at the Raft leader during validation", meaning: in the one place that
@@ -682,67 +631,16 @@ that boundary.
 explicitly; making source configuration itself tenant-aware was out of scope
 for #182 and is not implied by anything above.
 
-### What the export sink ships, and what it will not promise (issue #164)
+### What the export sink shipped, and why it is gone (issue #164, retired by D-71)
 
-T4 derives the audit stream; the export sink is what carries it off the fleet to
-somewhere the customer owns — an `https://` webhook (JSON Lines) or an
-`s3://<bucket>/<prefix>` (one object per batch). It is **optional and off by
-default**, and it adds **no dependency**: the SigV4 signing and HTTP client are
-the ones the `s3:` imposter-source provider already carries.
-
-**Configuration is fleet state; credentials are node-local.** The sink is a
-control-plane record, so every node agrees on where the audit goes and a node
-joining inherits it. The record carries an `auth_ref` — the *name* of a
-credential, never a credential — validated by the same
-`require_credential_free_uri` the source providers use, in the same
-hygiene-before-shape order. Reusing the function rather than restating the rule
-is deliberate: "the same error shape as a source URI" only stays true if there
-is one implementation, and a test asserts the two refusals are byte-identical.
-Resolution happens node-locally at export time, exactly as it does for a
-credentialed source.
-
-The one cleartext exception is `http://` to a **loopback** host, which puts no
-bytes on a network. Admission and the transport factory ask the same predicate
-(`control::is_loopback_http`) so they cannot drift — they did once during
-development, and the result was the worst available shape: a sink that committed
-cleanly, looked configured on every node, and silently exported nothing.
-
-**Leader-only, checkpointed, at-least-once.** Every node derives the same rows,
-so every node exporting would deliver N copies. The leader exports, grounded on
-the same `RaftMetrics` leadership watch the source scheduler reads — not a second
-notion of leadership. It checkpoints the last shipped revision as a control-plane
-record, so a failover *resumes* rather than restarting from zero or skipping a
-window; the checkpoint applies as `max(existing, new)`, so a deposed leader's
-late write is a no-op instead of a rewind.
-
-The guarantee is **at-least-once, and it is stated rather than implied**. A batch
-is shipped first and checkpointed second; a leader dying in between re-ships that
-batch. The consumer dedups on `(revision, op_id)`, which is why the row carries
-both. Exactly-once would need a transaction spanning the customer's bucket and
-the Raft log, which does not exist — so the weaker guarantee is named and the
-duplicate window is bounded to one batch.
-
-**The exporter's own checkpoint is not audited**, and this is the one deliberate
-hole in the "every op reaches the stream" rule. Auditing it would append a row,
-which the exporter would ship, which would write a new checkpoint, which would
-append a row — an unbounded loop whose only content is the loop. `audit_action()`
-returns `Option`, so opting out is an arm someone had to write rather than a
-missing branch, and adding an op still fails to compile until it decides.
-
-**Backpressure never reaches the write path.** Export reads committed state; no
-admin write waits on it. A sink that is down grows a lag gauge and a failure
-counter (`rift_cluster_audit_export_*`) and retries on bounded exponential
-backoff. If it stays down past `--cluster-audit-retention`, retention removes
-rows the exporter never shipped: that gap is **counted and logged at error
-level**, never passed over. It is reported as a *revision span*
-(`..._skipped_revisions_total`) rather than a row count, because once the rows
-are GC'd there is nothing left to count and revisions are not one-to-one with
-rows — an upper bound named as one is useful, a precise-looking guess is not.
-
-**One sink, fleet-wide — a stated non-goal, not an oversight.** The checkpoint is
-a single revision, which is what makes failover resumption work; per-tenant sinks
-would need a checkpoint per tenant and a per-tenant exporter. Configuring the
-sink is therefore gated on `cluster.admin`, not on a tenant-scoped action.
+T4 derived the audit stream; an optional, off-by-default export sink carried it
+off the fleet to somewhere the customer owned — an `https://` webhook (JSON
+Lines) or an `s3://<bucket>/<prefix>` (one object per batch), leader-only,
+checkpointed, at-least-once. **#546 removed it along with the projection it
+shipped.** The sink's credential-hygiene rule survives it and is the part worth
+keeping in mind: a control-plane record may carry an `auth_ref` — the *name* of a
+credential, never a credential — and `control::require_credential_free_uri`
+enforces that for the source providers that remain.
 
 ## Cluster-internal security
 
@@ -830,8 +728,8 @@ name is fleet-wide state, and a `TenantAdmin` of `acme` sending `X-Rift-Tenant: 
 become eligible to rename the cluster every other tenant is also looking at. `control::validate`
 enforces the same thing a second time — `require_fleet_scope` refuses the op outright — so a
 mis-built `ControlOp` fails at admission rather than filing a fleet-wide rename under one tenant's
-name in the audit stream. That belt-and-braces is deliberate: the audit-sink surface shipped
-exactly that bug once (`TenantId::default()` instead of `FLEET_SCOPE`).
+name. That belt-and-braces is deliberate: the since-removed audit-sink surface shipped exactly that
+bug once (`TenantId::default()` instead of `FLEET_SCOPE`).
 
 Why it is replicated rather than a per-node flag is a control-plane question, not a security one,
 and is recorded on `ControlOp::FleetNamePut` itself. The security-relevant half is that the name is
@@ -846,11 +744,11 @@ HMAC-signed cookie (`HttpOnly`, `Secure`, `SameSite=Strict`, 8-hour `Max-Age`). 
 it is a fleet-wide control-plane record, so **every node verifies from its own applied state and a
 login is not a Raft write** — only the first mint and any rotation are.
 
-That record carries an actual secret into the replicated log, which `SourcePut` and `AuditSinkPut`
-both refuse to do. The distinction is what the secret means *outside* the fleet:
+That record carries an actual secret into the replicated log, which `SourcePut` refuses to do. The
+distinction is what the secret means *outside* the fleet:
 
-- those ops carry the **name** of an operator credential for a third-party system (a bucket, a
-  webhook); replicating one would spread power that exists somewhere else, so only a reference
+- that op carries the **name** of an operator credential for a third-party system (a bucket, a git
+  host); replicating one would spread power that exists somewhere else, so only a reference
   travels;
 - this key is **fleet-internal and meaningless anywhere else**, and cannot be stored hashed the way
   a principal's API key is (§3.2, argon2id), because verifying an HMAC requires the key itself — a
@@ -888,8 +786,7 @@ dropped after the exchange.
 Recorded so the boundary cannot be oversold: no per-principal data-plane
 authorization (see the framing rule); no per-tenant TLS identities on imposter
 ports; no compute/memory isolation between tenants (quotas bound object
-counts, not CPU); no cross-cluster tenancy federation; no per-tenant audit
-export sink, and no exactly-once delivery to the one there is. Each of these is
+counts, not CPU); and no cross-cluster tenancy federation. Each of these is
 a conscious "no", not an omission.
 
 The data-plane one is the load-bearing one, and it is asserted rather than only

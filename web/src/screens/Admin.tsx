@@ -8,37 +8,20 @@ import type { Capability } from "../app/rbac.ts";
 import type { AdminTab } from "../app/routing.ts";
 import { toHash } from "../app/routing.ts";
 import {
-  useAuditRows,
-  useAuditSink,
   useCreatePrincipal,
   useCreateTenant,
-  useDeleteAuditSink,
   useDeleteBinding,
   useDeletePrincipal,
   useDeleteTenant,
   usePrincipals,
-  usePutAuditSink,
   usePutBinding,
   useSavePrincipal,
   useSaveTenant,
   useTenantProbe,
   useTenants,
-  AUDIT_PAGE_SIZE,
 } from "../app/queries.ts";
 import { useSession } from "../app/session.tsx";
-import {
-  Card,
-  Confirm,
-  Empty,
-  ErrorNote,
-  Ident,
-  Status,
-  Tile,
-  Truncated,
-  UNKNOWN,
-  UnconfirmedNote,
-} from "../components/primitives.tsx";
-import { failureReason, hasMorePages, isApplied, nextSince } from "../features/admin/audit.ts";
+import { Card, ErrorNote, Ident, Status, Truncated, UNKNOWN } from "../components/primitives.tsx";
 import { KEY_NOT_SHOWN_AGAIN } from "../features/admin/key.ts";
 import { assignableRoles } from "../features/admin/roles.ts";
 
@@ -52,16 +35,13 @@ const TAB_LABEL: Record<AdminTab, string> = {
   tenants: "Tenants",
   principals: "Principals",
   bindings: "Bindings",
-  audit: "Audit",
-  sink: "Audit sink",
 };
 
 /**
  * The capability each tab's own routes actually require.
  *
  * The tenancy surface splits across two actions and the tabs split with it: `TenantList`/`TenantRead`
- * and the whole audit-sink triple are `ClusterAdmin`, while listing and minting principals and
- * writing bindings are `TenantManage`. Reading a tenant's audit rows is `AuditRead`.
+ * are `ClusterAdmin`, while listing and minting principals and writing bindings are `TenantManage`.
  *
  * Filtering on this is load-bearing rather than tidy. `tenants` is the tab the nav lands on, and it
  * probes `GET /admin/tenants/:id` before rendering anything — including the tab bar, deliberately,
@@ -73,16 +53,12 @@ export const ADMIN_TABS: readonly AdminTab[] = [
   "tenants",
   "principals",
   "bindings",
-  "audit",
-  "sink",
 ];
 
 const TAB_CAPABILITY: Record<AdminTab, Capability> = {
   tenants: "cluster.admin",
   principals: "tenant.manage",
   bindings: "tenant.manage",
-  audit: "audit.read",
-  sink: "cluster.admin",
 };
 
 export function Admin({
@@ -198,10 +174,6 @@ function Content({ tab, tenant }: { tab: AdminTab; tenant: string | null }): Rea
       return tenant === null ? <NoTenantChosen /> : <PrincipalsTab tenant={tenant} />;
     case "bindings":
       return tenant === null ? <NoTenantChosen /> : <BindingsTab tenant={tenant} />;
-    case "audit":
-      return <AuditTab tenant={tenant} />;
-    case "sink":
-      return <AuditSinkTab />;
   }
 }
 
@@ -1009,347 +981,5 @@ function BindingsTab({ tenant }: { tenant: string }): ReactNode {
         </form>
       ) : null}
     </>
-  );
-}
-
-/* ------------------------------------------------------------------------------------------- */
-/* Audit                                                                                          */
-/* ------------------------------------------------------------------------------------------- */
-
-function AuditTab({ tenant }: { tenant: string | null }): ReactNode {
-  const [since, setSince] = useState(0);
-  const rows = useAuditRows(tenant, since);
-
-  if (rows.isError) {
-    return <AdminApiError error={rows.error} />;
-  }
-
-  const cursor = rows.data === undefined ? null : nextSince(rows.data);
-
-  return (
-    <>
-      {rows.isPending ? <p className="muted">Reading…</p> : null}
-      {rows.isSuccess ? (
-        <>
-          <section className="card">
-          <div className="scroll-x">
-        <table className="dense">
-            <thead>
-              <tr>
-                <th>Revision</th>
-                <th>Principal</th>
-                <th>Tenant</th>
-                <th>Action</th>
-                <th>Resource</th>
-                <th>Outcome</th>
-              </tr>
-            </thead>
-            <tbody>
-              {rows.data.map((row) => (
-                <tr key={row.opId} data-testid="audit-row">
-                  <td data-testid="audit-revision">{row.revision}</td>
-                  {/* `principal` and `resource` are attacker-influenceable (a chosen display name, a
-                      chosen resource id) — rendered as plain JSX text, never through the banned
-                      raw-HTML escape hatch (RFC-006 §9.1, enforced by lint). */}
-                  <td>{row.principal ?? UNKNOWN}</td>
-                  <td>{row.tenant}</td>
-                  <td>{row.action}</td>
-                  <td>{row.resource}</td>
-                  <td data-testid={`audit-row-${row.revision}`}>
-                    {isApplied(row.outcome) ? "applied" : `refused — ${failureReason(row.outcome)}`}
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-          </div>
-        </section>
-          <nav className="pager">
-            <button
-              className="btn"
-              type="button"
-              data-testid="audit-next"
-              // A page shorter than the limit is the end of the journal. Gating on the cursor alone
-              // left this live forever: clicking it then asked for a range past the end and rendered
-              // an empty table under a header, which reads as "the trail stops here" — the one thing
-              // an audit viewer must never imply.
-              disabled={cursor === null || !hasMorePages(rows.data ?? [], AUDIT_PAGE_SIZE)}
-              onClick={() => {
-                if (cursor !== null) setSince(cursor);
-              }}
-            >
-              Next (newer) page
-            </button>
-          </nav>
-        </>
-      ) : null}
-    </>
-  );
-}
-
-/**
- * Where the fleet ships its audit rows.
- *
- * `ClusterAdmin` throughout, and that is a deliberate ceiling rather than an oversight: a
- * `TenantAdmin` trusted to read their own tenant's audit rows is not thereby trusted to see — or
- * redirect — where every tenant's rows go. `authz.rs` puts `AuditSinkRead` in the same arm as the
- * writes for exactly that reason, so reading this screen is as privileged as changing it.
- */
-function AuditSinkTab(): ReactNode {
-  const { can } = useSession();
-  const mayAdminister = can("cluster.admin");
-  const sink = useAuditSink({ enabled: mayAdminister });
-  const put = usePutAuditSink();
-  const remove = useDeleteAuditSink();
-  const [editing, setEditing] = useState(false);
-  const [confirming, setConfirming] = useState(false);
-
-  if (!mayAdminister) {
-    return (
-      <p className="muted" data-testid="sink-forbidden">
-        The audit sink is fleet-scoped. A FleetAdmin binding is required to read or change it.
-      </p>
-    );
-  }
-
-  return (
-    <div className="rows">
-      {sink.isError ? <ErrorNote error={sink.error} context="Could not read the audit sink" /> : null}
-      {put.isError ? <ErrorNote error={put.error} context="The sink was not saved" /> : null}
-      {remove.isError ? <ErrorNote error={remove.error} context="The sink was not removed" /> : null}
-      {put.data?.kind === "unobservable" ? <UnconfirmedNote reason={put.data.reason} /> : null}
-      {remove.data?.kind === "unobservable" ? <UnconfirmedNote reason={remove.data.reason} /> : null}
-
-      {sink.isPending ? <p className="muted">Reading…</p> : null}
-
-      {sink.isSuccess && sink.data === null && !editing ? (
-        <Empty
-          testId="sink-none"
-          title="No audit sink declared"
-          body="Audit rows are retained in the fleet and readable on the Audit tab, but nothing is exporting them anywhere."
-        >
-          <button className="btn primary" type="button" onClick={() => setEditing(true)}>
-            Declare a sink
-          </button>
-        </Empty>
-      ) : null}
-
-      {sink.isSuccess && sink.data !== null && !editing ? (
-        <>
-          <Card
-            title="Declared sink"
-            actions={
-              <span className="row">
-                <button className="btn sm" type="button" onClick={() => setEditing(true)}>
-                  Edit
-                </button>
-                <button
-                  className="btn sm danger"
-                  type="button"
-                  data-testid="remove-sink"
-                  onClick={() => setConfirming(true)}
-                >
-                  Remove
-                </button>
-              </span>
-            }
-          >
-            <dl className="detail" data-testid="sink-detail">
-              <div className="kv">
-                <dt>URI</dt>
-                <dd>{sink.data.uri}</dd>
-              </div>
-              <div className="kv">
-                <dt>Credential</dt>
-                {/* A *name* the fleet resolves, never the credential. Absent is a real state — an
-                    unauthenticated sink — not a missing field to paper over. */}
-                <dd>{sink.data.authRef ?? <span className="muted">none</span>}</dd>
-              </div>
-              <div className="kv">
-                <dt>Batch max rows</dt>
-                <dd>{sink.data.batchMaxRows}</dd>
-              </div>
-              <div className="kv">
-                <dt>Declared at revision</dt>
-                <dd>{sink.data.revision}</dd>
-              </div>
-            </dl>
-          </Card>
-
-          <ExportStatus status={sink.data.exportStatus} />
-        </>
-      ) : null}
-
-      {editing ? (
-        <SinkForm
-          existing={sink.data ?? null}
-          busy={put.isPending}
-          onCancel={() => setEditing(false)}
-          onSave={(body) => put.mutate(body, { onSuccess: () => setEditing(false) })}
-        />
-      ) : null}
-
-      {confirming ? (
-        <Confirm
-          testId="confirm-remove-sink"
-          title="Remove the audit sink?"
-          body="The fleet stops exporting audit rows. They are still retained and still readable on the Audit tab; nothing is shipped until a sink is declared again."
-          confirmLabel="Remove sink"
-          busy={remove.isPending}
-          onCancel={() => setConfirming(false)}
-          onConfirm={() => {
-            remove.mutate();
-            setConfirming(false);
-          }}
-        />
-      ) : null}
-    </div>
-  );
-}
-
-/**
- * Export status, or the honest absence of it.
- *
- * **Only the leader runs the exporter**, so only the leader reports status. A follower answers with
- * the sink and no status at all — and the contract says so in as many words, "rather than a
- * fabricated all-zero one". Rendering absent as `0 rows shipped, not running` would turn "this node
- * cannot say" into "the export is broken", which is the same unknown-as-zero laundering the fleet
- * screen refuses.
- */
-function ExportStatus({
-  status,
-}: {
-  status: NonNullable<components["schemas"]["AuditSink"]["exportStatus"]> | undefined;
-}): ReactNode {
-  if (status === undefined) {
-    return (
-      <p className="hint" data-testid="sink-status-unknown">
-        Export status is reported by the leader only, and this node is not it. Nothing here says
-        whether the export is running — read this screen from the leader to see that.
-      </p>
-    );
-  }
-  return (
-    <div className="tiles" data-testid="sink-status">
-      <Tile
-        label="Exporter"
-        plain
-        value={
-          status.running ? (
-            <Status tone="ok" label="running" />
-          ) : (
-            <Status tone="warn" label="not running" />
-          )
-        }
-      />
-      <Tile label="Rows shipped" value={status.shippedRows ?? UNKNOWN} />
-      <Tile
-        label="Consecutive failures"
-        value={status.consecutiveFailures ?? UNKNOWN}
-        // Spread rather than `tone={cond ? "warn" : undefined}`: `exactOptionalPropertyTypes` makes
-        // an explicit `undefined` a different thing from an absent prop, and it is right to.
-        {...((status.consecutiveFailures ?? 0) > 0 ? { tone: "warn" as const } : {})}
-      />
-      <Tile
-        label="Last error"
-        plain
-        // `null` is "no error since the exporter started" and is a different fact from a missing
-        // field; both render as a word rather than an empty cell.
-        value={status.lastError ?? <span className="muted">none</span>}
-      />
-    </div>
-  );
-}
-
-function SinkForm({
-  existing,
-  busy,
-  onSave,
-  onCancel,
-}: {
-  existing: components["schemas"]["AuditSink"] | null;
-  busy: boolean;
-  onSave: (body: components["schemas"]["AuditSinkWrite"]) => void;
-  onCancel: () => void;
-}): ReactNode {
-  const [uri, setUri] = useState(existing?.uri ?? "");
-  const [authRef, setAuthRef] = useState(existing?.authRef ?? "");
-  const [batch, setBatch] = useState(existing?.batchMaxRows?.toString() ?? "");
-  const [invalid, setInvalid] = useState<string | null>(null);
-
-  function submit(event: FormEvent): void {
-    event.preventDefault();
-    if (uri.trim() === "") return setInvalid("A sink needs a URI.");
-    let batchMaxRows: number | undefined;
-    if (batch.trim() !== "") {
-      const parsed = Number(batch);
-      // Zero is refused rather than sent: the contract's default applies when the field is
-      // *omitted*, and a literal 0 is a batch size that ships nothing, forever.
-      if (!Number.isInteger(parsed) || parsed < 1) {
-        return setInvalid("Batch max rows must be a whole number of 1 or more, or left blank for the server default.");
-      }
-      batchMaxRows = parsed;
-    }
-    setInvalid(null);
-    onSave({
-      uri: uri.trim(),
-      ...(authRef.trim() === "" ? {} : { authRef: authRef.trim() }),
-      ...(batchMaxRows === undefined ? {} : { batchMaxRows }),
-    });
-  }
-
-  return (
-    <Card title={existing === null ? "Declare audit sink" : "Edit audit sink"}>
-      <form className="stub-form" onSubmit={submit} data-testid="sink-form">
-        <div className="field">
-          <label htmlFor="sink-uri">URI</label>
-          <input id="sink-uri" value={uri} onChange={(e) => setUri(e.target.value)} />
-        </div>
-        <div className="field-row">
-          <div className="field">
-            <label htmlFor="sink-auth">Credential name</label>
-            {/*
-              Deliberately a plain text input, not a password field. This names a credential the
-              fleet already holds — it is never the credential itself, and masking it would invite
-              an operator to paste a secret into a field that ships it verbatim into the audit
-              record.
-            */}
-            <input
-              id="sink-auth"
-              value={authRef}
-              onChange={(e) => setAuthRef(e.target.value)}
-              placeholder="optional"
-            />
-          </div>
-          <div className="field">
-            <label htmlFor="sink-batch">Batch max rows</label>
-            <input
-              id="sink-batch"
-              inputMode="numeric"
-              value={batch}
-              onChange={(e) => setBatch(e.target.value)}
-              placeholder="server default"
-            />
-          </div>
-        </div>
-        {invalid === null ? null : (
-          <p className="error" data-testid="sink-invalid" role="alert">
-            {invalid}
-          </p>
-        )}
-        <div className="row">
-          <button className="btn primary" type="submit" disabled={busy}>
-            {busy ? "Saving…" : "Save sink"}
-          </button>
-          <button className="btn" type="button" onClick={onCancel} disabled={busy}>
-            Cancel
-          </button>
-        </div>
-        <p className="hint">
-          A re-declared sink resumes exporting from its own recorded revision, so re-saving does not
-          replay the whole stream.
-        </p>
-      </form>
-    </Card>
   );
 }

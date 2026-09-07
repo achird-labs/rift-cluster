@@ -149,7 +149,6 @@ async fn start_with(admin_credential_configured: bool) -> Fixture {
         // Tables-only: this suite is about the control surface, not about
         // whether a port binds locally.
         engine: None,
-        audit_retention_secs: rift_cluster::DEFAULT_AUDIT_RETENTION_SECS,
         snapshot_log_entries: None,
         advertise_as_digest_only_incapable: false,
     };

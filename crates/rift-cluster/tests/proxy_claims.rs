@@ -74,7 +74,6 @@ async fn spawn_member(
         secret: Some(SECRET.to_owned()),
         routes: proxy_routes(Arc::clone(&net)),
         engine: None,
-        audit_retention_secs: rift_cluster::DEFAULT_AUDIT_RETENTION_SECS,
         snapshot_log_entries,
         advertise_as_digest_only_incapable: false,
     })

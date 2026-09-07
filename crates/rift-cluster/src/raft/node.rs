@@ -47,8 +47,8 @@ use super::store::{
 };
 use super::{NodeId, TypeConfig};
 use crate::control::{
-    AuditRow, AuditSink, ControlOp, ControlRequest, ControlResponse, Principal, Role, SessionKey,
-    SourceProvenance, Tenant, TenantConfigUsage, TenantId,
+    ControlOp, ControlRequest, ControlResponse, Principal, Role, SessionKey, SourceProvenance,
+    Tenant, TenantConfigUsage, TenantId,
 };
 use crate::rpc::{
     Authority, DnsResolver, PeerResolver, Router, RpcClient, RpcClientConfig, RpcError, RpcServer,
@@ -181,15 +181,6 @@ pub struct NodeConfig {
     /// engine yet) — applied configs are then served from the state machine but
     /// no imposters are actually bound.
     pub engine: Option<Arc<ImposterManager>>,
-    /// How long audit rows are kept, in seconds; `0` = forever (issue #163).
-    ///
-    /// **Must be identical on every node of a fleet.** It feeds the retention
-    /// GC that runs inside `apply`, so two nodes configured differently would
-    /// drop different rows from the same log and their audit tables would
-    /// permanently diverge — the one thing the replicated clock exists to
-    /// prevent. Node configuration rather than replicated state because it is
-    /// an operator's storage budget, not a tenant's policy.
-    pub audit_retention_secs: u64,
     /// Snapshot aggressively and purge immediately, so a lagging node must be caught up by a real
     /// `install_snapshot` over the wire rather than by log replication (issue #183).
     ///
@@ -1071,7 +1062,6 @@ impl RaftNode {
             Some(journal) => state_machine.with_journal(journal),
             None => state_machine,
         };
-        let state_machine = state_machine.with_audit_retention_secs(config.audit_retention_secs);
         // Dataset blobs materialise under the node's own data directory (RFC-005 D1, #285),
         // beside `RAFT_DB_FILE` — node-local derived state, not itself part of the redb file.
         let state_machine = state_machine.with_spool_dir(config.data_dir.join("datasets"));
@@ -1097,7 +1087,7 @@ impl RaftNode {
             ),
             None => {
                 // An unauthenticated cluster port must be observable at the point
-                // it is created, not just auditable in the config layer above.
+                // it is created, not just checkable in the config layer above.
                 tracing::warn!(
                     node_id = config.node_id,
                     bind = %config.bind,
@@ -1974,11 +1964,29 @@ impl RaftNode {
     /// does not commit; a *committed* refusal (validation, absent port) is the
     /// response's `Failed` outcome, not an error — the write itself succeeded.
     pub async fn write(&self, request: ControlRequest) -> Result<ControlResponse, NodeError> {
+        let op = request.op.kind();
+        let tenant = request.op.tenant().clone();
+        let op_id = request.op_id;
+        let principal = request.principal.clone();
         let response = self
             .raft
             .client_write(request)
             .await
             .map_err(map_write_err)?;
+        // The operator-facing trail of every configuration change (D-71, RFC-007 §3.2): the
+        // Raft log is the record, and this is the one line an operator can grep. Emitted here,
+        // on the leader, once the state machine has answered — so a committed refusal is
+        // recorded with its outcome rather than swallowed as a client error.
+        tracing::info!(
+            target: "rift_cluster::write",
+            revision = response.data.revision,
+            %op_id,
+            principal = principal.as_deref().unwrap_or("-"),
+            tenant = tenant.as_str(),
+            op,
+            outcome = ?response.data.outcome,
+            "control op committed"
+        );
         Ok(response.data)
     }
 
@@ -2704,34 +2712,6 @@ impl RaftNode {
             .map_err(|e| NodeError::Storage(e.to_string()))
     }
 
-    /// Audit rows at or after `since`, ascending by revision, optionally
-    /// narrowed to one tenant (RFC-002 §9, issue #163).
-    ///
-    /// Answers from local applied state — **no fan-out**. Every replica derives
-    /// the same rows from the same log, so any node can answer for the fleet.
-    /// (Contrast the M3 request journal, #147, which is per-node and needs
-    /// merge-on-read.)
-    pub fn audit_since(
-        &self,
-        since: u64,
-        tenant: Option<&str>,
-        limit: usize,
-    ) -> Result<Vec<AuditRow>, NodeError> {
-        self.sm_reader
-            .audit_since(since, tenant, limit)
-            .map_err(|e| NodeError::Storage(e.to_string()))
-    }
-
-    /// The fleet's declared audit export sink, or `None` (issue #164).
-    ///
-    /// # Errors
-    /// Storage I/O, or a stored sink record that will not parse.
-    pub fn audit_sink(&self) -> Result<Option<AuditSink>, NodeError> {
-        self.sm_reader
-            .audit_sink()
-            .map_err(|e| NodeError::Storage(e.to_string()))
-    }
-
     /// The fleet's session-signing key, or `None` when no console login has minted one yet
     /// (RFC-006 §5.3, issue #185).
     ///
@@ -2750,29 +2730,6 @@ impl RaftNode {
     pub fn fleet_name(&self) -> Result<Option<String>, NodeError> {
         self.sm_reader
             .fleet_name()
-            .map_err(|e| NodeError::Storage(e.to_string()))
-    }
-
-    /// The last revision shipped to the audit export sink; `0` when nothing has
-    /// shipped (issue #164).
-    ///
-    /// # Errors
-    /// Storage I/O.
-    pub fn audit_checkpoint(&self) -> Result<u64, NodeError> {
-        self.sm_reader
-            .audit_checkpoint()
-            .map_err(|e| NodeError::Storage(e.to_string()))
-    }
-
-    /// The highest revision retention GC has removed from the audit table; `0`
-    /// if it has never removed anything (issue #164). The exporter's only
-    /// evidence that rows were *lost* rather than never written.
-    ///
-    /// # Errors
-    /// Storage I/O.
-    pub fn audit_gc_watermark(&self) -> Result<u64, NodeError> {
-        self.sm_reader
-            .audit_gc_watermark()
             .map_err(|e| NodeError::Storage(e.to_string()))
     }
 
@@ -3257,7 +3214,6 @@ mod tests {
             secret: Some(SECRET.to_owned()),
             routes: Router::new(),
             engine: None,
-            audit_retention_secs: crate::raft::store::DEFAULT_AUDIT_RETENTION_SECS,
             snapshot_log_entries: None,
             advertise_as_digest_only_incapable: false,
         }

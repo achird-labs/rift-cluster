@@ -85,10 +85,10 @@ use serde::{Deserialize, Serialize};
 
 use super::TypeConfig;
 use crate::control::{
-    self, AuditRow, AuditSink, ControlOp, ControlRequest, ControlResponse, DEFAULT_TENANT,
-    DatasetRecord, Digest, FLEET_SCOPE, OnDrift, PreconditionTarget, Principal, Quotas, Role,
-    SessionKey, SourceMode, SourceProvenance, SpecFormat, SpecMeta, SpecProvenance, SpecSource,
-    StubEdit, StubEditScript, Tenant, TenantConfigUsage, TenantId, routes_installed_for,
+    self, ControlOp, ControlRequest, ControlResponse, DEFAULT_TENANT, DatasetRecord, Digest,
+    FLEET_SCOPE, OnDrift, PreconditionTarget, Principal, Quotas, Role, SessionKey, SourceMode,
+    SourceProvenance, SpecFormat, SpecMeta, SpecProvenance, SpecSource, StubEdit, StubEditScript,
+    Tenant, TenantConfigUsage, TenantId, routes_installed_for,
 };
 use crate::stores::journal::ClusterJournal;
 use crate::stores::sequencer::SequencingRegistry;
@@ -199,55 +199,15 @@ const SM_PRINCIPALS_TABLE: TableDefinition<&str, &str> = TableDefinition::new("s
 /// that trade is deliberate. Keying tenant-major would flip the cost onto
 /// every authorized request instead of onto an occasional admin query.
 const SM_BINDINGS_TABLE: TableDefinition<(&str, &str), &str> = TableDefinition::new("sm_bindings");
-/// `(revision, op_id) -> AuditRow` (JSON): the RFC-002 §9 audit projection
-/// (issue #163), journal-style.
-///
-/// Keyed **revision-major** so a `?since=` read is a range scan from that
-/// revision rather than a full-table filter, and so the natural key order is
-/// the order things happened. `op_id` is the tiebreaker component and exists
-/// only because redb keys must be unique — one revision applies exactly one
-/// op, so it never actually disambiguates anything today; it is there so that
-/// a future batched apply cannot silently overwrite a row.
-const SM_AUDIT_TABLE: TableDefinition<(u64, &str), &str> = TableDefinition::new("sm_audit");
-/// The fleet's audit export sink as JSON, under [`AUDIT_SINK_KEY`] (issue
-/// #164). A one-row table rather than a field on some metadata blob, so it
-/// snapshots, installs and gets cleared through exactly the same code shape as
-/// every other replicated table.
-const SM_AUDIT_SINK_TABLE: TableDefinition<&str, &str> = TableDefinition::new("sm_audit_sink");
-/// The last revision the leader has shipped to the sink, under
-/// [`AUDIT_SINK_KEY`] (issue #164). Separate from the sink record because the
-/// two have different lifetimes: removing a sink must not lose the checkpoint,
-/// or re-declaring one would re-ship the entire retained history.
-const SM_AUDIT_CHECKPOINT_TABLE: TableDefinition<&str, u64> =
-    TableDefinition::new("sm_audit_checkpoint");
-/// The single key both one-row audit-export tables use. Named rather than `()`
-/// so the tables read the same as the rest and a second sink, if one is ever
-/// wanted, is a key change and not a schema migration.
-/// The highest revision retention GC has ever *actually removed* from
-/// `sm_audit`, under [`AUDIT_SINK_KEY`] (issue #164).
-///
-/// Exists because the gap the exporter must report is not derivable from the
-/// audit table alone. "The next surviving row is not at `checkpoint + 1`" does
-/// **not** mean retention deleted something: `EntryPayload::Blank` (every
-/// election), `Membership` entries, and the exporter's own unaudited
-/// `AuditCheckpointPut` all consume a revision without producing a row — so
-/// that test fires on a perfectly healthy fleet, and would turn the one alarm
-/// for permanent audit loss into a rising false positive.
-///
-/// Written at apply, from the replicated clock, so every replica records the
-/// same watermark.
-const SM_AUDIT_GC_WATERMARK_TABLE: TableDefinition<&str, u64> =
-    TableDefinition::new("sm_audit_gc_watermark");
-const AUDIT_SINK_KEY: &str = "sink";
 /// The fleet's session-signing key as JSON, under [`SESSION_KEY_ROW`] (RFC-006 §5.3, issue
-/// #185). A one-row table, same shape as `sm_audit_sink` and for the same reason: it snapshots,
-/// installs and gets cleared through exactly the same code path as every other replicated
-/// table, rather than through a hand-written special case that is one commit away from missing
-/// the snapshot path and silently logging every console user out after a compaction.
+/// #185). A one-row table rather than a field on some metadata blob, so it snapshots, installs
+/// and gets cleared through exactly the same code path as every other replicated table, rather
+/// than through a hand-written special case that is one commit away from missing the snapshot
+/// path and silently logging every console user out after a compaction.
 const SM_SESSION_KEY_TABLE: TableDefinition<&str, &str> = TableDefinition::new("sm_session_key");
-/// The single key `sm_session_key` uses, named rather than `()` for the same reason
-/// [`AUDIT_SINK_KEY`] is: it reads like the rest of the schema and a second signing key, if one
-/// is ever wanted, is a key change and not a schema migration.
+/// The single key `sm_session_key` uses, named rather than `()` so it reads like the rest of
+/// the schema and a second signing key, if one is ever wanted, is a key change and not a schema
+/// migration.
 const SESSION_KEY_ROW: &str = "key";
 /// The fleet's operator-set name as a plain string, under [`FLEET_NAME_ROW`] (issue #373). A
 /// one-row table, same shape as `sm_session_key` and for the same reason: it snapshots, installs
@@ -258,8 +218,8 @@ const SM_FLEET_NAME_TABLE: TableDefinition<&str, &str> = TableDefinition::new("s
 /// [`SESSION_KEY_ROW`] is: it reads like the rest of the schema.
 const FLEET_NAME_ROW: &str = "name";
 /// `(tenant, port, space-tag) -> generation` (issue #224): the applied clear-generation
-/// counters `ControlOp::JournalClearGen` bumps. Modelled on `sm_audit_checkpoint` — a small,
-/// monotone, per-key counter table — except the key is three-part: `space-tag` is
+/// counters `ControlOp::JournalClearGen` bumps. A small, monotone, per-key counter table whose
+/// key is three-part: `space-tag` is
 /// [`journal_gen_space_key`]'s own encoding of `Option<&str>`, not a bare `&str`, because a
 /// port-wide clear (`None`) must never be representable the same way as a space-scoped one
 /// (`Some`) no matter what the space is named.
@@ -437,12 +397,6 @@ const SM_APPLIED_TABLE: TableDefinition<(), &[u8]> = TableDefinition::new("sm_ap
 /// not yet seen commit. NOT replicated state — never in snapshots, never
 /// touched by apply; each node parks and replays only what it accepted.
 const PENDING_INTENTS_TABLE: TableDefinition<&str, &str> = TableDefinition::new("pending_intents");
-
-/// How long audit rows are kept when nothing says otherwise: 30 days
-/// (RFC-002 §9, issue #163). Long enough to answer "who changed this last
-/// month", short enough that the table does not grow without bound on a busy
-/// fleet. Overridden by `--cluster-audit-retention`.
-pub const DEFAULT_AUDIT_RETENTION_SECS: u64 = 30 * 24 * 60 * 60;
 
 /// How long an applied op's response is retained for dedup: 24 h (issue #9).
 /// After expiry a replay of the same `op_id` re-applies — the durable-intent
@@ -806,35 +760,9 @@ struct SnapshotPayload {
     /// `(principal id, tenant, Role JSON)` rows of `sm_bindings` (issue #159).
     #[serde(default)]
     bindings: Vec<(String, String, String)>,
-    /// `(revision, op_id, AuditRow JSON)` rows of `sm_audit` (issue #163).
-    ///
-    /// Defaulted for the same reason `routes`/`sources`/`tenants` are, and the
-    /// reason is worth restating because this crate has already been bitten by
-    /// it once (#134/#137): **a table omitted from this payload is a table that
-    /// vanishes the next time a follower catches up by snapshot.** For an audit
-    /// stream that failure is silent and permanent — the node comes back with
-    /// an empty history and nothing reports a gap.
-    #[serde(default)]
-    audit: Vec<(u64, String, String)>,
-    /// The `sm_audit_sink` row, if one is declared (issue #164). Same
-    /// `#[serde(default)]` reasoning as `audit` above — and the same failure if
-    /// it is forgotten: a node catching up by snapshot would come back with no
-    /// sink, stop exporting the moment it won an election, and report nothing.
-    #[serde(default)]
-    audit_sink: Option<String>,
-    /// The `sm_audit_checkpoint` row (issue #164). A node that installs a
-    /// snapshot without it and then wins an election resumes from revision 0
-    /// and re-ships the entire retained history to the customer's bucket.
-    #[serde(default)]
-    audit_checkpoint: Option<u64>,
-    /// The `sm_audit_gc_watermark` row (issue #164). A node that installs a
-    /// snapshot without it forgets that retention ever deleted anything, and
-    /// its exporter then reports a clean stream over a window that is gone.
-    #[serde(default)]
-    audit_gc_watermark: Option<u64>,
     /// The `sm_session_key` row, if a console login has ever minted one (RFC-006 §5.3, issue
-    /// #185). `#[serde(default)]` for the same reason `audit_sink` is, and the same failure
-    /// shape if it is ever forgotten here: a node that installs a snapshot without it and then
+    /// #185). `#[serde(default)]` for the #134/#137 reason every table above carries it, and
+    /// this is the failure shape if it is ever forgotten here: a node that installs a snapshot without it and then
     /// serves a console login mints a *second* key at a fresh revision, which silently
     /// invalidates every session issued by every other node — the exact fleet-wide logout this
     /// field exists to prevent from happening by accident.
@@ -945,14 +873,6 @@ pub async fn new<P: AsRef<Path>>(path: P) -> StorageResult<(RedbLogStore, RedbSt
         write_txn.open_table(SM_TENANTS_TABLE).map_err(io)?;
         write_txn.open_table(SM_PRINCIPALS_TABLE).map_err(io)?;
         write_txn.open_table(SM_BINDINGS_TABLE).map_err(io)?;
-        write_txn.open_table(SM_AUDIT_TABLE).map_err(io)?;
-        write_txn.open_table(SM_AUDIT_SINK_TABLE).map_err(io)?;
-        write_txn
-            .open_table(SM_AUDIT_CHECKPOINT_TABLE)
-            .map_err(io)?;
-        write_txn
-            .open_table(SM_AUDIT_GC_WATERMARK_TABLE)
-            .map_err(io)?;
         write_txn.open_table(SM_SESSION_KEY_TABLE).map_err(io)?;
         write_txn.open_table(SM_FLEET_NAME_TABLE).map_err(io)?;
         write_txn.open_table(SM_JOURNAL_GENS_TABLE).map_err(io)?;
@@ -1271,10 +1191,10 @@ enum EngineAction {
 /// long gone and `current_principal()` is `None`. So the clustered path carries
 /// attribution in the log — `ControlRequest.principal` — and **re-opens** the
 /// scope here, around the engine call, which is the only place a listener runs.
-/// Without this, every clustered change event reaches M3's SSE and the #164
-/// export sink with `EventContext::principal == None`, and the fact that the
-/// audit table is correctly attributed does not help them: they are on the event
-/// path, not the log path.
+/// Without this, every clustered change event reaches M3's SSE with
+/// `EventContext::principal == None`, and the fact that the log entry itself is
+/// correctly attributed does not help it: it is on the event path, not the log
+/// path.
 ///
 /// `principal` is `None` for a drive with no single request behind it — a
 /// restart replay or a snapshot install, which materialize a whole table rather
@@ -1359,17 +1279,6 @@ pub struct RedbStateMachine {
     /// fleet agrees on is durable in `sm_journal_gens` either way, and a later snapshot install
     /// replays it into whatever journal eventually catches up.
     journal: OnceLock<Weak<ClusterJournal>>,
-    /// How long audit rows are kept, in seconds; `0` = forever (issue #163).
-    ///
-    /// **Every node in a fleet must be configured identically.** This value
-    /// feeds `gc_audit`, which runs inside `apply` — so two nodes with
-    /// different retention would drop different rows from the same log and
-    /// their audit tables would diverge, which is exactly the property the
-    /// replicated clock exists to protect. It is node configuration rather than
-    /// replicated state because it is an operator's storage-budget decision,
-    /// not a tenant's; `docs/rift-cluster-server.md` says so where the flag is
-    /// documented.
-    audit_retention_secs: u64,
     /// Where a dataset's csv bytes are materialised on this node's local disk, one file per
     /// digest (RFC-005 D1, #285) — `None` in storage tests and on an embedder that never wires
     /// one, exactly like `engine`. Node-local derived state, not replicated: every replica keeps
@@ -1411,7 +1320,6 @@ impl RedbStateMachine {
             routes: None,
             apply_failures: Arc::new(Mutex::new(BTreeMap::new())),
             journal: OnceLock::new(),
-            audit_retention_secs: DEFAULT_AUDIT_RETENTION_SECS,
             spool_dir: None,
             blob_source: None,
         }
@@ -1560,15 +1468,6 @@ impl RedbStateMachine {
             resolved.insert(hex, text);
         }
         Ok(resolved)
-    }
-
-    /// Set the audit retention window. Same before-`Raft::new` contract as
-    /// [`Self::with_engine`] — and see `audit_retention_secs`' doc for why every
-    /// node in a fleet must be given the same value.
-    #[must_use]
-    pub fn with_audit_retention_secs(mut self, secs: u64) -> Self {
-        self.audit_retention_secs = secs;
-        self
     }
 
     /// Attach the directory dataset blobs are materialised into (RFC-005 D1, #285). Same
@@ -3568,146 +3467,8 @@ impl RedbStateMachine {
         )
     }
 
-    /// Drop audit rows older than `retention_secs` relative to `now_secs` — the
-    /// replicated logical clock, exactly as [`Self::gc_dedup`] takes it, and
-    /// never a local `SystemTime::now()`.
-    ///
-    /// `retention_secs == 0` means keep everything: an operator who turns
-    /// retention off must not silently lose their history to a zero that reads
-    /// as "expire immediately".
-    ///
-    /// Rows are expired on `ts_secs`, the applying entry's `issued_at_secs`,
-    /// so "how old is this row" is answered with the same replicated clock that
-    /// wrote it.
-    ///
-    /// Called once per `apply` against the clock as it stood *before* that
-    /// batch, exactly as [`Self::gc_dedup`] is — so expiry lags the write that
-    /// crosses the boundary by one apply. That is deliberate and harmless here:
-    /// the lag is identical on every replica (they run the same GC at the same
-    /// log point with the same clock), and a retention window is a floor on how
-    /// long rows are kept, not a promise to delete them the instant it passes.
-    ///
-    /// A row whose JSON will not parse is dropped and logged rather
-    /// than kept forever: it is committed-state corruption, it cannot be served
-    /// to anyone, and it would otherwise pin the table's growth with something
-    /// no reader can use.
-    /// Returns the highest revision it removed, or `None` if it removed
-    /// nothing — the caller folds that into `sm_audit_gc_watermark`, which is
-    /// the exporter's only trustworthy evidence that rows were lost rather than
-    /// simply never written (see [`SM_AUDIT_GC_WATERMARK_TABLE`]).
-    fn gc_audit(
-        table: &mut Table<'_, (u64, &'static str), &'static str>,
-        now_secs: u64,
-        retention_secs: u64,
-    ) -> Result<Option<u64>, redb::StorageError> {
-        if retention_secs == 0 {
-            return Ok(None);
-        }
-        let cutoff = now_secs.saturating_sub(retention_secs);
-        let mut removed_through: Option<u64> = None;
-        table.retain(|(revision, op_id), value| {
-            let keep = match serde_json::from_str::<AuditRow>(value) {
-                Ok(row) => row.ts_secs >= cutoff,
-                Err(e) => {
-                    tracing::error!(revision, op_id, error = %e, "dropping unparseable sm_audit row");
-                    false
-                }
-            };
-            if !keep {
-                removed_through = Some(removed_through.map_or(revision, |seen: u64| seen.max(revision)));
-            }
-            keep
-        })?;
-        Ok(removed_through)
-    }
-
-    /// Audit rows at or after `since`, ascending by revision, optionally
-    /// narrowed to one tenant (issue #163).
-    ///
-    /// `tenant: Some(..)` is what a `TenantAdmin` gets — the filter is applied
-    /// **here, server-side**, not by the caller. Handing a tenant admin the
-    /// fleet's rows and trusting a client to narrow them would mean the server
-    /// had already sent another tenant's audit history, which is the same
-    /// mistake RFC-002 §4.3 warns about for the event stream.
-    ///
-    /// Answers from local applied state and needs no leadership or fan-out:
-    /// every replica derived the same rows from the same log.
-    #[allow(clippy::result_large_err)]
-    pub fn audit_since(
-        &self,
-        since: u64,
-        tenant: Option<&str>,
-        limit: usize,
-    ) -> StorageResult<Vec<AuditRow>> {
-        let read_txn = self
-            .db
-            .begin_read()
-            .map_err(|e| StorageIOError::read_state_machine(&e))?;
-        let table = read_txn
-            .open_table(SM_AUDIT_TABLE)
-            .map_err(|e| StorageIOError::read_state_machine(&e))?;
-        let mut out = Vec::new();
-        // Revision-major keys, so this is a range scan from `since` rather than
-        // a scan of everything followed by a filter.
-        for item in table
-            .range((since, "")..)
-            .map_err(|e| StorageIOError::read_state_machine(&e))?
-        {
-            if out.len() >= limit {
-                break;
-            }
-            let (key, value) = item.map_err(|e| StorageIOError::read_state_machine(&e))?;
-            let (revision, op_id) = key.value();
-            // A row that will not parse is committed-state corruption, not an
-            // absent row — surfaced as an error rather than skipped, for the
-            // same reason `principal_bindings` does it: an audit stream that
-            // quietly omits what it cannot read is worse than one that admits
-            // it is broken.
-            let row: AuditRow = serde_json::from_str(value.value()).map_err(|e| {
-                tracing::error!(revision, op_id, error = %e, "corrupt stored audit row");
-                StorageError::from(StorageIOError::read_state_machine(&e))
-            })?;
-            if let Some(tenant) = tenant
-                && row.tenant.as_str() != tenant
-            {
-                continue;
-            }
-            out.push(row);
-        }
-        Ok(out)
-    }
-
-    /// The fleet's declared audit export sink, or `None` when none is declared
-    /// (issue #164). Answered from local applied state, like `audit_since`.
-    ///
-    /// # Errors
-    /// Storage I/O, or a stored record that will not parse.
-    #[allow(clippy::result_large_err)]
-    pub fn audit_sink(&self) -> StorageResult<Option<AuditSink>> {
-        let read_txn = self
-            .db
-            .begin_read()
-            .map_err(|e| StorageIOError::read_state_machine(&e))?;
-        let table = read_txn
-            .open_table(SM_AUDIT_SINK_TABLE)
-            .map_err(|e| StorageIOError::read_state_machine(&e))?;
-        let Some(value) = table
-            .get(AUDIT_SINK_KEY)
-            .map_err(|e| StorageIOError::read_state_machine(&e))?
-        else {
-            return Ok(None);
-        };
-        // Surfaced, never defaulted away: an unparseable sink record must not
-        // read as "no sink configured", which would silently stop exporting.
-        let record: AuditSink = serde_json::from_str(value.value()).map_err(|e| {
-            tracing::error!(error = %e, "corrupt stored audit sink record");
-            StorageError::from(StorageIOError::read_state_machine(&e))
-        })?;
-        Ok(Some(record))
-    }
-
     /// The fleet's session-signing key, or `None` when no console login has minted one yet
-    /// (RFC-006 §5.3, issue #185). Answered from local applied state, like `audit_sink`.
+    /// (RFC-006 §5.3, issue #185). Answered from local applied state.
     ///
     /// # Errors
     /// Storage I/O, or a stored record that will not parse.
@@ -3728,7 +3489,7 @@ impl RedbStateMachine {
         };
         // Surfaced, never defaulted away: an unparseable key record must not read as "no key
         // minted yet", which would silently mint a second one and rotate every session out from
-        // under whoever was relying on the first — same reasoning as `audit_sink`.
+        // under whoever was relying on the first.
         let record: SessionKey = serde_json::from_str(value.value()).map_err(|e| {
             tracing::error!(error = %e, "corrupt stored session key record");
             StorageError::from(StorageIOError::read_state_machine(&e))
@@ -3761,46 +3522,6 @@ impl RedbStateMachine {
             return Ok(None);
         };
         Ok(Some(value.value().to_owned()))
-    }
-
-    /// The last revision shipped to the sink; `0` when nothing has shipped
-    /// (issue #164).
-    ///
-    /// # Errors
-    /// Storage I/O.
-    #[allow(clippy::result_large_err)]
-    pub fn audit_checkpoint(&self) -> StorageResult<u64> {
-        let read_txn = self
-            .db
-            .begin_read()
-            .map_err(|e| StorageIOError::read_state_machine(&e))?;
-        let table = read_txn
-            .open_table(SM_AUDIT_CHECKPOINT_TABLE)
-            .map_err(|e| StorageIOError::read_state_machine(&e))?;
-        Ok(table
-            .get(AUDIT_SINK_KEY)
-            .map_err(|e| StorageIOError::read_state_machine(&e))?
-            .map_or(0, |v| v.value()))
-    }
-
-    /// The highest revision retention GC has removed from `sm_audit`; `0` if it
-    /// has never removed anything (issue #164).
-    ///
-    /// # Errors
-    /// Storage I/O.
-    #[allow(clippy::result_large_err)]
-    pub fn audit_gc_watermark(&self) -> StorageResult<u64> {
-        let read_txn = self
-            .db
-            .begin_read()
-            .map_err(|e| StorageIOError::read_state_machine(&e))?;
-        let table = read_txn
-            .open_table(SM_AUDIT_GC_WATERMARK_TABLE)
-            .map_err(|e| StorageIOError::read_state_machine(&e))?;
-        Ok(table
-            .get(AUDIT_SINK_KEY)
-            .map_err(|e| StorageIOError::read_state_machine(&e))?
-            .map_or(0, |v| v.value()))
     }
 
     /// The applied clear generation for `port` (or `port`'s `space`, when given); `0` if
@@ -4887,8 +4608,6 @@ impl RedbStateMachine {
         tenants: &mut Table<'_, &'static str, &'static str>,
         principals: &mut Table<'_, &'static str, &'static str>,
         bindings: &mut Table<'_, (&'static str, &'static str), &'static str>,
-        audit_sink: &mut Table<'_, &'static str, &'static str>,
-        audit_checkpoint: &mut Table<'_, &'static str, u64>,
         session_key: &mut Table<'_, &'static str, &'static str>,
         fleet_name: &mut Table<'_, &'static str, &'static str>,
         journal_gens: &mut Table<'_, (&'static str, u16, &'static str), u64>,
@@ -4915,11 +4634,6 @@ impl RedbStateMachine {
         let io =
             |e: redb::StorageError| StorageError::from(StorageIOError::write_state_machine(&e));
         match op {
-            // Deliberately mutates nothing (RFC-002 §9's audit exception, issue #287). The op
-            // exists so the export is recorded, and the recording happens in the audit arm that
-            // runs for every committed op — not here. An empty arm someone had to write, rather
-            // than an absent branch: the "changes nothing" claim is the whole contract.
-            ControlOp::DatasetContentRead { .. } => Ok(Ok(Vec::new())),
             ControlOp::PutImposter { tenant, config } => {
                 // `validate` guaranteed the port; a missing one here means a
                 // caller skipped validation, and a deterministic refusal is the
@@ -5756,57 +5470,6 @@ impl RedbStateMachine {
                     .map_err(io)?;
                 Ok(Ok(Vec::new()))
             }
-            ControlOp::AuditSinkPut {
-                uri,
-                auth_ref,
-                batch_max_rows,
-                ..
-            } => {
-                let record = AuditSink {
-                    // Trimmed here, once, so the stored record is canonical.
-                    // `validate` trims before every one of its checks, so a
-                    // pasted " https://…" is admitted — and `transport_for`
-                    // does not trim, so storing it verbatim produced a sink
-                    // that committed fleet-wide, read back as configured, and
-                    // failed "unsupported scheme" on every pass forever.
-                    uri: uri.trim().to_owned(),
-                    auth_ref: auth_ref.clone(),
-                    batch_max_rows: *batch_max_rows,
-                    revision: index,
-                };
-                let value = serde_json::to_string(&record)
-                    .map_err(|e| StorageError::from(StorageIOError::write_state_machine(&e)))?;
-                audit_sink
-                    .insert(AUDIT_SINK_KEY, value.as_str())
-                    .map_err(io)?;
-                Ok(Ok(Vec::new()))
-            }
-            ControlOp::AuditSinkDelete { .. } => {
-                // The checkpoint is deliberately left behind. Removing a sink
-                // and re-declaring it must resume, not re-ship every retained
-                // row to the customer's bucket a second time.
-                audit_sink.remove(AUDIT_SINK_KEY).map_err(io)?;
-                Ok(Ok(Vec::new()))
-            }
-            ControlOp::AuditCheckpointPut { revision, .. } => {
-                // Monotonic, and enforced here rather than at the submitter:
-                // apply is the only place that sees every write in one order on
-                // every replica. A leader deposed mid-batch can still have a
-                // checkpoint in flight; committing it after the new leader has
-                // moved ahead would rewind the stream and re-ship a window that
-                // was already delivered. `max` makes that late write a no-op
-                // instead — deterministically, on all three replicas.
-                let current = audit_checkpoint
-                    .get(AUDIT_SINK_KEY)
-                    .map_err(io)?
-                    .map_or(0, |v| v.value());
-                if *revision > current {
-                    audit_checkpoint
-                        .insert(AUDIT_SINK_KEY, *revision)
-                        .map_err(io)?;
-                }
-                Ok(Ok(Vec::new()))
-            }
             ControlOp::SessionKeyPut { key, .. } => {
                 // Overwrites unconditionally: minting the *first* key and rotating an existing
                 // one are the same op (RFC-006 §5.3), and the record's `revision` — stamped from
@@ -6364,8 +6027,8 @@ impl RedbStateMachine {
             // individually is deliberate — one `apply` batch can hold entries
             // from different principals, and attributing the whole batch to
             // whichever one happened to be first would be worse than the `None`
-            // it replaces: wrong attribution in an audit-adjacent stream is not
-            // a smaller error than missing attribution.
+            // it replaces: wrong attribution is not a smaller error than missing
+            // attribution.
             rift_cluster_base::seams::with_principal_scope(principal, async {
                 self.drive_one(action).await;
             })
@@ -6602,10 +6265,6 @@ impl RedbStateMachine {
             tenants,
             principals,
             bindings,
-            audit,
-            audit_sink,
-            audit_checkpoint,
-            audit_gc_watermark,
             session_key,
             fleet_name,
             journal_gens,
@@ -6771,43 +6430,8 @@ impl RedbStateMachine {
                     value.value().to_owned(),
                 ));
             }
-            let audit_table = read_txn
-                .open_table(SM_AUDIT_TABLE)
-                .map_err(|e| StorageIOError::read_state_machine(&e))?;
-            let mut audit = Vec::new();
-            for item in audit_table
-                .iter()
-                .map_err(|e| StorageIOError::read_state_machine(&e))?
-            {
-                let (key, value) = item.map_err(|e| StorageIOError::read_state_machine(&e))?;
-                let (revision, op_id) = key.value();
-                audit.push((revision, op_id.to_owned(), value.value().to_owned()));
-            }
-            // The sink and its checkpoint travel too, for the same reason and
-            // with a sharper failure: a follower that installs without them and
-            // then wins an election either stops exporting (no sink) or resumes
-            // from zero and re-ships the whole retained history to the
-            // customer's bucket (no checkpoint).
-            let audit_sink = read_txn
-                .open_table(SM_AUDIT_SINK_TABLE)
-                .map_err(|e| StorageIOError::read_state_machine(&e))?
-                .get(AUDIT_SINK_KEY)
-                .map_err(|e| StorageIOError::read_state_machine(&e))?
-                .map(|v| v.value().to_owned());
-            let audit_checkpoint = read_txn
-                .open_table(SM_AUDIT_CHECKPOINT_TABLE)
-                .map_err(|e| StorageIOError::read_state_machine(&e))?
-                .get(AUDIT_SINK_KEY)
-                .map_err(|e| StorageIOError::read_state_machine(&e))?
-                .map(|v| v.value());
-            let audit_gc_watermark = read_txn
-                .open_table(SM_AUDIT_GC_WATERMARK_TABLE)
-                .map_err(|e| StorageIOError::read_state_machine(&e))?
-                .get(AUDIT_SINK_KEY)
-                .map_err(|e| StorageIOError::read_state_machine(&e))?
-                .map(|v| v.value());
-            // Travels with the snapshot for the same reason the sink does, with a sharper
-            // failure than a missed export: a follower that installs without it and then wins an
+            // Travels with the snapshot like every other replicated table, with a sharp
+            // failure if it did not: a follower that installs without it and then wins an
             // election either has no key to sign a login with (if none had ever been minted) or,
             // worse, mints its own on first login — silently rotating out from under every
             // session issued by every other node, with nothing reporting that a fleet-wide logout
@@ -6891,10 +6515,6 @@ impl RedbStateMachine {
                 tenants,
                 principals,
                 bindings,
-                audit,
-                audit_sink,
-                audit_checkpoint,
-                audit_gc_watermark,
                 session_key,
                 fleet_name,
                 journal_gens,
@@ -6915,10 +6535,6 @@ impl RedbStateMachine {
             tenants,
             principals,
             bindings,
-            audit,
-            audit_sink,
-            audit_checkpoint,
-            audit_gc_watermark,
             session_key,
             fleet_name,
             journal_gens,
@@ -7029,18 +6645,6 @@ impl RaftStateMachine<TypeConfig> for RedbStateMachine {
             let mut bindings = write_txn
                 .open_table(SM_BINDINGS_TABLE)
                 .map_err(|e| StorageIOError::write_state_machine(&e))?;
-            let mut audit = write_txn
-                .open_table(SM_AUDIT_TABLE)
-                .map_err(|e| StorageIOError::write_state_machine(&e))?;
-            let mut audit_sink = write_txn
-                .open_table(SM_AUDIT_SINK_TABLE)
-                .map_err(|e| StorageIOError::write_state_machine(&e))?;
-            let mut audit_checkpoint = write_txn
-                .open_table(SM_AUDIT_CHECKPOINT_TABLE)
-                .map_err(|e| StorageIOError::write_state_machine(&e))?;
-            let mut audit_gc_watermark = write_txn
-                .open_table(SM_AUDIT_GC_WATERMARK_TABLE)
-                .map_err(|e| StorageIOError::write_state_machine(&e))?;
             let mut session_key = write_txn
                 .open_table(SM_SESSION_KEY_TABLE)
                 .map_err(|e| StorageIOError::write_state_machine(&e))?;
@@ -7066,33 +6670,6 @@ impl RaftStateMachine<TypeConfig> for RedbStateMachine {
             // re-apply on one replica and collapse on another.
             Self::gc_dedup(&mut dedup, applied.logical_clock_secs)
                 .map_err(|e| StorageIOError::write_state_machine(&e))?;
-            // Audit retention runs on the same replicated clock, for a reason
-            // that is the same in kind and worse in consequence: two replicas
-            // disagreeing about which rows have expired would leave their audit
-            // tables permanently different, and the whole claim of this feature
-            // is that any node can answer because every node holds the same
-            // rows. A node whose local wall clock is a week fast must GC
-            // exactly what its peers do — so the local clock is never read.
-            let gc_removed_through = Self::gc_audit(
-                &mut audit,
-                applied.logical_clock_secs,
-                self.audit_retention_secs,
-            )
-            .map_err(|e| StorageIOError::write_state_machine(&e))?;
-            if let Some(removed_through) = gc_removed_through {
-                // Monotonic, like the export checkpoint: the watermark records
-                // how far retention has ever reached, so it can only advance.
-                let current = audit_gc_watermark
-                    .get(AUDIT_SINK_KEY)
-                    .map_err(|e| StorageIOError::write_state_machine(&e))?
-                    .map_or(0, |v| v.value());
-                if removed_through > current {
-                    audit_gc_watermark
-                        .insert(AUDIT_SINK_KEY, removed_through)
-                        .map_err(|e| StorageIOError::write_state_machine(&e))?;
-                }
-            }
-
             for entry in entries_iter {
                 let log_id = entry.log_id;
                 applied.last_applied_log = Some(log_id);
@@ -7145,8 +6722,6 @@ impl RaftStateMachine<TypeConfig> for RedbStateMachine {
                                         &mut tenants,
                                         &mut principals,
                                         &mut bindings,
-                                        &mut audit_sink,
-                                        &mut audit_checkpoint,
                                         &mut session_key,
                                         &mut fleet_name,
                                         &mut journal_gens,
@@ -7172,8 +6747,6 @@ impl RaftStateMachine<TypeConfig> for RedbStateMachine {
                                     &mut tenants,
                                     &mut principals,
                                     &mut bindings,
-                                    &mut audit_sink,
-                                    &mut audit_checkpoint,
                                     &mut session_key,
                                     &mut fleet_name,
                                     &mut journal_gens,
@@ -7203,48 +6776,6 @@ impl RaftStateMachine<TypeConfig> for RedbStateMachine {
                             }
                             Err(reason) => ControlResponse::failed(log_id.index, reason),
                         };
-
-                        // The audit projection (RFC-002 §9, issue #163).
-                        //
-                        // Here, and only here. Every replica runs this same
-                        // arm for the same committed entry with the same
-                        // inputs, so all three derive a byte-identical row —
-                        // which is what lets `GET /admin/audit` answer from
-                        // local state with no fan-out.
-                        //
-                        // Below the dedup short-circuit above, deliberately: a
-                        // replayed `op_id` returns the original response and
-                        // changes nothing, so it must not append a second row
-                        // for the same write. "Exactly once per write" is an
-                        // acceptance criterion, and this ordering is what
-                        // provides it.
-                        //
-                        // Refusals are recorded too. A `Failed` outcome is a
-                        // committed decision, and "who tried to do what and was
-                        // refused" is the half of an audit log that matters
-                        // most.
-                        //
-                        // An op with no action slug opts out (today: only the
-                        // exporter's own checkpoint, whose audit row would feed
-                        // the exporter that wrote it). The opt-out is a `None`
-                        // arm someone had to write, not a missing branch.
-                        if let Some(action) = request.op.audit_action() {
-                            let audit_row = AuditRow {
-                                ts_secs: request.issued_at_secs,
-                                principal: request.principal.clone(),
-                                tenant: request.op.tenant().clone(),
-                                action: action.to_owned(),
-                                resource: request.op.audit_resource(),
-                                op_id: request.op_id,
-                                revision: log_id.index,
-                                outcome: response.outcome.clone(),
-                            };
-                            let audit_value = serde_json::to_string(&audit_row)
-                                .map_err(|e| StorageIOError::write_state_machine(&e))?;
-                            audit
-                                .insert((log_id.index, op_key.as_str()), audit_value.as_str())
-                                .map_err(|e| StorageIOError::write_state_machine(&e))?;
-                        }
 
                         let dedup_entry = DedupEntry {
                             // Stored copy: the same response must come back for
@@ -7809,66 +7340,8 @@ impl RedbStateMachine {
                     .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
             }
 
-            // The audit table travels with the snapshot, like every other
-            // replicated table. A node joining by snapshot install must come
-            // back holding the same history as its peers — omitting this is how
-            // an audit stream silently loses everything before the join, with
-            // nothing reporting a gap (#134/#137 taught this crate the same
-            // lesson about sources).
-            let mut audit_table = write_txn
-                .open_table(SM_AUDIT_TABLE)
-                .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
-            audit_table
-                .retain(|_, _| false)
-                .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
-            for (revision, op_id, value) in &payload.audit {
-                audit_table
-                    .insert((*revision, op_id.as_str()), value.as_str())
-                    .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
-            }
-
-            // Cleared before it is repopulated, exactly like the tables above:
-            // a payload carrying no sink means the fleet has no sink, and
-            // leaving this node's stale one in place would have it keep
-            // shipping to an endpoint the fleet has retired.
-            let mut audit_sink_table = write_txn
-                .open_table(SM_AUDIT_SINK_TABLE)
-                .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
-            audit_sink_table
-                .retain(|_, _| false)
-                .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
-            if let Some(value) = &payload.audit_sink {
-                audit_sink_table
-                    .insert(AUDIT_SINK_KEY, value.as_str())
-                    .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
-            }
-
-            let mut audit_checkpoint_table = write_txn
-                .open_table(SM_AUDIT_CHECKPOINT_TABLE)
-                .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
-            audit_checkpoint_table
-                .retain(|_, _| false)
-                .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
-            if let Some(revision) = payload.audit_checkpoint {
-                audit_checkpoint_table
-                    .insert(AUDIT_SINK_KEY, revision)
-                    .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
-            }
-
-            let mut audit_gc_watermark_table = write_txn
-                .open_table(SM_AUDIT_GC_WATERMARK_TABLE)
-                .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
-            audit_gc_watermark_table
-                .retain(|_, _| false)
-                .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
-            if let Some(revision) = payload.audit_gc_watermark {
-                audit_gc_watermark_table
-                    .insert(AUDIT_SINK_KEY, revision)
-                    .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
-            }
-
-            // Cleared before it is repopulated, like the sink above: a payload carrying no key
-            // means no console login has ever minted one on the leader, and leaving a stale local
+            // Cleared before it is repopulated, exactly like the tables above: a payload carrying
+            // no key means no console login has ever minted one on the leader, and leaving a stale local
             // key in place would let this node keep verifying cookies against a revision the
             // fleet no longer agrees is current.
             let mut session_key_table = write_txn
@@ -8120,10 +7593,9 @@ mod tests {
         StoredDataset, StoredImposter, StoredSpec, new,
     };
     use crate::control::{
-        AUDIT_RESOURCE_ALL, AuditRow, AuthSource, ControlOp, ControlOutcome, ControlRequest,
-        ControlResponse, DEFAULT_TENANT, DatasetRecord, Digest, FLEET_SCOPE, OnDrift, Principal,
-        PrincipalId, Quotas, Role, SourceMode, SpecFormat, SpecMeta, SpecSource, StubEdit,
-        StubEditScript, TenantId,
+        AuthSource, ControlOp, ControlOutcome, ControlRequest, ControlResponse, DEFAULT_TENANT,
+        DatasetRecord, Digest, FLEET_SCOPE, OnDrift, Principal, PrincipalId, Quotas, Role,
+        SourceMode, SpecFormat, SpecMeta, SpecSource, StubEdit, StubEditScript, TenantId,
     };
     use crate::raft::TypeConfig;
     use crate::stores::journal::ClusterJournal;
@@ -14579,16 +14051,11 @@ mod tests {
         );
     }
 
-    // -- issue #163: the audit projection and leader-side quotas --------------
+    // -- issue #163: leader-side quotas ---------------------------------------
     //
-    // RFC-002 §9/§4.4. These are the state-machine half of the gate; the
+    // RFC-002 §4.4. These are the state-machine half of the gate; the
     // every-node claims are asserted across a real three-node cluster in
-    // `tests/cluster.rs`, and the RBAC-visibility claims over HTTP in
-    // `rift-cluster-server/tests/rbac.rs`.
-
-    fn audit_rows(sm: &RedbStateMachine) -> Vec<AuditRow> {
-        sm.audit_since(0, None, 10_000).expect("read audit")
-    }
+    // `tests/cluster.rs`.
 
     /// The ports a tenant currently holds, ascending. `configured_ports` is
     /// fleet-wide (it backs the operator surface, not a tenant-scoped read),
@@ -14734,94 +14201,6 @@ mod tests {
         )
     }
 
-    /// A write is audited once, with every field taken from the committed entry
-    /// rather than from anything a handler decided.
-    #[tokio::test]
-    async fn a_committed_write_is_projected_into_exactly_one_audit_row() {
-        let (_td, mut sm) = fresh_sm(None).await;
-        let mut req = put(7, 8080, json!([{ "id": "a" }]));
-        req.principal = Some("default/alice".to_owned());
-        req.issued_at_secs = 1_700_000_000;
-
-        let response = apply_one(&mut sm, 5, req).await;
-        assert_eq!(response.outcome, ControlOutcome::Applied);
-
-        let rows = audit_rows(&sm);
-        assert_eq!(rows.len(), 1, "one write, one row: {rows:?}");
-        let row = &rows[0];
-        assert_eq!(row.principal.as_deref(), Some("default/alice"));
-        assert_eq!(row.tenant, TenantId::default());
-        assert_eq!(row.action, "imposter.write");
-        assert_eq!(row.resource, "8080");
-        assert_eq!(row.op_id, Uuid::from_u128(7));
-        assert_eq!(
-            row.revision, 5,
-            "the row carries the applying log index, which is the same revision \
-             the write's own response returned"
-        );
-        assert_eq!(row.outcome, ControlOutcome::Applied);
-        assert_eq!(
-            row.ts_secs, 1_700_000_000,
-            "the timestamp is the entry's replicated issued_at_secs, so every \
-             replica derives the same one — never a local SystemTime::now()"
-        );
-    }
-
-    /// The exactly-once claim, against the one thing that can break it: a
-    /// replayed `op_id`. The projection sits below the dedup short-circuit, so a
-    /// replay returns the original response and appends nothing.
-    #[tokio::test]
-    async fn a_replayed_op_id_does_not_append_a_second_audit_row() {
-        let (_td, mut sm) = fresh_sm(None).await;
-        let first = apply_one(&mut sm, 1, put(7, 8080, json!([{ "id": "a" }]))).await;
-        let replay = apply_one(&mut sm, 2, put(7, 8080, json!([{ "id": "a" }]))).await;
-        assert_eq!(replay, first, "the replay returns the original response");
-
-        let rows = audit_rows(&sm);
-        assert_eq!(
-            rows.len(),
-            1,
-            "a replay is not a second write and must not be a second row: {rows:?}"
-        );
-        assert_eq!(rows[0].revision, 1, "the row keeps the original revision");
-    }
-
-    /// A refusal is a committed decision, and the audit stream records it. "Who
-    /// tried to do what and was refused" is the half of an audit log that
-    /// matters most.
-    #[tokio::test]
-    async fn a_refusal_is_audited_as_a_committed_failed_decision() {
-        let (_td, mut sm) = fresh_sm(None).await;
-        let mut req = request(
-            9,
-            ControlOp::PatchStubs {
-                tenant: TenantId::default(),
-                port: 4444,
-                edit: StubEditScript(vec![StubEdit::DeleteById {
-                    id: "nope".to_owned(),
-                }]),
-            },
-        );
-        req.principal = Some("default/mallory".to_owned());
-
-        let response = apply_one(&mut sm, 3, req).await;
-        let ControlOutcome::Failed { .. } = &response.outcome else {
-            panic!(
-                "patching an absent port must fail, got {:?}",
-                response.outcome
-            );
-        };
-
-        let rows = audit_rows(&sm);
-        assert_eq!(rows.len(), 1, "a refusal is still a row: {rows:?}");
-        assert_eq!(rows[0].principal.as_deref(), Some("default/mallory"));
-        assert_eq!(rows[0].revision, 3);
-        assert_eq!(
-            rows[0].outcome, response.outcome,
-            "the audited outcome is the committed one, verbatim"
-        );
-    }
-
     /// §11 open question 1, as a test: a quota refusal is not an error the
     /// submitter sees at submit time — it is a committed `Failed` at a revision,
     /// which is exactly what makes it discoverable through `op_status` after a
@@ -14867,14 +14246,6 @@ mod tests {
                 .is_none(),
             "a refused write must not land"
         );
-
-        let refusal_row = audit_rows(&sm)
-            .into_iter()
-            .find(|r| r.revision == 3)
-            .expect("the refusal is audited");
-        assert_eq!(refusal_row.outcome, refused.outcome);
-        assert_eq!(refusal_row.tenant, TenantId::new("acme"));
-        assert_eq!(refusal_row.resource, "8081");
     }
 
     /// The `max_imposters` count excludes the port being written, so a tenant
@@ -15023,240 +14394,24 @@ mod tests {
         }
     }
 
-    /// AC3. Retention is measured on the replicated logical clock, and this test
-    /// is built so that a local `SystemTime::now()` could not possibly pass it:
-    /// every timestamp here is decades in the past, so a GC reading the wall
-    /// clock would find *everything* expired and drop the row that must survive.
-    #[tokio::test]
-    async fn audit_retention_gc_runs_on_the_replicated_clock_not_the_local_one() {
-        let (_td, sm) = fresh_sm(None).await;
-        let mut sm = sm.with_audit_retention_secs(100);
-
-        // Three writes on a logical clock that has nothing to do with now.
-        for (index, ts) in [(1u64, 1_000u64), (2, 1_050), (3, 1_090)] {
-            let mut req = put(
-                u128::from(index),
-                8080 + index as u16,
-                json!([{ "id": "a" }]),
-            );
-            req.issued_at_secs = ts;
-            apply_one(&mut sm, index, req).await;
-        }
-        assert_eq!(audit_rows(&sm).len(), 3, "nothing has expired yet");
-
-        // A fourth write advances the replicated clock to 1_200. GC runs against
-        // the clock as it stood *before* its batch (see `gc_audit`), so this
-        // apply does not yet sweep — the fifth one does, with a cutoff of 1_100.
-        let mut advance = put(4, 8099, json!([{ "id": "a" }]));
-        advance.issued_at_secs = 1_200;
-        apply_one(&mut sm, 4, advance).await;
-        assert_eq!(
-            audit_rows(&sm).len(),
-            4,
-            "expiry lags the clock-advancing write by one apply, identically on \
-             every replica"
-        );
-
-        let mut sweep = put(5, 8098, json!([{ "id": "a" }]));
-        sweep.issued_at_secs = 1_200;
-        apply_one(&mut sm, 5, sweep).await;
-
-        let rows = audit_rows(&sm);
-        assert_eq!(
-            rows.iter().map(|r| r.revision).collect::<Vec<_>>(),
-            vec![4, 5],
-            "GC must expire on the replicated clock's cutoff of 1_100, keeping \
-             only the rows inside the window: {rows:?}"
-        );
-        assert!(
-            rows.iter().all(|r| r.ts_secs == 1_200),
-            "a wall-clock GC would have dropped these too — every timestamp in \
-             this test is decades old, so this assertion is what distinguishes \
-             the replicated clock from SystemTime::now(): {rows:?}"
-        );
-    }
-
-    /// `0` means keep everything. An operator who turns retention off must not
-    /// lose their history to a zero that reads as "expire immediately".
-    #[tokio::test]
-    async fn audit_retention_of_zero_keeps_every_row() {
-        let (_td, sm) = fresh_sm(None).await;
-        let mut sm = sm.with_audit_retention_secs(0);
-        for index in 1u64..=3 {
-            let mut req = put(
-                u128::from(index),
-                8080 + index as u16,
-                json!([{ "id": "a" }]),
-            );
-            req.issued_at_secs = index * 1_000_000;
-            apply_one(&mut sm, index, req).await;
-        }
-        assert_eq!(
-            audit_rows(&sm).len(),
-            3,
-            "retention 0 is 'forever', not 'expire immediately'"
-        );
-    }
-
-    /// AC4, snapshot half — and the #134/#137 mutant #165 keeps standing: drop
-    /// `audit` from `SnapshotPayload` and a follower that joins by snapshot
-    /// install comes back with an empty history and nothing reports a gap.
-    #[tokio::test]
-    async fn audit_rows_survive_a_snapshot_build_and_install() {
-        let (_td, mut sm) = fresh_sm(None).await;
-        let mut req = put(7, 8080, json!([{ "id": "a" }]));
-        req.principal = Some("default/alice".to_owned());
-        apply_one(&mut sm, 1, req).await;
-        let before = audit_rows(&sm);
-        assert_eq!(before.len(), 1);
-
-        let mut builder = sm.clone();
-        let Snapshot { meta, snapshot } = builder.build_snapshot().await.expect("build snapshot");
-
-        let (_td2, mut follower) = fresh_sm(None).await;
-        follower
-            .install_snapshot(&meta, snapshot)
-            .await
-            .expect("install");
-
-        assert_eq!(
-            audit_rows(&follower),
-            before,
-            "a node that joins by snapshot install must hold the same audit \
-             history as the node it joined from"
-        );
-    }
-
-    /// The #164 tables must ride the snapshot too — and this test exists
-    /// because the one that was supposed to cover them did not.
-    ///
-    /// `sink_and_checkpoint_survive_a_restart_and_snapshot_install` in
-    /// `tests/cluster.rs` restarts a node in a 3-node fleet. openraft here runs
-    /// the default `LogEntries(5000)` snapshot policy, and that fleet commits a
-    /// few dozen entries, so **no snapshot is ever built**: the node restores
-    /// from its own redb and the test proves restart-and-replay, not
-    /// `install_snapshot`. The chaos README already records the same correction
-    /// for C18 and C22. So the snapshot round trip is gated here, in process,
-    /// by driving `build_snapshot`/`install_snapshot` directly — exactly as
-    /// `audit_rows_survive_a_snapshot_build_and_install` does for #163's rows.
-    ///
-    /// The standing mutant (#134/#137): drop any of these three from
-    /// `SnapshotPayload` and a node joining by snapshot comes back either not
-    /// exporting at all, re-shipping the whole retained history to the
-    /// customer's bucket, or reporting a clean stream over a window retention
-    /// has already deleted.
-    #[tokio::test]
-    async fn the_audit_export_sink_checkpoint_and_gc_watermark_survive_a_snapshot_install() {
-        let (_td, sm) = fresh_sm(None).await;
-        // Retention short enough that GC actually runs below, so the watermark
-        // under test is a real one rather than a zero that would pass whether
-        // or not it was carried.
-        let mut sm = sm.with_audit_retention_secs(100);
-
-        apply_one(
-            &mut sm,
-            1,
-            request_at(
-                1,
-                1_000,
-                ControlOp::AuditSinkPut {
-                    tenant: TenantId::new(FLEET_SCOPE),
-                    uri: "s3://acme-audit/rift/".to_owned(),
-                    auth_ref: Some("prod-collector".to_owned()),
-                    batch_max_rows: 250,
-                },
-            ),
-        )
-        .await;
-        apply_one(
-            &mut sm,
-            2,
-            request_at(
-                2,
-                1_000,
-                ControlOp::AuditCheckpointPut {
-                    tenant: TenantId::new(FLEET_SCOPE),
-                    revision: 1,
-                },
-            ),
-        )
-        .await;
-
-        // Age the sink-declaration row out so GC records a watermark, the same
-        // clock-advance-then-sweep shape
-        // `audit_retention_gc_runs_on_the_replicated_clock_not_the_local_one`
-        // uses (expiry lags the advancing write by one apply).
-        for (index, ts) in [(3u64, 1_200u64), (4, 1_200)] {
-            let mut advance = put(
-                u128::from(index),
-                8080 + index as u16,
-                json!([{ "id": "a" }]),
-            );
-            advance.issued_at_secs = ts;
-            apply_one(&mut sm, index, advance).await;
-        }
-
-        let sink_before = sm.audit_sink().expect("read sink");
-        let checkpoint_before = sm.audit_checkpoint().expect("read checkpoint");
-        let watermark_before = sm.audit_gc_watermark().expect("read watermark");
-        assert!(sink_before.is_some(), "a sink was declared");
-        assert_eq!(checkpoint_before, 1);
-        assert!(
-            watermark_before > 0,
-            "GC must have run for the watermark to be worth carrying; without              this the assertion below would pass on a payload that dropped it"
-        );
-
-        let mut builder = sm.clone();
-        let Snapshot { meta, snapshot } = builder.build_snapshot().await.expect("build snapshot");
-
-        let (_td2, mut follower) = fresh_sm(None).await;
-        follower
-            .install_snapshot(&meta, snapshot)
-            .await
-            .expect("install");
-
-        assert_eq!(
-            follower.audit_sink().expect("read sink"),
-            sink_before,
-            "a node joining by snapshot install must inherit the fleet's sink;              without it, it stops exporting the moment it wins an election"
-        );
-        assert_eq!(
-            follower.audit_checkpoint().expect("read checkpoint"),
-            checkpoint_before,
-            "without the checkpoint it resumes from zero and re-ships the whole              retained history to the customer's bucket"
-        );
-        assert_eq!(
-            follower.audit_gc_watermark().expect("read watermark"),
-            watermark_before,
-            "without the watermark it forgets retention ever deleted anything              and reports a clean stream over a permanent hole"
-        );
-    }
-
-    /// An older snapshot, written before #164 existed, must still install —
+    /// An older snapshot, written before #185 existed, must still install —
     /// same `#[serde(default)]` contract every table added since #134 carries.
     #[tokio::test]
-    async fn a_pre_audit_export_snapshot_still_installs() {
+    async fn a_pre_session_key_snapshot_still_installs() {
         let (td, mut sm) = fresh_sm(None).await;
         apply_one(&mut sm, 1, put(1, 8080, json!([{ "id": "a" }]))).await;
         let mut builder = sm.clone();
         let Snapshot { meta, snapshot } = builder.build_snapshot().await.expect("build snapshot");
 
-        // Strip the #164 fields plus #185's `session_key`, standing in for a payload serialized
-        // by a binary that predates all of them.
+        // Strip #185's `session_key`, standing in for a payload serialized by a binary that
+        // predates it.
         let mut payload: serde_json::Value =
             serde_json::from_slice(&read_snapshot_bytes(snapshot).await)
                 .expect("snapshot payload is JSON");
-        for field in [
-            "audit_sink",
-            "audit_checkpoint",
-            "audit_gc_watermark",
-            "session_key",
-        ] {
-            payload
-                .as_object_mut()
-                .expect("payload is an object")
-                .remove(field);
-        }
+        payload
+            .as_object_mut()
+            .expect("payload is an object")
+            .remove("session_key");
         let stripped =
             snapshot_handle_from(td.path(), &serde_json::to_vec(&payload).expect("re-encode"))
                 .await;
@@ -15265,10 +14420,7 @@ mod tests {
         follower
             .install_snapshot(&meta, stripped)
             .await
-            .expect("a pre-#164/#185 snapshot must still install");
-        assert_eq!(follower.audit_sink().expect("read sink"), None);
-        assert_eq!(follower.audit_checkpoint().expect("read checkpoint"), 0);
-        assert_eq!(follower.audit_gc_watermark().expect("read watermark"), 0);
+            .expect("a pre-#185 snapshot must still install");
         assert_eq!(follower.session_key().expect("read session key"), None);
     }
 
@@ -15374,7 +14526,7 @@ mod tests {
     }
 
     /// RFC-006 §5.3, issue #185: the session-signing key must travel through a snapshot install
-    /// exactly like `sm_audit_sink` does — miss this and a node that joins by snapshot cannot
+    /// like every other replicated table — miss this and a node that joins by snapshot cannot
     /// verify cookies the rest of the fleet accepts, and if it is the one that later serves a
     /// login, it silently mints a second key that invalidates every outstanding session fleet-wide.
     #[tokio::test]
@@ -15413,128 +14565,11 @@ mod tests {
         );
     }
 
-    /// AC4, restart half: the rows are in redb, not in memory, so reopening the
-    /// same database file serves them.
-    #[tokio::test]
-    async fn audit_rows_survive_reopening_the_database() {
-        let td = TempDir::new().expect("tempdir");
-        let path = td.path().join("raft.redb");
-        let before = {
-            let (_, mut sm) = new(&path).await.expect("open store");
-            apply_one(&mut sm, 1, put(7, 8080, json!([{ "id": "a" }]))).await;
-            audit_rows(&sm)
-        };
-        let (_, sm) = new(&path).await.expect("reopen store");
-        assert_eq!(
-            audit_rows(&sm),
-            before,
-            "audit history must survive a restart"
-        );
-        assert_eq!(before.len(), 1);
-    }
-
-    /// `since` is a range scan from a revision, and `limit` bounds the response.
-    /// The endpoint is reachable by any tenant admin, so an unbounded read would
-    /// be an unbounded response.
-    #[tokio::test]
-    async fn audit_since_scans_from_a_revision_and_respects_its_limit() {
-        let (_td, mut sm) = fresh_sm(None).await;
-        for index in 1u64..=5 {
-            apply_one(
-                &mut sm,
-                index,
-                put(
-                    u128::from(index),
-                    8080 + index as u16,
-                    json!([{ "id": "a" }]),
-                ),
-            )
-            .await;
-        }
-
-        let from_three = sm.audit_since(3, None, 10_000).expect("read");
-        assert_eq!(
-            from_three.iter().map(|r| r.revision).collect::<Vec<_>>(),
-            vec![3, 4, 5],
-            "since is inclusive and ascending by revision"
-        );
-
-        let limited = sm.audit_since(0, None, 2).expect("read");
-        assert_eq!(limited.len(), 2, "limit bounds the response");
-        assert_eq!(limited[0].revision, 1, "and takes the oldest first");
-    }
-
-    /// The tenant filter is applied in the store, not by the caller: handing a
-    /// tenant admin the fleet's rows and trusting a client to narrow them would
-    /// mean the server had already sent another tenant's audit history.
-    #[tokio::test]
-    async fn audit_since_filters_by_tenant_in_the_store() {
-        let (_td, mut sm) = fresh_sm(None).await;
-        apply_one(&mut sm, 1, tenant_put_req(1, "acme", "Acme")).await;
-        apply_one(&mut sm, 2, tenant_put_req(2, "globex", "Globex")).await;
-        apply_one(&mut sm, 3, put_in_tenant(3, "acme", 8080)).await;
-        apply_one(&mut sm, 4, put_in_tenant(4, "globex", 8081)).await;
-
-        let acme = sm.audit_since(0, Some("acme"), 10_000).expect("read");
-        assert!(
-            acme.iter().all(|r| r.tenant.as_str() == "acme"),
-            "a tenant-scoped read must not leak another tenant's rows: {acme:?}"
-        );
-        assert!(
-            acme.iter().any(|r| r.resource == "8080"),
-            "and must still contain its own: {acme:?}"
-        );
-
-        let fleet = sm.audit_since(0, None, 10_000).expect("read");
-        assert!(
-            fleet.len() > acme.len(),
-            "an unfiltered read is the fleet's"
-        );
-    }
-
-    /// AC6, as deviated. RFC-002 §6 reasons that a fleet-wide delete "carries no
-    /// port, therefore no tenant" and asks for `tenant: null`. #159 has since put
-    /// an explicit tenant on every op, so the delete knows exactly whose
-    /// imposters it destroyed — and recording `null` would hide that in the row
-    /// describing the most destructive operation in the set. The wildcard
-    /// belongs in `resource`, and this asserts it lands there, so the choice is
-    /// pinned rather than left to be re-litigated as a bug.
-    #[tokio::test]
-    async fn delete_all_is_audited_with_the_real_tenant_and_a_wildcard_resource() {
-        let (_td, mut sm) = fresh_sm(None).await;
-        apply_one(&mut sm, 1, tenant_put_req(1, "acme", "Acme")).await;
-        apply_one(&mut sm, 2, put_in_tenant(2, "acme", 8080)).await;
-        apply_one(
-            &mut sm,
-            3,
-            request(
-                3,
-                ControlOp::DeleteAll {
-                    tenant: TenantId::new("acme"),
-                },
-            ),
-        )
-        .await;
-
-        let row = audit_rows(&sm)
-            .into_iter()
-            .find(|r| r.revision == 3)
-            .expect("the delete is audited");
-        assert_eq!(
-            row.tenant,
-            TenantId::new("acme"),
-            "the row names whose imposters were destroyed"
-        );
-        assert_eq!(row.resource, AUDIT_RESOURCE_ALL);
-        assert_eq!(row.action, "imposter.delete");
-    }
-
     /// U-10 (upstream #855). The admin request task's `with_principal_scope` does
     /// not survive the hop to openraft's state-machine task, so without the
     /// re-opened scope in `drive_engine` every clustered change event reaches
-    /// M3's SSE and the #164 export sink unattributed. The audit table being
-    /// correctly attributed does not help them — they are on the event path, not
-    /// the log path.
+    /// M3's SSE unattributed. The log entry being correctly attributed does not
+    /// help it — it is on the event path, not the log path.
     #[tokio::test]
     async fn a_clustered_change_event_carries_the_principal_from_the_log() {
         use rift_cluster_base::seams::{EventContext, ImposterEvent, ImposterEventListener};
@@ -15796,59 +14831,6 @@ mod tests {
             ports_in_tenant(&sm, "acme"),
             Vec::<u16>::new(),
             "nothing lands from a refused pull"
-        );
-    }
-
-    /// The audit projection lives in the `Normal` arm, so entries that carry no
-    /// `ControlOp` must produce no rows at all. This is the other half of
-    /// exactly-once: not just "no duplicates", but "nothing invented".
-    #[tokio::test]
-    async fn a_blank_entry_produces_no_audit_row() {
-        let (_td, mut sm) = fresh_sm(None).await;
-        let blank = Entry::<TypeConfig> {
-            log_id: LogId::new(CommittedLeaderId::new(1, 1), 1),
-            payload: EntryPayload::Blank,
-        };
-        sm.apply(vec![blank, entry(2, put(7, 8080, json!([{ "id": "a" }])))])
-            .await
-            .expect("apply");
-
-        let rows = audit_rows(&sm);
-        assert_eq!(
-            rows.len(),
-            1,
-            "only the write is audited; a Blank entry is not a write: {rows:?}"
-        );
-        assert_eq!(rows[0].revision, 2);
-    }
-
-    /// Every other test here applies one entry at a time. A committed batch is
-    /// the shape that would break a projection keyed on anything batch-scoped,
-    /// and `gc_audit`'s clock genuinely *is* batch-scoped — so the batch case is
-    /// worth its own assertion rather than an assumption.
-    #[tokio::test]
-    async fn every_entry_in_one_committed_batch_gets_its_own_audit_row() {
-        let (_td, mut sm) = fresh_sm(None).await;
-        let batch: Vec<_> = (1u64..=3)
-            .map(|i| {
-                entry(
-                    i,
-                    put(u128::from(i), 8080 + i as u16, json!([{ "id": "a" }])),
-                )
-            })
-            .collect();
-        let responses = sm.apply(batch).await.expect("apply");
-        assert_eq!(responses.len(), 3);
-
-        let rows = audit_rows(&sm);
-        assert_eq!(
-            rows.iter().map(|r| r.revision).collect::<Vec<_>>(),
-            vec![1, 2, 3],
-            "one row per entry, at its own revision: {rows:?}"
-        );
-        assert_eq!(
-            rows.iter().map(|r| r.resource.as_str()).collect::<Vec<_>>(),
-            vec!["8081", "8082", "8083"]
         );
     }
 

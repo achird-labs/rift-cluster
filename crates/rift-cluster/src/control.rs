@@ -438,7 +438,7 @@ pub enum Role {
 
 /// The envelope every log entry carries: the op plus the identity needed for
 /// dedup (`op_id`, from the client's `Idempotency-Key` or minted by the
-/// accepting node) and audit (`principal`, populated once RFC-002 lands).
+/// accepting node) and attribution (`principal`, RFC-002 §6).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ControlRequest {
     pub op_id: Uuid,
@@ -475,6 +475,17 @@ pub struct ControlRequest {
 /// records first (this slice) and enforcement second means the wire format
 /// and the replicated tables are stable before anything depends on them for
 /// access control.
+///
+/// **Removing a variant is a log-format break, and #546 took one deliberately.**
+/// This enum is externally-tagged `serde_json` with no envelope version and no
+/// `#[serde(other)]` catch-all — `raft::store` writes entries with
+/// `serde_json::to_vec` and reads them back with `from_slice` — so a variant that
+/// is gone here cannot be decoded at all: a node replaying a log that still holds
+/// an `AuditSinkPut`, `AuditSinkDelete`, `AuditCheckpointPut` or
+/// `DatasetContentRead` entry fails to start rather than skipping it. Pre-release
+/// that is the right trade, and clean removal is why it was taken; a fleet
+/// upgrading across this commit starts from a fresh `cluster-state-dir`. A
+/// *post*-release removal would have to keep the variant as an ignored arm.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ControlOp {
     PutImposter {
@@ -589,7 +600,7 @@ pub enum ControlOp {
     /// **Principals are a fleet-global namespace, and `tenant` does not scope
     /// them.** [`Principal`] rows are keyed by [`PrincipalId`] alone (see
     /// `SM_PRINCIPALS_TABLE`'s doc in `raft::store`); `tenant` is recorded for
-    /// audit and checked for liveness, nothing more. Two different tenants
+    /// attribution and checked for liveness, nothing more. Two different tenants
     /// naming the same [`PrincipalId`] address the *same* record, so the
     /// second write replaces the first — including its credential.
     ///
@@ -641,44 +652,6 @@ pub enum ControlOp {
         tenant: TenantId,
         principal_id: PrincipalId,
     },
-    /// Declare (or replace) the fleet's audit export sink (#164).
-    ///
-    /// Fleet state rather than node config, so every node agrees on where the
-    /// audit stream goes and a node joining inherits it. `auth_ref` is the
-    /// *name* of a credential and never a credential — the same split
-    /// [`ControlOp::SourcePut`] enforces, using the same
-    /// `require_credential_free_uri` check, so a secret cannot enter the
-    /// replicated log by either door.
-    ///
-    /// One sink, fleet-wide. A per-tenant sink would need a checkpoint per
-    /// tenant; the checkpoint here is a single revision, and that is the whole
-    /// mechanism by which a failover resumes rather than restarting.
-    AuditSinkPut {
-        tenant: TenantId,
-        uri: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        auth_ref: Option<String>,
-        /// Rows per shipped batch. Bounded by [`validate`].
-        batch_max_rows: u32,
-    },
-    /// Remove the audit export sink; the exporter goes quiet without losing its
-    /// checkpoint, so re-declaring a sink resumes rather than re-ships history.
-    AuditSinkDelete {
-        tenant: TenantId,
-    },
-    /// The last revision the leader has successfully shipped (#164).
-    ///
-    /// Committed *after* the batch is on the wire, never before — that ordering
-    /// is the at-least-once guarantee: a leader dying in between re-ships the
-    /// batch, and the consumer dedups on `(revision, op_id)`.
-    ///
-    /// Applied as `max(existing, new)` so a stale leader's late write cannot
-    /// rewind the stream. Deliberately **not** audited — see
-    /// [`ControlOp::audit_action`].
-    AuditCheckpointPut {
-        tenant: TenantId,
-        revision: u64,
-    },
     /// Mint or rotate the fleet's session-signing key (RFC-006 §5.3, issue #185).
     ///
     /// One key, fleet-wide, so every node verifies a console session cookie from its own applied
@@ -686,11 +659,11 @@ pub enum ControlOp {
     /// and rotating are; the steady state is pure local verification.
     ///
     /// **This op deliberately carries a secret into the replicated log, which
-    /// [`ControlOp::SourcePut`] and [`ControlOp::AuditSinkPut`] both refuse to do.** The
-    /// distinction is what the secret means outside the fleet:
+    /// [`ControlOp::SourcePut`] refuses to do.** The distinction is what the secret means outside
+    /// the fleet:
     ///
-    /// - Those ops carry the *name* of an operator credential for a third-party system (an S3
-    ///   bucket, a webhook). Replicating one would spread a credential that has power somewhere
+    /// - That op carries the *name* of an operator credential for a third-party system (an S3
+    ///   bucket, a git host). Replicating one would spread a credential that has power somewhere
     ///   else, so `validate` refuses it and only a reference travels.
     /// - This key is fleet-internal and meaningless anywhere else. It cannot be stored hashed the
     ///   way a principal's API key is (`argon2id`, RFC-002 §3.2), because verifying an HMAC needs
@@ -862,24 +835,6 @@ pub enum ControlOp {
         tenant: TenantId,
         name: String,
     },
-    /// A dataset's bytes were exported (RFC-002 §9's single named exception, issue #287).
-    ///
-    /// **Changes nothing.** It exists only so the export leaves a trace, and it is an op rather
-    /// than a local log line because audit rows are written inside apply, keyed by log index, and
-    /// replicate with everything else. A record written outside Raft would make "who exported
-    /// these bytes" depend on which node happened to answer.
-    ///
-    /// Carries the resolved `digest`, not just the name: a name can be re-versioned, and the
-    /// question the record has to answer is *which bytes left*, not which label they had.
-    ///
-    /// The read commits before the bytes are served, and a commit that fails refuses the read —
-    /// exporting unrecorded is the one outcome this op exists to prevent.
-    DatasetContentRead {
-        tenant: TenantId,
-        name: String,
-        version: u64,
-        digest: Digest,
-    },
 }
 
 /// The stub half of a [`ControlOp::ProxyRecorded`]: the generated stub plus everything its
@@ -922,32 +877,6 @@ pub struct SessionKey {
 /// Bytes in a session-signing key. 32 is HMAC-SHA256's block-optimal size — longer buys nothing,
 /// shorter weakens it.
 pub const SESSION_KEY_BYTES: usize = 32;
-
-/// The fleet's audit export sink, as applied state (#164).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct AuditSink {
-    /// `https://` (webhook, JSON lines) or `s3://` (bucket, batched objects).
-    /// Never carries credentials — [`validate`] refuses a URI whose authority
-    /// has any.
-    pub uri: String,
-    /// The *name* of a node-local credential, resolved at export time. Safe to
-    /// serve back over the admin API precisely because it is not a secret.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub auth_ref: Option<String>,
-    pub batch_max_rows: u32,
-    /// The revision of the `AuditSinkPut` that produced this record.
-    pub revision: u64,
-}
-
-/// Rows per shipped batch when an operator does not choose. Small enough that a
-/// re-ship after a failover is cheap, large enough that a busy fleet is not
-/// shipping one row per request.
-pub const DEFAULT_AUDIT_BATCH_MAX_ROWS: u32 = 500;
-
-/// Ceiling on `batch_max_rows`. A batch is buffered in memory and shipped as
-/// one request; an unbounded value is an operator-set OOM.
-pub const MAX_AUDIT_BATCH_MAX_ROWS: u32 = 10_000;
 
 /// How a source is kept current.
 ///
@@ -1193,74 +1122,43 @@ pub enum StubEdit {
     },
 }
 
-/// One audit record (RFC-002 §9, issue #163).
-///
-/// **Derived at apply, from the committed log entry** — never written by the
-/// handler that accepted the request. That is the entire design: the #14 intent
-/// log *is* the write-path audit record, so a row computed from it cannot
-/// disagree with it, and every replica applying the same entry computes the
-/// identical row. An audit log that can disagree with the thing it audits is
-/// worse than none.
-///
-/// The consequence worth stating, because it is unusual in this crate:
-/// **`GET /admin/audit` needs no fan-out.** Any node answers from local state.
-/// (Contrast the M3 request journal, #147, which is genuinely per-node and
-/// needs merge-on-read — do not import that machinery here.)
-///
-/// # What is not in here
-///
-/// Only ops that reach the log. Reads are not audited in v1 (§9, on volume),
-/// and — the part that is easy to misread as a bug — neither are the
-/// *reads-that-mutate* still served over the **proxy** path (`ScenarioReset`,
-/// and the flow-state half of a space teardown). Those are forwarded to the
-/// loopback core admin and never become a [`ControlOp`], so a log-derived
-/// projection cannot see them. Auditing them means putting them on consensus;
-/// recording them at the front door instead would produce per-node rows that can
-/// disagree with the log, which is the one thing this design refuses.
-///
-/// `SavedRequestsClear` **used to be on that list and no longer is.** Issue #224
-/// took the clear onto consensus as [`ControlOp::JournalClearGen`] — for
-/// convergence rather than for auditing, but the audit row falls out of that for
-/// free, which is exactly the trade this paragraph describes. The `?match=`
-/// narrowed form stays proxied and therefore stays unaudited: it is a targeted,
-/// best-effort per-shard deletion with no fleet-wide meaning to record.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct AuditRow {
-    /// The applying entry's `issued_at_secs` — the replicated clock, so the
-    /// timestamp is identical on every replica rather than each node's idea of
-    /// now.
-    pub ts_secs: u64,
-    /// Who ([`ControlRequest::principal`]). `None` for an op submitted with no
-    /// attribution — the open admin plane, or an internal submitter.
-    pub principal: Option<String>,
-    /// The tenant the op acted on.
-    ///
-    /// Never null, and deliberately so. RFC-002 §6 reasons that a fleet-wide
-    /// delete "carries no port, therefore no tenant" — but #159 put an explicit
-    /// `tenant` on **every** op, so a [`ControlOp::DeleteAll`] destroys one
-    /// named tenant's imposters and knows exactly which. Recording `null` there
-    /// would hide whose data was destroyed, in the row describing the most
-    /// destructive operation in the set. The wildcard belongs in `resource`,
-    /// which is where it is.
-    pub tenant: TenantId,
-    /// The RFC-002 §4.1 action slug — the same strings `authz::Action::as_str`
-    /// produces, so an audit row and an authorization decision name the same
-    /// thing.
-    pub action: String,
-    /// What was acted on: a port, an id, or `"*"` for a whole-scope op.
-    pub resource: String,
-    pub op_id: Uuid,
-    /// The applying log index — the same number the write's response carried.
-    pub revision: u64,
-    pub outcome: ControlOutcome,
-}
-
-/// The wildcard [`AuditRow::resource`] for an op that addresses a whole scope
-/// rather than one object.
-pub const AUDIT_RESOURCE_ALL: &str = "*";
-
 impl ControlOp {
+    /// The variant's name, for the committed-write log line (`RaftNode::write`). Exhaustive
+    /// with no wildcard arm so a new op cannot land in the trail as "unknown".
+    #[must_use]
+    pub fn kind(&self) -> &'static str {
+        match self {
+            ControlOp::PutImposter { .. } => "PutImposter",
+            ControlOp::PatchStubs { .. } => "PatchStubs",
+            ControlOp::DeleteImposter { .. } => "DeleteImposter",
+            ControlOp::DeleteAll { .. } => "DeleteAll",
+            ControlOp::SetEnabled { .. } => "SetEnabled",
+            ControlOp::PutRoutes { .. } => "PutRoutes",
+            ControlOp::DeleteRoute { .. } => "DeleteRoute",
+            ControlOp::SourcePut { .. } => "SourcePut",
+            ControlOp::SourceDelete { .. } => "SourceDelete",
+            ControlOp::SourcePullResult { .. } => "SourcePullResult",
+            ControlOp::TenantPut { .. } => "TenantPut",
+            ControlOp::TenantDelete { .. } => "TenantDelete",
+            ControlOp::PrincipalPut { .. } => "PrincipalPut",
+            ControlOp::PrincipalCreate { .. } => "PrincipalCreate",
+            ControlOp::PrincipalDelete { .. } => "PrincipalDelete",
+            ControlOp::BindingPut { .. } => "BindingPut",
+            ControlOp::BindingDelete { .. } => "BindingDelete",
+            ControlOp::SessionKeyPut { .. } => "SessionKeyPut",
+            ControlOp::FleetNamePut { .. } => "FleetNamePut",
+            ControlOp::JournalClearGen { .. } => "JournalClearGen",
+            ControlOp::ProxyRecorded { .. } => "ProxyRecorded",
+            ControlOp::ProxyRecordedClear { .. } => "ProxyRecordedClear",
+            ControlOp::SpecPut { .. } => "SpecPut",
+            ControlOp::SpecDelete { .. } => "SpecDelete",
+            ControlOp::SpecBind { .. } => "SpecBind",
+            ControlOp::SpecUnbind { .. } => "SpecUnbind",
+            ControlOp::DatasetPut { .. } => "DatasetPut",
+            ControlOp::DatasetDelete { .. } => "DatasetDelete",
+        }
+    }
+
     /// The tenant this op acts on. Every variant has one (#159).
     #[must_use]
     pub fn tenant(&self) -> &TenantId {
@@ -1282,9 +1180,6 @@ impl ControlOp {
             | ControlOp::PrincipalDelete { tenant, .. }
             | ControlOp::BindingPut { tenant, .. }
             | ControlOp::BindingDelete { tenant, .. }
-            | ControlOp::AuditSinkPut { tenant, .. }
-            | ControlOp::AuditSinkDelete { tenant }
-            | ControlOp::AuditCheckpointPut { tenant, .. }
             | ControlOp::SessionKeyPut { tenant, .. }
             | ControlOp::FleetNamePut { tenant, .. }
             | ControlOp::JournalClearGen { tenant, .. }
@@ -1295,163 +1190,7 @@ impl ControlOp {
             | ControlOp::SpecBind { tenant, .. }
             | ControlOp::SpecUnbind { tenant, .. }
             | ControlOp::DatasetPut { tenant, .. }
-            | ControlOp::DatasetDelete { tenant, .. }
-            | ControlOp::DatasetContentRead { tenant, .. } => tenant,
-        }
-    }
-
-    /// The §4.1 action slug for [`AuditRow::action`], or `None` for an op that
-    /// is deliberately not audited.
-    ///
-    /// Exhaustive with no wildcard arm, for the same reason
-    /// `admin_front::action_for` is: a new op added without deciding what it is
-    /// called in the audit stream should fail to compile, not appear under
-    /// whatever the fallthrough happened to say. The `Option` keeps that
-    /// property while letting an op opt *out* explicitly — silence has to be a
-    /// decision someone wrote down, not a missing arm.
-    ///
-    /// Exactly one op opts out today, and it has to:
-    /// [`ControlOp::AuditCheckpointPut`] records how far the exporter has
-    /// shipped. Auditing it would append a row, which the exporter would then
-    /// ship, which would write a new checkpoint, which would append a row —
-    /// an unbounded loop whose whole content is the loop itself.
-    #[must_use]
-    pub fn audit_action(&self) -> Option<&'static str> {
-        Some(match self {
-            ControlOp::AuditCheckpointPut { .. } => return None,
-            // The second op that opts out, for the same "the silence is a decision" reason:
-            // a recording is data-plane behavior — a proxied request the engine chose to
-            // record — with no administrative principal behind it, and under proxyAlways it
-            // commits once per proxied request. Auditing it would flood the stream that
-            // exists to carry administrative intent with traffic-rate noise (#226).
-            ControlOp::ProxyRecorded { .. } => return None,
-            ControlOp::PutImposter { .. } => "imposter.write",
-            ControlOp::PatchStubs { .. } => "stub.write",
-            ControlOp::DeleteImposter { .. } | ControlOp::DeleteAll { .. } => "imposter.delete",
-            ControlOp::SetEnabled { .. } => "lifecycle.toggle",
-            // The front door's route table predates §4.1's closed list and has
-            // no action of its own; `admin_front::action_for` gates it as an
-            // imposter-tier config write, and this matches that decision rather
-            // than inventing a second name for the same thing.
-            ControlOp::PutRoutes { .. } => "imposter.write",
-            ControlOp::DeleteRoute { .. } => "imposter.write",
-            // Sources are authorized under the existing config actions — there
-            // is deliberately no `SourceWrite` action (D-29): the audit stream
-            // already emits these names for the ops, and a new one would let
-            // the gate and the audit disagree.
-            ControlOp::SourcePut { .. } | ControlOp::SourcePullResult { .. } => "imposter.write",
-            ControlOp::SourceDelete { .. } => "imposter.delete",
-            ControlOp::TenantPut { .. }
-            | ControlOp::TenantDelete { .. }
-            | ControlOp::PrincipalPut { .. }
-            | ControlOp::PrincipalCreate { .. }
-            | ControlOp::PrincipalDelete { .. }
-            | ControlOp::BindingPut { .. }
-            | ControlOp::BindingDelete { .. } => "tenant.manage",
-            // Where the fleet's audit goes is a fleet-scoped decision, and it
-            // is named the same thing here as the action that gates the
-            // endpoint (`authz::Action::ClusterAdmin`).
-            ControlOp::AuditSinkPut { .. } | ControlOp::AuditSinkDelete { .. } => "cluster.admin",
-            // Minting or rotating the session key is a fleet-scoped security event, and rotation is
-            // how every console session is revoked at once — precisely the kind of act an auditor
-            // reading an incident timeline needs to see.
-            ControlOp::SessionKeyPut { .. } => "cluster.admin",
-            // Named identically to the session-key and audit-sink arms above: this is the same
-            // "fleet-scoped operator act" category, and a rename is exactly the kind of thing an
-            // incident timeline needs attributed — "which fleet was this?" is unanswerable
-            // afterwards if the rename itself left no row.
-            ControlOp::FleetNamePut { .. } => "cluster.admin",
-            // Unlike `AuditCheckpointPut`, this one IS audited (issue #224): taking the clear onto
-            // consensus is what makes an honest audit row possible at all — the pre-#224 fan-out
-            // had no log entry to attribute one to. Named identically to `authz::Action::SavedRequestsClear`'s
-            // own `as_str()`, matching every other action string here.
-            ControlOp::JournalClearGen { .. } => "savedRequests.clear",
-            // The clustered half of `DELETE .../savedProxyResponses` — gated by the same
-            // `authz::Action::SavedRequestsClear` as the journal clear above, so it carries
-            // the same name in the stream (#226).
-            ControlOp::ProxyRecordedClear { .. } => "savedRequests.clear",
-            // Bind and unbind are writes to the imposter's provenance, not a
-            // spec-record edit, but they share the spec-write name: an
-            // auditor reading the stream should see all three "this port's
-            // spec relationship changed" acts under one action, distinguished
-            // by `audit_resource` and the outcome text.
-            ControlOp::SpecPut { .. }
-            | ControlOp::SpecBind { .. }
-            | ControlOp::SpecUnbind { .. } => "spec.write",
-            ControlOp::SpecDelete { .. } => "spec.delete",
-            ControlOp::DatasetPut { .. } => "dataset.write",
-            ControlOp::DatasetDelete { .. } => "dataset.delete",
-            // The exception RFC-002 §9 names: reads are not audited, except this one. A dataset's
-            // content is a bulk export of whatever the operator uploaded, routinely PII, so it
-            // leaves a trace. Listings and version history do not — keeping the deviation narrow
-            // is what keeps it defensible.
-            ControlOp::DatasetContentRead { .. } => "dataset.read",
-        })
-    }
-
-    /// What this op addressed, for [`AuditRow::resource`].
-    #[must_use]
-    pub fn audit_resource(&self) -> String {
-        match self {
-            ControlOp::PutImposter { config, .. } => config
-                .port
-                .map_or_else(|| AUDIT_RESOURCE_ALL.to_owned(), |port| port.to_string()),
-            ControlOp::PatchStubs { port, .. }
-            | ControlOp::DeleteImposter { port, .. }
-            | ControlOp::SetEnabled { port, .. }
-            | ControlOp::ProxyRecorded { port, .. }
-            | ControlOp::ProxyRecordedClear { port, .. } => port.to_string(),
-            // A whole-scope op names no single object. Wildcard rather than an
-            // empty string so a reader never has to guess whether the field was
-            // omitted or the op really did address everything.
-            ControlOp::DeleteAll { .. }
-            | ControlOp::PutRoutes { .. }
-            | ControlOp::TenantDelete { .. } => AUDIT_RESOURCE_ALL.to_owned(),
-            ControlOp::DeleteRoute { id, .. } => id.clone(),
-            ControlOp::SourcePut { id, .. }
-            | ControlOp::SourceDelete { id, .. }
-            | ControlOp::SourcePullResult { id, .. } => id.clone(),
-            ControlOp::TenantPut { tenant, .. } => tenant.as_str().to_owned(),
-            ControlOp::PrincipalPut { principal, .. } => principal.id.as_str().to_owned(),
-            ControlOp::PrincipalCreate { principal, .. } => principal.id.as_str().to_owned(),
-            ControlOp::PrincipalDelete { principal_id, .. }
-            | ControlOp::BindingPut { principal_id, .. }
-            | ControlOp::BindingDelete { principal_id, .. } => principal_id.as_str().to_owned(),
-            // One sink, fleet-wide: it addresses the whole scope, not a named
-            // object. `AuditCheckpointPut` never reaches here (it is not
-            // audited) but must still answer, so it answers the same way.
-            ControlOp::AuditSinkPut { .. }
-            | ControlOp::AuditSinkDelete { .. }
-            | ControlOp::AuditCheckpointPut { .. }
-            // One key, fleet-wide: it addresses the whole scope, not a named object. The key itself
-            // must never reach an audit row.
-            | ControlOp::SessionKeyPut { .. }
-            // Same reasoning again: one name, fleet-wide, so it addresses the whole scope rather
-            // than a named object.
-            | ControlOp::FleetNamePut { .. } => AUDIT_RESOURCE_ALL.to_owned(),
-            // A port-wide clear addresses the port, exactly like `PatchStubs`/`SetEnabled`; a
-            // space-scoped one addresses the narrower `port/space` pair so an audit reader can
-            // tell the two apart without decoding the outcome text.
-            ControlOp::JournalClearGen { port, space, .. } => match space {
-                Some(space) => format!("{port}/{space}"),
-                None => port.to_string(),
-            },
-            ControlOp::SpecPut { id, .. }
-            | ControlOp::SpecDelete { id, .. }
-            | ControlOp::SpecBind { id, .. } => id.clone(),
-            // Unbind names no spec (it may run after the spec itself is
-            // gone); the port it cleared is the only thing left to address.
-            ControlOp::SpecUnbind { port, .. } => port.to_string(),
-            ControlOp::DatasetPut { record, .. } => record.name.clone(),
-            ControlOp::DatasetDelete { name, .. } => name.clone(),
-            // Not just the name: the row must name the exact bytes, because a name outlives the
-            // version it pointed at.
-            ControlOp::DatasetContentRead {
-                name,
-                version,
-                digest,
-                ..
-            } => format!("{name}@{version} ({digest})"),
+            | ControlOp::DatasetDelete { tenant, .. } => tenant,
         }
     }
 }
@@ -1541,10 +1280,6 @@ pub fn validate(op: &ControlOp) -> Result<(), String> {
             require_real_tenant(tenant)
         }
         ControlOp::DeleteAll { tenant } => require_real_tenant(tenant),
-        // Nothing else to check: this op carries no state to be wrong about — it records that
-        // bytes were exported. Whether those bytes *exist* is per-node state, which is the
-        // front's business before it ever submits, not `validate`'s (see this function's doc).
-        ControlOp::DatasetContentRead { tenant, .. } => require_real_tenant(tenant),
         ControlOp::SetEnabled { tenant, .. } => require_real_tenant(tenant),
         ControlOp::PutRoutes { tenant, table } => {
             require_real_tenant(tenant)?;
@@ -1781,39 +1516,6 @@ pub fn validate(op: &ControlOp) -> Result<(), String> {
             require_tenant_or_fleet_scope(tenant)?;
             require_principal_id(principal_id)
         }
-        ControlOp::AuditSinkPut {
-            tenant,
-            uri,
-            auth_ref,
-            batch_max_rows,
-        } => {
-            require_fleet_scope(tenant)?;
-            // The same call, in the same order, as the `SourcePut` arm: hygiene
-            // strictly before shape. #164 asks for "the same error shape as a
-            // source URI", and reusing the function is the only way to keep
-            // that true as either side changes.
-            require_credential_free_uri(uri)?;
-            require_audit_sink_uri(uri)?;
-            if let Some(auth_ref) = auth_ref
-                && !is_source_name(auth_ref)
-            {
-                return Err(
-                    "auth_ref must be a non-empty name of at most 128 characters drawn from \
-                     [A-Za-z0-9._-]"
-                        .to_owned(),
-                );
-            }
-            if *batch_max_rows == 0 || *batch_max_rows > MAX_AUDIT_BATCH_MAX_ROWS {
-                return Err(format!(
-                    "batchMaxRows must be between 1 and {MAX_AUDIT_BATCH_MAX_ROWS}: a batch is \
-                     buffered whole before it is shipped"
-                ));
-            }
-            Ok(())
-        }
-        ControlOp::AuditSinkDelete { tenant } | ControlOp::AuditCheckpointPut { tenant, .. } => {
-            require_fleet_scope(tenant)
-        }
         ControlOp::SessionKeyPut { tenant, key } => {
             require_fleet_scope(tenant)?;
             // Checked at admission rather than trusted from the caller: a short or malformed key
@@ -2040,13 +1742,12 @@ fn hex_decode(s: &str) -> Option<Vec<u8>> {
         .collect()
 }
 
-/// Several ops (the audit sink, the session-signing key, the fleet name) each address one
-/// fleet-wide piece of state, so the fleet scope is the only tenant any of them may carry.
+/// The session-signing key and the fleet name each address one fleet-wide piece of state, so
+/// the fleet scope is the only tenant either op may carry.
 ///
-/// Refused rather than tolerated: these ops are audited, and `AuditRow::tenant` means "the
-/// tenant the op acted on". Admitting `AuditSinkPut { tenant: "acme" }` — or a fleet rename
-/// under the same tenant — would file a fleet-wide configuration change under one tenant's
-/// name, in the stream this feature exists to produce.
+/// Refused rather than tolerated: `ControlOp::tenant` means "the tenant the op acted on", and
+/// admitting a fleet rename under `tenant: "acme"` would file a fleet-wide configuration change
+/// under one tenant's name in the log that is the record of every change.
 fn require_fleet_scope(tenant: &TenantId) -> Result<(), String> {
     if tenant.as_str() == FLEET_SCOPE {
         Ok(())
@@ -2057,112 +1758,6 @@ fn require_fleet_scope(tenant: &TenantId) -> Result<(), String> {
             tenant.as_str()
         ))
     }
-}
-
-/// Whether `uri` is a cleartext webhook that cannot leave this host.
-///
-/// The one exception to the https-only rule, and it is narrow on purpose: a
-/// loopback sink puts no bytes on a network, so there is nothing for the
-/// cleartext rule to protect. It exists so the export path is exercisable end
-/// to end — by this crate's own tests, and by an operator running a collector
-/// as a sidecar — without standing up a TLS terminator to prove it works.
-///
-/// Shared by [`validate`] (admission) and the transport factory (egress) so
-/// the two enforcement points cannot drift into disagreeing about what
-/// cleartext is permitted. They already did once: admission allowed a loopback
-/// sink the transport then refused to build, which is a sink that commits
-/// cleanly and silently exports nothing.
-pub(crate) fn is_loopback_http(uri: &str) -> bool {
-    let Some(rest) = uri.trim().strip_prefix("http://") else {
-        return false;
-    };
-    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
-    // `rsplit_once` so an IPv6 literal's own colons stay with the host.
-    let host = match authority.rsplit_once(':') {
-        Some((host, port)) if port.chars().all(|c| c.is_ascii_digit()) => host,
-        _ => authority,
-    };
-    matches!(host, "127.0.0.1" | "localhost" | "[::1]")
-}
-
-/// Which schemes the audit exporter can actually ship to.
-///
-/// Refused at admission rather than at export time for the same reason the
-/// source providers refuse an unfetchable URI: a sink that no transport can
-/// reach would otherwise be committed, agreed by the fleet, and then fail every
-/// batch forever while looking configured.
-///
-/// `http://` is refused as well as unknown schemes, save the narrow loopback
-/// carve-out [`is_loopback_http`] defines. An audit stream names who did what
-/// to which tenant; shipping it in cleartext is not a trade-off an operator
-/// should be able to make by typing one fewer character.
-///
-/// Every arm below recognises its scheme by a lowercase prefix test, so a
-/// *known* scheme spelled otherwise is refused with a targeted message rather
-/// than the generic one (issue #313). RFC 3986 §3.1 makes schemes
-/// case-insensitive on the wire, so without that the refusal quotes back the
-/// very schemes the operator believes they wrote — and `HTTP://127.0.0.1`
-/// misses [`is_loopback_http`] for the same reason, refusing a *permitted*
-/// sink as cleartext.
-fn require_audit_sink_uri(uri: &str) -> Result<(), String> {
-    let uri = uri.trim();
-    if uri.starts_with("https://") {
-        return Ok(());
-    }
-    if is_loopback_http(uri) {
-        return Ok(());
-    }
-    if let Some(rest) = uri.strip_prefix("s3://") {
-        // Same shape the s3 source parses: `s3://<bucket>/<key-prefix>`.
-        return match rest.split_once('/') {
-            Some((bucket, prefix)) if !bucket.is_empty() && !prefix.is_empty() => Ok(()),
-            _ => Err(
-                "an s3 audit sink is written `s3://<bucket>/<key-prefix>`: the prefix is where \
-                 the batched objects are written"
-                    .to_owned(),
-            ),
-        };
-    }
-    // Refused, not normalized: lowercasing here and nowhere else would put this
-    // checker and the transport factory on different spellings, which is the
-    // two-parsers-disagree bug (#301) in a new place. The message names only the
-    // canonical lowercase literal, never the input, keeping the no-echo rule
-    // above intact.
-    //
-    // A mixed-case scheme whose lowercase form would *still* be refused — say
-    // `HTTP://evil.example` — is told about the case first and meets the
-    // cleartext refusal on the next attempt. That teaching sequence is the same
-    // one #312 established for source URIs, and is why this check does not try
-    // to predict whether the corrected URI would pass.
-    let (scheme, rest) = split_scheme(uri);
-    if scheme.bytes().any(|b| b.is_ascii_uppercase()) {
-        let lower = scheme.to_ascii_lowercase();
-        // `http` is the one known scheme that lowercasing alone does not make
-        // admissible — only a loopback host may use cleartext. Hinting at the
-        // case for a remote `HTTP://` would replace an accurate, terminal
-        // message ("cleartext is refused") with a detour to the same refusal,
-        // so the hint is offered only where the corrected URI would actually be
-        // accepted. `https` and `s3` need no such test: for them lowercasing is
-        // either the whole fix or the next refusal is about shape, which is the
-        // teaching sequence #312 established.
-        let worth_hinting = match lower.as_str() {
-            "https" | "s3" => true,
-            "http" => is_loopback_http(&format!("{lower}:{rest}")),
-            _ => false,
-        };
-        if worth_hinting {
-            return Err(format!(
-                "an audit sink scheme must be lowercase: write `{lower}://…`"
-            ));
-        }
-    }
-
-    Err(
-        "an audit sink uri must be https:// (webhook, JSON lines) or s3:// (bucket, batched \
-         objects); http:// is refused because an audit stream must not cross the network in \
-         cleartext"
-            .to_owned(),
-    )
 }
 
 /// The rules every config carried by the log must satisfy, whether an operator
@@ -2851,19 +2446,15 @@ pub fn precondition_target(op: &ControlOp) -> Option<PreconditionTarget<'_>> {
         | ControlOp::PrincipalDelete { .. }
         | ControlOp::BindingPut { .. }
         | ControlOp::BindingDelete { .. }
-        // The audit-export ops address the fleet's sink, not an imposter record.
-        | ControlOp::AuditSinkPut { .. }
-        | ControlOp::AuditSinkDelete { .. }
-        | ControlOp::AuditCheckpointPut { .. }
         // The session key addresses the fleet, not an imposter record.
         | ControlOp::SessionKeyPut { .. }
         // The fleet name addresses the fleet, not an imposter record — same reasoning as the
         // session key immediately above.
         | ControlOp::FleetNamePut { .. }
         // A clear is a convergence primitive, not a config write conditioned on a stored
-        // revision: it commits unconditionally, like `AuditCheckpointPut`'s `max` does, so two
-        // concurrent clears compose rather than one losing an optimistic-concurrency race the
-        // op was never meant to run.
+        // revision: it commits unconditionally (apply takes the `max`), so two concurrent clears
+        // compose rather than one losing an optimistic-concurrency race the op was never meant
+        // to run.
         | ControlOp::JournalClearGen { .. }
         // A recording is submitted by the engine's claim owner, not by an
         // optimistic-concurrency client; its placement is resolved at apply against the
@@ -2886,8 +2477,7 @@ pub fn precondition_target(op: &ControlOp) -> Option<PreconditionTarget<'_>> {
         // A dataset addresses `sm_datasets`, not `sm_configs` — no imposter row for a
         // precondition to hold against (RFC-005 D1, #285).
         | ControlOp::DatasetPut { .. }
-        | ControlOp::DatasetDelete { .. }
-        | ControlOp::DatasetContentRead { .. } => None,
+        | ControlOp::DatasetDelete { .. } => None,
     }
 }
 
@@ -3684,321 +3274,6 @@ mod tests {
         }
     }
 
-    // -- audit export sink (#164) -------------------------------------------
-
-    fn sink_put(uri: &str) -> ControlOp {
-        ControlOp::AuditSinkPut {
-            tenant: TenantId::new(FLEET_SCOPE),
-            uri: uri.to_owned(),
-            auth_ref: None,
-            batch_max_rows: DEFAULT_AUDIT_BATCH_MAX_ROWS,
-        }
-    }
-
-    /// #164's "no credential in the log" criterion, asserted the strong way:
-    /// not merely that a credential-bearing sink URI is refused, but that it is
-    /// refused with the **byte-identical** message a source URI gets.
-    ///
-    /// Equality rather than a substring match is the point. The criterion says
-    /// "the same error shape as a source URI", and the only way that stays true
-    /// as either path changes is if both call one function — so the test is
-    /// written to fail the moment they diverge, including if someone
-    /// "improves" one message and not the other.
-    #[test]
-    fn a_sink_uri_with_embedded_credentials_is_refused_like_a_source_uri() {
-        for (sink_uri, source_uri) in [
-            (
-                "https://user:pass@collector.example/audit",
-                "https://user:pass@host/x.json",
-            ),
-            (
-                "https://token@collector.example/audit",
-                "https://token@host/x.json",
-            ),
-        ] {
-            let sink_err =
-                validate(&sink_put(sink_uri)).expect_err("a sink URI carrying credentials");
-            let source_err = validate(&source_put("mocks", source_uri))
-                .expect_err("a source URI carrying credentials");
-            assert_eq!(
-                sink_err, source_err,
-                "the sink and source hygiene refusals must be the same message, produced by \
-                 the same check"
-            );
-            assert!(
-                !sink_err.contains(sink_uri) && !sink_err.contains('@'),
-                "the refusal must not echo the credential-bearing uri back: {sink_err}"
-            );
-        }
-    }
-
-    /// Hygiene runs strictly before shape here, exactly as it does for a
-    /// source. A URI that fails both must be caught by the credential check,
-    /// whose message is deliberately free of the URI — running the more
-    /// specific scheme check first would put a secret into an operator-facing
-    /// error string.
-    #[test]
-    fn sink_credential_hygiene_runs_before_the_scheme_check() {
-        // A distinctive secret: the refusal's own text contains the word
-        // "pass" ("pass a credential name as auth_ref"), so a literal
-        // `user:pass@` would make this assertion fire on the message rather
-        // than on a leak.
-        let err = validate(&sink_put("ftp://user:s3cr3t-t0ken@host/audit"))
-            .expect_err("credential-bearing and wrong-scheme");
-        assert!(
-            err.contains("auth_ref"),
-            "the credential check must win: {err}"
-        );
-        assert!(
-            !err.contains("s3cr3t-t0ken"),
-            "the refusal must not echo the secret: {err}"
-        );
-    }
-
-    #[test]
-    fn an_audit_sink_uri_must_be_https_or_s3() {
-        validate(&sink_put("https://collector.example/audit")).expect("https is a webhook sink");
-        validate(&sink_put("s3://bucket/audit-prefix")).expect("s3 is a bucket sink");
-
-        // Cleartext over the network is refused rather than merely
-        // discouraged: an audit stream names who did what to which tenant.
-        let err = validate(&sink_put("http://collector.example/audit"))
-            .expect_err("http:// to a remote host must be refused");
-        assert!(err.contains("cleartext"), "{err}");
-
-        // …but a loopback collector never puts those bytes on a network, so it
-        // is allowed. Asserted so the carve-out stays exactly this narrow: a
-        // later "simplification" that allowed any http:// would pass the check
-        // above and be caught here.
-        for loopback in [
-            "http://127.0.0.1:9000/audit",
-            "http://localhost:9000/audit",
-            "http://[::1]:9000/audit",
-        ] {
-            validate(&sink_put(loopback))
-                .unwrap_or_else(|e| panic!("a loopback collector is allowed: {loopback}: {e}"));
-        }
-        for remote in [
-            "http://127.0.0.1.example.com/audit",
-            "http://evil.com/audit",
-            "http://10.0.0.1/audit",
-        ] {
-            validate(&sink_put(remote))
-                .expect_err("only a genuine loopback host may use cleartext");
-        }
-
-        let err = validate(&sink_put("s3://bucket")).expect_err("an s3 sink needs a key prefix");
-        assert!(err.contains("<bucket>/<key-prefix>"), "{err}");
-    }
-
-    /// RFC 3986 §3.1 makes schemes case-insensitive, but every arm of
-    /// `require_audit_sink_uri` recognises its scheme with a lowercase prefix
-    /// test. A mixed-case spelling of a *known* scheme therefore falls through
-    /// to the generic refusal, which quotes the very schemes the operator
-    /// believes they wrote (issue #313).
-    ///
-    /// `HTTP://127.0.0.1` is the case that makes this more than cosmetic:
-    /// `is_loopback_http` misses it for the same reason, so a sink that is
-    /// **permitted** in lowercase is refused with the cleartext-danger
-    /// message — wrong twice, since nothing about a loopback sink crosses a
-    /// network.
-    ///
-    /// The refusal names only the canonical lowercase literal, never the URI:
-    /// the file's standing no-echo rule, inherited from #312.
-    #[test]
-    fn an_audit_sink_scheme_must_be_lowercase() {
-        // The expected literal is pinned per case, not merely "contains
-        // lowercase": a message hardcoded to one scheme would satisfy a
-        // contains-check for all four while telling the `S3://` operator to
-        // write `https://`, which is worse than the generic refusal it replaced.
-        for (uri, want) in [
-            ("S3://bucket/audit-prefix", "`s3://"),
-            ("HTTPS://collector.example/audit", "`https://"),
-            ("Https://collector.example/audit", "`https://"),
-            ("HTTP://127.0.0.1:9000/audit", "`http://"),
-        ] {
-            let err = validate(&sink_put(uri)).expect_err("a mixed-case known scheme is refused");
-            assert!(
-                err.contains("lowercase"),
-                "refusing {uri}: expected a lowercase-scheme refusal, got {err:?}"
-            );
-            assert!(
-                err.contains(want),
-                "refusing {uri}: expected the hint to name {want}…`, got {err:?}"
-            );
-            assert!(!err.contains(uri), "the refusal echoed the uri: {err}");
-        }
-
-        // An *unknown* scheme in uppercase keeps the generic refusal. Telling
-        // the operator to try lowercase would be a lie: `ftp` is not a sink
-        // scheme in any spelling, and the hint would send them in circles.
-        let err = validate(&sink_put("FTP://host/audit")).expect_err("ftp is not a sink scheme");
-        assert!(
-            !err.contains("lowercase"),
-            "an unknown scheme must not be told to try lowercase: {err}"
-        );
-        assert!(
-            err.contains("cleartext"),
-            "expected the generic sink refusal: {err}"
-        );
-
-        // A *remote* uppercase `HTTP://` is the asymmetric case: unlike `https`
-        // and `s3`, lowercasing does not make it admissible, so the accurate
-        // cleartext refusal must survive rather than being displaced by a hint
-        // that leads back to it.
-        let err = validate(&sink_put("HTTP://collector.example/audit"))
-            .expect_err("remote cleartext is refused in any spelling");
-        assert!(
-            !err.contains("lowercase"),
-            "a remote HTTP:// must keep the accurate cleartext refusal: {err}"
-        );
-        assert!(err.contains("cleartext"), "{err}");
-    }
-
-    /// Credential hygiene runs before the scheme check, and must keep winning
-    /// when the URI is *both* credential-bearing and mixed-case — the ordering
-    /// #312 pinned for source URIs (`validate_rejects_embedded_credentials_in_a_source_uri`)
-    /// and which nothing pinned on the sink path until now. Without this, a
-    /// reordering of the two checks would leak a token into the admission log
-    /// silently, since every refusal on this path is echo-free and the tests
-    /// would all still pass.
-    #[test]
-    fn sink_credential_hygiene_wins_over_the_scheme_case_check() {
-        let err = validate(&sink_put(
-            "HTTPS://oauth2:ghp_supersecret@collector.example/audit",
-        ))
-        .expect_err("a credential-bearing sink uri is refused");
-        assert!(
-            !err.contains("ghp_supersecret"),
-            "the refusal echoed the secret: {err}"
-        );
-        assert!(
-            err.contains("auth_ref"),
-            "expected the hygiene refusal, got the scheme-case refusal: {err}"
-        );
-    }
-
-    #[test]
-    fn a_sink_batch_size_is_bounded() {
-        for (rows, why) in [
-            (0, "zero would ship nothing forever"),
-            (u32::MAX, "unbounded"),
-        ] {
-            let err = validate(&ControlOp::AuditSinkPut {
-                tenant: TenantId::new(FLEET_SCOPE),
-                uri: "https://collector.example/audit".to_owned(),
-                auth_ref: None,
-                batch_max_rows: rows,
-            })
-            .expect_err(why);
-            assert!(err.contains("batchMaxRows"), "{rows}: {err}");
-        }
-    }
-
-    /// The feedback loop this `None` exists to prevent: a checkpoint write that
-    /// produced an audit row would be shipped by the exporter, which would
-    /// write a new checkpoint, which would produce a new row — forever, with no
-    /// content but the loop itself.
-    #[test]
-    fn audit_checkpoint_writes_are_not_themselves_audited() {
-        assert_eq!(
-            ControlOp::AuditCheckpointPut {
-                tenant: TenantId::new(FLEET_SCOPE),
-                revision: 42,
-            }
-            .audit_action(),
-            None,
-            "auditing the exporter's own checkpoint is an unbounded feedback loop"
-        );
-
-        // Every *other* op still is audited — the opt-out must stay a
-        // deliberate single case, not a hole new ops fall into.
-        for op in [
-            ControlOp::AuditSinkPut {
-                tenant: TenantId::new(FLEET_SCOPE),
-                uri: "https://collector.example/audit".to_owned(),
-                auth_ref: None,
-                batch_max_rows: DEFAULT_AUDIT_BATCH_MAX_ROWS,
-            },
-            ControlOp::AuditSinkDelete {
-                tenant: TenantId::new(FLEET_SCOPE),
-            },
-            ControlOp::DeleteAll {
-                tenant: TenantId::default(),
-            },
-        ] {
-            assert!(
-                op.audit_action().is_some(),
-                "{op:?} must appear in the audit stream"
-            );
-        }
-    }
-
-    /// A fleet-scoped change must be *attributed* to the fleet, not filed under
-    /// whichever tenant happened to be handy.
-    ///
-    /// This shipped wrong once: the admin handler minted the sink ops with
-    /// `TenantId::default()`, so changing where the whole fleet's audit goes
-    /// produced a row claiming the `default` tenant did it — a wrong answer in
-    /// the one stream this feature exists to produce, and one that reads as
-    /// perfectly ordinary.
-    #[test]
-    fn a_fleet_scoped_sink_change_is_audited_against_the_fleet_scope() {
-        for op in [
-            ControlOp::AuditSinkPut {
-                tenant: TenantId::new(FLEET_SCOPE),
-                uri: "https://collector.example/audit".to_owned(),
-                auth_ref: None,
-                batch_max_rows: DEFAULT_AUDIT_BATCH_MAX_ROWS,
-            },
-            ControlOp::AuditSinkDelete {
-                tenant: TenantId::new(FLEET_SCOPE),
-            },
-        ] {
-            validate(&op).expect("the fleet scope is a valid tenant for a sink op");
-            assert_eq!(
-                op.tenant().as_str(),
-                FLEET_SCOPE,
-                "{op:?} must be audited against the fleet, not a tenant"
-            );
-            assert_eq!(
-                op.audit_resource(),
-                AUDIT_RESOURCE_ALL,
-                "one fleet-wide sink addresses a whole scope, not a named object"
-            );
-        }
-    }
-
-    /// The sink record is what a snapshot copies and `GET /admin/audit/sink`
-    /// serves, so the type must be incapable of carrying a secret in the first
-    /// place — a check on the *shape*, not on one instance's contents.
-    #[test]
-    fn the_stored_sink_record_carries_a_name_and_never_a_credential() {
-        let record = AuditSink {
-            uri: "s3://bucket/audit".to_owned(),
-            auth_ref: Some("prod-collector".to_owned()),
-            batch_max_rows: DEFAULT_AUDIT_BATCH_MAX_ROWS,
-            revision: 7,
-        };
-        let encoded = serde_json::to_value(&record).expect("sink record serializes");
-        // Compared as a set: `serde_json::Map` is a sorted map, so key order
-        // here is alphabetical and says nothing about the struct. The claim
-        // being locked is *which* fields exist, not their order.
-        let fields: std::collections::BTreeSet<&str> = encoded
-            .as_object()
-            .expect("a sink record is a JSON object")
-            .keys()
-            .map(String::as_str)
-            .collect();
-        assert_eq!(
-            fields,
-            ["authRef", "batchMaxRows", "revision", "uri"]
-                .into_iter()
-                .collect::<std::collections::BTreeSet<_>>(),
-            "a new field here is a new chance to leak a secret into the log; add it deliberately"
-        );
-    }
-
     // -- per-provider URI shape (#136) --------------------------------------
 
     /// A `git+https:` URI whose fragment is missing or malformed can never be
@@ -4697,18 +3972,15 @@ mod tests {
     }
 
     #[test]
-    fn dataset_ops_carry_their_audit_names_and_no_precondition() {
+    fn dataset_ops_carry_their_tenant_and_no_precondition() {
         let put = dataset_put("customers", &["id"], CUSTOMERS);
-        assert_eq!(put.audit_action(), Some("dataset.write"));
-        assert_eq!(put.audit_resource(), "customers");
         assert_eq!(put.tenant(), &TenantId::new("acme"));
         assert!(precondition_target(&put).is_none());
         let delete = ControlOp::DatasetDelete {
             tenant: TenantId::new("acme"),
             name: "customers".to_owned(),
         };
-        assert_eq!(delete.audit_action(), Some("dataset.delete"));
-        assert_eq!(delete.audit_resource(), "customers");
+        assert_eq!(delete.tenant(), &TenantId::new("acme"));
         assert!(precondition_target(&delete).is_none());
         assert!(
             validate(&ControlOp::DatasetDelete {
@@ -4885,33 +4157,6 @@ mod tests {
                 "{op:?} must not be admitted on the fleet scope"
             );
         }
-    }
-
-    #[test]
-    fn spec_ops_carry_their_audit_names() {
-        let put = spec_put("petstore", "{}");
-        assert_eq!(put.audit_action(), Some("spec.write"));
-        assert_eq!(put.audit_resource(), "petstore");
-        assert_eq!(put.tenant(), &TenantId::new("acme"));
-        let bind = ControlOp::SpecBind {
-            tenant: TenantId::new("acme"),
-            id: "petstore".to_owned(),
-            port: 4545,
-        };
-        assert_eq!(bind.audit_action(), Some("spec.write"));
-        assert_eq!(bind.audit_resource(), "petstore");
-        let unbind = ControlOp::SpecUnbind {
-            tenant: TenantId::new("acme"),
-            port: 4545,
-        };
-        assert_eq!(unbind.audit_action(), Some("spec.write"));
-        assert_eq!(unbind.audit_resource(), "4545");
-        let delete = ControlOp::SpecDelete {
-            tenant: TenantId::new("acme"),
-            id: "petstore".to_owned(),
-        };
-        assert_eq!(delete.audit_action(), Some("spec.delete"));
-        assert_eq!(delete.audit_resource(), "petstore");
     }
 
     /// `SpecBind` rides behind the `PutImposter` it follows in a deploy; the
@@ -5552,16 +4797,6 @@ mod tests {
         };
         let err = validate(&op).expect_err("a tenant-scoped fleet rename must be rejected");
         assert!(err.contains(FLEET_SCOPE), "{err}");
-    }
-
-    #[test]
-    fn fleet_name_put_is_audited_as_cluster_admin() {
-        // A rename is an operator act an incident timeline needs: "which fleet was this?" is
-        // unanswerable afterwards if the rename itself left no row.
-        assert_eq!(
-            fleet_name("rift-prod-eu").audit_action(),
-            Some("cluster.admin")
-        );
     }
 
     // ---- #439: digest-only SpecPut/DatasetPut -------------------------------
