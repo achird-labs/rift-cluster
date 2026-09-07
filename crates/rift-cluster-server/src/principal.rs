@@ -29,7 +29,7 @@ pub(crate) struct Resolved {
 
 /// The synthetic identity attributed to a request authenticated with the
 /// legacy `--api-key` (RFC-002 §3.4). Not a real [`rift_cluster::control::PrincipalId`]
-/// — no such row exists — but stable, so audit output can tell every legacy-key
+/// — no such row exists — but stable, so a log line can tell every legacy-key
 /// request apart from a real principal's.
 const LEGACY_PRINCIPAL_ID: &str = "legacy:api-key";
 
@@ -186,8 +186,7 @@ pub(crate) fn should_bypass(node: &RaftNode, api_key: Option<&str>) -> Result<bo
 /// (`admin_front`'s own proxied mapping does; the loopback [`AuthzRequest`]
 /// carries no path, so [`crate::authorizer::EeAuthorizer`] always passes
 /// `false`). That is harmless either way: both are Operator-tier, so which of
-/// the two is reported never changes the decision, only an audit label
-/// (#163).
+/// the two is reported never changes the decision, only a log label.
 #[must_use]
 pub(crate) fn map_action(
     action: &str,

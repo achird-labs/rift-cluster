@@ -92,7 +92,7 @@ pub mod seams {
     /// reconcile — the diff runs upstream, keyed by `stub_key`.
     ///
     /// [`EventContext`] is U-10 (upstream #855): it answers *who* caused a
-    /// change, which is what turns an event stream into an audit trail. It is
+    /// change, which is what turns an event stream into an attributed one. It is
     /// `#[non_exhaustive]`, so an embedder builds one from [`Default`] and
     /// assigns — a struct literal will not compile outside upstream.
     pub use rift_mock_core::imposter::{
@@ -530,7 +530,7 @@ mod tests {
     /// `#[non_exhaustive]`, so a struct literal will not compile outside
     /// upstream and `Default` + assignment is the only construction path an
     /// cluster crate has. Drop that derive upstream and the seam test above
-    /// still passes while every #163 audit test loses its ability to build a
+    /// still passes while every attribution test loses its ability to build a
     /// context at all.
     #[test]
     fn an_embedder_can_construct_an_event_context_and_carry_a_principal() {
@@ -618,7 +618,7 @@ mod tests {
         );
         assert!(rendered.contains("<redacted>"), "got: {rendered}");
         // A caller-asserted scope is not a secret and must stay visible — it is
-        // exactly what an audit record needs to show was *claimed*.
+        // exactly what a refusal has to be able to say was *claimed*.
         assert!(rendered.contains("tenant-a"), "got: {rendered}");
     }
 

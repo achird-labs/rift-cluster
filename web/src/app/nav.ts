@@ -151,7 +151,7 @@ export const NAV: readonly NavEntry[] = [
     route: { screen: "admin", tab: "principals", tenant: null },
     // Gates on the weakest admin capability, not `imposter.*`: viewer/operator/editor hold none of
     // `CAPABILITY_MATRIX`'s admin capabilities, so the entry (and every control inside the screen)
-    // is invisible below tenant-admin, where `tenant.manage` and `audit.read` both start.
+    // is invisible below tenant-admin, where `tenant.manage` starts.
     requires: "tenant.manage",
     group: "administration",
     glyph: "◇",

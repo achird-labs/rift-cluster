@@ -2899,7 +2899,7 @@ async fn c18_routes_survive_a_full_cluster_restart() {
 /// The imposter port `bind-squat.overlay.yml` squats inside rift-2's network
 /// namespace only. Not published to the host -- see that overlay's header for
 /// why. 6520 continues the numbering C17/C18 (6500-6512) and C20-C23 (6610-6640) already use in
-/// this file. C26 also uses 6520-6522, which is safe only because this tier runs `--test-threads=1`
+/// this file. C26 also uses 6520-6537, which is safe only because this tier runs `--test-threads=1`
 /// and every scenario brings up and tears down its own stack — the overlays differ, so the two
 /// never coexist. Reusing a number across scenarios is fine *for that reason*, not because the
 /// number is unused; anything that made these run concurrently would have to revisit it.
@@ -4017,7 +4017,7 @@ async fn c23_assert_committed_body(port: u16, marker: &str) {
 }
 
 // ---------------------------------------------------------------------------
-// Issue #165 — C24-C27: the tenancy/RBAC/audit boundary, at the container tier.
+// Issue #165 — C24-C27: the tenancy/RBAC boundary, at the container tier.
 //
 // These four are the only scenarios in this tier that run against a *closed*
 // admin plane. Every other one relies on RFC-002 §3.4 leaving the plane open
@@ -4120,21 +4120,9 @@ fn c24_matrix(port: u16) -> Vec<MatrixProbe> {
             body: None,
         },
         MatrixProbe {
-            label: "audit.read",
-            method: "GET",
-            path: "/admin/audit?since=0&limit=5".to_owned(),
-            body: None,
-        },
-        MatrixProbe {
             label: "tenant.manage",
             method: "GET",
             path: "/admin/tenants".to_owned(),
-            body: None,
-        },
-        MatrixProbe {
-            label: "cluster.admin",
-            method: "GET",
-            path: "/admin/audit/sink".to_owned(),
             body: None,
         },
     ]
@@ -4196,9 +4184,9 @@ fn c24_canonical(admin: u16, body: serde_json::Value) -> serde_json::Value {
 /// than for the one every route quietly fell back to. The role still
 /// genuinely discriminates in `acme`: the `imposter.read`/`write`/`delete`
 /// probes come from the viewer's tenant-scoped binding, and the 404 half of
-/// the split comes from the fleet-scoped routes (`GET /admin/tenants`,
-/// `GET /admin/audit/sink` both scope to `FLEET_SCOPE`), which a tenant-bound
-/// principal holds no binding for regardless of which tenant it is bound to.
+/// the split comes from the fleet-scoped route (`GET /admin/tenants` scopes
+/// to `FLEET_SCOPE`), which a tenant-bound principal holds no binding for
+/// regardless of which tenant it is bound to.
 ///
 /// Every request the viewer sends below carries an explicit `X-Rift-Tenant:
 /// acme`: unlike `default`, `acme` is not what an omitted header resolves to
@@ -4525,60 +4513,68 @@ async fn c25_probe(admin: u16, key: &str) -> (u16, serde_json::Value) {
 /// per-write convergence that bound is sized for.
 const SNAPSHOT_CATCHUP_TIMEOUT: Duration = Duration::from_secs(90);
 
-/// C26 — the audit chain survives a full-fleet stop/start, and survives a
-/// single lagging node's catch-up over a real `install_snapshot`.
+/// The first of C26's imposter ports. It writes one per node before the lag and
+/// fifteen more while a follower is stopped, consecutively from here, so the
+/// range is 6520–6537. See `C19_IMPOSTER_PORT`'s doc for why sharing 6520 with
+/// C19 is safe.
+const C26_FIRST_PORT: u16 = 6520;
+
+/// C26 — the replicated imposter set survives a single lagging node's catch-up
+/// over a real `install_snapshot`, and then a full-fleet stop/start.
 ///
-/// Two phases, because they guard two different regressions this scenario has
-/// caught before, in different code paths:
+/// The projection under test is every node's `(port, revision, stubs)` rows for
+/// the imposters this scenario wrote — each with a distinctive body, so an
+/// assertion that trips names *which* imposter is wrong, not how many. Rows are
+/// read by `c26_imposter_rows`; see its doc for why the revision comes from the
+/// `Rift-Cluster-Revision` header and not from `rift_cluster_config_revision`.
+///
+/// Two phases, because they guard two different regressions in different code
+/// paths:
 ///
 /// **Phase 1 — force the wire path.** A full-cluster restart alone never
 /// exercises `install_snapshot`: every node restores from its own redb and
-/// needs nothing from a peer, which is why this scenario's mutation target
-/// (the issue's "`audit` table omitted from `SnapshotPayload`") used to
-/// survive here — the same correction the README used to carry three times
-/// over, once each for C18/C22/C26, now consolidated into one explanation
-/// there. `RIFT_CLUSTER_SNAPSHOT_LOG_ENTRIES=10` (`chaos.overlay.yml`) is what
-/// makes a lagging node unable to avoid the wire path: this phase stops one
-/// follower, commits more than 10 entries through the other two (each an
-/// `imposter.write`, so the audit chain keeps growing), and restarts it. With
+/// needs nothing from a peer, which is why a table dropped from
+/// `SnapshotPayload` used to survive here — the same correction the README
+/// used to carry three times over, once each for C18/C22/C26, now consolidated
+/// into one explanation there. `RIFT_CLUSTER_SNAPSHOT_LOG_ENTRIES=10`
+/// (`snapshot-install.overlay.yml`) is what makes a lagging node unable to
+/// avoid the wire path: this phase stops one follower, commits more than 10
+/// entries through the other two (each a new imposter, so the set it must come
+/// back holding keeps growing), and restarts it. With
 /// `snapshot_policy = LogsSinceLast(10)` and `max_in_snapshot_log_to_keep = 0`
 /// (`NodeConfig::snapshot_log_entries`, `crates/rift-cluster/src/raft/node.rs`,
 /// pinned there by two unit tests), the leader purges the entries the
 /// follower missed as soon as it snapshots, so the only way back is a real
 /// `install_snapshot` — a real socket, real serialize/deserialize of
 /// `SnapshotPayload`. The post-restart convergence check is what goes red if
-/// the audit table is dropped from it.
+/// the configs table is dropped from it: the lagging node comes back holding
+/// only the imposters it had before it stopped.
 ///
-/// *The evidence that this is what actually happened is second-order, not
-/// direct, and that gap is deliberate rather than missed.* This tier has no
-/// admin-API or Prometheus signal that fires specifically on
-/// `install_snapshot` — checked, not assumed: `crates/rift-cluster/src/metrics.rs`
-/// has no such family, `/_cluster/members` reports only `last_applied`, and
-/// this file's own house rule (top of module) rules out a log line for it
-/// even if one exists upstream in openraft. So instead of observing the RPC,
-/// this phase asserts its *precondition*, from data the harness already reads:
-/// the live nodes' own last committed revision, taken after the extra writes,
-/// is checked to be more than 10 past the lagging node's revision from the
-/// moment it stopped — which is exactly what `LogsSinceLast(10)` +
-/// `max_in_snapshot_log_to_keep = 0` need to have already purged the entries
-/// it is missing (that arithmetic is what the two unit tests above pin). A
-/// regression that broke only the purge, leaving ordinary replication to
-/// quietly cover for it, would not trip this assertion. Closing that
-/// remaining gap needs a counter on `RedbStateMachine::install_snapshot`
-/// itself, which is a `crates/` change out of scope for this worktree.
+/// That the RPC really fired is asserted twice over. First its *precondition*,
+/// from the revisions the harness already reads: the live nodes' last
+/// committed write, taken after the extra imposters, must be more than 10 past
+/// the lagging node's last write from the moment it stopped — which is exactly
+/// what `LogsSinceLast(10)` + `max_in_snapshot_log_to_keep = 0` need to have
+/// already purged the entries it is missing (that arithmetic is what the two
+/// unit tests above pin). Then the fact itself, from
+/// `rift_cluster_snapshots_installed_total` on the lagging node: a regression
+/// that broke only the purge, leaving ordinary replication to quietly cover
+/// for it, would pass the precondition and converge to the same rows, and is
+/// caught there.
 ///
 /// **Phase 2 — the full-fleet restart, kept rather than replaced.** Its own
-/// mutant story is a different bug in a different place: "clearing `sm_audit`
-/// whenever the store is opened" — the ordinary cold-start path, no snapshot
-/// involved at all — went red only here, at `node rift-1 lost or reordered
-/// audit rows across the restart`. Phase 1's install-snapshot path does not
+/// mutant is a different bug in a different place: a store that drops or
+/// rewrites its configs whenever it is opened — the ordinary cold-start path,
+/// no snapshot involved at all. Phase 1's install-snapshot path does not
 /// subsume it: a node that never restarted a second time never re-opens its
 /// store from cold, which is exactly the path that mutant lives on. Every
-/// node's `(revision, action, resource)` projection must still be
-/// byte-identical to its own pre-restart one and to every other node's.
+/// node's rows must still be byte-identical to its own pre-restart ones and to
+/// every other node's — same stubs *and* same revision, so a restart that
+/// re-committed an unchanged config at a new revision fails here too, the way
+/// C22 pins `last_applied` across an unchanged pull.
 #[tokio::test]
 #[ignore = "needs a container runtime"]
-async fn c26_audit_chain_survives_a_full_cluster_restart() {
+async fn c26_replicated_imposters_survive_a_full_cluster_restart_by_snapshot_install() {
     let cluster = Cluster::up_with_overlays(&[
         "chaos.overlay.yml",
         "tenancy.overlay.yml",
@@ -4593,47 +4589,31 @@ async fn c26_audit_chain_survives_a_full_cluster_restart() {
         .await
         .expect("a leader settles");
 
-    // A session of writes, spread across nodes so the audit stream is not one
-    // node's local view of its own work. A `tenant.manage` write leads, so the
-    // session spans two action kinds rather than only `imposter.write`.
+    // One imposter through each node, so the set under test is not one node's
+    // local view of its own work.
     //
-    // The imposters go to the **default** tenant. Not a limitation any more — issue #182 made
-    // resource routes servable in every tenant — but this scenario is about the *audit chain*
-    // surviving a restart, and `default` keeps that the only variable under test. `acme` is still
-    // created below because the session under audit spans tenant writes too.
-    create_tenant(NODES[0].admin, "acme", TENANCY_FLEET_KEY)
-        .await
-        .expect("create tenant");
+    // All in the **default** tenant. Not a limitation — issue #182 made resource routes servable
+    // in every tenant — but this scenario is about the snapshot and cold-start paths, and
+    // `default` keeps that the only variable under test. The closed admin plane
+    // (`tenancy.overlay.yml`) is inherited from the C24–C27 family this scenario belongs to
+    // rather than under test here; the fleet key is simply what every write and read carries.
+    let mut ports: Vec<u16> = Vec::new();
     for (i, node) in NODES.iter().enumerate() {
-        let port = 6520 + i as u16;
-        let (status, body) = admin_with_key(
-            node.admin,
-            "POST",
-            "/imposters",
-            Some(&serde_json::json!({
-                "port": port,
-                "protocol": "http",
-                "stubs": [{ "responses": [{ "is": { "statusCode": 200, "body": "audited" } }] }]
-            })),
-            Some(TENANCY_FLEET_KEY),
-        )
-        .await
-        .expect("write");
-        assert!(
-            (200..300).contains(&status),
-            "write through {}: {status} {body}",
-            node.name
-        );
+        let port = C26_FIRST_PORT + i as u16;
+        c26_write_imposter(node, port, &format!("seed-{i}"), TENANCY_FLEET_KEY).await;
         wait_converged_with_key(u64::from(port), CONVERGE_TIMEOUT, TENANCY_FLEET_KEY)
             .await
             .expect("converged");
+        ports.push(port);
     }
 
-    let baseline = c26_audit_on_every_node(TENANCY_FLEET_KEY).await;
-    assert!(
-        baseline[0].len() >= NODES.len(),
-        "the session must have produced rows to lose: {:?}",
-        baseline[0].len()
+    let baseline = c26_imposters_on_every_node(&ports, TENANCY_FLEET_KEY).await;
+    assert_eq!(
+        baseline[0].len(),
+        ports.len(),
+        "the seed must have produced imposters to lose: {} holds {:?}",
+        NODES[0].name,
+        baseline[0]
     );
     for (i, rows) in baseline.iter().enumerate() {
         assert_eq!(
@@ -4655,12 +4635,12 @@ async fn c26_audit_chain_survives_a_full_cluster_restart() {
     let live: Vec<_> = NODES.iter().filter(|n| n.name != lagging.name).collect();
     assert_eq!(live.len(), 2, "exactly two nodes stay up under the lag");
 
-    // The lagging node's own last committed revision at the instant it stops
-    // -- captured from `baseline`, read moments earlier while all three still
+    // The lagging node's own last committed write at the instant it stops --
+    // captured from `baseline`, read moments earlier while all three still
     // agreed, so nothing commits between the read and the stop below.
     let lagging_revision_at_stop = baseline[lagging_idx]
         .iter()
-        .map(|(revision, _, _)| *revision)
+        .map(|(_, revision, _)| *revision)
         .max()
         .expect("baseline has rows");
 
@@ -4668,52 +4648,58 @@ async fn c26_audit_chain_survives_a_full_cluster_restart() {
         .stop(lagging.name)
         .expect("SIGTERM the lagging node");
 
-    // n, matching RIFT_CLUSTER_SNAPSHOT_LOG_ENTRIES (chaos.overlay.yml) and the
-    // LogsSinceLast(n) policy it drives (NodeConfig::snapshot_log_entries).
+    // n, matching RIFT_CLUSTER_SNAPSHOT_LOG_ENTRIES (snapshot-install.overlay.yml)
+    // and the LogsSinceLast(n) policy it drives (NodeConfig::snapshot_log_entries).
     const SNAPSHOT_LOG_ENTRIES: u64 = 10;
-    // More than n committed while it's down. n alone would already guarantee
-    // at least one full LogsSinceLast(n) window closes entirely after it
-    // stopped (worst case, the window was freshly opened and needs exactly n
-    // more entries); this is comfortably past that floor.
-    const ENTRIES_WHILE_DOWN: usize = 15;
-    for i in 0..ENTRIES_WHILE_DOWN {
+    // More than n imposters committed while it's down, each its own log entry.
+    // n alone would already guarantee at least one full LogsSinceLast(n) window
+    // closes entirely after it stopped (worst case, the window was freshly
+    // opened and needs exactly n more entries); this is comfortably past that
+    // floor.
+    const IMPOSTERS_WHILE_DOWN: usize = 15;
+    for i in 0..IMPOSTERS_WHILE_DOWN {
         let via = live[i % live.len()];
-        let (status, body) = admin_with_key(
-            via.admin,
-            "PUT",
-            "/imposters/6520/stubs",
-            Some(&serde_json::json!({
-                "stubs": [{ "responses": [{ "is": { "statusCode": 200, "body": format!("audited-{i}") } }] }]
-            })),
-            Some(TENANCY_FLEET_KEY),
-        )
-        .await
-        .unwrap_or_else(|e| panic!("write {i} while {} is down: {e}", lagging.name));
-        assert!(
-            (200..300).contains(&status),
-            "write {i} via {}: {status} {body}",
-            via.name
-        );
+        let port = C26_FIRST_PORT + NODES.len() as u16 + i as u16;
+        c26_write_imposter(via, port, &format!("while-down-{i}"), TENANCY_FLEET_KEY).await;
+        ports.push(port);
     }
 
     // The two live nodes must still agree with each other -- otherwise the
     // "more than n past the lagging node" check below would be comparing
-    // against a number that is not actually the fleet's.
-    let live_rows_0 = c26_audit_rows(live[0].admin, live[0].name, TENANCY_FLEET_KEY).await;
-    let live_rows_1 = c26_audit_rows(live[1].admin, live[1].name, TENANCY_FLEET_KEY).await;
+    // against a number that is not actually the fleet's. A live follower may
+    // trail the leader's acknowledgement by a beat, so each port is waited for
+    // on both before the rows are compared.
+    for &port in &ports {
+        cluster_chaos::wait_converged_on_with_key(
+            &live,
+            u64::from(port),
+            CONVERGE_TIMEOUT,
+            Some(TENANCY_FLEET_KEY),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("imposter {port} never reached both live nodes: {e}"));
+    }
+    let live_rows_0 = c26_imposter_rows(live[0], &ports, TENANCY_FLEET_KEY).await;
+    let live_rows_1 = c26_imposter_rows(live[1], &ports, TENANCY_FLEET_KEY).await;
+    assert_eq!(
+        live_rows_0.len(),
+        ports.len(),
+        "{} serves only {} of the {} imposters written: {live_rows_0:?}",
+        live[0].name,
+        live_rows_0.len(),
+        ports.len()
+    );
     assert_eq!(
         live_rows_1, live_rows_0,
         "the two live nodes must agree with each other while the third is down"
     );
     let live_revision_after_lag_writes = live_rows_0
         .iter()
-        .map(|(revision, _, _)| *revision)
+        .map(|(_, revision, _)| *revision)
         .max()
         .expect("the extra writes produced rows");
 
-    // The precondition `install_snapshot` needs: see the doc comment above for
-    // why this is the strongest evidence available at this tier without a new
-    // metric or a log line.
+    // The precondition `install_snapshot` needs: see the doc comment above.
     assert!(
         live_revision_after_lag_writes > lagging_revision_at_stop + SNAPSHOT_LOG_ENTRIES,
         "the lag must clear a full LogsSinceLast({SNAPSHOT_LOG_ENTRIES}) window: live revision \
@@ -4738,26 +4724,27 @@ async fn c26_audit_chain_survives_a_full_cluster_restart() {
     // one surface that only reaches parity once it has actually happened.
     let deadline = std::time::Instant::now() + SNAPSHOT_CATCHUP_TIMEOUT;
     let caught_up = loop {
-        let rows = c26_audit_rows(lagging.admin, lagging.name, TENANCY_FLEET_KEY).await;
+        let rows = c26_imposter_rows(lagging, &ports, TENANCY_FLEET_KEY).await;
         if rows == live_rows_0 {
             break rows;
         }
         if std::time::Instant::now() >= deadline {
             panic!(
-                "{} never caught up to the live nodes' audit chain within \
-                 {SNAPSHOT_CATCHUP_TIMEOUT:?}: got {} rows, wanted {}",
+                "{} never caught up to the live nodes' imposter set within \
+                 {SNAPSHOT_CATCHUP_TIMEOUT:?}: serves {} of {} imposters, {rows:?}",
                 lagging.name,
                 rows.len(),
-                live_rows_0.len()
+                ports.len()
             );
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
     };
-    // (preferred evidence) — this is what goes red if a table is dropped from
-    // `SnapshotPayload`: the lagging node comes back missing that table's rows.
+    // (preferred evidence) — this is what goes red if the configs table is
+    // dropped from `SnapshotPayload`: the lagging node comes back without the
+    // imposters written while it was down.
     assert_eq!(
         caught_up, live_rows_0,
-        "{} must converge to byte-identical audit rows after install_snapshot",
+        "{} must converge to byte-identical imposter rows after install_snapshot",
         lagging.name
     );
 
@@ -4783,7 +4770,16 @@ async fn c26_audit_chain_survives_a_full_cluster_restart() {
 
     // ---- Phase 2: the full-fleet restart ------------------------------------
 
-    let before = c26_audit_on_every_node(TENANCY_FLEET_KEY).await;
+    let before = c26_imposters_on_every_node(&ports, TENANCY_FLEET_KEY).await;
+    assert_eq!(
+        before[0].len(),
+        ports.len(),
+        "before the full-fleet restart {} serves only {} of {} imposters: {:?}",
+        NODES[0].name,
+        before[0].len(),
+        ports.len(),
+        before[0]
+    );
     for (i, rows) in before.iter().enumerate() {
         assert_eq!(
             rows, &before[0],
@@ -4807,11 +4803,23 @@ async fn c26_audit_chain_survives_a_full_cluster_restart() {
         .await
         .expect("the fleet re-forms a cluster");
 
-    let after = c26_audit_on_every_node(TENANCY_FLEET_KEY).await;
+    // Presence first, polled — the same gate `test_cold_start` puts after the
+    // same restart — so a node still rebinding its engine reads as "not yet"
+    // and only a port that never comes back fails, by name.
+    for &port in &ports {
+        wait_converged_with_key(u64::from(port), CONVERGE_TIMEOUT, TENANCY_FLEET_KEY)
+            .await
+            .unwrap_or_else(|e| {
+                panic!(
+                    "imposter {port} was held by every node and then lost across the restart: {e}"
+                )
+            });
+    }
+    let after = c26_imposters_on_every_node(&ports, TENANCY_FLEET_KEY).await;
     for (i, rows) in after.iter().enumerate() {
         assert_eq!(
             rows, &before[i],
-            "node {} lost or reordered audit rows across the full-fleet restart",
+            "node {} lost, rewrote or reordered imposters across the full-fleet restart",
             NODES[i].name
         );
     }
@@ -4824,47 +4832,118 @@ async fn c26_audit_chain_survives_a_full_cluster_restart() {
     }
 }
 
-/// `(revision, action, resource)` for one node's audit projection — the
-/// ordered projection C26 compares. Full rows would drag in per-read fields;
-/// this is the part that must be identical everywhere.
-async fn c26_audit_rows(admin: u16, name: &str, key: &str) -> Vec<(u64, String, String)> {
+/// `POST /imposters` through `node` for `port`, with one stub answering `marker`
+/// — so a wrong or missing config after a restart is visible in content, not
+/// only in a count. Panics on anything but a 2xx.
+async fn c26_write_imposter(node: &cluster_chaos::Node, port: u16, marker: &str, key: &str) {
     let (status, body) = admin_with_key(
-        admin,
-        "GET",
-        "/admin/audit?since=0&limit=1000",
-        None,
+        node.admin,
+        "POST",
+        "/imposters",
+        Some(&serde_json::json!({
+            "port": port,
+            "protocol": "http",
+            "stubs": [{ "responses": [{ "is": { "statusCode": 200, "body": marker } }] }]
+        })),
         Some(key),
     )
     .await
-    .unwrap_or_else(|e| panic!("audit read on {name}: {e}"));
-    assert_eq!(status, 200, "audit read on {name}: {body}");
-    // `GET /admin/audit` answers a bare JSON array, not a `{"rows": [...]}`
-    // envelope. Asserted rather than defaulted: an empty projection here would
-    // make "every node agrees" trivially true and the whole scenario vacuous,
-    // so a shape this does not recognise must stop the test.
-    body.as_array()
-        .unwrap_or_else(|| panic!("audit on {name} is not an array: {body}"))
-        .iter()
-        .map(|r| {
-            let revision = r["revision"]
-                .as_u64()
-                .unwrap_or_else(|| panic!("row without a revision on {name}: {r}"));
-            let action = r["action"]
-                .as_str()
-                .unwrap_or_else(|| panic!("row without an action on {name}: {r}"));
-            let resource = r["resource"]
-                .as_str()
-                .unwrap_or_else(|| panic!("row without a resource on {name}: {r}"));
-            (revision, action.to_owned(), resource.to_owned())
-        })
-        .collect()
+    .unwrap_or_else(|e| panic!("write imposter {port} through {}: {e}", node.name));
+    assert!(
+        (200..300).contains(&status),
+        "write imposter {port} through {}: {status} {body}",
+        node.name
+    );
 }
 
-/// `(revision, action, resource)` per row, per node — see [`c26_audit_rows`].
-async fn c26_audit_on_every_node(key: &str) -> Vec<Vec<(u64, String, String)>> {
-    let mut out = Vec::new();
+/// `(port, revision, stubs)` for each of `ports` that `node` currently serves —
+/// the ordered projection C26 compares across nodes and across restarts.
+///
+/// The revision is the `Rift-Cluster-Revision` token `GET /imposters/:port`
+/// carries (`default:<port>@<revision>`; `admin_front::imposter_read_token`),
+/// read from the node's own applied state: the log index that last wrote the
+/// imposter, the very record a conditional write is checked against. Not
+/// `rift_cluster_config_revision{port}` — that gauge is set only on the
+/// per-entry apply path (`metrics::config_applied`, called from
+/// `mutate_tables` alone), so a node whose configs arrived by
+/// `install_snapshot`, or that re-opened its store from cold, never publishes
+/// it for those ports. The two paths this scenario exists to exercise are
+/// exactly the two that gauge cannot observe.
+///
+/// Stubs are compared with each stub's `_links` dropped: those render this
+/// node's own admin authority (see `c24_canonical`), a self-reference and not a
+/// divergence. Everything else in a stub is replicated content.
+///
+/// A port answering anything but `200` is simply absent from the result, so a
+/// node that has not yet installed it reads as *shorter*, not as an error —
+/// the catch-up poll needs "not yet" to be representable. A caller expecting
+/// the full set asserts `len() == ports.len()` itself, which is also what
+/// keeps "every node agrees" from being satisfied by every node serving
+/// nothing.
+async fn c26_imposter_rows(
+    node: &cluster_chaos::Node,
+    ports: &[u16],
+    key: &str,
+) -> Vec<(u16, u64, serde_json::Value)> {
+    let mut rows = Vec::with_capacity(ports.len());
+    for &port in ports {
+        let response = reqwest::Client::new()
+            .get(format!("http://127.0.0.1:{}/imposters/{port}", node.admin))
+            .timeout(Duration::from_secs(10))
+            .header("authorization", key)
+            .send()
+            .await
+            .unwrap_or_else(|e| panic!("read imposter {port} on {}: {e}", node.name));
+        if response.status().as_u16() != 200 {
+            continue;
+        }
+        let revision: u64 = response
+            .headers()
+            .get("rift-cluster-revision")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|token| token.rsplit_once('@'))
+            .and_then(|(_, revision)| revision.parse().ok())
+            .unwrap_or_else(|| {
+                panic!(
+                    "imposter {port} on {} answered 200 without a parseable \
+                     Rift-Cluster-Revision",
+                    node.name
+                )
+            });
+        let body: serde_json::Value = response
+            .json()
+            .await
+            .unwrap_or_else(|e| panic!("imposter {port} on {} is not JSON: {e}", node.name));
+        let stubs: Vec<serde_json::Value> = body["stubs"]
+            .as_array()
+            .unwrap_or_else(|| {
+                panic!(
+                    "imposter {port} on {} has no stubs array: {body}",
+                    node.name
+                )
+            })
+            .iter()
+            .map(|stub| {
+                let mut stub = stub.clone();
+                if let Some(fields) = stub.as_object_mut() {
+                    fields.remove("_links");
+                }
+                stub
+            })
+            .collect();
+        rows.push((port, revision, serde_json::Value::Array(stubs)));
+    }
+    rows
+}
+
+/// [`c26_imposter_rows`] on every node, in [`NODES`] order.
+async fn c26_imposters_on_every_node(
+    ports: &[u16],
+    key: &str,
+) -> Vec<Vec<(u16, u64, serde_json::Value)>> {
+    let mut out = Vec::with_capacity(NODES.len());
     for node in &NODES {
-        out.push(c26_audit_rows(node.admin, node.name, key).await);
+        out.push(c26_imposter_rows(node, ports, key).await);
     }
     out
 }

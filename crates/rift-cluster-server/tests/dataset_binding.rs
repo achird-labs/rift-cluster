@@ -226,7 +226,7 @@ async fn a_template_token_inside_a_dataset_value_is_served_literally() {
 ///
 /// This is the property that makes a binding safe to leave running. Without the pin, uploading a
 /// corrected dataset would silently change what every bound stub answers — with no config write
-/// and nothing in the audit trail to explain it.
+/// and nothing in the log to explain it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_later_upload_does_not_move_a_bound_stub() {
     let state = TempDir::new().expect("tempdir");

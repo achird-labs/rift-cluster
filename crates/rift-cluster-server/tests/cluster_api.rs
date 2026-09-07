@@ -31,7 +31,6 @@ async fn start() -> Fixture {
         secret: Some(SECRET.to_owned()),
         routes: cluster_api::routes(rift_cluster::Router::new(), slot.clone(), readiness.clone()),
         engine: None,
-        audit_retention_secs: rift_cluster::DEFAULT_AUDIT_RETENTION_SECS,
         snapshot_log_entries: None,
         advertise_as_digest_only_incapable: false,
     };

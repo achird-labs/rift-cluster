@@ -782,7 +782,6 @@
     <div class="nav-group">
       <div class="eyebrow">Administration</div>
       <button class="nav-item" data-screen="admin" type="button"><span class="glyph">◇</span>Tenants &amp; principals</button>
-      <button class="nav-item" data-screen="admin" data-tab="audit" type="button"><span class="glyph">◇</span>Audit</button>
     </div>
 
     <div class="nav-group">
@@ -1003,20 +1002,9 @@
     { id: "legacy-soap",   priority: 30, enabled: false, host: "soap.test",       pathPrefix: null,   headers: [], method: null,   port: 6006, stripPrefix: false }
   ];
 
-  /* Two audit fixtures worth having: an applied write and a quota refusal,
-     because a refusal being a *committed decision* is the surprising part of
-     RFC-002 T4 and the viewer has to show it as a row, not hide it. */
-  const AUDIT = [
-    { revision: 1284, action: "imposter.write", resource: "6001",  tenant: "acme",    principal: "ci@acme",       outcome: "applied", ts: "17:42:09" },
-    { revision: 1283, action: "tenant.manage",  resource: "ci@acme", tenant: "acme",  principal: "ops@achird",    outcome: "applied", ts: "17:41:55" },
-    { revision: 1282, action: "imposter.write", resource: "6099",  tenant: "acme",    principal: "ci@acme",       outcome: "refused", ts: "17:40:12", reason: "quota: imposters 24/24" },
-    { revision: 1281, action: "audit.read",     resource: "*",     tenant: "acme",    principal: "auditor@acme",  outcome: "applied", ts: "17:38:41" },
-    { revision: 1280, action: "cluster.admin",  resource: "sink",  tenant: "*",       principal: "ops@achird",    outcome: "applied", ts: "17:31:02" }
-  ];
-
   const PRINCIPALS = [
     { id: "ci@acme",       display: "CI pipeline",   role: "editor",       disabled: false, created: "2026-06-02" },
-    { id: "auditor@acme",  display: "Compliance",    role: "tenant-admin", disabled: false, created: "2026-06-14" },
+    { id: "compliance@acme", display: "Compliance",    role: "tenant-admin", disabled: false, created: "2026-06-14" },
     { id: "readonly@acme", display: "Dashboards",    role: "viewer",       disabled: false, created: "2026-07-01" },
     { id: "old-runner",    display: "Retired runner", role: "editor",      disabled: true,  created: "2026-02-11" }
   ];
@@ -1025,13 +1013,13 @@
      ladder. Rendered as a matrix because that is the artefact a security
      reviewer reads, and authz.rs is written as explicit per-role arms for
      exactly that reason. */
-  const ACTIONS = ["imposter.read", "imposter.write", "lifecycle.toggle", "verify.run", "tenant.manage", "audit.read", "cluster.admin"];
+  const ACTIONS = ["imposter.read", "imposter.write", "lifecycle.toggle", "verify.run", "tenant.manage", "cluster.admin"];
   const LADDER = ["viewer", "operator", "editor", "tenant-admin", "fleet-admin"];
   const GRANTS = {
     "viewer":       ["imposter.read"],
     "operator":     ["imposter.read", "lifecycle.toggle"],
     "editor":       ["imposter.read", "lifecycle.toggle", "imposter.write", "verify.run"],
-    "tenant-admin": ["imposter.read", "lifecycle.toggle", "imposter.write", "verify.run", "tenant.manage", "audit.read"],
+    "tenant-admin": ["imposter.read", "lifecycle.toggle", "imposter.write", "verify.run", "tenant.manage"],
     "fleet-admin":  ACTIONS.slice()
   };
 
@@ -1770,7 +1758,6 @@
       <div class="tabs" id="admin-tabs" role="tablist">
         <button role="tab" data-v="tenants"    aria-selected="${tab === "tenants"}">Tenants</button>
         <button role="tab" data-v="principals" aria-selected="${tab === "principals"}">Principals &amp; roles</button>
-        <button role="tab" data-v="audit"      aria-selected="${tab === "audit"}">Audit</button>
       </div>`;
 
     let body = "";
@@ -1837,7 +1824,7 @@
             </table>
           </div>
           <div class="card-body">
-            <p class="hint" style="margin:0">A strict superset ladder: Viewer ⊂ Operator ⊂ Editor ⊂ TenantAdmin ⊂ FleetAdmin. Two placements are deliberate and worth reading twice — <code>audit.read</code> is <em>not</em> a Viewer grant despite being a read, and it is <em>not</em> part of <code>tenant.manage</code> either, so managing principals does not make you an auditor. <b>FleetAdmin binds only on the fleet scope <code>*</code></b>, never inside a tenant, so it is not offered as an in-tenant role.</p>
+            <p class="hint" style="margin:0">A strict superset ladder: Viewer ⊂ Operator ⊂ Editor ⊂ TenantAdmin ⊂ FleetAdmin. One placement is deliberate and worth reading twice: <b>FleetAdmin binds only on the fleet scope <code>*</code></b>, never inside a tenant, so it is not offered as an in-tenant role.</p>
           </div>
         </div>
         <div class="banner info">
@@ -1847,47 +1834,9 @@
         </div>`;
     }
 
-    if (tab === "audit") {
-      const rows = AUDIT.map(a => `
-        <tr>
-          <td class="num">${esc(String(a.revision))}</td>
-          <td class="num">${esc(a.ts)}</td>
-          <td><span class="clause">${esc(a.action)}</span></td>
-          <td class="mono">${esc(a.resource)}</td>
-          <td class="mono">${esc(a.tenant)}</td>
-          <td class="mono">${esc(a.principal)}</td>
-          <td>${a.outcome === "applied"
-                ? pill("good", "●", "applied")
-                : pill("warn", "▲", "refused")}${a.reason ? `<div class="meta mono" style="margin-top:3px;color:var(--ink-3);font-size:11px">${esc(a.reason)}</div>` : ""}</td>
-        </tr>`).join("");
-
-      body = `
-        <div class="card">
-          <div class="card-head"><h2>Audit</h2><div class="spacer"></div>
-            <span class="readonly-hint">GET /admin/audit?since=0&amp;limit=50</span></div>
-          <div class="scroll-x">
-            <table>
-              <thead><tr><th class="r">Rev</th><th>Time</th><th>Action</th><th>Resource</th><th>Tenant</th><th>Principal</th><th>Outcome</th></tr></thead>
-              <tbody>${rows}</tbody>
-            </table>
-          </div>
-          <div class="pager">
-            <button class="btn sm" type="button" disabled>Newer</button>
-            <button class="btn sm" type="button">Older</button>
-            <span class="count">rev 1280–1284 · ${state.role === "fleet-admin" ? "fleet-wide" : `filtered to ${esc(state.tenant)}`}</span>
-          </div>
-        </div>
-        <div class="banner info">
-          <span class="b-glyph" aria-hidden="true">◈</span>
-          <div><strong>A refusal is a committed row, not a missing one.</strong>
-            <p>Revision 1282 is a quota refusal. Quotas are validated where the op applies, so a refusal is a decision the fleet agreed to and it appears in the stream like any other outcome — an audit view that showed only successes would make the interesting half invisible.</p></div>
-        </div>
-        <p class="hint">Rows are ordered by revision, which is the fleet's own total order — not by wall-clock, which can disagree across nodes. Reads are tenant-filtered from the caller's bindings: a TenantAdmin sees their tenant, a FleetAdmin sees the fleet. <code>resource</code> and <code>principal</code> are attacker-influenceable and render as text.</p>`;
-    }
-
     return `
       <div class="page-head">
-        <div><h1>Administration</h1><div class="sub">Tenancy, identity and the audit stream.</div></div>
+        <div><h1>Administration</h1><div class="sub">Tenancy and identity.</div></div>
       </div>
       ${tabs}
       <div class="section-stack">${body}</div>`;

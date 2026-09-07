@@ -40,7 +40,7 @@ export const POLLED_REQUESTS = {
  *
  * A 4xx from the admin front is a decision, not a hiccup — 401 means the session lapsed, 403 that
  * the role refuses it, and 404 on a fleet-scoped route that the principal lacks the scope (RFC-002
- * §8.4). Retrying those doubles the audited denials and delays the honest message on screen by a
+ * §8.4). Retrying those only repeats the denial and delays the honest message on screen by a
  * backoff interval, for an outcome that cannot change.
  */
 export function retryTransportFailures(failureCount: number, error: Error): boolean {

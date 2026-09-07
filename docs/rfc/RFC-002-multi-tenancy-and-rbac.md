@@ -559,6 +559,8 @@ exactly the window consensus is being paid for.
 
 ## 9. Audit
 
+> **Retired by D-71** (RFC-007 §3.2, #546): the audit projection, exporter and sink were removed. The section stays as history.
+
 **One stream, two sources, one format.** Every applied `ControlOp` (which already
 carries `op_id` and, with this RFC, `principal` — #14) and every U-10 event emit:
 

@@ -2,12 +2,8 @@
 //!
 //! The unit tests prove the router and the RBAC table in isolation. These prove the things only a
 //! live front can show: which role gets which status, that a cross-tenant probe is
-//! indistinguishable from a missing one, and — the reason this slice exists — that a **content
-//! read leaves an audit record while a listing does not**.
-//!
-//! That last pair is asserted together on purpose. RFC-002 §9 says reads are not audited, and #287
-//! carves out exactly one exception; a test that only proved the positive would let the exception
-//! quietly widen to every dataset read without anything failing.
+//! indistinguishable from a missing one, and that a content read serves the uploaded bytes back
+//! as CSV.
 
 use std::time::Duration;
 
@@ -127,11 +123,10 @@ struct Fixture {
     admin: std::net::SocketAddr,
     viewer: String,
     editor: String,
-    tenant_admin: String,
     client: reqwest::Client,
 }
 
-/// A solo node with `acme` and `other` tenants, and one principal per role in `acme`.
+/// A solo node with `acme` and `other` tenants, and a viewer and an editor principal in `acme`.
 async fn fixture() -> Fixture {
     let state = TempDir::new().expect("tempdir");
     let server = compose::start(cluster_cli(&state)).await.expect("starts");
@@ -154,7 +149,6 @@ async fn fixture() -> Fixture {
     }
     let viewer = seed_principal(&node, &mut op_id, "viewer", "acme", Role::Viewer).await;
     let editor = seed_principal(&node, &mut op_id, "editor", "acme", Role::Editor).await;
-    let tenant_admin = seed_principal(&node, &mut op_id, "admin", "acme", Role::TenantAdmin).await;
     let admin = server.admin_addr();
     Fixture {
         _state: state,
@@ -162,7 +156,6 @@ async fn fixture() -> Fixture {
         admin,
         viewer,
         editor,
-        tenant_admin,
         client: reqwest::Client::new(),
     }
 }
@@ -219,34 +212,6 @@ impl Fixture {
         let status = response.status().as_u16();
         (status, response.text().await.unwrap_or_default())
     }
-
-    /// A content read carrying an `Idempotency-Key`, which must *not* deduplicate.
-    async fn get_keyed(&self, key: &str, path: &str, idempotency: &str) -> (u16, String) {
-        let response = self
-            .client
-            .get(format!("http://{}{path}", self.admin))
-            .header("authorization", key)
-            .header("idempotency-key", idempotency)
-            .send()
-            .await
-            .expect("get");
-        let status = response.status().as_u16();
-        (status, response.text().await.unwrap_or_default())
-    }
-
-    /// Every audit row `acme` can see, as raw JSON.
-    async fn audit(&self) -> String {
-        let response = self
-            .client
-            .get(format!("http://{}/admin/audit", self.admin))
-            .header("authorization", self.tenant_admin.clone())
-            .header("x-rift-tenant", "acme")
-            .send()
-            .await
-            .expect("audit read");
-        assert_eq!(response.status().as_u16(), 200, "audit must be readable");
-        response.text().await.unwrap_or_default()
-    }
 }
 
 /// E1/E2 — the read/redefine ladder, end to end.
@@ -299,36 +264,21 @@ async fn a_cross_tenant_probe_is_indistinguishable_from_a_missing_dataset() {
     );
 }
 
-/// E4 + E5 — the audit exception, both halves.
-///
-/// The negative half is the load-bearing one: it is what keeps "reads are not audited" true of
-/// everything except this single route.
+/// E4 — a content read serves the uploaded bytes back, byte for byte, as CSV.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_content_read_is_audited_and_a_listing_is_not() {
+async fn a_content_read_serves_the_uploaded_bytes_as_csv() {
     let f = fixture().await;
     let (status, body) = f.upload(&f.editor, "acme", "customers", CUSTOMERS).await;
     assert_eq!(status, 201, "{body}");
 
-    let before = f.audit().await;
-    assert!(
-        !before.contains("dataset.read"),
-        "nothing has been exported yet: {before}"
-    );
-
-    // A listing and a history read: neither is an export.
-    let (status, _, _) = f.get(&f.editor, "/admin/tenants/acme/datasets").await;
+    // A listing and a history read both answer, as JSON.
+    let (status, _, content_type) = f.get(&f.editor, "/admin/tenants/acme/datasets").await;
     assert_eq!(status, 200);
+    assert_eq!(content_type.as_deref(), Some("application/json"));
     let (status, _, _) = f
         .get(&f.editor, "/admin/tenants/acme/datasets/customers")
         .await;
     assert_eq!(status, 200);
-
-    let after_reads = f.audit().await;
-    assert!(
-        !after_reads.contains("dataset.read"),
-        "a listing and a history read must leave no trace — the exception is one route, not all \
-         dataset reads: {after_reads}"
-    );
 
     // The export.
     let (status, csv, content_type) = f
@@ -343,26 +293,6 @@ async fn a_content_read_is_audited_and_a_listing_is_not() {
         content_type.as_deref(),
         Some("text/csv; charset=utf-8"),
         "a CSV is served as one, not as JSON"
-    );
-
-    let after_export = f.audit().await;
-    assert!(
-        after_export.contains("dataset.read"),
-        "the export must leave a trace: {after_export}"
-    );
-    assert!(
-        after_export.contains("customers@1"),
-        "the record names the dataset and version: {after_export}"
-    );
-    let digest = {
-        use sha2::{Digest as _, Sha256};
-        let mut hasher = Sha256::new();
-        hasher.update(CUSTOMERS.as_bytes());
-        format!("{:x}", hasher.finalize())
-    };
-    assert!(
-        after_export.contains(&digest),
-        "and the digest, so the row names the exact bytes that left: {after_export}"
     );
 }
 
@@ -432,12 +362,9 @@ async fn a_duplicate_key_is_refused_naming_the_column() {
     );
 }
 
-/// E7 — an absent version is a 404 and, critically, leaves no audit row.
-///
-/// Nothing was exported, so a record claiming an export would be a false entry in the one stream
-/// that exists to be trusted.
+/// E7 — an absent version is a 404, not a 500 and not a coerced 'latest'.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_content_read_of_an_absent_version_is_not_audited() {
+async fn a_content_read_of_an_absent_version_is_a_404() {
     let f = fixture().await;
     let (status, body) = f.upload(&f.editor, "acme", "customers", CUSTOMERS).await;
     assert_eq!(status, 201, "{body}");
@@ -449,12 +376,6 @@ async fn a_content_read_of_an_absent_version_is_not_audited() {
         )
         .await;
     assert_eq!(status, 404, "there is no version 99");
-
-    let audit = f.audit().await;
-    assert!(
-        !audit.contains("dataset.read"),
-        "nothing was exported, so nothing may claim it was: {audit}"
-    );
 }
 
 /// E13 — a non-numeric version is a 404, not a 500 and not a coerced 'latest'.
@@ -543,37 +464,4 @@ async fn a_bound_dataset_cannot_be_deleted_until_its_binding_goes() {
         "and it is gone from the listing: {listing}"
     );
     let _ = &f.server;
-}
-
-/// An `Idempotency-Key` must not buy an unrecorded export.
-///
-/// This is the defect that made the slice's central claim false. `base_op_id` derives the op id
-/// from the key, and a replayed op id short-circuits in the state machine *above* the audit write,
-/// while the front serves a body it computed before submitting. So a second keyed read returned the
-/// bytes and recorded nothing — and because dedup keys on the op id alone and never on the op's
-/// content, the replay did not even have to name the same dataset. One recorded read bought 24
-/// hours of unrecorded exports.
-///
-/// Two keyed reads, two audit rows. Counting them is the assertion: "an audit row exists" would
-/// have passed against the broken code, because the *first* read always recorded one.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_repeated_idempotency_key_cannot_buy_an_unrecorded_export() {
-    let f = fixture().await;
-    let (status, body) = f.upload(&f.editor, "acme", "customers", CUSTOMERS).await;
-    assert_eq!(status, 201, "{body}");
-
-    let path = "/admin/tenants/acme/datasets/customers/1/content";
-    for _ in 0..2 {
-        let (status, csv) = f.get_keyed(&f.editor, path, "the-same-key").await;
-        assert_eq!(status, 200);
-        assert_eq!(csv, CUSTOMERS, "each read really does export the bytes");
-    }
-
-    let audit = f.audit().await;
-    let exports = audit.matches("dataset.read").count();
-    assert_eq!(
-        exports, 2,
-        "two exports must leave two records; a deduplicated second read would serve the bytes and \
-         record nothing: {audit}"
-    );
 }

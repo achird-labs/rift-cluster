@@ -37,7 +37,7 @@ If you read only three chapters, read **1 (Overview)**, **4 (Write Path)**, and
 | 5 | [The Read Path](05-read-path.md) | Life of a mock request: matching, stateful gates, where RPCs happen |
 | 6 | [Flow State](06-flow-state.md) | Ownership, replication, durability, recovery, fencing |
 | 7 | [The Verification Plane](07-verification-plane.md) | Recorded requests, counters, clears, cursors/SSE, proxyOnce |
-| 8 | [Multi-Tenancy & Security](08-tenancy-security.md) | Tenants, roles, audit, cluster-internal auth |
+| 8 | [Multi-Tenancy & Security](08-tenancy-security.md) | Tenants, roles, cluster-internal auth |
 | 9 | [Durability & Failure](09-durability-failure.md) | What survives what: the restart matrix and partition behavior |
 | 10 | [Operations](10-operations.md) | Deployment, probes, metrics, runbooks, rolling upgrades, sizing |
 | 11 | [The Upstream Boundary](11-upstream-boundary.md) | What lives upstream, what stays cluster, and how Cargo enforces it |

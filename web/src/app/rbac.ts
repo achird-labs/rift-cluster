@@ -115,7 +115,6 @@ export type Capability =
    */
   | "flowState.clear"
   | "tenant.manage"
-  | "audit.read"
   | "fleet.read"
   /**
    * `Action::ClusterAdmin` — held by `fleet-admin` alone.
@@ -165,11 +164,7 @@ export function roleAllows(role: Role, capability: Capability): boolean {
         capability === "space.stubWrite"
       );
     case "tenant-admin":
-      return (
-        roleAllows("editor", capability) ||
-        capability === "tenant.manage" ||
-        capability === "audit.read"
-      );
+      return roleAllows("editor", capability) || capability === "tenant.manage";
     case "fleet-admin":
       return true;
   }

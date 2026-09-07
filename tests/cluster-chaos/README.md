@@ -183,8 +183,8 @@ would quietly turn C20's `== 1` into whatever the transport happened to do.
 `build_snapshot` / `install_snapshot` name openraft's wire path for catching a
 lagging follower up wholesale rather than entry-by-entry. Three scenarios'
 issues each named it as a mutation target — C18 ("rides the snapshot"), C22
-("`sm_sources` omitted from the snapshot"), C26 ("the `audit` table omitted
-from `SnapshotPayload`") — and each, applied and measured against this tier's
+("`sm_sources` omitted from the snapshot"), C26 ("the table it compares
+omitted from `SnapshotPayload`") — and each, applied and measured against this tier's
 plain full-fleet restart, **survived**. Not because the scenarios were weak:
 openraft's default `snapshot_policy` (`LogsSinceLast(5000)`,
 `crates/rift-cluster/src/raft/node.rs`) never triggers on the few dozen
@@ -221,10 +221,10 @@ inferred — without it the scenario would prove only that a snapshot install
 *should* have been needed, and would stay green if a regression quietly restored
 catch-up-by-log.
 
-`c26_audit_chain_survives_a_full_cluster_restart` is the one scenario built on
-top of it: it stops one follower, commits more than 10 entries through the
-other two so the leader snapshots and purges what the follower would need,
-then restarts it — forcing a real `install_snapshot` rather than assuming the
+`c26_replicated_imposters_survive_a_full_cluster_restart_by_snapshot_install` is the one
+scenario built on top of it: it stops one follower, commits more than 10
+imposters through the other two so the leader snapshots and purges what the
+follower would need, then restarts it — forcing a real `install_snapshot` rather than assuming the
 config alone proves the wire path ran. See its doc comment for the mechanism
 and for what the container tier can and cannot observe about `install_snapshot`
 directly. C18 and C22 still run the plain full-fleet restart, so their named
@@ -327,7 +327,7 @@ Implemented and passing: `test_config_sync_converges`, `test_node_rejoin`,
 `c23_drift_flags_and_pull_overwrites`,
 `c24_rbac_enforcement_is_identical_through_any_node`,
 `c25_key_revocation_survives_a_partition`,
-`c26_audit_chain_survives_a_full_cluster_restart`,
+`c26_replicated_imposters_survive_a_full_cluster_restart_by_snapshot_install`,
 `c27_tenancy_isolates_ownership_but_not_the_data_plane`,
 `c28_fleet_journal_is_exact_under_node_kill`,
 `c29_partial_reads_answer_within_budget_and_count_themselves`,
@@ -626,7 +626,7 @@ The demo these four back is `deploy/compose/sources-demo.yml` — one
 `POST /admin/sources/:id/pull` rolling the fleet onto new content. See
 `deploy/README.md`'s "Imposter sources demo".
 
-## C24–C27: tenancy, RBAC and audit
+## C24–C27: tenancy, RBAC and the closed admin plane
 
 Issue #165 closes #146's acceptance list. These four are the **only** scenarios in
 this tier that run against a *closed* admin plane: every other one relies on
@@ -639,7 +639,7 @@ file's header for why a scenario cannot bootstrap one over HTTP itself.
 |---|---|---|
 | `c24_rbac_enforcement_is_identical_through_any_node` | one Viewer bound in a non-default tenant (`acme`), the §4.1 action matrix through all three nodes, every verdict identical **including the response body** — plus vacuity guards requiring the matrix to contain a `200`, a `403` and a `404`, so "everyone agreed" cannot be satisfied by a fleet that refuses everything | `RaftNode::principal_bindings` returning empty on a non-leader (a leader-only authorizer) went red on the follower: `node rift-2 never applied the viewer's binding: 404` while the leader answered `200` |
 | `c25_key_revocation_survives_a_partition` | (a) a partitioned minority cannot itself perform an authorization write (`503`/`504`), and (b) the **first** request through the previously-minority node after the heal is refused, with the convergence window measured and bounded | a 60 s TTL cache over `principal_bindings` went red on the majority side immediately: `the side that committed the revocation must refuse the revoked key at once` |
-| `c26_audit_chain_survives_a_full_cluster_restart` | a session spanning `tenant.manage` and `imposter.write` through all three nodes; after a full-fleet stop/start every node's `(revision, action, resource)` projection is byte-identical to its own pre-restart one **and** to every other node's | clearing `sm_audit` whenever the store is opened — rows behaving as if held in memory — went red at `node rift-1 lost or reordered audit rows across the restart` |
+| `c26_replicated_imposters_survive_a_full_cluster_restart_by_snapshot_install` | three imposters written through all three nodes, then one follower stopped while fifteen more are committed past `RIFT_CLUSTER_SNAPSHOT_LOG_ENTRIES`; the restarted follower converges to the live nodes' `(port, revision, stubs)` rows over a real `install_snapshot` (asserted from `rift_cluster_snapshots_installed_total`); then after a full-fleet stop/start every node's rows are byte-identical to its own pre-restart ones **and** to every other node's | the configs table dropped from `SnapshotPayload` goes red at the catch-up: the follower comes back serving only the three imposters it held before it stopped; a store clearing its configs whenever it is opened goes red at `node rift-1 lost, rewrote or reordered imposters across the full-fleet restart` |
 | `c27_tenancy_isolates_ownership_but_not_the_data_plane` | two tenants, one imposter each; each tenant's Editor reads and manages (`AddStub`) its own imposter (`2xx`) and is refused the other's with a `404` **byte-identical** to a port that does not exist; the tenancy surface refuses cross-tenant reads the same way; and both imposters answer unauthenticated data-plane traffic — even a bogus credential — through every node | requiring an `authorization` header in `handle_request_inner` went red at `alpha's imposter must answer unauthenticated traffic through rift-1 — RFC-002 §7` |
 
 **C24 now runs its matrix in a non-default tenant (`acme`), and that is the
@@ -653,10 +653,9 @@ ownership gate in the same choke point (an authorized action is still refused
 if the addressed port belongs to a *different* tenant), so a tenant other than
 `default` is genuinely served, and C24 exercises that: the role still
 discriminates inside `acme` (`imposter.read`/`write`/`delete`), and the 404
-half of the split now comes purely from the *fleet-scoped* routes (`GET
-/admin/tenants` and `GET /admin/audit/sink` both scope to `FLEET_SCOPE`),
-which a tenant-bound principal holds no binding for regardless of which
-tenant it is bound to. Every request the viewer sends carries an explicit
+half of the split now comes purely from the *fleet-scoped* route (`GET
+/admin/tenants` scopes to `FLEET_SCOPE`), which a tenant-bound principal
+holds no binding for regardless of which tenant it is bound to. Every request the viewer sends carries an explicit
 `X-Rift-Tenant: acme` — unlike `default`, `acme` is not what an omitted
 header falls back to.
 
@@ -676,21 +675,25 @@ performs. The data-plane assertion is strengthened to also send a bogus
 `authorization` header, proving the data plane has no authentication to fail
 rather than merely none presented.
 
-**C26 closes the gap the other two record.** The issue named "the `audit`
-table omitted from `SnapshotPayload`" as its mutation target and asked for
-"the snapshot-install path, not only restart-and-replay" — see "Why the
-snapshot round trip needed a knob" above for why the plain full-fleet restart
-this scenario used to run could never supply that. It now runs two phases: one
-that deliberately lags a follower past `RIFT_CLUSTER_SNAPSHOT_LOG_ENTRIES` and
+**C26 closes the gap the other two record.** The issue named a table
+omitted from `SnapshotPayload` as its mutation target and asked for "the
+snapshot-install path, not only restart-and-replay" — see "Why the snapshot
+round trip needed a knob" above for why the plain full-fleet restart this
+scenario used to run could never supply that. It runs two phases: one that
+deliberately lags a follower past `RIFT_CLUSTER_SNAPSHOT_LOG_ENTRIES` and
 restarts it, forcing a real `install_snapshot`, and the original full-fleet
-restart, kept because it separately guards "clearing `sm_audit` whenever the
-store is opened" — a different bug on the ordinary cold-start path that the
-snapshot phase does not touch. Both mutant stories, and how the container
-tier observes `install_snapshot` actually running (from
-`rift_cluster_snapshots_installed_total` — this file's own house rule, that
-assertions read the admin API and Prometheus metrics and never log output,
-rules out a log line), are recorded in the scenario's own doc comment rather
-than repeated here.
+restart, kept because it separately guards a store that drops its configs
+whenever it is opened — a different bug on the ordinary cold-start path that
+the snapshot phase does not touch. Its payload is the imposter set — the
+projection the rest of this tier already reads, with the per-port revision
+taken from the `Rift-Cluster-Revision` header rather than from
+`rift_cluster_config_revision`, which neither a snapshot install nor a cold
+re-open repopulates (D-71 removed the projection it used to compare). Both
+mutant stories, and how the container tier observes `install_snapshot`
+actually running (from `rift_cluster_snapshots_installed_total` — this file's
+own house rule, that assertions read the admin API and Prometheus metrics and
+never log output, rules out a log line), are recorded in the scenario's own
+doc comment rather than repeated here.
 
 **`GET /admin/whoami` is not a revocation probe, and neither is it a binding
 probe.** It classifies no action (§4.3's `None` case), so it answers `200` to

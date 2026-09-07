@@ -9,7 +9,7 @@ whose backend has shipped or is sliced:
 | App shell, tenant switcher, imposters, cluster/fleet | C4 | [#187](https://github.com/achird-labs/rift-cluster/issues/187) |
 | Stub editor — form ⟷ JSON, lint, 409 rebase | C5 | [#188](https://github.com/achird-labs/rift-cluster/issues/188) |
 | Request log (per-node) and front-door route editor | C6 | [#189](https://github.com/achird-labs/rift-cluster/issues/189) |
-| Tenants, principals, roles, audit | C7 | [#190](https://github.com/achird-labs/rift-cluster/issues/190) |
+| Tenants, principals, roles | C7 | [#190](https://github.com/achird-labs/rift-cluster/issues/190) |
 
 Scenarios and flow state (#149), sources (#20) and specs (#148) appear as greyed nav entries carrying
 their issue number — a visible roadmap rather than a 404, which is what §4 asks for.
@@ -37,7 +37,7 @@ the state is also readable from the query string so any combination is linkable:
 | `scopeNode` | `rift-1` · `rift-2` · `rift-3` (request log only) |
 | `req` | a request id, e.g. `r-8812` (request log only) |
 | `stubCase` | `simple` · `unmodelled` · `conflict` (stub editor only) |
-| `adminTab` | `tenants` · `principals` · `audit` (administration only) |
+| `adminTab` | `tenants` · `principals` (administration only) |
 
 ```
 console-prototype.html?screen=requests&fleet=degraded&scopeNode=rift-3
@@ -130,14 +130,9 @@ Deleting a single route is the safe operation and should be preferred where that
 **A key is shown once.** The fleet stores an argon2id hash, so there is nothing to reveal later and no
 reveal action is offered — one would teach operators to expect a feature that cannot exist.
 
-**A refusal is a committed row.** The audit fixture includes a quota refusal at revision 1282. Quotas
-are validated where the op applies, so a refusal is a decision the fleet agreed to and belongs in the
-stream like any other outcome; a viewer showing only successes hides the interesting half.
-
 The role matrix is rendered as a matrix on purpose. `authz.rs::role_allows` is written as explicit
 per-role arms precisely so a security reviewer can read the table, and the UI should have the same
-property. Note `audit.read` is deliberately **not** a Viewer grant and deliberately **not** part of
-`tenant.manage`, and `FleetAdmin` binds only on the fleet scope `*` — so it is never offered as an
+property. Note `FleetAdmin` binds only on the fleet scope `*` — so it is never offered as an
 in-tenant role.
 
 ## Design decisions, and why

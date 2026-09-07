@@ -668,6 +668,10 @@ variants `DatasetPut` / `DatasetDelete` join the reserved-op pattern
 
 ## 8. Threat model
 
+> **Amended by D-71** (RFC-007 §3.2, #546): the audit projection was removed, and with it
+> the content-read audit exception §8.3 describes. `DatasetRead` still gates the route; what is
+> gone is the committed record of the export. The paragraph stays as history.
+
 Datasets are the first EE object whose *payload* is plausibly real customer
 data — teams export production rows to get "realistic test profiles". That
 asymmetry drives this section.

@@ -46,7 +46,7 @@ test.describe("the shipped console loads", () => {
 
   test("renders the administration screens as fleet-admin", async ({ page }) => {
     await signIn(page, "fleet-admin");
-    for (const tab of ["tenants", "principals", "bindings", "audit", "sink"]) {
+    for (const tab of ["tenants", "principals", "bindings"]) {
       await goToScreen(page, `/admin/${tab}/default`);
       await expect(page.getByTestId("admin-screen")).toBeVisible();
     }

@@ -141,52 +141,6 @@ lazy_static! {
     )
     .expect("rift_cluster_snapshots_installed_total registers once");
 
-    /// `rift_cluster_audit_export_shipped_total` — audit rows accepted by the
-    /// sink (issue #164). At-least-once, so this can exceed the number of rows
-    /// derived: a leader that dies between shipping and checkpointing re-ships
-    /// its last batch, and that is by design rather than a defect.
-    static ref AUDIT_EXPORT_SHIPPED: IntCounter = register_int_counter!(
-        "rift_cluster_audit_export_shipped_total",
-        "Audit rows accepted by the export sink (at-least-once, so re-ships are counted)"
-    )
-    .expect("rift_cluster_audit_export_shipped_total registers once");
-
-    /// `rift_cluster_audit_export_failures_total` — failed ship attempts.
-    /// Rising while `..._shipped_total` is flat is the signal that a sink is
-    /// down; the write path is unaffected either way, which is the whole point
-    /// of exporting from a background task.
-    static ref AUDIT_EXPORT_FAILURES: IntCounter = register_int_counter!(
-        "rift_cluster_audit_export_failures_total",
-        "Failed attempts to ship a batch to the export sink"
-    )
-    .expect("rift_cluster_audit_export_failures_total registers once");
-
-    /// `rift_cluster_audit_export_skipped_revisions_total` — the revision span
-    /// the exporter found already GC'd when it came back to it (issue #164).
-    ///
-    /// A **revision** span, not a row count, and the name says so deliberately:
-    /// once retention has removed the rows there is nothing left to count, and
-    /// revisions are not one-to-one with audit rows (a deduped replay and a
-    /// non-audited op each consume a revision without producing one). So this
-    /// is an upper bound on what was lost. An upper bound that is named as one
-    /// is useful; a precise-looking number that is actually a guess is not.
-    static ref AUDIT_EXPORT_SKIPPED: IntCounter = register_int_counter!(
-        "rift_cluster_audit_export_skipped_revisions_total",
-        "Revision span that aged past audit retention before the exporter shipped it \
-         (an upper bound on rows lost)"
-    )
-    .expect("rift_cluster_audit_export_skipped_revisions_total registers once");
-
-    /// `rift_cluster_audit_export_lag_revisions` — last applied revision minus
-    /// the export checkpoint, sampled on the leader. Zero on a follower, which
-    /// is correct rather than missing: a follower is not behind on exporting,
-    /// it is not exporting.
-    static ref AUDIT_EXPORT_LAG: Gauge = register_gauge!(
-        "rift_cluster_audit_export_lag_revisions",
-        "Revisions between the last applied entry and the audit export checkpoint (leader only)"
-    )
-    .expect("rift_cluster_audit_export_lag_revisions registers once");
-
     /// `rift_cluster_source_scheduler_corrupt_rows` — source rows the leader's
     /// poll scheduler could not decode on its last reconcile.
     ///
@@ -437,26 +391,6 @@ pub(crate) fn dedup_hit() {
 /// A peer's snapshot was applied to this node's state machine (issue #183).
 pub(crate) fn snapshot_installed() {
     SNAPSHOTS_INSTALLED.inc();
-}
-
-pub(crate) fn audit_export_shipped(rows: usize) {
-    AUDIT_EXPORT_SHIPPED.inc_by(rows as u64);
-}
-
-pub(crate) fn audit_export_failure() {
-    AUDIT_EXPORT_FAILURES.inc();
-}
-
-pub(crate) fn audit_export_skipped(revisions: u64) {
-    AUDIT_EXPORT_SKIPPED.inc_by(revisions);
-}
-
-pub(crate) fn audit_export_lag(revisions: u64) {
-    #[expect(
-        clippy::cast_precision_loss,
-        reason = "a gauge is f64; a lag deep enough to lose precision is already the alarm"
-    )]
-    AUDIT_EXPORT_LAG.set(revisions as f64);
 }
 
 pub(crate) fn flow_wal_lag(depth: usize) {

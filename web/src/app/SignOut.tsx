@@ -36,7 +36,7 @@ export function SignOut(): ReactNode {
        * Two steps, and the order is the whole point.
        *
        * First drop every read *except* `whoami`, so the previous principal's imposters, tenants and
-       * audit rows are gone rather than merely stale — invalidation would leave them on screen for
+       * principals are gone rather than merely stale — invalidation would leave them on screen for
        * whoever signs in next, for as long as the refetches take.
        *
        * Then reset `whoami` specifically, which refetches it because `App` still has it mounted.

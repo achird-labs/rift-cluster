@@ -64,7 +64,7 @@ test.describe("accessibility", () => {
     });
   }
 
-  for (const tab of ["tenants", "principals", "bindings", "audit", "sink"]) {
+  for (const tab of ["tenants", "principals", "bindings"]) {
     test(`the ${tab} admin tab`, async ({ page }) => {
       await signIn(page, "fleet-admin");
       await goToScreen(page, `/admin/${tab}/default`);

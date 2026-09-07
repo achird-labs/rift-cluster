@@ -63,7 +63,6 @@ const EXPECTED: Record<Capability, Role[]> = {
   // `/admin/imposters/`, whether or not a key is named.
   "flowState.clear": ["operator", "editor", "tenant-admin", "fleet-admin"],
   "tenant.manage": ["tenant-admin", "fleet-admin"],
-  "audit.read": ["tenant-admin", "fleet-admin"],
   "fleet.read": ["fleet-admin"],
   // `Action::ClusterAdmin`. Deliberately not `tenant-admin`: the whole `/admin/tenants` CRUD and
   // `PrincipalPut`/`PrincipalDelete` sit behind it, which is why it has to be separable from

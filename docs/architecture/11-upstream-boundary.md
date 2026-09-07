@@ -37,7 +37,7 @@ table is where a `U-n` is defined (`scripts/design-check.py` resolves citations 
 | U-7 | rift#317 | `ServerBuilder` / `run_metrics_server` / `dispatch_to_port` (+ `handle_imposter_request`, re-exported for #344) | `rift-cluster-server` composes instead of forking `main` (D-11) | merged |
 | U-8 | rift#318 | `BackendUnavailable` + `annotate()` + `ResponseDecorator` | every `Rift-Cluster-*` header, without core handlers knowing what a cluster is | merged |
 | U-9 | rift#854 (+ `authz::classify`, rift#889) | `AdminAuthorizer` / `AuthzRequest` / `AuthzDecision` | RFC-002 enforcement point (Chapter 8) | merged |
-| U-10 | rift#855 | `EventContext` on `ImposterEventListener` (principal-on-events) | audit attribution (RFC-002, Chapter 8) | merged |
+| U-10 | rift#855 | `EventContext` on `ImposterEventListener` (principal-on-events) | event attribution (RFC-002, Chapter 8) | merged |
 | U-11 | — | `front_door::{RouteTable, bind_front_door, RouteObserver}` (route table + listener) | single-port content routing (#19, Chapter 13); the admin CRUD is a replicated control-plane object here (#131) | merged |
 | U-12 | — | `ImposterSource` provider trait, `SourceRegistry`, `parse_remote_document`; `FileSource`/`HttpSource` built-ins | imposter sources (#20, Chapter 13) | merged |
 | U-13 | rift#966/#967 | `ExchangeInspector` / `ExchangeInspectorProvider` (`extensions::exchange_inspector`) | request-side hook after journaling and before matching; response-side hook in the shared funnel — spec traffic validation (RFC-004 §6); re-exported by #281 | merged |
@@ -152,7 +152,7 @@ where code *belongs*, not about what is withheld.
 Everything in `rift-cluster` and `rift-cluster-server`: the Raft control plane and
 its storage, the ownership ring and fencing, HMAC RPC, the flow-state durable
 tier, the sharded journal and vector cursors, the proxyOnce owner machine,
-tenancy/RBAC/audit, `/_cluster/*`, the chaos harness and k8s manifests. The
+tenancy/RBAC, `/_cluster/*`, the chaos harness and k8s manifests. The
 Redis-strict backends of D-12 are demand-gated and none is built: the cluster
 crates contain no Redis implementation of any seam — the durable tier is redb
 (D-16), and the only Redis `FlowStore` anywhere is upstream's own (D-6).

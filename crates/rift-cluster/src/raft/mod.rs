@@ -27,7 +27,7 @@ pub use node::{
     JoinOutcome, JoinedAs, LeaveOutcome, NodeConfig, NodeError, RaftNode, StatusReport,
 };
 pub use ring::{KeyClass, OwnStatus, OwnedKey, Ring};
-pub use store::{DEFAULT_AUDIT_RETENTION_SECS, PullOutcome, SourceRecord, SourceRow};
+pub use store::{PullOutcome, SourceRecord, SourceRow};
 
 use openraft::BasicNode;
 

@@ -15,7 +15,7 @@ src/api/       schema.ts (generated, committed) · client.ts (the only fetch) ·
 src/app/       Shell · session · rbac · nav · routing · queries · contract · fleetView
 src/screens/   Login · Imposters · ImposterDetail · Fleet · RequestLog · Routes · Admin
 src/features/  requests/source.ts (the #147 seam) · routes/order.ts (front-door ordering)
-               admin/{roles,audit,key}.ts (RFC-002 admin plane)
+               admin/{roles,key}.ts (RFC-002 admin plane)
 src/components/primitives (Status, Truncated, Ident, ErrorNote)
 ```
 

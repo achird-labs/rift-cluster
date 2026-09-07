@@ -523,8 +523,8 @@ impl SourcePuller {
 
     /// Fetch `tenant`'s named source and submit what it produced.
     ///
-    /// `principal` is recorded on the op for audit — "who updated the mocks, and
-    /// to which version" is a log query rather than a mystery.
+    /// `principal` is recorded on the op for attribution — "who updated the mocks,
+    /// and to which version" is a log query rather than a mystery.
     ///
     /// `tenant` is explicit rather than defaulted because a source id is unique
     /// only within its tenant: the poll scheduler pulls whichever tenant
@@ -557,7 +557,7 @@ impl SourcePuller {
 
         // The credential *name* travels with the fetch; the secret is resolved
         // inside the provider and never returns here, so it cannot reach the
-        // op, the audit row below, or a `PullError` rendered to the caller.
+        // op, the log line below, or a `PullError` rendered to the caller.
         let fetched = self
             .registry
             .fetch(&source_ref, record.auth_ref.as_deref())
@@ -708,7 +708,7 @@ impl SourcePuller {
         // `Applied` means the op was committed and ran — not that it changed
         // anything. A drifted source under `on_drift: skip` commits a decision
         // to hold off, and reporting that as an apply would put a false
-        // "source pull applied" line in the audit log and name ports in
+        // "source pull applied" line in the log and name ports in
         // `changed` that were never touched.
         let skipped = node
             .source(tenant, id)
@@ -718,12 +718,11 @@ impl SourcePuller {
                     && after.last_outcome == Some(PullOutcome::Skipped)
             });
 
-        // The audit row the issue asks for: who pulled what, to which version,
-        // at which revision, and whether it landed. `target: "audit"` so a
-        // deployment can route these somewhere durable without also shipping
-        // every debug line.
+        // Who pulled what, to which version, at which revision, and whether it
+        // landed. Its own target so a deployment can route these somewhere
+        // durable without also shipping every debug line.
         tracing::info!(
-            target: "audit",
+            target: "rift_cluster::sources",
             event = "source.pull",
             tenant = %tenant,
             source_id = %id,

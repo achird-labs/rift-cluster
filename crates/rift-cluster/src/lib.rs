@@ -20,7 +20,6 @@
 //! * [`decorate`] — the response decorator that turns cluster op notes into
 //!   `Rift-Cluster-*` headers, so the open-source handlers stay cluster-unaware.
 
-pub mod audit_export;
 pub mod blobs;
 pub mod bridge;
 pub mod config;
@@ -37,19 +36,18 @@ pub mod stores;
 pub use bridge::{Bridge, BridgeConfig, CallerClass};
 pub use config::{ClusterConfig, ConfigError, RuntimeTopology};
 pub use control::{
-    AUDIT_RESOURCE_ALL, AuditRow, AuditSink, ControlOp, ControlOutcome, ControlRequest,
-    ControlResponse, DEFAULT_AUDIT_BATCH_MAX_ROWS, DEFAULT_TENANT, Digest, FLEET_SCOPE,
-    MAX_AUDIT_BATCH_MAX_ROWS, MAX_SOURCE_PAYLOAD_BYTES, MAX_SPEC_BYTES, OnDrift,
-    PreconditionTarget, RecordedStub, RecordedStubPlacement, SESSION_KEY_BYTES, SessionKey,
-    SourceMode, SourceProvenance, SpecFormat, SpecMeta, SpecProvenance, SpecSource, StubEdit,
-    StubEditScript, TenantId, precondition_target, routes_installed_for,
+    ControlOp, ControlOutcome, ControlRequest, ControlResponse, DEFAULT_TENANT, Digest,
+    FLEET_SCOPE, MAX_SOURCE_PAYLOAD_BYTES, MAX_SPEC_BYTES, OnDrift, PreconditionTarget,
+    RecordedStub, RecordedStubPlacement, SESSION_KEY_BYTES, SessionKey, SourceMode,
+    SourceProvenance, SpecFormat, SpecMeta, SpecProvenance, SpecSource, StubEdit, StubEditScript,
+    TenantId, precondition_target, routes_installed_for,
 };
 pub use decorate::ClusterDecorator;
 pub use pull_on_miss::PullOnMissInterceptor;
 pub use raft::{
-    ADMIT_CURRENCY_WAIT, DEFAULT_AUDIT_RETENTION_SECS, JoinOutcome, JoinedAs, KeyClass,
-    LeaveOutcome, NodeConfig, NodeError, NodeId, NodeIdentity, OwnStatus, OwnedKey, PullOutcome,
-    RaftNode, Ring, SourceRecord, SourceRow, StatusReport,
+    ADMIT_CURRENCY_WAIT, JoinOutcome, JoinedAs, KeyClass, LeaveOutcome, NodeConfig, NodeError,
+    NodeId, NodeIdentity, OwnStatus, OwnedKey, PullOutcome, RaftNode, Ring, SourceRecord,
+    SourceRow, StatusReport,
 };
 // `raft::store` is `pub(crate)` (not re-exported by `raft`'s own `pub use`, unlike
 // `SourceRecord`/`SourceRow`) — reached directly here rather than widening that module's own

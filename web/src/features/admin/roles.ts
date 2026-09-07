@@ -28,8 +28,7 @@ export function assignableRoles(scope: string): readonly Role[] {
  * capabilities this console's `Capability` type names — RFC-002 §4.2 as a table a reviewer can read
  * beside the Rust, rather than a rank comparison that hides which capability a role actually adds.
  *
- * Two placements worth stating twice, because they are easy to "tidy" into the wrong place: `audit.
- * read` starts at `tenant-admin`, not `viewer` and not folded into `tenant.manage`; and `imposter.
+ * One placement worth stating twice, because it is easy to "tidy" into the wrong place: `imposter.
  * write` starts at `editor` — `operator` gets lifecycle control, not write.
  *
  * **Derived from `rbac.ts::roleAllows`, never hand-written.** An independent second transcription of
@@ -50,7 +49,6 @@ export const CAPABILITIES = [
   "imposter.lifecycle",
   "imposter.write",
   "tenant.manage",
-  "audit.read",
   "fleet.read",
   "cluster.admin",
 ] as const satisfies readonly Capability[];

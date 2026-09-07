@@ -1234,7 +1234,7 @@ impl ProxyRecordingStore for ClusterProxyStore {
     /// which every node's engine drive reaches on every imposter delete or replace while
     /// `apply` awaits it — a submit from there either blocks the apply loop it needs
     /// (the C22/C23/C26 write-deadline storms) or, spawned, has *every replica* minting
-    /// its own audited op per reclaim (the C26 audit-chain drift). And nothing durable
+    /// its own op per reclaim (the C26 per-replica op drift). And nothing durable
     /// needs doing here anyway: the delete/replace ops purge the marker rows atomically
     /// at apply, and the explicit `DELETE .../savedProxyResponses` terminates at the
     /// front door as one `ProxyRecordedClear` op. Stale completion-cache entries on

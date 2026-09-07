@@ -60,34 +60,20 @@ struct Member {
     node: Option<Arc<RaftNode>>,
 }
 
-async fn spawn(
-    id: NodeId,
-    addr: SocketAddr,
-    dir: &Path,
-    audit_retention_secs: u64,
-) -> Arc<RaftNode> {
+async fn spawn(id: NodeId, addr: SocketAddr, dir: &Path) -> Arc<RaftNode> {
     // Most of these tests drive `build_snapshot`/`install_snapshot` directly, so they need no help
     // provoking one. The exception is #428's catch-up test, which needs a real snapshot to cross
     // the wire and so passes the knob explicitly.
-    spawn_with_snapshot_policy(id, addr, dir, audit_retention_secs, None).await
+    spawn_with_snapshot_policy(id, addr, dir, None).await
 }
 
 async fn spawn_with_snapshot_policy(
     id: NodeId,
     addr: SocketAddr,
     dir: &Path,
-    audit_retention_secs: u64,
     snapshot_log_entries: Option<u64>,
 ) -> Arc<RaftNode> {
-    spawn_full(
-        id,
-        addr,
-        dir,
-        audit_retention_secs,
-        snapshot_log_entries,
-        false,
-    )
-    .await
+    spawn_full(id, addr, dir, snapshot_log_entries, false).await
 }
 
 /// [`spawn_with_snapshot_policy`] plus the #481 capability knob: `advertise_as_digest_only_incapable`
@@ -98,7 +84,6 @@ async fn spawn_full(
     id: NodeId,
     addr: SocketAddr,
     dir: &Path,
-    audit_retention_secs: u64,
     snapshot_log_entries: Option<u64>,
     advertise_as_digest_only_incapable: bool,
 ) -> Arc<RaftNode> {
@@ -110,7 +95,6 @@ async fn spawn_full(
         secret: Some(SECRET.to_owned()),
         routes: Router::new(),
         engine: None,
-        audit_retention_secs,
         snapshot_log_entries,
         advertise_as_digest_only_incapable,
     };
@@ -129,35 +113,19 @@ struct TestCluster {
     members: Vec<Member>,
     /// Retained so `restart` brings a node back with the same snapshot policy.
     snapshot_log_entries: Option<u64>,
-    /// Retained so `restart` brings a node back with the same retention it was
-    /// started with. A node that silently reverted to the 30-day default on
-    /// restart would look like a GC bug rather than a harness bug.
-    audit_retention_secs: u64,
 }
 
 impl TestCluster {
     /// Start `n` nodes, bootstrap node 1, and seed-join the rest through it, so
     /// the returned cluster is one converged group of `n` voters.
     async fn start(n: usize) -> Self {
-        Self::start_with_audit_retention(n, rift_cluster::DEFAULT_AUDIT_RETENTION_SECS).await
-    }
-
-    /// [`Self::start`] with an explicit audit retention window, for the tests
-    /// that need GC to actually run within a test's lifetime.
-    async fn start_with_audit_retention(n: usize, audit_retention_secs: u64) -> Self {
-        Self::start_full(n, audit_retention_secs, None, None).await
+        Self::start_full(n, None, None).await
     }
 
     /// [`Self::start`] with every node snapshotting every `entries` log entries and purging to
     /// the tip, so a member that falls behind must be caught up by `install_snapshot`.
     async fn start_with_snapshots(n: usize, entries: u64) -> Self {
-        Self::start_full(
-            n,
-            rift_cluster::DEFAULT_AUDIT_RETENTION_SECS,
-            Some(entries),
-            None,
-        )
-        .await
+        Self::start_full(n, Some(entries), None).await
     }
 
     /// [`Self::start`] with `incapable`'s blob route advertising `applies_digest_only: false`
@@ -165,18 +133,11 @@ impl TestCluster {
     /// shape. The only way this in-process harness puts a version-skewed member in a cluster
     /// without standing up two binary versions.
     async fn start_with_one_member_digest_only_incapable(n: usize, incapable: NodeId) -> Self {
-        Self::start_full(
-            n,
-            rift_cluster::DEFAULT_AUDIT_RETENTION_SECS,
-            None,
-            Some(incapable),
-        )
-        .await
+        Self::start_full(n, None, Some(incapable)).await
     }
 
     async fn start_full(
         n: usize,
-        audit_retention_secs: u64,
         snapshot_log_entries: Option<u64>,
         digest_only_incapable: Option<NodeId>,
     ) -> Self {
@@ -196,7 +157,6 @@ impl TestCluster {
             members[0].id,
             members[0].addr,
             members[0].dir.path(),
-            audit_retention_secs,
             snapshot_log_entries,
             digest_only_incapable == Some(members[0].id),
         )
@@ -210,7 +170,6 @@ impl TestCluster {
                 member.id,
                 member.addr,
                 member.dir.path(),
-                audit_retention_secs,
                 snapshot_log_entries,
                 digest_only_incapable == Some(member.id),
             )
@@ -224,7 +183,6 @@ impl TestCluster {
         let cluster = Self {
             members,
             snapshot_log_entries,
-            audit_retention_secs,
         };
         let all: BTreeSet<NodeId> = cluster.members.iter().map(|m| m.id).collect();
         assert!(
@@ -372,14 +330,7 @@ impl TestCluster {
         // Ensure the previous instance is gone before rebinding the port.
         self.kill(id).await;
         let dir = self.member(id).dir.path().to_path_buf();
-        let node = spawn_with_snapshot_policy(
-            mid,
-            addr,
-            &dir,
-            self.audit_retention_secs,
-            self.snapshot_log_entries,
-        )
-        .await;
+        let node = spawn_with_snapshot_policy(mid, addr, &dir, self.snapshot_log_entries).await;
         self.member_mut(id).node = Some(node);
     }
 
@@ -528,14 +479,12 @@ async fn test_uninitialized_fleet_never_ready() {
         1,
         format!("127.0.0.1:{}", ports[0]).parse().unwrap(),
         da.path(),
-        rift_cluster::DEFAULT_AUDIT_RETENTION_SECS,
     )
     .await;
     let b = spawn(
         2,
         format!("127.0.0.1:{}", ports[1]).parse().unwrap(),
         db.path(),
-        rift_cluster::DEFAULT_AUDIT_RETENTION_SECS,
     )
     .await;
 
@@ -1022,7 +971,7 @@ async fn test_rejoin_after_leave() {
     let new_dir = TempDir::new().expect("tempdir");
     let addr = cluster.member(departed).addr;
     let seed = cluster.leader().expect("a leader to seed off").advertise();
-    let rejoined = spawn(departed, addr, new_dir.path(), cluster.audit_retention_secs).await;
+    let rejoined = spawn(departed, addr, new_dir.path()).await;
     rejoined.join_via(seed).await.expect("rejoin via seed");
     cluster.member_mut(departed).node = Some(rejoined);
     // Keep the fresh directory alive for the rest of the test (and
@@ -1103,7 +1052,7 @@ async fn test_rejoin_after_leave_with_retained_state_dir() {
     let dir = cluster.member(departed).dir.path().to_path_buf();
     let addr = cluster.member(departed).addr;
     let seed = cluster.leader().expect("a leader to seed off").advertise();
-    let rejoined = spawn(departed, addr, &dir, cluster.audit_retention_secs).await;
+    let rejoined = spawn(departed, addr, &dir).await;
     rejoined
         .join_via(seed)
         .await
@@ -1715,39 +1664,13 @@ async fn deleting_a_tracking_source_stops_its_poller() {
 }
 
 // ---------------------------------------------------------------------------
-// Issue #163 — the audit stream and leader-side quotas across a real cluster.
+// Issue #163 — leader-side quotas across a real cluster.
 //
-// The state-machine unit tests in `raft/store.rs` already pin the projection's
-// shape. What can only be asserted here is the claim that makes the endpoint
-// fan-out-free: every replica derives the *same* rows from the same log, so any
-// node answers for the fleet. Narrating that property is not the same as
-// checking it, so these tests query all three nodes and compare.
+// The state-machine unit tests in `raft/store.rs` already pin the refusal's
+// shape. What can only be asserted here is that the refusal is the *same*
+// committed decision on every replica: the write lands nowhere, and every node
+// applies the revision that refused it.
 // ---------------------------------------------------------------------------
-
-/// Poll, bounded, until every live node's audit stream is byte-identical.
-/// Returns the agreed rows, or `None` on timeout — never a synthetic pass.
-async fn wait_audit_agreed(
-    cluster: &TestCluster,
-    deadline: Duration,
-) -> Option<Vec<rift_cluster::AuditRow>> {
-    let start = Instant::now();
-    loop {
-        let per_node: Vec<Vec<rift_cluster::AuditRow>> = cluster
-            .live()
-            .map(|n| n.audit_since(0, None, 10_000).expect("read audit"))
-            .collect();
-        if let Some(first) = per_node.first()
-            && !first.is_empty()
-            && per_node.iter().all(|rows| rows == first)
-        {
-            return Some(first.clone());
-        }
-        if start.elapsed() > deadline {
-            return None;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-}
 
 fn submit_request(op_id: u128, issued_at_secs: u64, op: rift_cluster::ControlOp) -> ControlRequest {
     ControlRequest {
@@ -1757,58 +1680,6 @@ fn submit_request(op_id: u128, issued_at_secs: u64, op: rift_cluster::ControlOp)
         expected_revision: None,
         op,
     }
-}
-
-/// AC1: every write appears exactly once, with the same revision, on every node
-/// — asserted by querying all three and comparing, which is the whole of the
-/// "no fan-out needed" claim.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn the_audit_stream_is_identical_on_every_node() {
-    let _serial = TEST_LOCK.lock().await;
-    let mut cluster = TestCluster::start(3).await;
-    assert!(cluster.wait_for_leader(LEADER_DEADLINE).await.is_some());
-
-    let ports = [18081u16, 18082, 18083];
-    for (i, port) in ports.iter().enumerate() {
-        cluster.write_on_leader(*port, &format!("cfg-{i}")).await;
-    }
-    for (i, port) in ports.iter().enumerate() {
-        assert!(
-            cluster
-                .wait_converged(*port, &format!("cfg-{i}"), CONVERGE_DEADLINE)
-                .await
-        );
-    }
-
-    let rows = wait_audit_agreed(&cluster, CONVERGE_DEADLINE)
-        .await
-        .expect("every node must derive the same audit rows from the same log");
-
-    for port in ports {
-        let matching: Vec<_> = rows
-            .iter()
-            .filter(|r| r.resource == port.to_string())
-            .collect();
-        assert_eq!(
-            matching.len(),
-            1,
-            "each write is audited exactly once, not once per node and not \
-             twice on a replay: {matching:?}"
-        );
-        assert_eq!(matching[0].action, "imposter.write");
-    }
-
-    let mut revisions: Vec<u64> = rows.iter().map(|r| r.revision).collect();
-    let unique = revisions.len();
-    revisions.sort_unstable();
-    revisions.dedup();
-    assert_eq!(
-        revisions.len(),
-        unique,
-        "revisions are unique per row: {rows:?}"
-    );
-
-    cluster.shutdown_all().await;
 }
 
 /// AC2: a quota refusal is a *committed* decision — the same `Failed` outcome at
@@ -1876,911 +1747,42 @@ async fn a_quota_refusal_is_the_same_committed_decision_on_every_node() {
         panic!("the second imposter is over the ceiling: {refused:?}");
     };
 
-    let rows = wait_audit_agreed(&cluster, CONVERGE_DEADLINE)
-        .await
-        .expect("the audit stream must agree across nodes");
-
-    let refusal: Vec<_> = rows.iter().filter(|r| r.resource == "18092").collect();
-    assert_eq!(refusal.len(), 1, "the refusal is audited once: {rows:?}");
-    assert_eq!(
-        refusal[0].revision, refused.revision,
-        "the audited refusal sits at the revision the write returned"
+    assert!(
+        refused.revision > first.revision,
+        "a refusal is a committed entry with a revision of its own: {refused:?}"
     );
-    assert_eq!(
-        refusal[0].outcome, refused.outcome,
-        "the committed outcome is the audited one, verbatim"
-    );
-    assert_eq!(refusal[0].tenant, rift_cluster::TenantId::new("acme"));
 
-    // And the refusal really is the same decision everywhere, not just the same
-    // row shape: every node reports the identical outcome at that revision.
+    // The refusal really is the same decision everywhere: every node applies the
+    // revision that refused it, and on every node the first imposter landed while
+    // the second did not. A node that applied the entry differently — or skipped
+    // it — would hold a different table from its peers.
     for node in cluster.live() {
-        let node_rows = node.audit_since(refused.revision, None, 10).expect("read");
-        let row = node_rows
-            .iter()
-            .find(|r| r.revision == refused.revision)
-            .expect("every node holds the refusal");
-        assert_eq!(row.outcome, refused.outcome);
-    }
-
-    cluster.shutdown_all().await;
-}
-
-/// AC4, the restart half: audit history is committed state, so it survives every
-/// node going down and coming back — not just the leader.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn audit_rows_survive_a_full_cluster_restart() {
-    let _serial = TEST_LOCK.lock().await;
-    let mut cluster = TestCluster::start(3).await;
-    assert!(cluster.wait_for_leader(LEADER_DEADLINE).await.is_some());
-
-    cluster.write_on_leader(18095, "before-restart").await;
-    assert!(
-        cluster
-            .wait_converged(18095, "before-restart", CONVERGE_DEADLINE)
-            .await
-    );
-    let before = wait_audit_agreed(&cluster, CONVERGE_DEADLINE)
-        .await
-        .expect("the audit stream agrees before the restart");
-
-    for id in [1, 2, 3] {
-        cluster.restart(id).await;
-    }
-    assert!(
-        cluster.wait_for_leader(LEADER_DEADLINE).await.is_some(),
-        "the cluster must re-elect after a full restart"
-    );
-
-    let after = wait_audit_agreed(&cluster, CONVERGE_DEADLINE)
-        .await
-        .expect("the audit stream agrees after the restart");
-    assert_eq!(
-        after, before,
-        "audit history is committed state and must survive a full-cluster \
-         restart unchanged"
-    );
-
-    cluster.shutdown_all().await;
-}
-
-/// AC3 across a real cluster.
-///
-/// The store-level test is the one that proves the *mechanism* is clock-agnostic
-/// — it uses timestamps decades in the past, so a `SystemTime::now()`-based GC
-/// would sweep everything and fail it. The criterion's literal phrasing ("a node
-/// whose local clock is skewed by a week") cannot be staged in-process for
-/// exactly the reason the feature is correct: nothing in the retention path
-/// reads a local clock, so there is no local clock to skew.
-///
-/// What is worth asserting here is the consequence: retention GC, running inside
-/// apply on every replica, leaves the three streams **in agreement**. A GC that
-/// read node-local state would diverge them, and this is where that would show.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn retention_gc_leaves_every_node_holding_the_same_rows() {
-    let _serial = TEST_LOCK.lock().await;
-    let mut cluster = TestCluster::start_with_audit_retention(3, 100).await;
-    assert!(cluster.wait_for_leader(LEADER_DEADLINE).await.is_some());
-
-    let leader = cluster.leader().expect("a leader");
-    let imposter = |port: u16| {
-        serde_json::from_value(serde_json::json!({
-            "port": port,
-            "protocol": "http",
-            "host": "127.0.0.1",
-        }))
-        .expect("test config parses")
-    };
-
-    // Three writes on an old logical clock, then two that advance it well past
-    // the retention window — the second of which triggers the sweep.
-    for (op_id, port, ts) in [
-        (1u128, 19201u16, 1_000u64),
-        (2, 19202, 1_050),
-        (3, 19203, 1_090),
-        (4, 19204, 5_000),
-        (5, 19205, 5_001),
-    ] {
-        leader
-            .write(submit_request(
-                op_id,
-                ts,
-                rift_cluster::ControlOp::PutImposter {
-                    tenant: rift_cluster::TenantId::default(),
-                    config: Box::new(imposter(port)),
-                },
-            ))
-            .await
-            .expect("write commits");
-    }
-
-    let rows = wait_audit_agreed(&cluster, CONVERGE_DEADLINE)
-        .await
-        .expect("every node must agree after retention GC has run");
-
-    assert!(
-        rows.iter().all(|r| r.ts_secs >= 4_901),
-        "rows outside the retention window must be gone on every node: {rows:?}"
-    );
-    assert!(
-        rows.iter().any(|r| r.resource == "19205"),
-        "and the recent ones must remain: {rows:?}"
-    );
-
-    // Belt and braces: compare the three streams element-wise, not just their
-    // agreed-upon length.
-    let per_node: Vec<Vec<rift_cluster::AuditRow>> = cluster
-        .live()
-        .map(|n| n.audit_since(0, None, 10_000).expect("read audit"))
-        .collect();
-    for stream in &per_node {
-        assert_eq!(
-            stream, &rows,
-            "a node that GC'd differently would show up here"
-        );
-    }
-
-    cluster.shutdown_all().await;
-}
-
-// ---------------------------------------------------------------------------
-// Issue #164 — the audit export sink: leader-only, checkpointed, at-least-once.
-// ---------------------------------------------------------------------------
-
-/// A collector that counts what actually arrived.
-///
-/// Deliberately a real HTTP listener rather than an injected fake transport:
-/// the criteria are about what reaches a sink across a failover, and a fake
-/// that the exporter calls directly would not exercise the framing, the batch
-/// boundary, or the failure path that a 500 produces.
-struct CountingSink {
-    addr: std::net::SocketAddr,
-    received: Arc<std::sync::Mutex<Vec<(u64, String)>>>,
-    requests: Arc<std::sync::atomic::AtomicUsize>,
-    task: tokio::task::JoinHandle<()>,
-}
-
-impl CountingSink {
-    /// `status` is what every request gets: 200 for the happy path, 500 for the
-    /// permanently-failing-sink scenario.
-    async fn start(status: u16) -> Self {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind counting sink");
-        let addr = listener.local_addr().expect("sink addr");
-        let received: Arc<std::sync::Mutex<Vec<(u64, String)>>> = Arc::default();
-        let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let (rx_rows, rx_reqs) = (Arc::clone(&received), Arc::clone(&requests));
-
-        let task = tokio::spawn(async move {
-            loop {
-                let Ok((mut stream, _)) = listener.accept().await else {
-                    return;
-                };
-                let (rows, reqs) = (Arc::clone(&rx_rows), Arc::clone(&rx_reqs));
-                tokio::spawn(async move {
-                    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
-                    let mut buf = Vec::new();
-                    let mut chunk = [0u8; 8192];
-                    // Read headers, then exactly Content-Length bytes of body.
-                    let body = loop {
-                        let Ok(n) = stream.read(&mut chunk).await else {
-                            return;
-                        };
-                        if n == 0 {
-                            return;
-                        }
-                        buf.extend_from_slice(&chunk[..n]);
-                        let Some(split) = buf.windows(4).position(|w| w == b"\r\n\r\n") else {
-                            continue;
-                        };
-                        let head = String::from_utf8_lossy(&buf[..split]).to_lowercase();
-                        let len: usize = head
-                            .lines()
-                            .find_map(|l| l.strip_prefix("content-length:"))
-                            .and_then(|v| v.trim().parse().ok())
-                            .unwrap_or(0);
-                        if buf.len() >= split + 4 + len {
-                            break buf[split + 4..split + 4 + len].to_vec();
-                        }
-                    };
-                    reqs.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                    if status < 400 {
-                        let mut guard = rows.lock().expect("sink rows lock");
-                        for line in String::from_utf8_lossy(&body).lines() {
-                            if line.trim().is_empty() {
-                                continue;
-                            }
-                            let row: serde_json::Value = serde_json::from_str(line)
-                                .expect("the sink ships one row per line");
-                            guard.push((
-                                row["revision"].as_u64().expect("row carries a revision"),
-                                row["opId"]
-                                    .as_str()
-                                    .expect("row carries an opId")
-                                    .to_owned(),
-                            ));
-                        }
-                    }
-                    let reason = if status < 400 { "OK" } else { "Server Error" };
-                    let response =
-                        format!("HTTP/1.1 {status} {reason}\r\ncontent-length: 0\r\n\r\n");
-                    stream.write_all(response.as_bytes()).await.ok();
-                    stream.flush().await.ok();
-                });
-            }
-        });
-
-        Self {
-            addr,
-            received,
-            requests,
-            task,
-        }
-    }
-
-    fn uri(&self) -> String {
-        format!("http://{}/audit", self.addr)
-    }
-
-    fn rows(&self) -> Vec<(u64, String)> {
-        self.received.lock().expect("sink rows lock").clone()
-    }
-
-    fn request_count(&self) -> usize {
-        self.requests.load(std::sync::atomic::Ordering::SeqCst)
-    }
-}
-
-impl Drop for CountingSink {
-    fn drop(&mut self) {
-        self.task.abort();
-    }
-}
-
-fn export_context() -> Arc<rift_cluster::audit_export::ExportContext> {
-    Arc::new(rift_cluster::audit_export::ExportContext {
-        resolver: Arc::new(rift_cluster::sources::auth::StandardResolver::new(None)),
-        s3: rift_cluster::sources::s3::S3Config {
-            endpoint: None,
-            region: "us-east-1".to_owned(),
-        },
-    })
-}
-
-/// Attach an exporter to every live node. Every node runs one, exactly as in
-/// production — which is the only way the leader-only claim is actually under
-/// test rather than assumed by the harness.
-fn attach_exporters(cluster: &TestCluster) -> Vec<tokio::task::JoinHandle<()>> {
-    attach_exporters_with_status(cluster).1
-}
-
-/// The statuses are returned alongside the tasks because they are the only
-/// observable surface for "the exporter noticed it was failing". Discarding
-/// them (as this harness first did) leaves a 500-forever scenario asserting
-/// only that writes still work — which passes just as well against an exporter
-/// that silently gave up.
-#[allow(clippy::type_complexity)]
-fn attach_exporters_with_status(
-    cluster: &TestCluster,
-) -> (
-    Vec<Arc<rift_cluster::audit_export::ExportStatus>>,
-    Vec<tokio::task::JoinHandle<()>>,
-) {
-    let context = export_context();
-    cluster
-        .members
-        .iter()
-        .filter_map(|m| m.node.as_ref())
-        .map(|node| {
-            rift_cluster::audit_export::AuditExporter::spawn(
-                &tokio::runtime::Handle::current(),
-                node,
-                Arc::clone(&context),
-            )
-        })
-        .unzip()
-}
-
-/// Read a Prometheus counter out of the process-global default registry.
-///
-/// `None` when the family has not been emitted yet. The registry is global and
-/// this harness is serialized by `TEST_LOCK`, but counters still accumulate
-/// across scenarios in one binary — so callers must compare against a baseline
-/// taken in the same test, never against an absolute value.
-fn counter_value(name: &str) -> Option<f64> {
-    prometheus::gather()
-        .into_iter()
-        .find(|family| family.get_name() == name)?
-        .get_metric()
-        .first()
-        .map(|m| m.get_counter().get_value())
-}
-
-async fn declare_sink(cluster: &TestCluster, uri: &str) {
-    declare_sink_with_batch(cluster, uri, 50).await;
-}
-
-async fn declare_sink_with_batch(cluster: &TestCluster, uri: &str, batch_max_rows: u32) {
-    let leader = cluster.leader().expect("a leader to accept the sink");
-    let response = leader
-        .submit(ControlRequest {
-            op_id: uuid::Uuid::new_v4(),
-            principal: None,
-            issued_at_secs: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |d| d.as_secs()),
-            expected_revision: None,
-            op: rift_cluster::ControlOp::AuditSinkPut {
-                tenant: rift_cluster::TenantId::new(rift_cluster::FLEET_SCOPE),
-                uri: uri.to_owned(),
-                auth_ref: None,
-                batch_max_rows,
-            },
-        })
-        .await
-        .expect("the sink declaration commits");
-    assert_eq!(
-        response.outcome,
-        rift_cluster::ControlOutcome::Applied,
-        "a valid sink declaration must apply"
-    );
-}
-
-/// Commit a checkpoint directly, standing in for a leader that shipped a batch.
-async fn submit_checkpoint(cluster: &TestCluster, revision: u64) {
-    cluster
-        .leader()
-        .expect("a leader")
-        .submit(ControlRequest {
-            op_id: uuid::Uuid::new_v4(),
-            principal: None,
-            issued_at_secs: 0,
-            expected_revision: None,
-            op: rift_cluster::ControlOp::AuditCheckpointPut {
-                tenant: rift_cluster::TenantId::new(rift_cluster::FLEET_SCOPE),
-                revision,
-            },
-        })
-        .await
-        .expect("a checkpoint commits");
-}
-
-/// Poll until the leader's export checkpoint reaches `want`, or the deadline
-/// passes. Returns whatever it last read, so the caller asserts on the value.
-async fn wait_checkpoint(cluster: &TestCluster, want: u64, deadline: Duration) -> u64 {
-    let start = Instant::now();
-    loop {
-        let seen = cluster
-            .leader()
-            .and_then(|n| n.audit_checkpoint().ok())
-            .unwrap_or(0);
-        if seen >= want || start.elapsed() > deadline {
-            return seen;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-}
-
-/// Poll until the sink has seen at least `want` distinct rows, or the deadline
-/// passes. Returns what it saw either way, so the caller asserts on content
-/// rather than on this helper's verdict.
-/// Wait until every revision in `want` has reached the sink.
-///
-/// Not [`wait_rows`] with `want.len()`: the sink receives a row for *every*
-/// auditable control op, including ones this test did not write — declaring the
-/// sink itself, and whatever the engine happens to do at startup. Counting rows
-/// therefore returns as soon as `n` arrive, which may be `n` rows that are not
-/// the `n` this test is about, and the assertion that follows then reports a
-/// committed-but-unshipped revision that was merely still in flight. Waiting for
-/// the specific revisions makes the test immune to an unrelated op appearing
-/// before them — which is exactly what an upstream change did (vendor bump to
-/// `4b4f841`: one extra revision is consumed before the writes, so the first six
-/// rows started one too early).
-async fn wait_for_revisions(
-    sink: &CountingSink,
-    want: &[u64],
-    deadline: Duration,
-) -> Vec<(u64, String)> {
-    let start = Instant::now();
-    loop {
-        let rows = sink.rows();
-        let shipped: BTreeSet<u64> = rows.iter().map(|(rev, _)| *rev).collect();
-        if want.iter().all(|rev| shipped.contains(rev)) || start.elapsed() > deadline {
-            return rows;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-}
-
-async fn wait_rows(sink: &CountingSink, want: usize, deadline: Duration) -> Vec<(u64, String)> {
-    let start = Instant::now();
-    loop {
-        let rows = sink.rows();
-        let distinct: BTreeSet<_> = rows.iter().cloned().collect();
-        if distinct.len() >= want || start.elapsed() > deadline {
-            return rows;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-}
-
-/// AC1: off by default. With no sink record the exporter must not read the
-/// audit table, must not build a transport, and must not reach any network.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn audit_export_is_inert_without_a_sink_record() {
-    let _serial = TEST_LOCK.lock().await;
-    let mut cluster = TestCluster::start(3).await;
-    cluster
-        .wait_for_leader(LEADER_DEADLINE)
-        .await
-        .expect("a leader");
-
-    // A sink exists and is listening, but nothing points at it.
-    let sink = CountingSink::start(200).await;
-    let tasks = attach_exporters(&cluster);
-
-    for port in [19_001, 19_002, 19_003] {
-        cluster.write_on_leader(port, "inert").await;
-    }
-    tokio::time::sleep(Duration::from_secs(2)).await;
-
-    assert_eq!(
-        sink.request_count(),
-        0,
-        "with no sink record declared, the exporter must never reach the network"
-    );
-    for member in &cluster.members {
-        if let Some(node) = &member.node {
-            assert_eq!(
-                node.audit_sink().expect("read sink"),
-                None,
-                "node {} must hold no sink record",
-                member.id
-            );
-            assert_eq!(
-                node.audit_checkpoint().expect("read checkpoint"),
-                0,
-                "node {} must not have checkpointed anything",
-                member.id
-            );
-        }
-    }
-
-    for task in tasks {
-        task.abort();
-    }
-    cluster.shutdown_all().await;
-}
-
-/// AC2: exactly one copy of each audit row reaches the sink across a 3-node
-/// fleet. Every node runs an exporter; only the leader may ship.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn every_audit_row_reaches_the_sink_exactly_once() {
-    let _serial = TEST_LOCK.lock().await;
-    let mut cluster = TestCluster::start(3).await;
-    cluster
-        .wait_for_leader(LEADER_DEADLINE)
-        .await
-        .expect("a leader");
-
-    let sink = CountingSink::start(200).await;
-    declare_sink(&cluster, &sink.uri()).await;
-    let tasks = attach_exporters(&cluster);
-
-    let mut written = Vec::new();
-    for port in 19_100..19_106 {
-        written.push(cluster.write_on_leader(port, "shipped").await);
-    }
-
-    let rows = wait_for_revisions(&sink, &written, Duration::from_secs(20)).await;
-    let distinct: BTreeSet<(u64, String)> = rows.iter().cloned().collect();
-
-    // The strong assertion: no duplicates at all. Three nodes each derive these
-    // rows, so if leadership were not gating the export this would be 3×.
-    assert_eq!(
-        rows.len(),
-        distinct.len(),
-        "without a failover there is no duplicate window; got {} rows, {} distinct: {rows:?}",
-        rows.len(),
-        distinct.len()
-    );
-    let shipped_revisions: BTreeSet<u64> = distinct.iter().map(|(rev, _)| *rev).collect();
-    for revision in &written {
         assert!(
-            shipped_revisions.contains(revision),
-            "revision {revision} was committed but never shipped; shipped: {shipped_revisions:?}"
+            node.await_local_applied(refused.revision, CONVERGE_DEADLINE)
+                .await,
+            "node {} never applied the refusing revision {}",
+            node.id(),
+            refused.revision
         );
-    }
-
-    // …and the checkpoint catches up, so a failover would resume rather than
-    // re-ship from zero.
-    //
-    // Polled rather than asserted outright, and the reason is the design under
-    // test: the checkpoint is committed *after* the batch is on the wire, so
-    // between the sink recording the last row and the checkpoint landing there
-    // is a real window. That window is the at-least-once guarantee; a test that
-    // asserted the checkpoint the instant the rows arrived would be asserting
-    // exactly-once, which this feature deliberately does not provide.
-    let want = *written.last().expect("a write");
-    let checkpoint = wait_checkpoint(&cluster, want, CONVERGE_DEADLINE).await;
-    assert!(
-        checkpoint >= want,
-        "the checkpoint must catch up to everything that shipped: {checkpoint} < {want}"
-    );
-
-    for task in tasks {
-        task.abort();
-    }
-    cluster.shutdown_all().await;
-}
-
-/// AC2b: a leader kill mid-export. Duplicates are permitted **only** across the
-/// failover boundary, and every row must still arrive at least once.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_leader_kill_duplicates_only_across_the_failover_boundary() {
-    let _serial = TEST_LOCK.lock().await;
-    let mut cluster = TestCluster::start(3).await;
-    let first_leader = cluster
-        .wait_for_leader(LEADER_DEADLINE)
-        .await
-        .expect("a leader");
-
-    let sink = CountingSink::start(200).await;
-    declare_sink(&cluster, &sink.uri()).await;
-    let tasks = attach_exporters(&cluster);
-
-    let mut written = Vec::new();
-    for port in 19_200..19_206 {
-        written.push(cluster.write_on_leader(port, "before-failover").await);
-    }
-    wait_for_revisions(&sink, &written, Duration::from_secs(20)).await;
-
-    cluster.kill(first_leader).await;
-    let new_leader = cluster
-        .wait_for_leader(LEADER_DEADLINE)
-        .await
-        .expect("a new leader after the kill");
-    assert_ne!(new_leader, first_leader, "leadership must actually move");
-
-    // The surviving nodes already have exporters attached from `attach_exporters`.
-    for port in 19_210..19_216 {
-        written.push(cluster.write_on_leader(port, "after-failover").await);
-    }
-    let rows = wait_for_revisions(&sink, &written, Duration::from_secs(30)).await;
-
-    let distinct: BTreeSet<(u64, String)> = rows.iter().cloned().collect();
-    let shipped_revisions: BTreeSet<u64> = distinct.iter().map(|(rev, _)| *rev).collect();
-
-    // At-least-once: nothing is lost across the boundary.
-    for revision in &written {
         assert!(
-            shipped_revisions.contains(revision),
-            "revision {revision} was committed but never shipped across the failover. \
-             missing: {:?}; written: {written:?}; shipped: {shipped_revisions:?}",
-            written
-                .iter()
-                .filter(|r| !shipped_revisions.contains(r))
-                .collect::<Vec<_>>()
+            node.imposter_config("acme", 18091).expect("read").is_some(),
+            "node {} lost the imposter that was within quota",
+            node.id()
+        );
+        assert!(
+            node.imposter_config("acme", 18092).expect("read").is_none(),
+            "node {} landed the imposter the quota refused",
+            node.id()
         );
     }
-
-    // The duplicate *set* is asserted, not hand-waved: every duplicate must be
-    // dedupable by `(revision, op_id)` — i.e. a repeat of an identical pair,
-    // never two different rows claiming the same revision.
-    let mut counts: std::collections::BTreeMap<(u64, String), usize> =
-        std::collections::BTreeMap::new();
-    for row in &rows {
-        *counts.entry(row.clone()).or_default() += 1;
-    }
-    let mut by_revision: std::collections::BTreeMap<u64, BTreeSet<String>> =
-        std::collections::BTreeMap::new();
-    for (revision, op_id) in &distinct {
-        by_revision
-            .entry(*revision)
-            .or_default()
-            .insert(op_id.clone());
-    }
-    for (revision, op_ids) in &by_revision {
-        assert_eq!(
-            op_ids.len(),
-            1,
-            "revision {revision} arrived with {} different op_ids, so `(revision, op_id)` \
-             would not dedup it: {op_ids:?}",
-            op_ids.len()
-        );
-    }
-    let duplicated: Vec<_> = counts.iter().filter(|(_, n)| **n > 1).collect();
-    assert!(
-        duplicated.len() <= 50,
-        "duplicates must be bounded by the in-flight batch (50 rows), got {}: {duplicated:?}",
-        duplicated.len()
-    );
-
-    for task in tasks {
-        task.abort();
-    }
-    cluster.shutdown_all().await;
-}
-
-/// AC3: a sink that returns 500 forever must not stall admin writes.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_permanently_failing_sink_does_not_stall_admin_writes() {
-    let _serial = TEST_LOCK.lock().await;
-    let mut cluster = TestCluster::start(3).await;
-    cluster
-        .wait_for_leader(LEADER_DEADLINE)
-        .await
-        .expect("a leader");
-
-    let sink = CountingSink::start(500).await;
-    declare_sink(&cluster, &sink.uri()).await;
-    let failures_before = counter_value("rift_cluster_audit_export_failures_total").unwrap_or(0.0);
-    let (statuses, tasks) = attach_exporters_with_status(&cluster);
-
-    // The write path must be entirely unaffected. Timed, because "does not
-    // stall" is a latency claim: a write that eventually succeeds after the
-    // exporter's backoff would satisfy a bare success assertion and still be
-    // the bug.
-    let start = Instant::now();
-    let mut revisions = Vec::new();
-    for port in 19_300..19_310 {
-        revisions.push(cluster.write_on_leader(port, "still-writable").await);
-    }
-    let elapsed = start.elapsed();
-    assert!(
-        elapsed < Duration::from_secs(10),
-        "10 admin writes took {elapsed:?} against a dead sink; the export path must never \
-         appear in the write path"
-    );
-
-    // The fleet still converges, and the audit rows still exist locally.
-    assert!(
-        cluster
-            .wait_converged(19_309, "still-writable", CONVERGE_DEADLINE)
-            .await,
-        "the fleet must stay writable and converge with the sink down"
-    );
-
-    // The sink was genuinely attempted and genuinely failed — otherwise this
-    // test would pass just as well against an exporter that never ran.
-    let start = Instant::now();
-    while sink.request_count() == 0 && start.elapsed() < Duration::from_secs(20) {
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    assert!(
-        sink.request_count() > 0,
-        "the exporter must have attempted to ship; otherwise this proves nothing"
-    );
-    assert!(
-        sink.rows().is_empty(),
-        "a 500 must not be recorded as a successful ship"
-    );
-
-    // AC3's second half: the failure must be *visible*. Without these two
-    // assertions this test passes against an exporter that swallowed the 500,
-    // and against one that stopped trying after the first failure.
-    let start = Instant::now();
-    let mut observed = None;
-    while start.elapsed() < Duration::from_secs(20) {
-        let failing = statuses
-            .iter()
-            .map(|s| s.snapshot())
-            .find(|s| s.consecutive_failures > 0);
-        if let Some(snapshot) = failing {
-            observed = Some(snapshot);
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    let observed = observed.expect(
-        "some node's exporter must record the sink failure; a 500 that leaves \
-         consecutive_failures at 0 is a swallowed error",
-    );
-    assert!(
-        observed.last_error.is_some(),
-        "a failing sink must leave a readable reason, not just a count: {observed:?}"
-    );
-    assert_eq!(
-        observed.shipped_rows, 0,
-        "nothing was accepted, so nothing may be counted as shipped: {observed:?}"
-    );
-    let failures_after = counter_value("rift_cluster_audit_export_failures_total")
-        .expect("the failure counter family must exist once an export has been attempted");
-    assert!(
-        failures_after > failures_before,
-        "rift_cluster_audit_export_failures_total must grow while the sink is down: \
-         {failures_before} -> {failures_after}"
-    );
-
-    // Nothing was checkpointed: ship-then-checkpoint means a failed ship leaves
-    // the checkpoint where it was, so the batch is retried rather than skipped.
-    let leader = cluster.leader().expect("a leader");
-    assert_eq!(
-        leader.audit_checkpoint().expect("checkpoint"),
-        0,
-        "a failed ship must never advance the checkpoint — that would silently drop the batch"
-    );
-    assert!(!revisions.is_empty());
-
-    for task in tasks {
-        task.abort();
-    }
-    cluster.shutdown_all().await;
-}
-
-/// The monotonicity rule, asserted directly: a late checkpoint from a deposed
-/// leader must not rewind the stream and re-ship a delivered window.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn the_checkpoint_never_moves_backwards() {
-    let _serial = TEST_LOCK.lock().await;
-    let mut cluster = TestCluster::start(3).await;
-    cluster
-        .wait_for_leader(LEADER_DEADLINE)
-        .await
-        .expect("a leader");
-
-    submit_checkpoint(&cluster, 50).await;
-    assert_eq!(
-        cluster
-            .leader()
-            .expect("a leader")
-            .audit_checkpoint()
-            .expect("read"),
-        50
-    );
-
-    submit_checkpoint(&cluster, 20).await;
-    assert_eq!(
-        cluster
-            .leader()
-            .expect("a leader")
-            .audit_checkpoint()
-            .expect("read"),
-        50,
-        "a late checkpoint from a deposed leader must be a no-op, not a rewind"
-    );
-
-    submit_checkpoint(&cluster, 70).await;
-    assert_eq!(
-        cluster
-            .leader()
-            .expect("a leader")
-            .audit_checkpoint()
-            .expect("read"),
-        70,
-        "forward progress must still be recorded"
-    );
-
-    // Every replica must agree — the `max` runs at apply, so this is a claim
-    // about determinism, not just about the leader's copy.
-    for member in &cluster.members {
-        if let Some(node) = &member.node {
-            let start = Instant::now();
-            while node.audit_checkpoint().expect("read") != 70
-                && start.elapsed() < CONVERGE_DEADLINE
-            {
-                tokio::time::sleep(Duration::from_millis(50)).await;
-            }
-            assert_eq!(
-                node.audit_checkpoint().expect("read"),
-                70,
-                "node {} disagrees about the checkpoint",
-                member.id
-            );
-        }
-    }
-
-    cluster.shutdown_all().await;
-}
-
-/// The sink and checkpoint survive a node restart.
-///
-/// **Restart, not snapshot install** — the name said otherwise until it was
-/// measured. openraft here runs the default `LogEntries(5000)` snapshot policy,
-/// and this harness commits a few dozen entries, so no snapshot is ever built:
-/// the restarted node restores from its own redb. The chaos README records the
-/// same correction for C18 and C22. The snapshot round trip is gated in process
-/// by `the_audit_export_sink_checkpoint_and_gc_watermark_survive_a_snapshot_install`
-/// in `raft/store.rs`, which drives `build_snapshot`/`install_snapshot`
-/// directly; what this scenario covers is durability across a process death.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn sink_and_checkpoint_survive_a_node_restart() {
-    let _serial = TEST_LOCK.lock().await;
-    let mut cluster = TestCluster::start(3).await;
-    cluster
-        .wait_for_leader(LEADER_DEADLINE)
-        .await
-        .expect("a leader");
-
-    let sink = CountingSink::start(200).await;
-    declare_sink(&cluster, &sink.uri()).await;
-    let tasks = attach_exporters(&cluster);
-    let mut written = Vec::new();
-    for port in 19_400..19_404 {
-        written.push(cluster.write_on_leader(port, "snapshotted").await);
-    }
-    wait_for_revisions(&sink, &written, Duration::from_secs(20)).await;
-
-    // Rows at the sink do **not** mean the checkpoint has advanced: the exporter
-    // ships first and checkpoints second, and the checkpoint is a replicated
-    // `AuditCheckpointPut` — a whole consensus round after the bytes leave. So
-    // wait for it before aborting the exporters, or the abort freezes it at
-    // whatever it happened to be. Measured on this tree before the fix: the
-    // checkpoint read **0** at the moment the old row-count wait returned, on 2 of
-    // 3 local runs, which is exactly the `must have advanced` failure (#495).
-    let last_written = *written.iter().max().expect("the test wrote something");
-    let expected_checkpoint = wait_checkpoint(&cluster, last_written, CONVERGE_DEADLINE).await;
-    assert!(
-        expected_checkpoint >= last_written,
-        "the exporter never checkpointed the rows it shipped within {CONVERGE_DEADLINE:?} — \
-         nothing below can be measured until it has: checkpoint={expected_checkpoint} \
-         last_written={last_written} written={written:?} sink_rows={}",
-        sink.rows().len()
-    );
-
-    for task in tasks {
-        task.abort();
-    }
-
-    let expected_sink = cluster
-        .leader()
-        .expect("a leader")
-        .audit_sink()
-        .expect("read sink")
-        .expect("a sink is declared");
-
-    // Restart a follower: it reloads from its own persisted state machine, and
-    // catches the rest up from the leader.
-    let victim = cluster
-        .members
-        .iter()
-        .map(|m| m.id)
-        .find(|id| Some(*id) != cluster.leader().map(RaftNode::id))
-        .expect("a follower");
-    cluster.restart(victim).await;
-    cluster
-        .wait_for_leader(LEADER_DEADLINE)
-        .await
-        .expect("a leader after the restart");
-
-    let restarted = cluster
-        .member(victim)
-        .node
-        .as_ref()
-        .expect("the restarted node");
-    // At least, not exactly: `task.abort()` above does not stop an exporter
-    // mid-iteration, so one already in flight can still advance the checkpoint
-    // after `expected_checkpoint` was sampled. The invariant here is that the
-    // restart did not *lose* ground — an overshoot means more was exported and
-    // less will be re-shipped, which is the safe direction. Demanding equality
-    // made this fail under load with left > right, a passing state read as a
-    // failure (seen at 13 vs 8).
-    let start = Instant::now();
-    while restarted.audit_checkpoint().expect("read") < expected_checkpoint
-        && start.elapsed() < CONVERGE_DEADLINE
-    {
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    assert_eq!(
-        restarted.audit_sink().expect("read sink"),
-        Some(expected_sink),
-        "a node that came back without the sink record would stop exporting the moment it \
-         won an election, silently"
-    );
-    assert!(
-        restarted.audit_checkpoint().expect("read checkpoint") >= expected_checkpoint,
-        "a node that came back without the checkpoint would re-ship the entire retained \
-         history to the customer's bucket on its first election"
-    );
 
     cluster.shutdown_all().await;
 }
 
 /// The fleet's name survives a process death (issue #373).
 ///
-/// **Restart, not snapshot install** — the same correction this file already records for the
-/// audit sink and checkpoint above, and for chaos C18/C22. `snapshot_round_trips_the_fleet_name`
+/// **Restart, not snapshot install** — the same correction the chaos README records for C18 and
+/// C22. `snapshot_round_trips_the_fleet_name`
 /// in `raft/store.rs` drives `build_snapshot`/`install_snapshot` directly against a *fresh* state
 /// machine; it never closes and reopens the same redb file. A restart is the far more common
 /// event of the two — the default `LogEntries(5000)` policy means most nodes come back by
@@ -2845,258 +1847,6 @@ async fn the_fleet_name_survives_a_node_restart() {
          reading the fleet through it, with nothing logged to say why"
     );
 
-    cluster.shutdown_all().await;
-}
-
-/// AC5: a backlog that ages past retention is counted and logged, never
-/// silently dropped.
-///
-/// This test previously asserted only storage state and never attached an
-/// exporter — so the counter and the error log it claims to cover were never
-/// executed, and deleting both would have left it green. It now runs the real
-/// exporter against a dead sink and asserts the counter moved.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_backlog_aged_past_retention_is_counted_not_dropped() {
-    let _serial = TEST_LOCK.lock().await;
-    let mut cluster = TestCluster::start_with_audit_retention(3, 1).await;
-    cluster
-        .wait_for_leader(LEADER_DEADLINE)
-        .await
-        .expect("a leader");
-
-    // A dead sink, so the backlog genuinely ages instead of being shipped.
-    let dead = CountingSink::start(500).await;
-    declare_sink(&cluster, &dead.uri()).await;
-    let skipped_before =
-        counter_value("rift_cluster_audit_export_skipped_revisions_total").unwrap_or(0.0);
-    let (_statuses, tasks) = attach_exporters_with_status(&cluster);
-
-    for port in 19_500..19_506 {
-        cluster.write_on_leader(port, "will-age-out").await;
-    }
-
-    // Let the one-second retention window pass, then keep writing until GC has
-    // actually run.
-    //
-    // **Two** writes are the minimum, and the reason is easy to get wrong:
-    // `gc_audit` runs at the top of `apply`, before the batch's entries are
-    // folded in, so it sees the logical clock as of the *previous* apply. One
-    // write after the sleep therefore GCs against a clock that has not moved
-    // yet and removes nothing. (The earlier version of this test asserted
-    // `oldest > 1` as its proof that GC had run — which passes vacuously on
-    // bootstrap revisions, so it proved nothing and hid exactly this.)
-    tokio::time::sleep(Duration::from_secs(3)).await;
-    let mut recent = 0;
-    let mut port = 19_510;
-    let start = Instant::now();
-    while cluster
-        .leader()
-        .expect("a leader")
-        .audit_gc_watermark()
-        .expect("read watermark")
-        == 0
-        && start.elapsed() < Duration::from_secs(20)
-    {
-        recent = cluster.write_on_leader(port, "survives").await;
-        port += 1;
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-
-    let leader = cluster.leader().expect("a leader");
-
-    // GC recorded what it removed. This is the exporter's only evidence that
-    // rows were *lost* rather than never written, and it must be replicated:
-    // a node that forgot it would report a clean stream over a hole.
-    let watermark = leader.audit_gc_watermark().expect("read watermark");
-    assert!(
-        watermark > 0,
-        "retention must actually have removed rows for this test to mean anything"
-    );
-
-    let surviving = leader.audit_since(0, None, 10_000).expect("read audit");
-    let oldest = surviving
-        .first()
-        .expect("at least the recent write survives")
-        .revision;
-    assert!(
-        oldest > watermark,
-        "everything at or below the watermark was removed, so the oldest survivor must sit \
-         above it: oldest={oldest} watermark={watermark}"
-    );
-    assert!(
-        surviving.iter().any(|r| r.revision == recent),
-        "the recent write must survive its own retention window"
-    );
-    for member in &cluster.members {
-        if let Some(node) = &member.node {
-            let start = Instant::now();
-            while node.audit_gc_watermark().expect("read") != watermark
-                && start.elapsed() < CONVERGE_DEADLINE
-            {
-                tokio::time::sleep(Duration::from_millis(50)).await;
-            }
-            assert_eq!(
-                node.audit_gc_watermark().expect("read"),
-                watermark,
-                "node {} disagrees about how far retention has reached",
-                member.id
-            );
-            let rows = node.audit_since(0, None, 10_000).expect("read audit");
-            assert_eq!(
-                rows.first().map(|r| r.revision),
-                Some(oldest),
-                "every replica must drop the same rows; node {} disagrees",
-                member.id
-            );
-        }
-    }
-
-    // The assertion this test exists for: the loss is COUNTED, not passed over.
-    let start = Instant::now();
-    let mut skipped_after = skipped_before;
-    while start.elapsed() < Duration::from_secs(20) {
-        skipped_after =
-            counter_value("rift_cluster_audit_export_skipped_revisions_total").unwrap_or(0.0);
-        if skipped_after > skipped_before {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    assert!(
-        skipped_after > skipped_before,
-        "rows aged out before the sink accepted them, so \
-         rift_cluster_audit_export_skipped_revisions_total must grow: \
-         {skipped_before} -> {skipped_after}. A silent gap in an exported audit trail is the \
-         worst failure this feature has."
-    );
-
-    for task in tasks {
-        task.abort();
-    }
-    cluster.shutdown_all().await;
-}
-
-/// The counterpart to the test above, and the one that matters more in
-/// practice: a **healthy** fleet must never report a gap.
-///
-/// The first implementation derived loss from revision arithmetic
-/// (`first.revision > checkpoint + 1`). That fires constantly in steady state,
-/// because the exporter's own unaudited `AuditCheckpointPut` — plus every
-/// election's blank entry and every membership change — consumes a revision
-/// without producing an audit row. Ship a batch, let the checkpoint land, write
-/// once more, and the next pass would claim permanent data loss on a cluster
-/// that had lost nothing. That turns the one counter operators are told to
-/// alert on into a rising false positive, which is worse than not having it.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_healthy_fleet_never_reports_a_retention_gap() {
-    let _serial = TEST_LOCK.lock().await;
-    let mut cluster = TestCluster::start(3).await;
-    cluster
-        .wait_for_leader(LEADER_DEADLINE)
-        .await
-        .expect("a leader");
-
-    let sink = CountingSink::start(200).await;
-    declare_sink(&cluster, &sink.uri()).await;
-    let skipped_before =
-        counter_value("rift_cluster_audit_export_skipped_revisions_total").unwrap_or(0.0);
-    let tasks = attach_exporters(&cluster);
-
-    // Ship a batch and let its checkpoint commit — the checkpoint op itself
-    // takes a revision and writes no audit row, which is the trap.
-    let first = cluster.write_on_leader(19_700, "healthy-one").await;
-    wait_rows(&sink, 1, Duration::from_secs(20)).await;
-    wait_checkpoint(&cluster, first, CONVERGE_DEADLINE).await;
-
-    // Now write again, across the gap the checkpoint entry left.
-    let second = cluster.write_on_leader(19_701, "healthy-two").await;
-    wait_rows(&sink, 2, Duration::from_secs(20)).await;
-    wait_checkpoint(&cluster, second, CONVERGE_DEADLINE).await;
-
-    // And once more, so at least two checkpoint entries sit between audited ops.
-    let third = cluster.write_on_leader(19_702, "healthy-three").await;
-    wait_rows(&sink, 3, Duration::from_secs(20)).await;
-    wait_checkpoint(&cluster, third, CONVERGE_DEADLINE).await;
-    tokio::time::sleep(Duration::from_secs(2)).await;
-
-    let skipped_after =
-        counter_value("rift_cluster_audit_export_skipped_revisions_total").unwrap_or(0.0);
-    assert_eq!(
-        skipped_after, skipped_before,
-        "nothing aged out and nothing was lost, so the skipped-revisions counter must not \
-         move: {skipped_before} -> {skipped_after}. Retention GC never ran here; any increase \
-         is the counter reporting ordinary unaudited revisions as permanent data loss."
-    );
-    assert_eq!(
-        cluster
-            .leader()
-            .expect("a leader")
-            .audit_gc_watermark()
-            .expect("read watermark"),
-        0,
-        "no GC ran, so the watermark must still be zero"
-    );
-
-    for task in tasks {
-        task.abort();
-    }
-    cluster.shutdown_all().await;
-}
-
-/// The export loop must keep going, batch after batch — not ship once and park.
-///
-/// Every other scenario here writes fewer rows than one batch holds, so a loop
-/// that ran exactly once would satisfy all of them. This one sets the batch to
-/// three rows and writes well past that, so it fails unless the loop iterates,
-/// re-reads from the advanced checkpoint, and ships the remainder.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn the_exporter_ships_batch_after_batch_rather_than_once() {
-    let _serial = TEST_LOCK.lock().await;
-    let mut cluster = TestCluster::start(3).await;
-    cluster
-        .wait_for_leader(LEADER_DEADLINE)
-        .await
-        .expect("a leader");
-
-    let sink = CountingSink::start(200).await;
-    declare_sink_with_batch(&cluster, &sink.uri(), 3).await;
-    let tasks = attach_exporters(&cluster);
-
-    let mut written = Vec::new();
-    for port in 19_600..19_612 {
-        written.push(cluster.write_on_leader(port, "batched").await);
-    }
-
-    // The revisions written, not a row count: `wait_rows` returns as soon as *any* twelve
-    // rows arrive, and under load those can be twelve that are not these (the same shape
-    // `every_audit_row_reaches_the_sink_exactly_once` was cured of at the `4b4f841` bump).
-    let rows = wait_for_revisions(&sink, &written, Duration::from_secs(30)).await;
-    let shipped: BTreeSet<u64> = rows.iter().map(|(rev, _)| *rev).collect();
-    for revision in &written {
-        assert!(
-            shipped.contains(revision),
-            "revision {revision} never shipped; a loop that runs once would stop after the \
-             first {} rows. shipped: {shipped:?}",
-            3
-        );
-    }
-    assert!(
-        sink.request_count() >= 4,
-        "12+ rows at 3 per batch must take at least 4 requests, got {}",
-        sink.request_count()
-    );
-
-    // The checkpoint must have followed the last batch, not the first.
-    let want = *written.last().expect("a write");
-    let checkpoint = wait_checkpoint(&cluster, want, CONVERGE_DEADLINE).await;
-    assert!(
-        checkpoint >= want,
-        "the checkpoint must advance with every batch: {checkpoint} < {want}"
-    );
-
-    for task in tasks {
-        task.abort();
-    }
     cluster.shutdown_all().await;
 }
 
@@ -4003,7 +2753,7 @@ async fn a_node_joining_after_the_upload_materialises_the_spool_file() {
     let addr: SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
     let dir = TempDir::new().expect("tempdir");
     let seed = cluster.leader().expect("leader").advertise();
-    let joiner = spawn(3, addr, dir.path(), cluster.audit_retention_secs).await;
+    let joiner = spawn(3, addr, dir.path()).await;
     joiner.join_via(seed).await.expect("join");
 
     let deadline = Instant::now() + CONVERGE_DEADLINE;
@@ -4101,9 +2851,8 @@ async fn a_joiner_is_caught_up_by_a_multi_mebibyte_snapshot() {
     let addr2: SocketAddr = format!("127.0.0.1:{}", ports[1]).parse().expect("addr");
     let dir1 = TempDir::new().expect("tempdir");
     let dir2 = TempDir::new().expect("tempdir");
-    let retention = rift_cluster::DEFAULT_AUDIT_RETENTION_SECS;
 
-    let leader = spawn_with_snapshot_policy(1, addr1, dir1.path(), retention, Some(2)).await;
+    let leader = spawn_with_snapshot_policy(1, addr1, dir1.path(), Some(2)).await;
     leader.cluster_init().await.expect("bootstrap node 1");
     let deadline = Instant::now() + LEADER_DEADLINE;
     while !leader.status().is_leader {
@@ -4158,7 +2907,7 @@ async fn a_joiner_is_caught_up_by_a_multi_mebibyte_snapshot() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 
-    let joiner = spawn_with_snapshot_policy(2, addr2, dir2.path(), retention, Some(2)).await;
+    let joiner = spawn_with_snapshot_policy(2, addr2, dir2.path(), Some(2)).await;
     let seed = Authority::from(addr1);
     // Timed from *before* the call: the install races the admission window from here, so this is
     // the same quantity `ADMIT_CURRENCY_WAIT` is compared against inside `admit`.
@@ -4311,9 +3060,8 @@ async fn a_snapshot_catch_up_does_not_disturb_a_fleet_that_already_has_quorum() 
         .map(|p| format!("127.0.0.1:{p}").parse().expect("addr"))
         .collect();
     let dirs: Vec<TempDir> = (0..3).map(|_| TempDir::new().expect("tempdir")).collect();
-    let retention = rift_cluster::DEFAULT_AUDIT_RETENTION_SECS;
 
-    let n1 = spawn_with_snapshot_policy(1, addrs[0], dirs[0].path(), retention, Some(2)).await;
+    let n1 = spawn_with_snapshot_policy(1, addrs[0], dirs[0].path(), Some(2)).await;
     n1.cluster_init().await.expect("bootstrap node 1");
     let deadline = Instant::now() + LEADER_DEADLINE;
     while !n1.status().is_leader {
@@ -4323,7 +3071,7 @@ async fn a_snapshot_catch_up_does_not_disturb_a_fleet_that_already_has_quorum() 
     let seed = Authority::from(addrs[0]);
     // Node 2 joins while there is nothing to catch up on, so the two-voter quorum below is formed
     // without exercising the path under test.
-    let n2 = spawn_with_snapshot_policy(2, addrs[1], dirs[1].path(), retention, Some(2)).await;
+    let n2 = spawn_with_snapshot_policy(2, addrs[1], dirs[1].path(), Some(2)).await;
     n2.join_via(&seed)
         .await
         .expect("node 2 joins an empty fleet");
@@ -4348,7 +3096,7 @@ async fn a_snapshot_catch_up_does_not_disturb_a_fleet_that_already_has_quorum() 
     // See the sibling test: no public signal for "snapshot built and purged", so this is a settle.
     tokio::time::sleep(Duration::from_secs(2)).await;
 
-    let n3 = spawn_with_snapshot_policy(3, addrs[2], dirs[2].path(), retention, Some(2)).await;
+    let n3 = spawn_with_snapshot_policy(3, addrs[2], dirs[2].path(), Some(2)).await;
     let mut joined = n3.join_via(&seed).await.is_ok();
     let mut last_attempt = Instant::now();
     let deadline = Instant::now() + CONVERGE_BY;
@@ -4491,14 +3239,8 @@ async fn a_joiner_behind_a_purged_log_starts_as_learner_and_the_leader_promotes_
     let port = reserve_ports(1)[0];
     let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
     let dir = TempDir::new().expect("tempdir");
-    let joiner = spawn_with_snapshot_policy(
-        4,
-        addr,
-        dir.path(),
-        cluster.audit_retention_secs,
-        cluster.snapshot_log_entries,
-    )
-    .await;
+    let joiner =
+        spawn_with_snapshot_policy(4, addr, dir.path(), cluster.snapshot_log_entries).await;
 
     let seed = Authority::from(cluster.member(1).addr);
     let asked = tokio::time::Instant::now();
