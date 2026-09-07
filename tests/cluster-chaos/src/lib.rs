@@ -196,10 +196,27 @@ pub struct Cluster {
     /// with only the base file leaves toxiproxy and Envoy running, and the next
     /// scenario inherits them.
     files: Vec<String>,
+    /// The admin credential this stack boots with, if any — see [`fleet_key_for`].
+    fleet_key: Option<&'static str>,
     _guard: MutexGuard<'static, ()>,
     /// When this stack was asked for, so `Drop` can report what the scenario
     /// cost end to end. See [`record`].
     created: Instant,
+}
+
+/// The admin credential a stack composed from `files` boots with, if any.
+///
+/// `/_fleet/members` is gated at `ClusterAdmin` through the same chokepoint as
+/// every other admin route, so on the closed plane `tenancy.overlay.yml` boots
+/// the harness has to present [`TENANCY_FLEET_KEY`] to read membership at all;
+/// on the open plane every other overlay leaves, an unauthenticated read is the
+/// right one. Derived from the compose file list rather than threaded through
+/// every constructor, because the overlay is the one place the key is set.
+fn fleet_key_for(files: &[String]) -> Option<&'static str> {
+    files
+        .iter()
+        .any(|file| file.ends_with("tenancy.overlay.yml"))
+        .then_some(TENANCY_FLEET_KEY)
 }
 
 impl Cluster {
@@ -252,6 +269,7 @@ impl Cluster {
         let guard = stack_lock().lock().unwrap_or_else(|e| e.into_inner());
         let cluster = Self {
             files: vec![base_file()],
+            fleet_key: None,
             _guard: guard,
             created: Instant::now(),
         };
@@ -273,8 +291,10 @@ impl Cluster {
         // Poisoning only means a previous scenario panicked; the stack is torn
         // down by `Drop` either way, so the lock still hands over a clean slate.
         let guard = stack_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let fleet_key = fleet_key_for(&files);
         let cluster = Self {
             files,
+            fleet_key,
             _guard: guard,
             created: Instant::now(),
         };
@@ -309,38 +329,37 @@ impl Cluster {
 
     /// Wait until the fleet has actually formed a cluster, not merely started.
     ///
-    /// `/readyz` going 200 on all three is necessary but not sufficient: the
-    /// Raft-derived gauges are resampled on a 5s timer, so a node that founded
-    /// solo and has since been joined still *publishes* one voter for up to a
-    /// sampling interval. A scenario that begins asserting on that window reads
-    /// a stale gauge as a membership change -- which is how C6 failed before
-    /// this existed, and it would have been reported as the product flapping.
+    /// `/readyz` going 200 on all three is necessary but not sufficient: a node
+    /// that founded solo is ready before the others have joined and been
+    /// promoted, so a scenario that begins asserting on that window reads a
+    /// legitimate promotion as a membership change -- which is how C6 failed
+    /// before this existed, and it would have been reported as the product
+    /// flapping. Formed means every node lists a full voter set and every node
+    /// names the same, non-null `current_leader` on `/_fleet/members` — the
+    /// shape `deploy/compose/smoke.sh` asserts (#555).
     pub async fn wait_cluster_formed(&self, timeout: Duration) -> anyhow::Result<()> {
         let deadline = Instant::now() + timeout;
         loop {
             let mut voters_ok = 0;
-            let mut leaders = 0;
+            let mut leaders: Vec<Option<String>> = Vec::new();
             for node in &NODES {
-                if metric(node.metrics, VOTER_GAUGE)
-                    .await
-                    .is_ok_and(|v| v == NODES.len() as f64)
-                {
-                    voters_ok += 1;
-                }
-                if metric(node.metrics, LEADER_GAUGE)
-                    .await
-                    .is_ok_and(|v| v == 1.0)
-                {
-                    leaders += 1;
+                if let Ok(body) = fleet_members(node.admin, self.fleet_key).await {
+                    if voter_count(&body) == Some(NODES.len()) {
+                        voters_ok += 1;
+                    }
+                    leaders.push(body["current_leader"].as_str().map(str::to_owned));
                 }
             }
-            if voters_ok == NODES.len() && leaders == 1 {
+            let agreed = leaders.len() == NODES.len()
+                && leaders[0].is_some()
+                && leaders.iter().all(|leader| *leader == leaders[0]);
+            if voters_ok == NODES.len() && agreed {
                 return Ok(());
             }
             if Instant::now() >= deadline {
                 bail!(
                     "fleet started but never formed a cluster: {voters_ok}/{} nodes see a \
-                     full voter set, {leaders} leaders",
+                     full voter set, leaders named: {leaders:?}",
                     NODES.len()
                 );
             }
@@ -1486,7 +1505,12 @@ pub async fn wait_converged_on_with_key(
     }
 }
 
-/// Scrape one gauge/counter family from a node's metrics port.
+/// Scrape one counter or gauge family from a node's metrics port.
+///
+/// Only the families `crates/rift-cluster/src/metrics.rs` keeps as correctness
+/// instrumentation (D-71, #548) — counts of things that happened, which no
+/// state endpoint can answer. Membership, leadership and bind state are read
+/// from [`fleet_members`] instead.
 ///
 /// Assertions read metrics and the admin API, never log output: a log line is
 /// not an interface and a scenario that greps for one fails the day someone
@@ -1512,28 +1536,63 @@ pub async fn metric(port: u16, family: &str) -> anyhow::Result<f64> {
     bail!("metric family {family} not present on :{port}")
 }
 
-/// `rift_cluster_members{state="leader"}` — 1 on the node that holds
-/// leadership, 0 elsewhere, so summing it across the fleet answers "is there
-/// exactly one leader?".
-const LEADER_GAUGE: &str = r#"rift_cluster_members{state="leader"}"#;
-/// `rift_cluster_members{state="voter"}` — the size of the effective voter set
-/// as this node sees it.
-const VOTER_GAUGE: &str = r#"rift_cluster_members{state="voter"}"#;
+/// `GET /_fleet/members` on a node's admin port — the fleet's live membership
+/// view (RFC-006 §5.2): `voters`, `current_leader`, `is_leader`, `last_applied`
+/// and this node's own `bind_failures` (#369).
+///
+/// The admin port, not `/_cluster/members`: that one rides the **cluster port**
+/// behind the HMAC credential the harness does not hold (see
+/// `FAILOVER_WRITE_BOUND` in the scenarios). `key` is the admin credential of a
+/// closed plane (`tenancy.overlay.yml`); `None` on the open plane every other
+/// overlay leaves.
+///
+/// Live, not sampled: the body is read off the node's Raft state at request
+/// time, so unlike the retired `rift_cluster_members` gauges (D-71, #548) there
+/// is no sampler to race. The waits below still poll, because forming, electing
+/// and promoting are asynchronous.
+pub async fn fleet_members(admin: u16, key: Option<&str>) -> anyhow::Result<serde_json::Value> {
+    let (status, body) = get_json_with_key(admin, "/_fleet/members", key).await?;
+    if status != 200 {
+        bail!("/_fleet/members on :{admin} answered {status}");
+    }
+    Ok(body)
+}
+
+/// Whether a `/_fleet/members` answer says the answering node holds leadership.
+#[must_use]
+pub fn claims_leadership(body: &serde_json::Value) -> bool {
+    body["is_leader"].as_bool() == Some(true)
+}
+
+/// The effective voter set's size, as a `/_fleet/members` answer reports it.
+#[must_use]
+pub fn voter_count(body: &serde_json::Value) -> Option<usize> {
+    body["voters"].as_array().map(Vec::len)
+}
 
 /// Wait until **exactly one** node reports itself leader, and return its index.
 ///
 /// Exactly one, not at least one: a split brain must fail here rather than pass
-/// as "a leader exists". The fleet gauges are sampled on a 5s timer, so this
-/// polls rather than reading once — asserting immediately races the sampler and
-/// fails on a healthy cluster.
+/// as "a leader exists". Polled rather than read once because an election is
+/// asynchronous — asserting immediately after readiness fails a healthy cluster
+/// that is still electing.
 pub async fn wait_single_leader(timeout: Duration) -> anyhow::Result<usize> {
+    wait_single_leader_with_key(timeout, None).await
+}
+
+/// [`wait_single_leader`] on a closed admin plane (C24–C27 under
+/// `tenancy.overlay.yml`), where `/_fleet/members` answers only a fleet admin.
+pub async fn wait_single_leader_with_key(
+    timeout: Duration,
+    key: Option<&str>,
+) -> anyhow::Result<usize> {
     let deadline = Instant::now() + timeout;
     loop {
         let mut leaders = Vec::new();
         for (i, node) in NODES.iter().enumerate() {
-            if metric(node.metrics, LEADER_GAUGE)
+            if fleet_members(node.admin, key)
                 .await
-                .is_ok_and(|v| v == 1.0)
+                .is_ok_and(|body| claims_leadership(&body))
             {
                 leaders.push(i);
             }
@@ -1970,19 +2029,22 @@ pub fn source_document(ports_and_bodies: &[(u16, &str)]) -> serde_json::Value {
     serde_json::json!({ "imposters": imposters })
 }
 
-/// Wait until `node` reports the effective voter set has reached `expected`.
-pub async fn wait_voters(node: &Node, expected: f64, timeout: Duration) -> anyhow::Result<()> {
+/// Wait until `node` reports the effective voter set has reached `expected`
+/// (`voters` on `/_fleet/members`, read on the open admin plane).
+pub async fn wait_voters(node: &Node, expected: usize, timeout: Duration) -> anyhow::Result<()> {
     let deadline = Instant::now() + timeout;
     loop {
-        let seen = metric(node.metrics, VOTER_GAUGE).await;
-        if seen.as_ref().is_ok_and(|v| *v == expected) {
+        let seen = fleet_members(node.admin, None)
+            .await
+            .map(|body| voter_count(&body));
+        if seen.as_ref().is_ok_and(|v| *v == Some(expected)) {
             return Ok(());
         }
         if Instant::now() >= deadline {
             bail!(
                 "{} reports voters={:?}, expected {expected}",
                 node.name,
-                seen.ok()
+                seen.ok().flatten()
             );
         }
         tokio::time::sleep(POLL).await;

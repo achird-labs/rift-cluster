@@ -67,6 +67,16 @@ static_resources:
       health_checks:
         - timeout: 1s
           interval: 1s
+          # Envoy's default `no_traffic_interval` is 60s: until the cluster has
+          # routed a request, checks run once a minute, and the switch to
+          # `interval` happens only when the *next* check is scheduled. So a
+          # backend killed within a few seconds of the front coming up is not
+          # re-checked for ~60s — the whole of `wait_backend_ejected`'s budget.
+          # The scenario used to pass only because the harness's old
+          # gauge-sampled readiness wait happened to delay the kill by ~10s
+          # (#548 made readiness live, and the scenario failed 3 of 4 runs).
+          no_traffic_interval: 1s
+          no_traffic_healthy_interval: 1s
           # Deliberately impatient: a scenario asserts that the front notices a
           # dead backend, and at the shipped 5s/3-failure defaults that assertion
           # would spend most of its budget waiting on Envoy rather than on Rift.

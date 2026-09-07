@@ -272,8 +272,12 @@ than a property (#94). It failed intermittently for that reason, including a
 same-SHA fail-then-pass on PR #92.
 
 What actually separates a correct fleet from a flapping one is the **rate**, so
-C6 bounds transitions against `C6_MAX_LEADER_TRANSITIONS`, derived from the
-~5 s leader-gauge resolution rather than tuned. If C6 fails on that bound, the
+C6 bounds transitions against `C6_MAX_LEADER_TRANSITIONS`, derived from a ~5 s
+leadership sampling resolution rather than tuned. That resolution was the retired
+`rift_cluster_members{state="leader"}` gauge's resample interval; the harness now
+reads the live `/_fleet/members` and imposes the same cadence itself
+(`C6_LEADER_SAMPLE_INTERVAL`), deliberately, so the derivation still holds
+(D-42, #548). If C6 fails on that bound, the
 question is whether the fleet is genuinely re-electing continuously — **do not
 raise the constant to make it pass.** The derivation lives in the doc comment on
 the constant; changing `raft/node.rs`'s timeouts or C6's toxics means re-deriving
@@ -283,12 +287,14 @@ though C6 itself only runs in the container tier.
 
 ## House rules
 
-- **Assertions read the admin API and Prometheus metrics, never log output.** A
-  log line is not an interface; a scenario that greps one fails the day someone
-  rewords it.
-- **Convergence is polled against a real surface, never slept-and-hoped.** The
-  fleet gauges are sampled on a 5 s timer, so asserting immediately races the
-  sampler and fails on a healthy cluster.
+- **Assertions read the admin API and the surviving `rift_cluster_*` counters,
+  never log output.** A log line is not an interface; a scenario that greps one
+  fails the day someone rewords it. Membership, leadership and bind state come
+  from `GET /_fleet/members`; the counters carry what no state endpoint can
+  answer, a count of things that happened (D-71, #548).
+- **Convergence is polled against a real surface, never slept-and-hoped.**
+  Forming, electing and promoting are asynchronous, so asserting immediately
+  after readiness fails a healthy cluster.
 - **Exactly one leader, not at least one.** A split brain must fail rather than
   pass as "a leader exists".
 - **An invariant violation is a bug to file, not a flake to retry.** Infra
@@ -429,11 +435,11 @@ weaker properties:
 - C5 and C14 gained the failover bound (`WRITES_RESUME_BOUND`), and C14 the
   100-write storm and a zero-duplicates check.
 
-**Failover is measured as write availability, not off the leader gauge.** The
-gauge is resampled on a ~5 s timer, so it cannot resolve a 3 s bound at all — a
-scenario polling it would be reading a quantity coarser than the thing it claims
-to measure, the same mistake #94 fixed in C6. A write returning 201 proves a
-leader exists, timestamped when it mattered, and is what a client experiences.
+**Failover is measured as write availability, not off `/_fleet/members`.** The
+membership view is live, so it *could* time the election — but a node named
+`current_leader` there is not yet a leader that accepts writes: the write barrier
+is paid after the election. A write returning 201 proves a leader exists,
+timestamped when it mattered, and is what a client experiences.
 
 `c15_flow_state_survives_a_full_cluster_restart` (#121) closes the #16 epic: a
 scripted imposter advances four independent flows, each step deliberately
@@ -549,8 +555,8 @@ bind-failed node answered before #143, because every node now constructs the
 imposter and claims the port in its map regardless of the local bind outcome.
 `wait_converged` — reading `GET /imposters`, the map, not the socket —
 converges fleet-wide despite the squat: convergence of the config, not of the
-bind. rift-2's own `rift_cluster_bind_failures{port="6520"}` gauge reads `1`,
-because serving unbound is not the same as pretending to be healthy. And
+bind. `bind_failures` on rift-2's own `GET /_fleet/members` names port `6520`
+(#369), because serving unbound is not the same as pretending to be healthy. And
 finally the dividend: a route to the squatted port dispatches `2xx` with the
 imposter's body through **rift-2's own front door** — the node whose bind
 failed. A last check against rift-1's front door, whose bind succeeded, is
@@ -917,6 +923,7 @@ there are exact enough to name a mechanism, and both are open (D-58):
   runs of this branch differing only by #513 under the second measured
   teardown at 15.6 s and 15.2 s, 37 stacks each — no change. Still
   unaccounted for.
-- `wait_cluster_formed` is 5.0 s on every one of 36 stacks — the voter gauge's
-  resample interval, which that function's own doc comment names. It measures
-  the sampler, not convergence.
+- `wait_cluster_formed` was 5.0 s on every one of 36 stacks — the voter gauge's
+  resample interval, which that function's doc comment named at the time. It
+  measured the sampler, not convergence. Since #548 it reads the live
+  `/_fleet/members`, so that figure needs re-measuring before it is quoted again.

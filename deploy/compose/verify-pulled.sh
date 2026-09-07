@@ -262,44 +262,44 @@ run_stack() {
 
   # One cluster, not three single-node clusters that each happen to be ready —
   # what a broken seed configuration produces, and what readiness alone misses.
-  # Polled because the fleet gauges are sampled on a 5s timer, so asserting
-  # immediately races the sampler and fails on a healthy cluster.
+  # Read from `GET /_fleet/members` on the admin port, the same view `smoke.sh`
+  # and `verify.sh` assert on (the `rift_cluster_members` gauges this used to
+  # sum were retired by D-71, #548). Polled because the fleet forms
+  # asynchronously after every node reports ready.
   #
-  # `|| true` on every metrics read below is load-bearing, not defensive noise:
-  # `$(curl | awk)` under `set -euo pipefail` aborts the whole script on the first
+  # `|| true` on every read below is load-bearing, not defensive noise:
+  # `$(curl | jq)` under `set -euo pipefail` aborts the whole script on the first
   # connection refusal, which is the *expected* state in the seconds between
-  # readiness and the exporter being live. Without it the retry loop these reads
-  # sit inside can never reach its second iteration, and a healthy-but-slow
+  # readiness and the admin port being live. Without it the retry loop these
+  # reads sit inside can never reach its second iteration, and a healthy-but-slow
   # cluster fails the release with a bare curl exit status instead of the named
   # diagnostic below. An empty read is not mistaken for success — it fails the
-  # `case` match and leaves the counter short.
+  # comparison and the loop goes round again.
+  members() { curl -fsS --max-time 5 "http://127.0.0.1:${1}/_fleet/members" 2>/dev/null; }
   echo "--- asserting one cluster of three voters ---"
   voters=""
   for _ in $(seq 1 20); do
-    voters="$(curl -fsS --max-time 5 "http://127.0.0.1:19090/metrics" 2>/dev/null \
-      | awk '/^rift_cluster_members\{state="voter"\}/ { print $2 }' || true)"
-    case "$voters" in 3 | 3.0) break ;; esac
+    voters="$(members 12525 | jq -r '.voters | length' 2>/dev/null || true)"
+    [ "$voters" = "3" ] && break
     sleep 2
   done
-  case "$voters" in
-    3 | 3.0) echo "PASS: single 3-voter cluster" ;;
-    *) fail "expected 3 voters, got '${voters:-<none>}'" ;;
-  esac
+  [ "$voters" = "3" ] || fail "expected 3 voters, got '${voters:-<none>}'"
+  echo "PASS: single 3-voter cluster"
 
-  echo "--- asserting exactly one leader across the fleet ---"
-  leaders=0
+  echo "--- asserting every node names the same leader ---"
+  agreed=""
   for _ in $(seq 1 20); do
-    leaders=0
-    for port in 19090 29090 39090; do
-      v="$(curl -fsS --max-time 5 "http://127.0.0.1:${port}/metrics" 2>/dev/null \
-        | awk '/^rift_cluster_members\{state="leader"\}/ { print $2 }' || true)"
-      case "$v" in 1 | 1.0) leaders=$((leaders + 1)) ;; esac
-    done
-    [ "$leaders" -eq 1 ] && break
+    l1="$(members 12525 | jq -r '.current_leader // ""' 2>/dev/null || true)"
+    l2="$(members 22525 | jq -r '.current_leader // ""' 2>/dev/null || true)"
+    l3="$(members 32525 | jq -r '.current_leader // ""' 2>/dev/null || true)"
+    if [ -n "$l1" ] && [ "$l1" = "$l2" ] && [ "$l1" = "$l3" ]; then
+      agreed="$l1"
+      break
+    fi
     sleep 2
   done
-  [ "$leaders" -eq 1 ] || fail "expected exactly 1 leader, found ${leaders}"
-  echo "PASS: exactly 1 leader"
+  [ -n "$agreed" ] || fail "the nodes do not agree on one leader (rift-1: '${l1:-}', rift-2: '${l2:-}', rift-3: '${l3:-}')"
+  echo "PASS: every node names leader ${agreed}"
 
   echo "--- asserting the console is served on every node ---"
   for port in 12525 22525 32525; do

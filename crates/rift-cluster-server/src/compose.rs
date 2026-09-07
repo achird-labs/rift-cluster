@@ -509,10 +509,6 @@ pub async fn start_with_runtimes(
     let identity = NodeIdentity::load_or_mint(&state_dir, cli.proposed_node_id())
         .with_context(|| format!("reading node identity from {}", state_dir.display()))?;
 
-    // Auditable before anything binds: an unauthenticated cluster port must be
-    // visible on /metrics even if the node then fails to start.
-    metrics::set_insecure(cluster.is_insecure());
-
     let readiness = Arc::new(Readiness::awaiting([GATE_JOINED, GATE_RECONCILED]));
 
     // Probes come up first, before the node exists. `/healthz` has to answer
@@ -718,10 +714,9 @@ pub async fn start_with_runtimes(
         return Err(anyhow::Error::new(e).context("binding the operator surface to the node"));
     }
     // Sampled once here so the gauge is already correct on `/metrics` before
-    // the periodic sampler's first tick (issue #161) — unlike `set_insecure`
-    // above, this cannot run before the node exists: it reads the state
-    // machine. `spawn_metrics_sampler` keeps it current from here on, because
-    // (unlike "is the cluster port authenticated") whether the fleet has any
+    // the periodic sampler's first tick (issue #161): it reads the state
+    // machine, so it cannot run before the node exists. `spawn_metrics_sampler`
+    // keeps it current from here on, because whether the fleet has any
     // principal can change at any moment a `PrincipalPut` commits.
     sample_no_principals(&node);
     pull_on_miss.bind(&node);
@@ -1413,7 +1408,7 @@ fn spawn_reconciler(
     })
 }
 
-/// Re-sample the fleet gauges on a timer.
+/// Re-sample `rift_cluster_no_principals` on a timer (issue #161).
 ///
 /// A `Weak` handle for the same reason the operator surface holds one: this task
 /// must never be what keeps the node alive, or shutdown would deadlock on a task
@@ -1425,14 +1420,13 @@ fn spawn_metrics_sampler(node: Arc<RaftNode>) -> tokio::task::JoinHandle<()> {
         loop {
             ticker.tick().await;
             let Some(node) = node.upgrade() else { return };
-            metrics::observe_node(&node.status(), &node.ring());
             sample_no_principals(&node);
         }
     })
 }
 
 /// Resample `rift_cluster_no_principals` (issue #161). A read error is logged
-/// rather than propagated: this is an observability gauge, not a decision —
+/// rather than propagated: this is a reporting gauge, not a decision —
 /// the authorization path (`principal::should_bypass`) makes its own read and
 /// fails closed on the same error, so a sampler that skips a tick here costs
 /// a stale metric, never a wrong access decision.
@@ -1649,10 +1643,7 @@ async fn drain_parked_intents(node: &RaftNode) {
             // no-op inside its 24 h window (a metric for over-aged intents is
             // the metrics slice's job).
             Ok(_) => match node.unpark_intent(&op_id) {
-                Ok(()) => {
-                    metrics::intent_replayed();
-                    tracing::info!(%op_id, "replayed parked intent");
-                }
+                Ok(()) => tracing::info!(%op_id, "replayed parked intent"),
                 Err(e) => tracing::error!(%op_id, error = %e, "replayed but could not unpark"),
             },
             // No quorum fails every intent identically — stop the sweep. Any

@@ -1036,7 +1036,6 @@ impl FlowNet {
         };
 
         let mut reached = false;
-        let mut entries_seen = 0usize;
         for holder in holders {
             match node
                 .call_member(holder, "POST", SYNC_PATH, body.clone())
@@ -1047,7 +1046,6 @@ impl FlowNet {
                         reached = true;
                         for (flow, entries) in reply.flows {
                             for (key, entry) in entries {
-                                entries_seen += 1;
                                 self.merge_entry(&flow, &key, entry, REPAIR_DURABILITY)
                                     .await;
                             }
@@ -1060,14 +1058,12 @@ impl FlowNet {
         }
 
         if reached {
-            metrics::flow_adoption(if entries_seen > 0 { "found" } else { "empty" });
             self.adopted.lock().insert(flow_id.to_owned(), m_idx);
         } else {
             // Serve anyway, on the local copy: a takeover during a partition
             // must not turn every flow op into an error. The staleness bound is
             // one replication round (§7.2.3), the marker stays unstamped so the
-            // next touch retries, and the count is the observable.
-            metrics::flow_adoption("unreachable");
+            // next touch retries, and the warning is the observable.
             tracing::warn!(
                 flow_id,
                 m_idx,
@@ -1115,12 +1111,8 @@ impl FlowNet {
                         Ok(reply) => {
                             for (flow, entries) in reply.flows {
                                 for (key, entry) in entries {
-                                    if self
-                                        .merge_entry(&flow, &key, entry, REPAIR_DURABILITY)
-                                        .await
-                                    {
-                                        metrics::flow_repair();
-                                    }
+                                    self.merge_entry(&flow, &key, entry, REPAIR_DURABILITY)
+                                        .await;
                                 }
                             }
                         }

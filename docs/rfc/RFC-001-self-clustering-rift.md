@@ -1416,6 +1416,8 @@ kill-criteria gate, §13.3). Every phase ships behind `--cluster` +
 
 ### 11.1 Observability
 
+> **Retired by D-71** (RFC-007 §3.2, #548): the operator observability pack — dashboards, rules, overlay, CI lanes — is removed; the families that remain are test instrumentation, listed in crates/rift-cluster/src/metrics.rs.
+
 Cluster admin endpoints (served on the cluster port, auth'd; JSON):
 
 - `GET /_cluster/members` — roster: node, state (Joining/Ready/Live/Suspect/Dead/Leaving),

@@ -656,12 +656,10 @@ impl ResponseSequencer for ClusteredSequencer {
                         budget_secs = RESET_TOTAL_BUDGET.as_secs(),
                         "sequencer reset fan-out exceeded its budget and was abandoned"
                     );
-                    crate::metrics::sequence_reset_incomplete();
                     return;
                 }
             };
             if !unreached.is_empty() {
-                crate::metrics::sequence_reset_incomplete();
                 // Named, not counted-and-forgotten: a member that missed a reset keeps cycling a
                 // stub that no longer exists until the next membership change re-keys it, and the
                 // operator can only act on that if they know which one (the D-53 shape).

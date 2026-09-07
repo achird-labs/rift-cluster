@@ -50,111 +50,52 @@ echo "PASS: 3/3 ready"
 
 # One cluster, not three single-node clusters that each happen to be ready —
 # which is exactly what a broken seed configuration produces, and what a
-# readiness check alone would not catch.
-# Poll rather than read once: the fleet gauges are SAMPLED on a timer (5s), so
-# a node can be ready a moment before its own metrics catch up. Asserting
-# immediately races the sampler and fails on a healthy cluster.
+# readiness check alone would not catch. Read from `GET /_fleet/members` on
+# the admin port, the same view `smoke.sh` asserts on (#555): a voter list and
+# an agreed leader id are stronger facts than the two gauges this used to sum
+# (retired by D-71, #548). Polled, because the fleet forms asynchronously after
+# every node reports ready.
+#
+# `|| true` is load-bearing under `set -euo pipefail`: a node that has not
+# started answering yet makes `curl` exit non-zero, which would otherwise kill
+# the script before the retry loop could retry. An empty read is not mistaken
+# for success — it fails the comparison and the loop goes round again.
+members() { curl -fsS --max-time 5 "http://127.0.0.1:${1}/_fleet/members" 2>/dev/null; }
 echo "--- asserting the three agree on one cluster ---"
 voters=""
 for _ in $(seq 1 20); do
-  voters="$(curl -fsS --max-time 5 "http://127.0.0.1:19090/metrics" 2>/dev/null \
-    | awk '/^rift_cluster_members\{state="voter"\}/ { print $2 }')"
-  case "$voters" in 3|3.0) break ;; esac
+  voters="$(members 12525 | jq -r '.voters | length' 2>/dev/null || true)"
+  [ "$voters" = "3" ] && break
   sleep 2
 done
 echo "rift-1 reports voters=${voters:-<none>}"
-case "$voters" in
-  3|3.0) echo "PASS: single 3-voter cluster" ;;
-  *) echo "FAIL: expected 3 voters, got '${voters:-<none>}'"
-     "${COMPOSE[@]}" logs --tail=40
-     exit 1 ;;
-esac
-
-# Exactly one leader across the fleet. Summing the gauge is the query the
-# metric was shaped for; two leaders means a split brain.
-leaders=0
-for _ in $(seq 1 20); do
-  leaders=0
-  for port in 19090 29090 39090; do
-    v="$(curl -fsS --max-time 5 "http://127.0.0.1:${port}/metrics" 2>/dev/null \
-      | awk '/^rift_cluster_members\{state="leader"\}/ { print $2 }')"
-    case "$v" in 1|1.0) leaders=$((leaders + 1)) ;; esac
-  done
-  [ "$leaders" -eq 1 ] && break
-  sleep 2
-done
-if [ "$leaders" -ne 1 ]; then
-  echo "FAIL: expected exactly 1 leader, found ${leaders}"
+if [ "$voters" = "3" ]; then
+  echo "PASS: single 3-voter cluster"
+else
+  echo "FAIL: expected 3 voters, got '${voters:-<none>}'"
+  "${COMPOSE[@]}" logs --tail=40
   exit 1
 fi
-echo "PASS: exactly 1 leader"
 
-# The observability overlay (#227) is not part of the default compose smoke:
-# it pulls two extra images and the default smoke has to stay dependency-free.
-# Gated on RIFT_OBSERVABILITY=1 so nothing below runs, and nothing above
-# changes, on a plain `deploy/compose/verify.sh`.
-if [ "${RIFT_OBSERVABILITY:-0}" = "1" ]; then
-  echo "--- RIFT_OBSERVABILITY=1: bringing up the observability overlay ---"
-  OBS_COMPOSE=(docker compose -f docker-compose.yml -f observability.overlay.yml)
-  # rift-1/2/3 are already up from the `up -d --build` above; this layers in
-  # only prometheus and grafana. `down -v --remove-orphans` in the cleanup
-  # trap still tears both of them down even though it only knows about
-  # docker-compose.yml -- that is exactly what --remove-orphans is for.
-  "${OBS_COMPOSE[@]}" up -d prometheus grafana
-
-  # Fixed dev-only credential, matching observability.overlay.yml's
-  # GF_SECURITY_ADMIN_PASSWORD. Not production guidance -- see that file.
-  GRAFANA_AUTH="admin:rift-observability-dev-only"
-
-  echo "--- asserting Prometheus scrapes 3/3 targets ---"
-  up_targets=0
-  for _ in $(seq 1 30); do
-    # `|| true` is load-bearing under this script's `set -euo pipefail`. On the
-    # first poll Prometheus has not completed a scrape, so `grep` matches
-    # nothing and exits 1; `pipefail` promotes that to the pipeline, the
-    # assignment fails, and `set -e` kills the script *before* the retry loop
-    # can retry and before the FAIL branch below can print. The symptom is the
-    # worst kind: the run dies straight after the header with no diagnostic at
-    # all. `wc -l` still emits `0` for empty input, so the rescued value is the
-    # honest count. The Grafana loop below was already written this way
-    # (`|| echo 000`); this one was not, and nothing noticed because until
-    # issue #316 no CI lane ever ran this block.
-    up_targets="$(curl -fsS --max-time 5 "http://127.0.0.1:19091/api/v1/targets" 2>/dev/null \
-      | grep -o '"health":"up"' | wc -l | tr -d ' ' || true)"
-    [ "${up_targets:-0}" -eq 3 ] && break
-    sleep 2
-  done
-  if [ "${up_targets:-0}" -ne 3 ]; then
-    echo "FAIL: expected 3 up targets, got '${up_targets:-0}'"
-    curl -fsS --max-time 5 "http://127.0.0.1:19091/api/v1/targets" || true
-    # Dumped here, not by the caller: `trap cleanup EXIT` above runs
-    # `compose down` on every exit path, so by the time any wrapper could ask
-    # for logs the containers are already gone and it gets silence.
-    "${OBS_COMPOSE[@]}" logs --tail=100 prometheus || true
-    exit 1
+# One agreed leader: every node names the same, non-null `current_leader`.
+# Two nodes naming different leaders is a split brain; a node naming none is
+# still electing.
+agreed=""
+for _ in $(seq 1 20); do
+  l1="$(members 12525 | jq -r '.current_leader // ""' 2>/dev/null || true)"
+  l2="$(members 22525 | jq -r '.current_leader // ""' 2>/dev/null || true)"
+  l3="$(members 32525 | jq -r '.current_leader // ""' 2>/dev/null || true)"
+  if [ -n "$l1" ] && [ "$l1" = "$l2" ] && [ "$l1" = "$l3" ]; then
+    agreed="$l1"
+    break
   fi
-  echo "PASS: Prometheus reports 3/3 targets up"
-
-  echo "--- asserting Grafana serves the three dashboards ---"
-  for uid in rift-fleet-overview rift-latency-analytics rift-verification-plane; do
-    status=0
-    for _ in $(seq 1 30); do
-      status="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 5 \
-        -u "$GRAFANA_AUTH" "http://127.0.0.1:13000/api/dashboards/uid/${uid}" || echo 000)"
-      [ "$status" = "200" ] && break
-      sleep 2
-    done
-    if [ "$status" != "200" ]; then
-      echo "FAIL: dashboard uid '${uid}' answered ${status}, expected 200"
-      # Same reason as the Prometheus branch: the EXIT trap tears the stack
-      # down, so logs have to be taken before it fires. A provisioning error is
-      # only ever visible in Grafana's own log.
-      "${OBS_COMPOSE[@]}" logs --tail=100 grafana || true
-      exit 1
-    fi
-  done
-  echo "PASS: Grafana serves 3/3 dashboards"
+  sleep 2
+done
+if [ -z "$agreed" ]; then
+  echo "FAIL: the nodes do not agree on one leader (rift-1: '${l1:-}', rift-2: '${l2:-}', rift-3: '${l3:-}')"
+  exit 1
 fi
+echo "PASS: every node names leader ${agreed}"
 
 # An imposter created on one node is the config-sync deliverable and does NOT
 # replicate yet (that lands with the config-sync work), so this only asserts

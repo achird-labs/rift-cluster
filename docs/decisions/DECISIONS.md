@@ -658,13 +658,19 @@ PR-time `cluster-smoke` runs each container chaos scenario once and is a require
 little the soak does not catch) and a flat 100× nightly (C6's 60 s toxic window alone is ~3.6 h).
 
 ### D-42 — C6 bounds an election *rate*; election timers are not an operator knob
-- **Status:** active
+- **Status:** amended
 - **Decided:** 2026-07 · #94
 - **Code:** tests/cluster-chaos/tests/scenarios.rs, crates/rift-cluster/src/raft/node.rs
 
 C6's injected jitter overlaps the 150–300 ms election timeout by design, so occasional elections
 are in spec; the scenario bounds leadership transitions by `C6_MAX_LEADER_TRANSITIONS` (derived
 from the ~5 s gauge resolution), never by a fixed count.
+
+**Amendment (D-71, 2026-09-07, #548):** the `rift_cluster_members` gauge that supplied the samples
+is retired with the operator observability pack. The harness now samples `current_leader` from
+`GET /_fleet/members` at `C6_LEADER_SAMPLE_INTERVAL`, deliberately the same ~5 s cadence the gauge
+was resampled at, so the derivation of `C6_MAX_LEADER_TRANSITIONS` is unchanged. The bound is a
+rate over that sampling window, exactly as before; only the sample's source moved.
 
 *Rejected:* widening the election timeout so a count bound holds — the timers stay fixed in
 `raft/node.rs`; making them a `NodeConfig` knob needs its own design pass and has no operator

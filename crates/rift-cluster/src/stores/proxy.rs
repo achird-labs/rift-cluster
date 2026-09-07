@@ -368,13 +368,13 @@ impl ProxyNet {
         let mut pending = self.pending.lock();
         let now = Instant::now();
         let slot = (req.port, req.sig_hash.clone());
-        if let Some(claim) = pending.get(&slot) {
-            if claim.deadline > now {
-                return ClaimReply::InFlight;
-            }
-            // The previous winner ran out its deadline: the signature frees itself and the
-            // old token is stale from here on.
-            metrics::proxy_claim_release("deadline");
+        // A claim past its deadline is *not* returned as in flight: the previous winner ran
+        // out its deadline, so the signature frees itself and the old token is stale from
+        // here on — the fall-through below mints a new one.
+        if let Some(claim) = pending.get(&slot)
+            && claim.deadline > now
+        {
+            return ClaimReply::InFlight;
         }
         let token = self.mint_token();
         pending.insert(
@@ -396,7 +396,6 @@ impl ProxyNet {
         let slot = (req.port, req.sig_hash.clone());
         if pending.get(&slot).is_some_and(|c| c.token == req.token) {
             pending.remove(&slot);
-            metrics::proxy_claim_release("upstream_failure");
         }
     }
 
@@ -428,7 +427,6 @@ impl ProxyNet {
                 self.pending
                     .lock()
                     .remove(&(req.port, req.sig_hash.clone()));
-                metrics::proxy_claim_release("publish_failure");
                 return SettleReply::Unavailable {
                     reason: format!("proxy store: encode recording: {e}"),
                 };
@@ -458,7 +456,6 @@ impl ProxyNet {
             Err(_) => {
                 let slot = (req.port, req.sig_hash.clone());
                 self.pending.lock().remove(&slot);
-                metrics::proxy_claim_release("publish_failure");
                 return SettleReply::Unavailable {
                     reason: "proxy store: publication timed out".to_owned(),
                 };
@@ -484,7 +481,6 @@ impl ProxyNet {
                     // A committed refusal (imposter deleted, quota): release so the
                     // signature is retryable, and say why.
                     self.pending.lock().remove(&slot);
-                    metrics::proxy_claim_release("publish_failure");
                     SettleReply::Unavailable { reason }
                 }
             },
@@ -492,7 +488,6 @@ impl ProxyNet {
                 // The publication did not commit. Releasing here is what keeps the failure
                 // retryable instead of wedging Pending until the deadline (#226 AC3).
                 self.pending.lock().remove(&slot);
-                metrics::proxy_claim_release("publish_failure");
                 SettleReply::Unavailable {
                     reason: format!("proxy store: publication failed: {e}"),
                 }

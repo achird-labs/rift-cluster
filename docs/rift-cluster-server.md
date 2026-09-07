@@ -819,51 +819,44 @@ cargo run -q -p rift-cluster --example cluster-curl -- \
 
 ## Metrics
 
-Under `--cluster` the node publishes fleet gauges on the existing metrics port
-(`--metrics-port`, default 9090), alongside the open-source metrics — they are
-registered into the same Prometheus registry `GET /metrics` already serves, so
-there is nothing extra to scrape:
+> **Retired by D-71** (RFC-007 §3.2, #548): the operator observability pack —
+> dashboards, rules, the compose overlay and the CI lanes that checked them — is
+> removed, along with every `rift_cluster_*` family nothing but a dashboard read.
+> What remains is **correctness instrumentation**, listed with its readers in the
+> module doc of `crates/rift-cluster/src/metrics.rs`.
 
-| Metric | Meaning |
-|---|---|
-| `rift_cluster_members{state="voter"}` | size of the effective voter set as this node sees it |
-| `rift_cluster_members{state="leader"}` | `1` on the leader, `0` elsewhere — summing it across the fleet answers "is there exactly one leader?" |
-| `rift_cluster_ring_epoch` | membership log index the ownership ring is derived from; two nodes reporting different epochs have not converged |
-| `rift_cluster_insecure` | `1` when this node's cluster port runs unauthenticated, so a fleet can be audited for it |
-| `rift_cluster_no_principals` | `1` when the fleet has no principal defined at all (issue #161) — the condition under which the admin plane's open-by-default bypass applies. Resampled continuously, not only at startup: a `PrincipalPut` can flip it at any moment the fleet is running |
+**Membership and leadership are read from `GET /_fleet/members`** on the admin
+port, not from metrics: `voters` is the effective voter set, `current_leader` the
+node every member should name, `is_leader` whether the answering node holds it,
+and `bind_failures` this node's own map of port → reason for a committed config
+it could not realize locally (#369). It is served off the node's Raft state at
+request time, so — unlike the 5 s-sampled gauges it replaced — there is no
+sampler to lag readiness. Whether this node's cluster port runs unauthenticated
+is a **startup log line** (`cluster port started WITHOUT authentication`), which
+is what a fleet is audited against.
 
-These are sampled from Raft metrics every 5s rather than pushed, because
-leadership and membership change without the cluster crate being called; an
-event-driven gauge would silently go stale. (If you are asserting on them right
-after a node reports ready, poll — the gauge can lag readiness by one sample.)
+The surviving families are published on the existing metrics port
+(`--metrics-port`, default 9090), alongside the open-source metrics: they are
+registered into the `prometheus` crate's global default registry, which is what
+`GET /metrics` already serves, so there is nothing extra to scrape. That works
+only while the whole build links **one** copy of that crate; a second one would
+carry its own registry and these families would silently reach no endpoint.
+`scripts/check-single-prometheus.sh` enforces it in CI.
 
-They reach `/metrics` by registering into the `prometheus` crate's global
-default registry, which is what the open-source metrics server already serves.
-That works only while the whole build links **one** copy of that crate; a second
-one would carry its own registry and these gauges would silently reach no
-endpoint. `scripts/check-single-prometheus.sh` enforces it in CI.
+Config sync (issue #9): `rift_cluster_config_revision{port}` (applied revision
+per imposter — two nodes disagreeing have not converged) and
+`rift_cluster_dedup_hits_total` (ops collapsed by op-id — a replay and a retry
+proving to be one operation), plus the R4 ledger's `rift_cluster_intents_pending`
+(resampled by every replay sweep, so a restart's carried-over ledger reads true).
+`rift_cluster_no_principals` is `1` when the fleet has no principal defined at
+all (issue #161) — the condition under which the admin plane's open-by-default
+bypass applies; resampled continuously, because a `PrincipalPut` can flip it at
+any moment the fleet is running.
 
-The config-sync families (issue #9): `rift_cluster_config_revision{port}`
-(applied revision per imposter — two nodes disagreeing have not converged),
-`rift_cluster_bind_failures{port}` (1 while a committed config cannot be
-realized locally; resampled after every engine drive, so healing clears it),
-`rift_cluster_write_forwards_total`, `rift_cluster_barrier_waits_total` /
-`rift_cluster_barrier_timeouts_total`, `rift_cluster_dedup_hits_total`, and
-the R4 ledger's `rift_cluster_intents_parked_total` / `_replayed_total` /
-`rift_cluster_intents_pending` (resampled by every replay sweep). The
-Phase-1 plan's `rift_cluster_config_converged` and
-`rift_cluster_config_conflicts_total` are still pending — convergence is a
-fleet-level derivation (compare `config_revision` across nodes) and conflicts
-cannot exist until a non-Raft write mode does.
-
-The pull-on-miss family (issue #49): `rift_cluster_pull_on_miss_checks_total`
-(no-match requests the net evaluated), `_lagging_total` (of those, the ones
-that found this node behind the leader) and `_retries_total` (requests sent
-back through the matcher once). The useful reading is the ratio: `lagging /
-checks` persistently high means followers are serving while behind, which is a
-readiness-gate question rather than a matcher one. There is deliberately no
-`rescues_total` — the hook cannot see the retry's outcome, so such a counter
-would be a guess; use the response header below as rescue evidence.
+The pull-on-miss net (issue #49) keeps `rift_cluster_pull_on_miss_retries_total`
+— requests sent back through the matcher once, which is what C16 reads. There is
+deliberately no `rescues_total`: the hook cannot see the retry's outcome, so such
+a counter would be a guess; use the response header below as rescue evidence.
 
 ## Response headers
 
@@ -1041,11 +1034,10 @@ skipped." Entries are ordered by each one's own recorded timestamp, never
 a node-local arrival clock — the latter would let two nodes disagree about
 the merged order, which is exactly the property the issue's acceptance
 criteria require they do not. Every peer pull failure — errored, unparseable,
-or lost to the budget — is logged and counted on
-`rift_cluster_journal_peer_pull_failures_total{peer}`, so an operator can
-tell a partition (self-healing) from a decode failure from version skew
-(will not self-heal) apart, rather than seeing only the aggregate partial
-rate. The replica cache this warms is bounded by the same per-shard cap the
+or lost to the budget — is logged at `warn` with the peer, the port and the real
+error, so an operator can tell a partition (self-healing) from a decode failure
+from version skew (will not self-heal) apart, rather than seeing only the
+aggregate partial rate. The replica cache this warms is bounded by the same per-shard cap the
 local journal enforces on itself, and folds a peer's reply in by `seq`
 rather than appending it, so it cannot grow past what a fleet's worth of
 shards should hold or double-count an entry a race redelivered.
@@ -2057,12 +2049,11 @@ And every node runs a 5-second **anti-entropy** loop pulling the flows it holds
 but does not own from their owners, so a replica that missed a push converges
 within one tick.
 
-Observability: `rift_cluster_flow_reads_total{path=owner|forward|local}` says
-where reads are answered, `rift_cluster_cas_conflicts_total{reason=cas|fence|misroute|isolated}`
-counts owner-side refusals, `rift_cluster_flow_adoptions_total{outcome}` makes
-takeovers visible (`unreachable` is the label worth alerting on), and
-`rift_cluster_flow_repairs_total` counts anti-entropy merges that actually fixed
-something — steady non-zero means pushes are being missed.
+Instrumentation: `rift_cluster_flow_reads_total{path=owner|forward|local}` says
+where reads are answered — it is what pins the D-13 RPC budget per read path —
+and `rift_cluster_cas_conflicts_total{reason=cas|fence|misroute|isolated}` counts
+owner-side refusals, so a refusal is never dropped silently. A takeover that
+could not reach any holder is named in a `warn` line rather than counted.
 
 ## The web console (`--features console`, #186, #187)
 

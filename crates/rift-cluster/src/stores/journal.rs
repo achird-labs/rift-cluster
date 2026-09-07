@@ -43,7 +43,6 @@ use crate::raft::NodeId;
 use crate::raft::node::RaftNode;
 use crate::stores::journal_seq::SeqFloors;
 use parking_lot::RwLock;
-use prometheus::Gauge;
 use rift_cluster_base::seams::{
     JournalEntry, JournalRead, JournalReadSince, MAX_RECORDED_REQUESTS, MatchOutcome,
     RecordedRequest, RequestJournal,
@@ -623,14 +622,10 @@ struct PortShard {
     /// on every record, and warning per eviction serializes the recording path on the
     /// tracing writer (upstream issue #718). Deliberate deletions re-arm it.
     cap_warned: AtomicBool,
-    /// Resolved once per shard, not per append: `with_label_values` allocates the label
-    /// string and hashes it under the registry lock, which is not something the recording
-    /// path should pay for every request.
-    entries_gauge: Gauge,
 }
 
 impl PortShard {
-    fn new(port: u16, boot_floor: u64) -> Self {
+    fn new(boot_floor: u64) -> Self {
         Self {
             entries: RwLock::new(VecDeque::new()),
             count: AtomicU64::new(0),
@@ -641,7 +636,6 @@ impl PortShard {
             clear_gen: AtomicU64::new(0),
             space_gens: RwLock::new(HashMap::new()),
             cap_warned: AtomicBool::new(false),
-            entries_gauge: crate::metrics::journal_entries_gauge(port),
         }
     }
 }
@@ -1007,7 +1001,7 @@ impl ClusterJournal {
             self.ports
                 .write()
                 .entry(port)
-                .or_insert_with(|| Arc::new(PortShard::new(port, boot_floor))),
+                .or_insert_with(|| Arc::new(PortShard::new(boot_floor))),
         )
     }
 
@@ -1035,8 +1029,7 @@ impl ClusterJournal {
         now: u64,
         cap: usize,
         drained: &mut Vec<ShardEntry>,
-    ) -> Evicted {
-        let mut evicted = Evicted::default();
+    ) {
         // Saturating: only an embedder passing a near-`Duration::MAX` max_age reaches it,
         // and the resulting "never expires" is what that value already means.
         let max_age = u64::try_from(self.config.max_age.as_millis()).unwrap_or(u64::MAX);
@@ -1052,7 +1045,6 @@ impl ClusterJournal {
                 .evicted_below_seq
                 .fetch_max(oldest.seq, Ordering::SeqCst);
             drained.push(oldest);
-            evicted.age += 1;
         }
 
         // `while`, not `if`: a membership change shrinks the cap, so a shard can start an
@@ -1072,37 +1064,22 @@ impl ClusterJournal {
                 .evicted_below_seq
                 .fetch_max(oldest.seq, Ordering::SeqCst);
             drained.push(oldest);
-            evicted.cap += 1;
         }
-        evicted
     }
-}
-
-/// What one append's retention pass removed, reported to metrics after the lock drops.
-#[derive(Debug, Default)]
-struct Evicted {
-    cap: usize,
-    age: usize,
 }
 
 /// The tail every deliberate deletion shares. Caller holds the entries write lock.
 ///
-/// Two things have to happen after `clear` / `retain` / `clear_flow`, and neither is
-/// obvious from the deletion itself:
-///
-/// * The cap warning re-arms, because a deliberate deletion starts a new fill-up and each
-///   fill-up warns once. Re-armed under the write lock so a racing recorder cannot observe
-///   the stale flag and skip its fill-up's warning.
-/// * The depth gauge is republished, because it is otherwise only written by
-///   `record_indexed` — a port cleared and never written again would report its pre-clear
-///   depth forever.
+/// One thing has to happen after `clear` / `retain` / `clear_flow`, and it is not obvious
+/// from the deletion itself: the cap warning re-arms, because a deliberate deletion starts a
+/// new fill-up and each fill-up warns once. Re-armed under the write lock so a racing recorder
+/// cannot observe the stale flag and skip its fill-up's warning.
 ///
 /// What deliberately does *not* happen: the watermark and `seq` are untouched. Losing
 /// entries you asked to delete is not a hole in your view, and a cursor held across a
 /// clear has to stay valid.
-fn finish_deletion(shard: &PortShard, retained: usize) {
+fn finish_deletion(shard: &PortShard) {
     shard.cap_warned.store(false, Ordering::SeqCst);
-    shard.entries_gauge.set(retained as f64);
 }
 
 impl RequestJournal for ClusterJournal {
@@ -1142,9 +1119,9 @@ impl RequestJournal for ClusterJournal {
         // Outlives the guard below, so evicted entries' destructors run after it drops.
         let mut drained = Vec::new();
 
-        let (seq, evicted, retained) = {
+        let seq = {
             let mut entries = shard.entries.write();
-            let evicted = self.evict(port, &shard, &mut entries, now, cap, &mut drained);
+            self.evict(port, &shard, &mut entries, now, cap, &mut drained);
             // Assigned under the write lock: a fetch_add outside it could interleave with
             // a concurrent recorder and push entries in a different order than their seqs,
             // which would make the cursor cut skip entries and the binary search in
@@ -1186,11 +1163,9 @@ impl RequestJournal for ClusterJournal {
                 request: req,
                 recorded_at_millis: now,
             });
-            (seq, evicted, entries.len())
+            seq
         };
 
-        shard.entries_gauge.set(retained as f64);
-        crate::metrics::note_journal_evictions(evicted.cap, evicted.age);
         // After the write lock is released, so a woken reader always finds the entry it was
         // woken for. Waking inside the lock would let the reader race the recorder to
         // `entries` and see the shard as it was before the push.
@@ -1260,7 +1235,7 @@ impl RequestJournal for ClusterJournal {
         let mut entries = shard.entries.write();
         entries.clear();
         shard.count.store(0, Ordering::SeqCst);
-        finish_deletion(&shard, 0);
+        finish_deletion(&shard);
         Ok(())
     }
 
@@ -1268,14 +1243,14 @@ impl RequestJournal for ClusterJournal {
         let shard = self.shard(port);
         let mut entries = shard.entries.write();
         entries.retain(|entry| keep(&entry.request));
-        finish_deletion(&shard, entries.len());
+        finish_deletion(&shard);
     }
 
     fn clear_flow(&self, port: u16, flow_id: &str) -> anyhow::Result<()> {
         let shard = self.shard(port);
         let mut entries = shard.entries.write();
         entries.retain(|entry| entry.flow_id != flow_id);
-        finish_deletion(&shard, entries.len());
+        finish_deletion(&shard);
         Ok(())
     }
 

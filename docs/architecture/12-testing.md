@@ -24,8 +24,11 @@ c.sigterm("b").await?;                         // graceful leave
 c.heal().await?;
 ```
 
-Two rules with teeth: **every assertion reads the admin API or metrics, never
-logs** (logs are for humans; contracts are for machines), and **invariant
+Two rules with teeth: **every assertion reads the admin API or the correctness
+instrumentation, never logs** (logs are for humans; contracts are for machines) —
+membership, leadership and bind state come from `GET /_fleet/members`, and the
+`rift_cluster_*` counters that survive D-71 (#548) carry what no state endpoint
+can answer, a count of things that happened — and **invariant
 violations never auto-retry** — an infra flake retries once, but a violated
 invariant files a bug, and persistently flaky scenarios get quarantined behind
 an issue rather than deleted. CI budget: at PR time every scenario runs
@@ -105,7 +108,7 @@ fail under D-15) and stay unallocated.
 | C16 ✅ | 250 ms constant-latency toxic on one follower's inbound cluster link, then data-plane reads through that follower (#102: `c16_pull_on_miss_rescues_lagging_follower`) | The pull-on-miss safety net (#49) rescues the read within its 500 ms budget: the `rift-cluster-pull-on-miss: rescued-wait` header is only set on the lagged-then-caught-up path, so it is the proof the node lagged; zero jitter keeps leadership untouched |
 | C17 ✅ | Route-table write on one node, twice — create, then retarget the same route id (#132: `c17_routes_converge`) | Dispatch through the two nodes that never saw the write succeeds **the moment the write returns 2xx**, no polling — the barrier's return is the assertion (R1 for routes) |
 | C18 ✅ | Full-fleet stop/start with a three-route table: exact host, wildcard host, path prefix (#132: `c18_routes_survive_a_full_cluster_restart`) | After restart every node passes two separate checks: `GET /front-door/routes` (the stored table) **and** a real dispatch of all three shapes through its own front door (the rebuilt in-memory table) |
-| C19 ✅ | A `socat` sidecar squats an imposter's port inside rift-2's network namespace, confirmed held before the write (#143: `c19_front_door_routes_around_bind_divergence`) | The write is 201; config converges fleet-wide; `rift_cluster_bind_failures{port}` reads 1 on rift-2; a route to the squatted port dispatches 2xx through **rift-2's own** front door, and through rift-1's |
+| C19 ✅ | A `socat` sidecar squats an imposter's port inside rift-2's network namespace, confirmed held before the write (#143: `c19_front_door_routes_around_bind_divergence`) | The write is 201; config converges fleet-wide; `bind_failures` on rift-2's `GET /_fleet/members` names the squatted port; a route to the squatted port dispatches 2xx through **rift-2's own** front door, and through rift-1's |
 | C20 ✅ | One `POST /admin/sources/:id/pull` against a counting origin, then an unchanged second pull (#137: `c20_source_pull_converges_and_fetches_once`) | Converges fleet-wide with provenance on every node **and** the origin served exactly **one** request (`== 1`, never `>= 1`); the second pull fetches once more, writes nothing, answers `unchanged: true` |
 | C21 ✅ | `kill -9` the leader while a `tracking` source polls (#137: `c21_tracking_poll_is_leader_only_and_survives_failover`) | Origin request **rate** matches one poller (3–12 per 40 s window), not three; after re-election the rate resumes and a content change converges; `rift_cluster_source_polls_total` summed fleet-wide equals what the origin served |
 | C22 ✅ | Full-fleet SIGTERM/restart with declared sources (#137: `c22_sources_survive_a_full_cluster_restart`) | Every node keeps its source records, port provenance and the replicated `drifted` flag; a post-restart pull short-circuits on the unchanged digest without moving `last_applied` |
