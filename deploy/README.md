@@ -118,6 +118,21 @@ Builds the image, starts three nodes, and asserts: all three report `/readyz`
 reports its own identity, including the embedded upstream Rift.
 
 ```sh
+deploy/compose/smoke.sh                   # the core smoke check (RFC-007 §5)
+deploy/compose/smoke.sh --attach          # against a fleet that is already up
+```
+
+`verify.sh` proves the cluster *forms*; `smoke.sh` proves it *works*. It layers
+`smoke.overlay.yml` on the same compose file (an admin key, the router's listener,
+and a fourth node behind the `join` profile) and asserts the distributed core's
+promises on a real fleet: an imposter written on one node answers on every node
+through the router; a route table written on one node is installed everywhere; a
+stopped node catches up; a stopped leader is replaced and writes keep landing; a
+node joins from a seed, serves the same imposters, and leaves the voter set when
+it goes. Every removal under epic #544 runs it before and after. `--keep` leaves
+the fleet up for hand-driving; `--attach` skips the build and teardown.
+
+```sh
 deploy/compose/verify-pulled.sh --check   # static; no daemon, no pull
 deploy/compose/verify-pulled.sh           # pulls the pinned tag and runs it
 RIFT_CLUSTER_VERSION=0.2.0 deploy/compose/verify-pulled.sh
