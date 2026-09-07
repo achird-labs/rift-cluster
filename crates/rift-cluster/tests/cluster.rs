@@ -1723,7 +1723,14 @@ async fn a_joiner_is_caught_up_by_a_multi_mebibyte_snapshot() {
 
     // The other half of the new shape: once current, the leader's promotion sweep makes the
     // joiner a voter with no further part played by the joiner itself.
-    let deadline = Instant::now() + CONVERGE_DEADLINE;
+    //
+    // Bounded by `CONVERGE_BY`, not the generic `CONVERGE_DEADLINE`: since #549 the fixture's
+    // 4 MiB configs ride the log inline (the blob sideload is gone), so "current" means the
+    // joiner has applied eight 4 MiB entries — binding eight imposters — after a 32 MiB install.
+    // The claim here is that the sweep promotes a caught-up learner with no help from the joiner,
+    // not how fast a CI runner can apply 32 MiB; a 10 s bound failed on GitHub's runners while
+    // passing 3/3 locally in ~25 s per whole test.
+    let deadline = Instant::now() + CONVERGE_BY;
     while !leader.status().voters.contains(&2) {
         assert!(
             Instant::now() < deadline,
