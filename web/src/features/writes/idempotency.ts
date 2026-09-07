@@ -46,12 +46,12 @@ import { ApiError } from "../../api/client.ts";
  * via `base_op_id`, and those are the ones {@link keyedAttempt} is for.
  *
  * The routes in {@link UNDECLARED} do **not** declare the parameter, and the fleet does not read it
- * on them — the source writes and `try` return from `terminate` before the header is parsed, and
- * space teardown mints its own op id. An earlier revision of this console sent a key there anyway.
- * It was harmless on the wire and wrong as documentation: a reader seeing the header go out would
- * reasonably conclude those writes were retry-safe by key, when what actually makes them safe to
- * repeat is that each is convergent on its own terms — an upsert by id, a delete, a re-pull that
- * reapplies the same source, a monotone generation bump, and a `try` that writes no state at all.
+ * on them — `try` returns from `terminate` before the header is parsed, and space teardown mints
+ * its own op id. An earlier revision of this console sent a key there anyway. It was harmless on
+ * the wire and wrong as documentation: a reader seeing the header go out would reasonably conclude
+ * those writes were retry-safe by key, when what actually makes them safe to repeat is that each is
+ * convergent on its own terms — a monotone generation bump, and a `try` that writes no state at
+ * all.
  *
  * So the console now sends the key where it means something and not where it does not, and the
  * reason each of those routes is safe is recorded above rather than implied by a header.
@@ -65,10 +65,7 @@ import { ApiError } from "../../api/client.ts";
  */
 export const UNDECLARED: Readonly<Record<string, string>> = Object.freeze({
   // Keyed by the contract's own path templates, because that is what the test resolves them
-  // against — `{sourceId}`, not the console's `{id}`.
-  "POST /admin/sources": "an upsert by id — a repeat converges on the same record",
-  "DELETE /admin/sources/{sourceId}": "a delete — absent is the same outcome as removed",
-  "POST /admin/sources/{sourceId}/pull": "re-applies the same source content",
+  // against.
   "POST /admin/imposters/{port}/try":
     "writes no state; a repeat is a second probe, not a second write",
   "DELETE /imposters/{port}/spaces/{flowId}": "the journal generation bump is monotone",

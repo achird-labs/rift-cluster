@@ -55,7 +55,7 @@ leaving them bindable. `ci_reserves_every_published_port_that_linux_could_hand_o
 fails the build if you forget, so this is a note about *why*, not a thing to
 remember.
 
-Below 32768 (the base tier's own ports, and 16300/26300, 14790/24790) there is
+Below 32768 (the base tier's own ports, and 16300/26300) there is
 nothing to do.
 
 ### The chaos overlay
@@ -129,61 +129,51 @@ dispatches to them in-process (`dispatch_to_port` against the local
 `ImposterManager`, never a socket), so every C17/C18 assertion goes through a
 front-door port and never touches an imposter port directly.
 
-### The sources overlay
+### The proxy-origin overlay
 
-C20–C23 need two things the shipped topology deliberately does not give them, so
-`sources.overlay.yml` adds both:
+C10 and C11 both assert on *how many* upstream calls the fleet made, so they need
+something outside the fleet that counts requests exactly. `proxy-origin.overlay.yml`
+adds it:
 
 ```sh
 docker compose -f deploy/compose/docker-compose.yml \
-               -f tests/cluster-chaos/compose/sources.overlay.yml up -d
+               -f tests/cluster-chaos/compose/proxy-origin.overlay.yml up -d
 ```
 
-`Cluster::up_with_overlays(&["sources.overlay.yml"])` does this.
+`Cluster::up_with_overlays(&["proxy-origin.overlay.yml"])` does this.
 
 | what | host port | why |
 |---|---|---|
-| rift-1/2/3 cluster port | 14790 / 24790 / 34790 | `/admin/sources*` rides the **cluster port**, not the admin API — a source is a control-plane object authenticated with the cluster credential |
-| `source-origin` admin API | 46525 | where the fetch counter is read, and where the served document is changed mid-scenario |
+| `proxy-origin` admin API | 46525 | where the upstream counter (`numberOfRequests`, `savedRequests`) is read, and where the served response is configured |
 
-**The counting server is a fourth `rift-cluster-server`, not a new image.** C20's
-claim is that a pull fetches the source *exactly once fleet-wide*, and asserting
-that needs something that counts requests exactly. So the origin is a rift node
-run **un-clustered**, whose imposter's response body *is* the config document
-the fleet fetches — and its Mountebank-compatible admin API then hands the
-harness the counter for free (`GET /imposters/6600` → `numberOfRequests`,
-maintained whether or not request recording is on). "Fetched once" becomes `== 1`
-against a first-class API value rather than a log scrape.
+**The counting server is a fourth `rift-cluster-server`, not a new image.** The
+origin is a rift node run **un-clustered**, and its Mountebank-compatible admin
+API hands the harness the counter for free (`GET /imposters/6810` →
+`numberOfRequests`, plus the per-path `savedRequests` C10 and C11 diff across a
+window — both maintained whether or not request recording is on). The bound
+becomes an equality against a first-class API value rather than a log scrape.
 
 A rift container rather than a small static-file image, deliberately: this tier
 pins `toxiproxy` and `envoy` by digest, and a new public image means a new digest
 to pin, review and rotate — a supply-chain surface added to serve a counter the
 binary already in this repo publishes. It also buys, for nothing, the ability to
-**change** what the origin serves mid-scenario (`PUT /imposters/6600/stubs`),
-which C21's content change and C23's repair pull both need and which a static
-file could not do without a container restart.
+hold a response open (`behaviors.wait`), which is what keeps C10's proxy claims
+Pending while it kills their owners.
 
 Un-clustered is load-bearing too: the origin has to be a plain HTTP host the
-fleet fetches *from*, entirely outside the replicated log. A fourth voter would
-change the quorum arithmetic every one of these scenarios depends on, and C21
-kills a leader.
+fleet proxies *to*, entirely outside the replicated log. A fourth voter would
+change the quorum arithmetic these scenarios depend on, and C10 kills a leader.
 
-**This is the one place the harness depends on a first-party crate.** Everything
-else here is driven over plain HTTP — an imposter config, a route table and a
-source declaration are all built as JSON at the call site, the way an operator's
-`curl` would. The cluster port is the exception: it is HMAC-authenticated per
-request over a length-prefixed canonical form and negotiates a protocol version
-(RFC-001 §11.2). `cluster_api` therefore uses `rift_cluster::rpc::RpcClient`
-rather than re-implementing that framing, with `max_retries: 0` — the default
-client retries three times, and a retried `POST .../pull` fetches again, which
-would quietly turn C20's `== 1` into whatever the transport happened to do.
+The fleet reaches it by service name (`http://proxy-origin:6810`) through
+Docker's embedded DNS, never a host address: a proxy target is replicated state,
+so it must be reachable from every node rather than only from the harness's side.
 
 ### Why the snapshot round trip needed a knob
 
 `build_snapshot` / `install_snapshot` name openraft's wire path for catching a
-lagging follower up wholesale rather than entry-by-entry. Three scenarios'
-issues each named it as a mutation target — C18 ("rides the snapshot"), C22
-("`sm_sources` omitted from the snapshot"), C26 ("the table it compares
+lagging follower up wholesale rather than entry-by-entry. Two scenarios'
+issues each named it as a mutation target — C18 ("rides the snapshot") and C26
+("the table it compares
 omitted from `SnapshotPayload`") — and each, applied and measured against this tier's
 plain full-fleet restart, **survived**. Not because the scenarios were weak:
 openraft's default `snapshot_policy` (`LogsSinceLast(5000)`,
@@ -227,9 +217,9 @@ imposters through the other two so the leader snapshots and purges what the
 follower would need, then restarts it — forcing a real `install_snapshot` rather than assuming the
 config alone proves the wire path ran. See its doc comment for the mechanism
 and for what the container tier can and cannot observe about `install_snapshot`
-directly. C18 and C22 still run the plain full-fleet restart, so their named
-snapshot mutants still survive here for the reason above — the round trip for
-routes and sources is gated in process instead, as their own entries below say.
+directly. C18 still runs the plain full-fleet restart, so its named
+snapshot mutant still survives here for the reason above — the round trip for
+routes is gated in process instead, as its own entry below says.
 
 ### Why partitions are not toxiproxy
 
@@ -321,10 +311,6 @@ Implemented and passing: `test_config_sync_converges`, `test_node_rejoin`,
 `c5_rolling_restart_never_stops_accepting_writes`,
 `whole_fleet_sigterm_then_cold_start_converges`, `c17_routes_converge`,
 `c18_routes_survive_a_full_cluster_restart`,
-`c20_source_pull_converges_and_fetches_once`,
-`c21_tracking_poll_is_leader_only_and_survives_failover`,
-`c22_sources_survive_a_full_cluster_restart`,
-`c23_drift_flags_and_pull_overwrites`,
 `c24_rbac_enforcement_is_identical_through_any_node`,
 `c25_key_revocation_survives_a_partition`,
 `c26_replicated_imposters_survive_a_full_cluster_restart_by_snapshot_install`,
@@ -348,11 +334,11 @@ measured properly.)
 None of the journal scenarios needs a new overlay — traffic goes through
 `front-door.overlay.yml`'s already-published per-node listeners and every
 merged read is an *admin* call on a port the base file publishes; imposter data
-ports stay unpublished. The proxy pair borrows `sources.overlay.yml`'s
-standalone `source-origin` server as its counting origin (in-network by service
-name, single-node admin already published and port-reserved), so the whole
-family adds exactly one piece of compose surface: `faketime.overlay.yml` for
-C12, which publishes nothing.
+ports stay unpublished. The proxy pair brings up `proxy-origin.overlay.yml`'s
+standalone `proxy-origin` server as its counting origin (in-network by service
+name, single-node admin published and port-reserved — see "The proxy-origin
+overlay" above), so the whole family adds exactly two pieces of compose surface:
+that overlay and `faketime.overlay.yml` for C12, which publishes nothing.
 
 | scenario | asserts | vacuity guard |
 |---|---|---|
@@ -562,69 +548,6 @@ imposter's body through **rift-2's own front door** — the node whose bind
 failed. A last check against rift-1's front door, whose bind succeeded, is
 what makes this a proof of divergence rather than of a stack that is
 uniformly broken.
-
-## C20–C23: imposter sources
-
-Issue #137 closes #20's cluster acceptance list for imposter sources (#134) and
-their tracking scheduler (#135). All four ride `sources.overlay.yml` — see "The
-sources overlay" above for why the counting server is a fourth rift container.
-
-| scenario | asserts | mutation story |
-|---|---|---|
-| `c20_source_pull_converges_and_fetches_once` | one pull converges fleet-wide (`wait_converged` + `wait_revisions_agree` + provenance on every node) **and** the origin served exactly **one** request for it; a second, unchanged pull fetches once more and writes nothing | `SourcePuller::pull` fetching once per voter instead of once — a stand-in for the fetch-in-apply design #134 rejected — went red **only** on the counter: `left: 3, right: 1`. Every convergence assertion still passed, which is the point |
-| `c21_tracking_poll_is_leader_only_and_survives_failover` | the origin's request **rate** matches one node's cadence, not three; after the leader is `kill -9`ed and the fleet re-elects, the rate resumes at one node's cadence and a content change converges fleet-wide | deleting the `if !is_leader { … }` arm from `SourceScheduler::supervise` went red on the first window: **22 fetches in 40s** against a one-poller bound of 3–12 (three pollers is ≥ 21, which is what the bound's derivation predicts) |
-| `c22_sources_survive_a_full_cluster_restart` | after a full-fleet SIGTERM/restart, every node still holds the source records, the provenance stamped on their ports, and the replicated `drifted` flag — and a post-restart pull still short-circuits on the unchanged digest without moving `last_applied` | emptying `sm_sources` whenever the store is opened went red immediately after the restart: `404 unknown route: GET /admin/sources/clean`. **The issue's named mutant does not apply here** — see below |
-| `c23_drift_flags_and_pull_overwrites` | a hand edit of a source-owned imposter is visible as `drifted: true` on **every** node, and the next pull (`onDrift: overwrite`) restores the declared content in every node's committed config | making `RedbStateMachine::mark_drifted` a no-op went red on the post-edit check with all three nodes reporting `false` — while the repair pull and the content afterwards still passed, which is exactly the shape of the regression worth catching |
-
-**Fetched-once is asserted as an equality, never an inequality.** `>= 1` would
-pass against a fleet that had quietly gone back to per-node fetching, which is
-the whole regression C20 exists to catch. The reason the fetch may be
-non-deterministic I/O at all is that it happens *once*: the receiving node
-fetches, canonicalizes, hashes and submits an ordinary control op, and every
-replica applies those same bytes. Two nodes fetching the same URI a second apart
-can legitimately get different bytes, and a fleet that applied *different*
-configs from the "same" op would have diverged with nothing to point at.
-
-C20 also pins the other half of that contract, which is easy to misread: a pull
-**always** fetches — it cannot know the content is unchanged without asking. What
-the digest short circuit removes is the *write*. So the second pull moves the
-counter by one and answers `unchanged: true`.
-
-**C21 bounds a rate, for the same reason C6 does.** A single count cannot tell a
-slow box from a second poller. The window is 40 s at the enforced 5 s poll floor,
-±10 % jitter, so one poller completes 6–10 sleeps on an idle box; the bound is
-widened to 3–12 (down for a stretched sleep and the leaderless gap after the
-kill, up for ~50 % of runner headroom) and three pollers cost ≥ 21. If it fails,
-the question is how many nodes are polling — do not move the numbers. The
-scenario also reads `rift_cluster_source_polls_total` fleet-wide as an
-independent second opinion: only the leader increments it, so the sum counts each
-poll once and must equal what the origin served.
-
-**Correction to C22's named mutation.** The issue names "`sm_sources` omitted
-from the snapshot"; applied and measured, that mutant **survives** here for
-the reason "Why the snapshot round trip needed a knob" gives above — not
-because the scenario is weak. The snapshot round trip **is** gated, in
-process, by `provenance_is_reported_and_survives_snapshot_restore` in
-`crates/rift-cluster/src/raft/store.rs`, which drives `build_snapshot` /
-`install_snapshot` directly. What C22 exercises is the restart path, and the
-mutant that kills it is the one named in the table above. Recorded here rather
-than left to be re-derived: a mutant that survives is evidence about where a
-property is enforced, not a gap to paper over.
-
-**C23 runs only the `overwrite` arm.** `on_drift` has three, and all three are
-already covered in process over real HTTP by #134's suite —
-`a_skipped_pull_does_not_short_circuit_the_pull_that_resolves_it` in
-`crates/rift-cluster-server/tests/sources.rs` for `skip`, and the state machine's own
-`drifted_source_fails_when_asked` for `fail`. What containers add is process
-death and the operator-facing surface, neither of which differs between the arms,
-so triplicating a ~40 s scenario would buy a third copy of the same evidence.
-`overwrite` is the arm run here because it is the default and the only one whose
-effect is visible in committed content rather than only in a report field.
-
-The demo these four back is `deploy/compose/sources-demo.yml` — one
-`RIFT_IMPOSTERS` variable, three nodes serving the same mocks, and one
-`POST /admin/sources/:id/pull` rolling the fleet onto new content. See
-`deploy/README.md`'s "Imposter sources demo".
 
 ## C24–C27: tenancy, RBAC and the closed admin plane
 

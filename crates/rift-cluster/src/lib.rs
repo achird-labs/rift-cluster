@@ -20,42 +20,30 @@
 //! * [`decorate`] — the response decorator that turns cluster op notes into
 //!   `Rift-Cluster-*` headers, so the open-source handlers stay cluster-unaware.
 
-pub mod blobs;
 pub mod bridge;
 pub mod config;
 pub mod control;
-pub mod datasets;
 pub mod decorate;
 pub mod metrics;
 pub mod pull_on_miss;
 pub mod raft;
 pub mod rpc;
-pub mod sources;
 pub mod stores;
 
 pub use bridge::{Bridge, BridgeConfig, CallerClass};
 pub use config::{ClusterConfig, ConfigError, RuntimeTopology};
 pub use control::{
-    ControlOp, ControlOutcome, ControlRequest, ControlResponse, DEFAULT_TENANT, Digest,
-    FLEET_SCOPE, MAX_SOURCE_PAYLOAD_BYTES, MAX_SPEC_BYTES, OnDrift, PreconditionTarget,
-    RecordedStub, RecordedStubPlacement, SESSION_KEY_BYTES, SessionKey, SourceMode,
-    SourceProvenance, SpecFormat, SpecMeta, SpecProvenance, SpecSource, StubEdit, StubEditScript,
-    TenantId, precondition_target, routes_installed_for,
+    ControlOp, ControlOutcome, ControlRequest, ControlResponse, DEFAULT_TENANT, FLEET_SCOPE,
+    PreconditionTarget, RecordedStub, RecordedStubPlacement, SESSION_KEY_BYTES, SessionKey,
+    StubEdit, StubEditScript, TenantId, precondition_target, routes_installed_for,
 };
 pub use decorate::ClusterDecorator;
 pub use pull_on_miss::PullOnMissInterceptor;
 pub use raft::{
     ADMIT_CURRENCY_WAIT, JoinOutcome, JoinedAs, KeyClass, LeaveOutcome, NodeConfig, NodeError,
-    NodeId, NodeIdentity, OwnStatus, OwnedKey, PullOutcome, RaftNode, Ring, SourceRecord,
-    SourceRow, StatusReport,
+    NodeId, NodeIdentity, OwnStatus, OwnedKey, RaftNode, Ring, StatusReport,
 };
-// `raft::store` is `pub(crate)` (not re-exported by `raft`'s own `pub use`, unlike
-// `SourceRecord`/`SourceRow`) — reached directly here rather than widening that module's own
-// visibility just to route two more types through it.
-pub use raft::store::{DatasetSummary, SpecBinding, SpecRecord};
 pub use rpc::{Authority, AuthorityError, Router, RpcClient, RpcError, RpcServer};
-pub use sources::scheduler::{PollStatus, SourceScheduler};
-pub use sources::{PullError, PullReport, SourcePuller};
 
 use serde::{Deserialize, Serialize};
 

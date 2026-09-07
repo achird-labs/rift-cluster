@@ -12,7 +12,6 @@ import {
   isEmptyQuery,
   matchesText,
   sortImposters,
-  sourceOwnedPorts,
   stubCount,
   unclassifiedCount,
   visibleImposters,
@@ -134,48 +133,6 @@ describe("filterImposters", () => {
   });
 });
 
-describe("owner filter", () => {
-  const list = [
-    imposter({ port: 4545, name: "from-git" }),
-    imposter({ port: 4546, name: "hand-made" }),
-    imposter({ port: 4547, name: "also-git" }),
-  ];
-  const owned = sourceOwnedPorts([{ ports: [4545] }, { ports: [4547] }]);
-
-  it("unions every declared source's ports", () => {
-    expect([...(owned ?? [])].sort()).toEqual([4545, 4547]);
-  });
-
-  it("is null when there is no reading of sources at all", () => {
-    // Refused, unread or still loading — all the same fact, and all mean "cannot answer".
-    expect(sourceOwnedPorts(undefined)).toBeNull();
-  });
-
-  it("is an empty set, NOT null, when the tenant declares no sources", () => {
-    // A real reading of zero sources is knowledge: everything is hand-created. Collapsing it into
-    // `null` would silently disable a filter that has a correct answer.
-    expect(sourceOwnedPorts([])).toEqual(new Set());
-  });
-
-  it("narrows to source-owned and to hand-created", () => {
-    expect(filterImposters(list, query({ owner: "source" }), owned).map((i) => i.port)).toEqual([4545, 4547]);
-    expect(filterImposters(list, query({ owner: "hand" }), owned).map((i) => i.port)).toEqual([4546]);
-  });
-
-  it("is a NO-OP without a sources reading, never an answer of `all hand-created`", () => {
-    // The failure this prevents: with nothing to join against, "hand-created" would match every
-    // imposter — including the source-owned ones — and read as a confident, wrong answer.
-    expect(filterImposters(list, query({ owner: "hand" }), null)).toHaveLength(3);
-    expect(filterImposters(list, query({ owner: "source" }), null)).toHaveLength(3);
-  });
-
-  it("treats an imposter with no port as hand-created, since no source can own it", () => {
-    const portless = [imposter({ port: undefined, name: "nameless" })];
-    expect(filterImposters(portless, query({ owner: "hand" }), owned)).toHaveLength(1);
-    expect(filterImposters(portless, query({ owner: "source" }), owned)).toHaveLength(0);
-  });
-});
-
 describe("unclassifiedCount", () => {
   const list = [
     imposter({ port: 4545, stubs: [PROXY_STUB] }),
@@ -197,20 +154,6 @@ describe("unclassifiedCount", () => {
       imposter({ port: 4546, name: "checkout", stubs: undefined }),
     ];
     expect(unclassifiedCount(named, query({ recording: "has", text: "bill" }))).toBe(1);
-  });
-
-  it("counts only rows that pass the OWNER filter", () => {
-    // The gap that shipped: an earlier version repeated the conjunction and left `owner` out, so a
-    // row excluded because the operator asked for hand-created only was reported as "not shown
-    // because we could not read its stubs" — the count that names the right reason, naming a wrong one.
-    const mixed = [
-      imposter({ port: 4545, stubs: undefined }),
-      imposter({ port: 4546, stubs: undefined }),
-    ];
-    const owned = sourceOwnedPorts([{ ports: [4545] }]);
-    expect(unclassifiedCount(mixed, query({ recording: "has", owner: "hand" }), owned)).toBe(1);
-    expect(unclassifiedCount(mixed, query({ recording: "has", owner: "source" }), owned)).toBe(1);
-    expect(unclassifiedCount(mixed, query({ recording: "has" }), owned)).toBe(2);
   });
 
   it("counts only rows that pass the OTHER filters", () => {
@@ -317,7 +260,7 @@ describe("encodeQuery / decodeQuery", () => {
   });
 
   it("round-trips every non-default field", () => {
-    const full = query({ text: "checkout api", state: "disabled", recording: "has", owner: "source", sort: "stubs", direction: "desc" });
+    const full = query({ text: "checkout api", state: "disabled", recording: "has", bind: "failed", sort: "stubs", direction: "desc" });
     expect(decodeQuery(encodeQuery(full))).toEqual(full);
   });
 
@@ -332,7 +275,7 @@ describe("encodeQuery / decodeQuery", () => {
 
   it("falls back to the default for every unrecognised value", () => {
     // A stale or hand-edited bookmark is a normal thing to receive; the screen must still render.
-    expect(decodeQuery("state=sideways&rec=maybe&owner=nobody&sort=colour&dir=widdershins")).toEqual(EMPTY_QUERY);
+    expect(decodeQuery("state=sideways&rec=maybe&bind=nobody&sort=colour&dir=widdershins")).toEqual(EMPTY_QUERY);
   });
 
   it("keeps the fields it can parse when others are junk", () => {
@@ -348,7 +291,7 @@ describe("isEmptyQuery", () => {
     expect(isEmptyQuery(query({ text: "x" }))).toBe(false);
     expect(isEmptyQuery(query({ state: "enabled" }))).toBe(false);
     expect(isEmptyQuery(query({ recording: "has" }))).toBe(false);
-    expect(isEmptyQuery(query({ owner: "source" }))).toBe(false);
+    expect(isEmptyQuery(query({ bind: "failed" }))).toBe(false);
     expect(isEmptyQuery(query({ sort: "name" }))).toBe(false);
     expect(isEmptyQuery(query({ direction: "desc" }))).toBe(false);
   });

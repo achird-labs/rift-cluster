@@ -70,7 +70,6 @@ async fn spawn_member(id: NodeId, addr: SocketAddr, dir: &Path) -> Member {
         routes: seq_routes(Arc::clone(&seq)),
         engine: None,
         snapshot_log_entries: None,
-        advertise_as_digest_only_incapable: false,
     })
     .await
     .unwrap_or_else(|e| panic!("start node {id}: {e}"));

@@ -1,27 +1,20 @@
 //! `curl` for the cluster port: a signed request, printed.
 //!
-//! The cluster port carries the operator surface (`/_cluster/*`) and the
-//! imposter-source surface (`/admin/sources*`) — see `docs/rift-cluster-server.md`.
-//! Both are authenticated with the **cluster credential**, not the admin API
-//! key: every request has to carry an HMAC over a canonical encoding of its
+//! The cluster port carries the operator surface (`/_cluster/*`) — see
+//! `docs/rift-cluster-server.md`. It is authenticated with the **cluster credential**, not the
+//! admin API key: every request has to carry an HMAC over a canonical encoding of its
 //! timestamp, nonce, method, path and body (RFC-001 §11.2). Plain `curl` cannot
 //! produce that, which leaves the endpoints documented and unreachable for
 //! anyone without a client.
 //!
 //! This is that client, in the crate that defines the format, so it cannot
 //! drift from the server it talks to. It is deliberately the smallest thing
-//! that works — one request, no subcommands, no config file — because it exists
-//! to make the source demo (`deploy/compose/sources-demo.yml`) runnable as
-//! documented, not to become a CLI.
+//! that works — one request, no subcommands, no config file.
 //!
 //! ```sh
 //! cargo run -q -p rift-cluster --example cluster-curl -- \
 //!     --secret local-development-cluster-secret \
-//!     GET http://127.0.0.1:14790/admin/sources
-//!
-//! cargo run -q -p rift-cluster --example cluster-curl -- \
-//!     --secret local-development-cluster-secret \
-//!     POST http://127.0.0.1:14790/admin/sources/my-mocks/pull
+//!     GET http://127.0.0.1:14790/_cluster/health
 //! ```
 //!
 //! `--secret` may be omitted when `RIFT_CLUSTER_SECRET` is set, which is how a
@@ -50,13 +43,11 @@ async fn run(args: Args) -> anyhow::Result<()> {
         Arc::new(AlwaysHealthy),
         RpcClientConfig {
             connect_timeout: Duration::from_secs(5),
-            // A source pull does a real fetch against a foreign host and then a
-            // Raft round trip, so the 2s peer-RPC default is far too short for
-            // an operator command.
+            // An operator command may sit behind a Raft round trip, so the 2s peer-RPC default
+            // is far too short.
             request_timeout: Duration::from_secs(60),
-            // Never retried. A retried `POST .../pull` fetches the source a
-            // second time, and this tool must do exactly what it was asked to
-            // do once — a failure is the operator's to see and repeat.
+            // Never retried: this tool must do exactly what it was asked to do once, and a
+            // failure is the operator's to see and repeat.
             max_retries: 0,
         },
     );
@@ -140,4 +131,4 @@ usage: cluster-curl [--secret SECRET] [--data BODY] METHOD URL
   --data    request body, sent as application/json
 
   cluster-curl GET  http://127.0.0.1:14790/_cluster/members
-  cluster-curl POST http://127.0.0.1:14790/admin/sources/my-mocks/pull";
+  cluster-curl GET  http://127.0.0.1:14790/_cluster/health";

@@ -296,6 +296,9 @@ taken once the API has stopped shrinking (#554).
    still are partial when a peer is down. Default: keep it on those reads only (#552).
 4. **Should the OpenAPI compile endpoint live on the server at all, or only in the console?** A
    server endpoint lets curl users import too. Default: server endpoint, stateless (#549).
+   **Resolved by #549 (D-72):** the server keeps a stateless `POST /specs/compile` that compiles
+   a submitted OpenAPI document and answers the imposter JSON plus its operation index, retaining
+   nothing — the caller writes the result with an ordinary `PUT /imposters`.
 
 ## 9. Progress
 
@@ -309,7 +312,7 @@ Updated as PRs merge. Status is one of `open`, `in progress`, `merged`.
 | #546 | Audit | open | — |
 | #547 | MCP | open | — |
 | #548 | Metrics and observability | open | — |
-| #549 | Sources, datasets, specs, blobs | open | — |
+| #549 | Sources, datasets, specs, blobs | in progress | — |
 | #550 | Tenancy and RBAC | open | — |
 | ~~#551~~ | Flow state, sequencer, proxyOnce, spaces | withdrawn 2026-09-06 — stays | — |
 | #552 | Journal merge | open | — |

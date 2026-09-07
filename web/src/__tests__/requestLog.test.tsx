@@ -202,8 +202,8 @@ describe("the per-node copy is gone from the source, not just from the screen", 
 
     /*
      * The two label *sentences*, not the loose words. "whole fleet" on its own appears in
-     * unrelated prose that this slice has no business deleting — `fleetView.ts` / `Sources.tsx`
-     * and the generated `schema.ts`. Matching those would make this assertion fail for reasons
+     * unrelated prose that this slice has no business deleting — `fleetView.ts` and the generated
+     * `schema.ts`. Matching those would make this assertion fail for reasons
      * that have nothing to do with the request log, and the usual repair for a noisy guard is to
      * loosen it until it stops meaning anything. Anchoring on the exact copy keeps it strict
      * where it matters: either sentence reappearing anywhere under `src` fails this test.

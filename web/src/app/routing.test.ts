@@ -55,9 +55,9 @@ describe("parseHash", () => {
   });
 
   it("falls back to the imposters screen for an unknown hash", () => {
-    // A stale bookmark to a screen that does not exist yet is a navigation miss, not an error page:
-    // the nav already tells the operator which screens are unbuilt.
-    expect(parseHash("#/specs")).toEqual({ screen: "imposters" });
+    // A stale bookmark to a screen that does not exist — never built, or removed, as `#/sources`
+    // was by #549 — is a navigation miss, not an error page.
+    expect(parseHash("#/sources")).toEqual({ screen: "imposters" });
     expect(parseHash("#/imposters/4545/stubs/0")).toEqual({ screen: "imposters" });
   });
 
@@ -99,7 +99,7 @@ describe("query strings are screen state, not route", () => {
   });
 
   it("still falls back for a genuinely unknown route that happens to carry a query", () => {
-    expect(parseHash("#/specs?q=x")).toEqual({ screen: "imposters" });
+    expect(parseHash("#/sources?q=x")).toEqual({ screen: "imposters" });
   });
 
   it("reads the query string back out", () => {

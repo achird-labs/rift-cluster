@@ -2,8 +2,8 @@
  * The console's design system.
  *
  * Redesigned onto the "technical light" direction of `RiftCluster Console.dc.html` — warm paper
- * rather than the cool blue-grey this file shipped before, drift and provenance foregrounded, and
- * IBM Plex carrying the distinction between prose and identifiers. The information architecture is
+ * rather than the cool blue-grey this file shipped before, and IBM Plex carrying the distinction
+ * between prose and identifiers. The information architecture is
  * unchanged; what changed is the surface, the type, and the amount of chrome each row spends.
  *
  * Build-time CSS only (RFC-006 §7). Runtime CSS-in-JS injects a <style> element, and while C5

@@ -244,8 +244,8 @@ type AppendOutcome =
 
 /// Floor on the link speed a replication transfer is granted before it is
 /// declared failed: 8 MiB at 1 MiB/s is 8 s on top of the ordinary request
-/// timeout, which puts a dataset at its 8 MiB quota ceiling at the admin front's
-/// own 10 s write deadline. A link slower than this parks the intent for replay
+/// timeout, which puts an entry at the largest size the front will admit inside
+/// the admin front's own 10 s write deadline. A link slower than this parks the intent for replay
 /// rather than holding the transfer open indefinitely; op-id dedup then makes
 /// the eventual commit happen exactly once.
 const MIN_REPLICATION_BYTES_PER_SEC: u64 = 1024 * 1024;
@@ -253,9 +253,9 @@ const MIN_REPLICATION_BYTES_PER_SEC: u64 = 1024 * 1024;
 /// How long a transfer of `body_len` bytes is given, from the client's ordinary
 /// per-attempt timeout plus an allowance at [`MIN_REPLICATION_BYTES_PER_SEC`].
 ///
-/// `pub(crate)` rather than private: `blobs::client` (#437) needs the identical
-/// size-aware deadline for its own single-attempt transfers, and re-deriving it
-/// there would risk the two drifting apart.
+/// `pub(crate)` rather than private so any other single-attempt bulk transfer derives the same
+/// deadline instead of re-deriving one that could drift from it. (`blobs::client` was the first
+/// such caller, #437; it left with D-72.)
 pub(crate) fn replication_deadline(request_timeout: Duration, body_len: usize) -> Duration {
     // Milliseconds rather than whole seconds so a few-hundred-KiB entry gets a
     // proportional allowance instead of being truncated to zero.
@@ -266,9 +266,10 @@ pub(crate) fn replication_deadline(request_timeout: Duration, body_len: usize) -
 /// How one Raft RPC that goes through [`PeerClient::send`] is delivered.
 ///
 /// Only `install_snapshot` is bulk. `append_entries` carries payloads just as large — a
-/// `DatasetPut` entry is the whole CSV — but it does not come through `send` at all: #411 gives it
-/// its own single-flight path so that concurrent attempts share one in-flight transfer instead of
-/// restarting it. `vote` is small and keeps the client's ordinary retry budget.
+/// `PutImposter` entry is the whole config, stubs and bodies included — but it does not come
+/// through `send` at all: #411 gives it its own single-flight path so that concurrent attempts
+/// share one in-flight transfer instead of restarting it. `vote` is small and keeps the client's
+/// ordinary retry budget.
 #[derive(Clone, Copy, Debug)]
 enum Delivery {
     /// A small, latency-bound RPC. [`RpcClient`]'s own retries and flat `request_timeout` apply.
@@ -291,8 +292,8 @@ enum Delivery {
 /// follower. It then re-issues the same range on the next tick, so an entry only
 /// ever commits if one attempt happens to complete transfer *and* the follower's
 /// fsync inside a single heartbeat. A 512 KiB entry took 23-548 s; 1 MiB and up
-/// never committed at all, which capped the fleet far below the 4 MiB spec and
-/// 8 MiB dataset quotas that are already accepted at the front door.
+/// never committed at all, which capped the fleet far below the multi-MiB config
+/// documents the front door already accepts.
 struct InflightAppend {
     /// The transfer's identity: a re-send matches only if it is based on the
     /// same term and the same predecessor entry.
@@ -1319,291 +1320,6 @@ async fn committed_members_and_voters(
     .map_err(|e| RpcError::Handler(format!("reading committed membership for {id}: {e}")))
 }
 
-/// The two voter sets a blob fan-out must satisfy a majority of *both* of
-/// (#438, D-19): the committed configuration and the effective one.
-///
-/// Neither alone is sound, which is why this is a pair rather than a choice:
-///
-/// - **committed only** — a cluster growing 3→5 with the new config still
-///   uncommitted has a committed majority of 2. The op commits, the membership
-///   commits after it, and the blob is on 2 of 5: not a majority of the
-///   configuration now in force.
-/// - **effective only** — effective membership can carry an uncommitted entry
-///   from a deposed leader that later truncates (the hazard
-///   [`committed_voters`] documents). If the truncated config had *removed*
-///   nodes, the majority fanned to may not be a majority of the config that
-///   survives.
-///
-/// A majority of both is the joint-consensus rule Raft itself requires while a
-/// joint configuration is in flight, and it is what makes the set of holders
-/// one that no single membership change can empty — the precondition #439's
-/// fetch-on-apply depends on. Fix this rule and the residual propose-window
-/// stops mattering; leave it committed-only and no amount of fetch-on-apply
-/// recovers it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct QuorumTargets {
-    committed: BTreeSet<NodeId>,
-    effective: BTreeSet<NodeId>,
-}
-
-impl QuorumTargets {
-    #[cfg(test)]
-    pub(crate) fn new(committed: BTreeSet<NodeId>, effective: BTreeSet<NodeId>) -> Self {
-        Self {
-            committed,
-            effective,
-        }
-    }
-
-    /// Every node worth sending to: the union, since a node in either
-    /// configuration can count toward that configuration's majority.
-    pub(crate) fn members(&self) -> BTreeSet<NodeId> {
-        self.committed.union(&self.effective).copied().collect()
-    }
-
-    /// Whether `acks` carries a majority of **both** configurations.
-    pub(crate) fn satisfied_by(&self, acks: &BTreeSet<NodeId>) -> bool {
-        majority_of(&self.committed, acks) && majority_of(&self.effective, acks)
-    }
-
-    /// Whether the two configurations differ — i.e. a membership change is in
-    /// flight and the second majority is doing real work.
-    pub(crate) fn is_joint(&self) -> bool {
-        self.committed != self.effective
-    }
-}
-
-/// Whether `acks` contains a strict majority of `config`.
-///
-/// Acks from nodes outside `config` are ignored rather than counted: a learner
-/// or a departing node holding the blob is not evidence about *this*
-/// configuration's durability.
-///
-/// An **empty** configuration is not satisfied. A real cluster always has at
-/// least one voter, so empty means the membership has not loaded yet — the
-/// question cannot be answered, and this decides whether a write is durable
-/// enough to commit. Answering "yes" to a question that could not be evaluated
-/// is the one direction that is unrecoverable, so the unknown case takes the
-/// refusing branch.
-fn majority_of(config: &BTreeSet<NodeId>, acks: &BTreeSet<NodeId>) -> bool {
-    if config.is_empty() {
-        return false;
-    }
-    let held = config.intersection(acks).count();
-    held * 2 > config.len()
-}
-
-/// The two membership views one blob fan-out needs, read together (#481, D-53): whom to send
-/// bytes to (`voters`, D-19's quorum, unchanged) and whom to ask about digest-only support
-/// (`all`, which adds the learners — they apply the log too).
-pub(crate) struct JointMembership {
-    pub(crate) voters: QuorumTargets,
-    pub(crate) all: BTreeSet<NodeId>,
-}
-
-/// Read both voter sets in **one** `with_raft_state` closure (#438, D-19).
-///
-/// One read, not two: separate reads can observe different membership epochs,
-/// and a "joint" pair assembled from two epochs describes a configuration that
-/// never existed — the precise failure the joint rule exists to prevent.
-///
-/// # Errors
-///
-/// [`RpcError::Handler`] if the RaftCore loop cannot be reached to answer.
-pub(crate) async fn joint_voters(raft: &Raft<TypeConfig>) -> Result<QuorumTargets, RpcError> {
-    raft.with_raft_state(|state| QuorumTargets {
-        committed: state.membership_state.committed().voter_ids().collect(),
-        effective: state.membership_state.effective().voter_ids().collect(),
-    })
-    .await
-    .map_err(|e| RpcError::Handler(format!("reading membership for blob fan-out: {e}")))
-}
-
-/// Every node id in the committed configuration ∪ the effective one — voters **and**
-/// learners (#481). A sibling to [`joint_voters`] rather than a change to it: that function
-/// answers a narrower question on purpose (voters only, for D-19's byte quorum), and this
-/// answers a different one — "who applies this log" — which a learner is part of too. openraft
-/// replicates to and applies on a learner exactly as it does a voter; a learner just does not
-/// count toward an election or toward the byte quorum a blob fan-out sends to.
-///
-/// `RaftNode::fan_out_blob` uses this to decide who to *probe* for sideload capability (every
-/// member here), which is deliberately a larger set than who it *sends bytes to* (only
-/// [`QuorumTargets::members`]) — D-19's byte quorum is unchanged by this.
-///
-/// The voter sets and the member union come from **one** `with_raft_state` closure, for
-/// [`joint_voters`]' reason and one more: read separately, the byte-quorum set and the
-/// capability-probe set could come from different membership epochs, and the gate would then be
-/// deciding about a configuration that never existed.
-///
-/// # Errors
-///
-/// [`RpcError::Handler`] if the RaftCore loop cannot be reached to answer.
-pub(crate) async fn joint_members(raft: &Raft<TypeConfig>) -> Result<JointMembership, RpcError> {
-    raft.with_raft_state(|state| {
-        let committed = state.membership_state.committed();
-        let effective = state.membership_state.effective();
-        JointMembership {
-            voters: QuorumTargets {
-                committed: committed.voter_ids().collect(),
-                effective: effective.voter_ids().collect(),
-            },
-            all: committed
-                .nodes()
-                .map(|(id, _)| *id)
-                .chain(effective.nodes().map(|(id, _)| *id))
-                .collect(),
-        }
-    })
-    .await
-    .map_err(|e| RpcError::Handler(format!("reading membership for blob sideload probe: {e}")))
-}
-
-/// The fleet's applied-index floor, as [`fleet_applied_floor`] could establish it (D-55, #504).
-///
-/// `Known` **only when every member answered** — it is the minimum over the whole committed ∪
-/// effective membership, or nothing. A minimum over "whoever replied" would be the exact wrong
-/// number: the member that did not reply is the parked, restarting replica rule C exists to
-/// protect — so "a floor over some members" is not a state this type can express. `Unknown`
-/// names the members that could not be read, sorted by id, so the warning the GC sweep emits
-/// carries who to look at rather than a bare "unknown".
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum FleetAppliedFloor {
-    Known(u64),
-    Unknown(Vec<NodeId>),
-}
-
-/// Pull every member's applied index and fold it to the fleet minimum (D-55, #504) — blob GC's
-/// rule C input: a tombstoned blob is reaped only once every member has applied past the entry
-/// that unreferenced it, because a member whose log is ahead of its applied index replays that
-/// entry from its own log and is never offered the snapshot rule A's argument assumes.
-///
-/// **Pulled, not leader-published.** openraft carries no applied index on the wire — a
-/// follower's `AppendEntriesResponse` reports `matching`, which keeps advancing on a parked
-/// replica while `last_applied` does not — so the leader's replication view can never see this
-/// case. The channel is the one the write barrier (`RaftNode::await_applied`, #9) already uses:
-/// [`CLUSTER_APPLIED_PATH`] on the signed cluster port, in this crate. What was missing was the
-/// fold, not a channel or a layer (D-52 said otherwise, twice; #505 and #504 corrected it).
-///
-/// **Who is asked:** the committed ∪ effective membership, voters *and* learners — a learner
-/// applies the log too, so it can park too (the widening D-53 made for the capability probe).
-/// This node answers from its own metrics; each peer is asked concurrently, any of its resolved
-/// addresses answering being the peer answering (#79), each under `budget` so one hung member
-/// costs one budget, not one per address per retry. `Err` only when the membership itself cannot
-/// be read; a member that does not resolve, does not answer inside `budget`, sends an undecodable
-/// reply or reports `applied: None` is not an error — it is named in `unknown` and the floor is
-/// withheld, which is the fail-closed reading the sweep needs (one unreachable member pins every
-/// tombstoned blob until it answers or is evicted, D-21/D-26).
-pub(crate) async fn fleet_applied_floor(
-    raft: &Raft<TypeConfig>,
-    client: &RpcClient,
-    resolver: &Arc<dyn PeerResolver>,
-    budget: Duration,
-) -> Result<FleetAppliedFloor, RpcError> {
-    // One `with_raft_state` read, for `joint_members`' reason: two reads can straddle a
-    // membership change and describe a fleet that never existed.
-    let members: std::collections::BTreeMap<NodeId, String> = raft
-        .with_raft_state(|state| {
-            let committed = state.membership_state.committed();
-            let effective = state.membership_state.effective();
-            committed
-                .nodes()
-                .chain(effective.nodes())
-                .map(|(id, node)| (*id, node.addr.clone()))
-                .collect()
-        })
-        .await
-        .map_err(|e| RpcError::Handler(format!("reading membership for the applied floor: {e}")))?;
-
-    // Every member starts as unknown and is overwritten by its answer, so a probe that never
-    // reports — a panic in its task — leaves the member unknown rather than absent from the fold.
-    let mut applied: std::collections::BTreeMap<NodeId, Option<u64>> =
-        members.keys().map(|member| (*member, None)).collect();
-    // This node's own id and applied index come from the same metrics read. Taking the id from a
-    // caller instead would let a miscall fill a *peer's* slot with this node's applied index —
-    // a floor too high, which is the one direction this rule must never err in.
-    let (id, own_applied) = {
-        let receiver = raft.metrics();
-        let metrics = receiver.borrow();
-        (metrics.id, metrics.last_applied.map(|l| l.index))
-    };
-    let mut probes = tokio::task::JoinSet::new();
-    for (member, addr) in members {
-        if member == id {
-            applied.insert(member, own_applied);
-            continue;
-        }
-        let client = client.clone();
-        let resolver = Arc::clone(resolver);
-        probes.spawn(async move {
-            let probe = async {
-                let addrs = match resolve_authority(&resolver, &addr).await {
-                    Ok(addrs) => addrs,
-                    Err(e) => {
-                        tracing::debug!(
-                            node_id = member, %addr, error = %e,
-                            "applied floor: member address did not resolve"
-                        );
-                        return None;
-                    }
-                };
-                for peer in addrs {
-                    // Both arms fold to "unknown" by design (fail closed); they are logged so a
-                    // member the sweep keeps naming can be told apart: never answered, or
-                    // answered with something this build cannot read.
-                    let reply = match client
-                        .call(peer, "POST", CLUSTER_APPLIED_PATH, Vec::new())
-                        .await
-                    {
-                        Ok(reply) => reply,
-                        Err(e) => {
-                            tracing::debug!(
-                                node_id = member, %peer, error = %e,
-                                "applied floor: member did not answer"
-                            );
-                            continue;
-                        }
-                    };
-                    match serde_json::from_slice::<AppliedReply>(&reply) {
-                        Ok(reply) => return reply.applied,
-                        Err(e) => {
-                            tracing::debug!(
-                                node_id = member, %peer, error = %e,
-                                "applied floor: member's reply did not decode"
-                            );
-                        }
-                    }
-                }
-                None
-            };
-            let applied = tokio::time::timeout(budget, probe).await.unwrap_or(None);
-            (member, applied)
-        });
-    }
-    while let Some(joined) = probes.join_next().await {
-        match joined {
-            Ok((member, index)) => {
-                applied.insert(member, index);
-            }
-            // A panic in a probe task is a defect of ours; its member stays unknown above.
-            Err(e) => tracing::error!(error = %e, "applied floor probe panicked"),
-        }
-    }
-
-    let unknown: Vec<NodeId> = applied
-        .iter()
-        .filter_map(|(member, index)| index.is_none().then_some(*member))
-        .collect();
-    if !unknown.is_empty() {
-        return Ok(FleetAppliedFloor::Unknown(unknown));
-    }
-    // Every member answered `Some`, so the fold is over the whole fleet. An empty membership —
-    // a node that has not been initialised into any cluster yet — has no floor to speak of.
-    Ok(applied.values().flatten().min().copied().map_or(
-        FleetAppliedFloor::Unknown(Vec::new()),
-        FleetAppliedFloor::Known,
-    ))
-}
-
 /// Leader-side: evict `node_id` from the cluster (issue #6). Mirrors
 /// [`admit`]'s use of [`membership_change`] so both admission and departure
 /// share the same commit barrier and `InProgress` retry (#38). Must run on the
@@ -1861,127 +1577,6 @@ mod tests {
 
     fn log_id(index: u64) -> LogId<NodeId> {
         LogId::new(CommittedLeaderId::new(1, 0), index)
-    }
-
-    // ---- joint-consensus quorum (#438) ----------------------------------
-    //
-    // The rule the maintainer ruled on, and the one piece of #438 that can be
-    // checked without a cluster. Every expectation below is a literal: a
-    // three-node majority is 2 because 2 is written here, never because the
-    // implementation says so.
-
-    fn ids(ids: &[NodeId]) -> BTreeSet<NodeId> {
-        ids.iter().copied().collect()
-    }
-
-    #[test]
-    fn a_stable_configuration_needs_a_simple_majority() {
-        let targets = QuorumTargets::new(ids(&[1, 2, 3]), ids(&[1, 2, 3]));
-
-        assert!(!targets.is_joint());
-        assert!(
-            !targets.satisfied_by(&ids(&[1])),
-            "1 of 3 is not a majority"
-        );
-        assert!(targets.satisfied_by(&ids(&[1, 2])), "2 of 3 is");
-        assert!(targets.satisfied_by(&ids(&[1, 2, 3])));
-    }
-
-    /// Pins D-19: the fan-out quorum is a majority of BOTH the committed and the
-    /// effective voter configuration — growing 3→5, the committed majority of 2 is
-    /// not enough, because the blob would sit on 2 of the 5 nodes now in force.
-    #[test]
-    fn growing_three_to_five_is_not_satisfied_by_the_committed_majority_alone() {
-        // The case that makes committed-only unsound, and the concrete reason
-        // this is a pair rather than a choice. Committed is {1,2,3} and its
-        // majority is 2; effective is {1..5} and needs 3. Acking {1,2} would
-        // commit the op with the blob on 2 of the 5 nodes now in force.
-        let targets = QuorumTargets::new(ids(&[1, 2, 3]), ids(&[1, 2, 3, 4, 5]));
-
-        assert!(targets.is_joint());
-        assert!(
-            !targets.satisfied_by(&ids(&[1, 2])),
-            "a committed majority alone must not pass while the config is growing"
-        );
-        assert!(targets.satisfied_by(&ids(&[1, 2, 3])));
-    }
-
-    /// Pins D-19: the effective majority alone is not enough either — shrinking
-    /// 5→3, {1,2} is a majority of the effective set but not of the committed one.
-    #[test]
-    fn shrinking_five_to_three_is_not_satisfied_by_the_effective_majority_alone() {
-        // The mirror case, which is what makes effective-only unsound: the
-        // effective entry can truncate under a deposed leader. Effective
-        // {1,2,3} needs 2; committed {1..5} needs 3, so {1,2} must fail.
-        let targets = QuorumTargets::new(ids(&[1, 2, 3, 4, 5]), ids(&[1, 2, 3]));
-
-        assert!(targets.is_joint());
-        assert!(
-            !targets.satisfied_by(&ids(&[1, 2])),
-            "an effective majority alone must not pass while the config is shrinking"
-        );
-        assert!(targets.satisfied_by(&ids(&[1, 2, 3])));
-    }
-
-    /// Pins D-19: an ack from a node outside a configuration does not count toward
-    /// that configuration's majority — a learner holding the blob is not evidence
-    /// of the voters' durability.
-    #[test]
-    fn an_ack_from_outside_the_configuration_does_not_count() {
-        // Edge 2: the accepting node adds itself to the acks unconditionally
-        // because it has just stored the blob. When it is a learner rather than
-        // a voter, that ack must be ignored — a non-voter holding the blob says
-        // nothing about this configuration's durability. The intersection is
-        // what makes the learner case fall out rather than need its own branch.
-        let targets = QuorumTargets::new(ids(&[1, 2, 3]), ids(&[1, 2, 3]));
-
-        assert!(
-            !targets.satisfied_by(&ids(&[1, 99])),
-            "node 99 is not a voter; 1 of 3 is still not a majority"
-        );
-        assert!(targets.satisfied_by(&ids(&[1, 2, 99])));
-    }
-
-    #[test]
-    fn a_single_node_configuration_is_satisfied_by_itself() {
-        // Edge 3: the solo case must not dial anyone or wait for anyone.
-        let targets = QuorumTargets::new(ids(&[7]), ids(&[7]));
-
-        assert!(targets.satisfied_by(&ids(&[7])));
-        assert!(!targets.satisfied_by(&ids(&[])));
-    }
-
-    #[test]
-    fn members_is_the_union_so_a_node_in_either_configuration_is_dialled() {
-        // Fanning out to only one configuration's members would make the other
-        // majority unreachable by construction.
-        let targets = QuorumTargets::new(ids(&[1, 2, 3]), ids(&[3, 4, 5]));
-
-        assert_eq!(targets.members(), ids(&[1, 2, 3, 4, 5]));
-    }
-
-    #[test]
-    fn an_unloaded_membership_is_never_a_quorum() {
-        // Empty means the membership has not loaded, not that the bar is zero.
-        // This decides whether a write is durable enough to commit, so the
-        // unanswerable case refuses rather than waves through.
-        let targets = QuorumTargets::new(ids(&[]), ids(&[]));
-
-        assert!(!targets.satisfied_by(&ids(&[])));
-        assert!(!targets.satisfied_by(&ids(&[1, 2, 3])));
-    }
-
-    #[test]
-    fn a_four_node_configuration_needs_three_not_two() {
-        // An even configuration is where an off-by-one in the majority rule
-        // hides: `held * 2 > len` gives 3, while `>=` would wrongly accept 2.
-        let targets = QuorumTargets::new(ids(&[1, 2, 3, 4]), ids(&[1, 2, 3, 4]));
-
-        assert!(
-            !targets.satisfied_by(&ids(&[1, 2])),
-            "2 of 4 is a tie, not a majority"
-        );
-        assert!(targets.satisfied_by(&ids(&[1, 2, 3])));
     }
 
     /// The retry decision must read openraft's typed error, not its rendered

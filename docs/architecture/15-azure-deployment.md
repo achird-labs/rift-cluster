@@ -120,7 +120,7 @@ Azure-specific decisions and why:
 - **Multi-zone is in-scope, multi-region is not** (checklist 6). Same envelope as Chapter 14:
   intra-region inter-zone RTT is within the design's LAN assumptions; cross-region
   violates every timeout assumption (Chapter 1's non-goal). One cluster per
-  region, each pulling the same sources (#20).
+  region, each bootstrapped from the same imposter documents.
 - **Cluster port stays ClusterIP-internal** (checklist 1) — never on the load
   balancer. NSG: cluster port node-to-node only; front-door/admin from the LB
   subnet; metrics from the scrape infrastructure.
@@ -131,45 +131,14 @@ Azure-specific decisions and why:
 ### Secrets (checklist 5)
 
 Key Vault → **Secrets Store CSI driver** (the AKS-managed add-on) or External
-Secrets Operator → a mounted **file**. Two distinct shapes, as on AWS:
-
-- the **cluster HMAC secret** is a single file named by `--cluster-secret-file`;
-- **source `auth_ref`s** (Git tokens, registry creds, object-store static keys)
-  are a *directory* of `<auth_ref>`-named files pointed at by
-  `RIFT_SOURCE_SECRETS_DIR`, or individual `RIFT_SOURCE_AUTH_<REF>` environment
-  variables, which take precedence (#136).
+Secrets Operator → a mounted **file**: the **cluster HMAC secret**, named by
+`--cluster-secret-file`. That is the whole list, as on AWS — since D-71 (#549)
+the fleet consumes no third-party credentials of any kind.
 
 **Workload identity federation is the IRSA analogue**, and it is one of several
 ways to give the Key Vault CSI add-on an identity (a user-assigned managed
 identity on the node pool is the out-of-box default). Any of them is fine — the
 chart consumes a Kubernetes Secret and does not care how it got there.
-
-**Sources are where Azure is genuinely thinner than AWS, and it is worth being
-blunt about it.** This build registers exactly these schemes:
-
-| Scheme | Credentialed |
-|---|---|
-| `git+https`, `git+file` | yes, via `auth_ref` |
-| `registry` (OCI) | yes, via `auth_ref` |
-| `s3` | yes, via `auth_ref` (static keys only) |
-| `file`, `http` | no — anonymous |
-
-There is **no Azure Blob provider**. Blob Storage has no native S3 API either,
-so `s3://` does not reach a storage account unless you put an S3-compatible
-gateway in front of it and point the source's `endpoint` at that gateway. The
-practical consequences on Azure:
-
-- **Use Git or an OCI registry.** Azure DevOps Repos and GitHub over
-  `git+https`, or ACR over `registry` — both authenticate through `auth_ref` and
-  are the shapes this design was built around anyway (Chapter 13).
-- **A storage account is only usable if it is anonymously readable** over
-  `http:`. Do not mint a storage-account access key and put it in an `auth_ref`
-  expecting it to work — nothing consumes it, because nothing speaks to Blob
-  Storage.
-- **The `s3://` ambient-credential caveat from Ch.14 still applies** wherever you
-  do use S3: the provider signs with static keys from an `auth_ref`, and ambient
-  role credentials are not implemented in this build. Workload identity does not
-  change that on Azure any more than IRSA does on AWS.
 
 ## Container Apps / ACI — not supported, and here is exactly why
 
@@ -200,15 +169,16 @@ So: **Container Apps and ACI are not supported deployment targets.** Not "works
 with caveats" — the platform cannot satisfy requirement 2.
 
 Chapter 14's escape hatch for Fargate does not rescue it either. That option
-(accept ephemeral state, re-seed every `pinned` source on cold start) rests on
-provenance: configs live in Git or a registry, so losing them locally is
-recoverable. Replica-scoped ephemeral storage does survive a *container* restart,
+(accept ephemeral state, re-run the `--imposters` bootstrap on cold start) rests
+on the imposter documents living somewhere outside the fleet, so losing them
+locally is recoverable. Replica-scoped ephemeral storage does survive a
+*container* restart,
 so a single crash-looping container is fine. What it does not survive is replica
 replacement — which is the routine event here, not the exotic one, since it is
 what every deploy, scale, and node recycle does. Each replacement is a voter
 returning with an empty state directory, so the fleet is permanently in the
-re-seed path rather than occasionally in it; and flow state, which has no source
-to re-pull from, is lost every time.
+re-seed path rather than occasionally in it; and flow state, which has nothing
+outside the fleet to re-seed from, is lost every time.
 
 If what you actually wanted was "no node pool to manage", the answer is AKS with
 the cluster autoscaler or Node Autoprovisioning — **not** Virtual Nodes, which
@@ -258,7 +228,7 @@ zero-cost leave.
 | 3× compute | D2s-class (2 vCPU/8 GiB) or D2ps (Arm) | Rift is CPU-light per request; scale for target RPS, learners for read fan-out |
 | 3× Azure Disk | P10-class (128 GiB) or Premium SSD v2 at 20 GiB | State dir: Raft log (snapshot-bounded) + flow shard; IOPS matter more than size. P-series bundles IOPS with capacity, so the smallest tier that meets your IOPS floor sets the size; Premium SSD v2 decouples them and is usually cheaper for this shape |
 | 1× internal Standard LB | 2 listeners | front door + admin |
-| Key Vault | 2–5 secrets | cluster key + source creds |
+| Key Vault | 1 secret | cluster key |
 
 No Cosmos DB, no Azure Cache for Redis, no Event Hubs, no external coordinator —
 the zero-dependency premise is what makes the bill this short, on Azure exactly
@@ -275,5 +245,5 @@ Chapter 14's six items, and where each is answered above:
 | 2 | A real block device per voter, surviving replacement in its zone; never NFS under the state dir | Azure Disk — but note the built-in classes give ZRS on a zone-spread cluster, so opt down to `Premium_LRS` with `WaitForFirstConsumer`, or use `managed-csi-premium-v2` (LRS by definition). Azure Files explicitly rejected — and the reason Container Apps is unsupported |
 | 3 | Stable seed DNS, re-resolved per attempt | Headless Service inside AKS; Private DNS zone for external clients and for VMSS seeds |
 | 4 | SIGTERM with ≥ 2× leave-timeout on every replacement path | Helm derives `terminationGracePeriodSeconds`; on VMSS, terminate notifications + Scheduled Events |
-| 5 | Secrets as files, never env-inlined | Key Vault via Secrets Store CSI; `--cluster-secret-file` and `RIFT_SOURCE_SECRETS_DIR` |
-| 6 | One cluster per region; share mocks via sources | Unchanged — sources (#20), not stretched consensus |
+| 5 | Secrets as files, never env-inlined | Key Vault via Secrets Store CSI; `--cluster-secret-file` |
+| 6 | One cluster per region; share mocks by bootstrapping each from the same documents | Unchanged — not stretched consensus |

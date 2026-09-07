@@ -46,18 +46,9 @@ xxhash-rust.workspace = true
 prometheus.workspace = true
 lazy_static.workspace = true
 
-# The `git+https:`/`git+file:` source (#136) fetches into a scratch working
-# directory per pull — a production dependency, not just a test fixture, since
-# the fetch itself (not only `provider_tests.rs`) needs one.
-tempfile = "3"
-
-# Group-kill for a timed-out `git` subprocess — see `sources::git::kill_group`.
-# Unix-only: elsewhere the direct child is killed and its transport helper, if
-# any, is left to exit on its own.
-[target.'cfg(unix)'.dependencies]
-libc.workspace = true
-
 [dev-dependencies]
+# Scratch directories for the redb-backed store tests.
+tempfile = "3"
 # Round-trip and rejection invariants for the vector cursor token (#225): the codec is
 # pure logic over inputs no fixture enumerates, which is exactly what this is for.
 proptest.workspace = true

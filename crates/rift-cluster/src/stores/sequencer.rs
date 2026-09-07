@@ -662,7 +662,9 @@ impl ResponseSequencer for ClusteredSequencer {
             if !unreached.is_empty() {
                 // Named, not counted-and-forgotten: a member that missed a reset keeps cycling a
                 // stub that no longer exists until the next membership change re-keys it, and the
-                // operator can only act on that if they know which one (the D-53 shape).
+                // operator can only act on that if they know which one. (The shape D-53 used for
+                // its capability probe, which D-72 superseded along with the probe; the reporting
+                // rule is what survives.)
                 tracing::warn!(
                     ?unreached,
                     "sequencer reset did not reach every member; their cursors for this scope \

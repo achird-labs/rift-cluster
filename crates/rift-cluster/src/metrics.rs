@@ -28,9 +28,8 @@
 //! | `rift_cluster_sequence_fallbacks_total` | C33 — owner identified by killing it ("the assertion, not the index") |
 //! | `rift_cluster_sequence_decisions_total{op,path}` | `sequencer.rs` — the D-63 RPC budget: one `next` per decision, never a `peek` |
 //!
-//! Families owned by surfaces that leave with other children of #544 (audit export, the
-//! source scheduler and blob store, `no_principals`, the journal's partial-read count) stay
-//! here until those children land and go with them.
+//! Families owned by surfaces that leave with other children of #544 (`no_principals`, the
+//! journal's partial-read count) stay here until those children land and go with them.
 //!
 //! They ride upstream's `/metrics` because that is where the tests already read them: the
 //! families are registered into the `prometheus` crate's *global default* registry, which the
@@ -42,9 +41,8 @@
 
 use lazy_static::lazy_static;
 use prometheus::{
-    Gauge, GaugeVec, Histogram, IntCounter, IntCounterVec, IntGauge, register_gauge,
-    register_gauge_vec, register_histogram, register_int_counter, register_int_counter_vec,
-    register_int_gauge,
+    Gauge, GaugeVec, IntCounter, IntCounterVec, register_gauge, register_gauge_vec,
+    register_int_counter, register_int_counter_vec,
 };
 
 lazy_static! {
@@ -58,53 +56,6 @@ lazy_static! {
         "1 when the fleet has no principal defined at all"
     )
     .expect("rift_cluster_no_principals registers once");
-
-    // -- sideloaded blobs (#439, D-48) ---------------------------------------
-
-    /// `rift_cluster_blob_fetch_stalled` — `1` while this node's apply is parked on a
-    /// sideloaded blob no member can supply; `0` otherwise. The metric form of
-    /// `/_cluster/health`'s `blob_fetch_stall`. Degraded, not not-ready: the node stays in
-    /// the load balancer, and every committed write behind the parked entry is unapplied
-    /// on it until a holder returns.
-    static ref BLOB_FETCH_STALLED: IntGauge = register_int_gauge!(
-        "rift_cluster_blob_fetch_stalled",
-        "1 while apply is parked on a blob no member can supply"
-    )
-    .expect("rift_cluster_blob_fetch_stalled registers once");
-
-    /// `rift_cluster_blob_fetch_stalls_total` — one per stall onset. Rising on a fleet with
-    /// no partition says a blob is being reaped before its op commits — the #438 pin failing.
-    static ref BLOB_FETCH_STALLS: IntCounter = register_int_counter!(
-        "rift_cluster_blob_fetch_stalls_total",
-        "Blob fetches that went unsatisfied past the escalation window"
-    )
-    .expect("rift_cluster_blob_fetch_stalls_total registers once");
-
-    /// `rift_cluster_blob_gc_retained` — tombstoned blobs this node's most recent GC sweep kept
-    /// because its own log has not yet been purged past the index that unreferenced them (#480).
-    /// A gauge, resampled every sweep like `rift_cluster_intents_pending`: "how many right now"
-    /// is the useful reading, and the count falls back to 0 on its own once compaction catches
-    /// up — nothing here needs to be reset by hand.
-    static ref BLOB_GC_RETAINED: IntGauge = register_int_gauge!(
-        "rift_cluster_blob_gc_retained",
-        "Tombstoned blobs kept because this node's log has not purged past their unreferencing index"
-    )
-    .expect("rift_cluster_blob_gc_retained registers once");
-
-    /// `rift_cluster_blob_sideload_deferred_total{reason}` — writes that kept their full bytes
-    /// on the log because `fan_out_blob` could not confirm every member's sideload capability
-    /// (#481). `member_incapable` = a member is confirmed to run a build that cannot apply a
-    /// digest-only `ControlOp` (an explicit `false` `?stat` answer, or no blob route at all);
-    /// `member_unobserved` = a member has simply never answered the question (typically a
-    /// fresh join, or a transient probe failure). Persistently non-zero on a fleet that is
-    /// *not* mid-rolling-upgrade means a member is stuck on an old build.
-    static ref BLOB_SIDELOAD_DEFERRED: IntCounterVec = register_int_counter_vec!(
-        "rift_cluster_blob_sideload_deferred_total",
-        "Writes whose bytes stayed on the log because the fan-out could not confirm every \
-         member's sideload capability, by reason",
-        &["reason"]
-    )
-    .expect("rift_cluster_blob_sideload_deferred_total registers once");
 
     // -- config-sync (issue #9) ---------------------------------------------
 
@@ -140,34 +91,6 @@ lazy_static! {
         "Snapshots received from a peer and applied to this node's state machine"
     )
     .expect("rift_cluster_snapshots_installed_total registers once");
-
-    /// `rift_cluster_source_scheduler_corrupt_rows` — source rows the leader's
-    /// poll scheduler could not decode on its last reconcile.
-    ///
-    /// Deliberately unlabelled. Which row is corrupt is a question for the
-    /// transition log, which names tenant and id; a metric label would put
-    /// operator-chosen ids into the cardinality budget for a value that is
-    /// almost always zero. Nonzero is the alert: each of those sources is held
-    /// at whatever cadence it was last started with, and cannot adopt a change
-    /// until the record is rewritten.
-    static ref SOURCE_SCHEDULER_CORRUPT_ROWS: Gauge = register_gauge!(
-        "rift_cluster_source_scheduler_corrupt_rows",
-        "Source rows the poll scheduler could not decode on its last reconcile (leader only)"
-    )
-    .expect("rift_cluster_source_scheduler_corrupt_rows registers once");
-
-    /// `rift_cluster_source_scheduler_read_failures_total` — reconciles that
-    /// could not read the source table at all.
-    ///
-    /// Distinct from the gauge above, and the distinction is the point: a
-    /// corrupt *row* now costs only itself, but a table- or transaction-level
-    /// failure still parks the whole reconcile. That residue is rare and
-    /// transient, and this is what makes it alertable rather than grep-able.
-    static ref SOURCE_SCHEDULER_READ_FAILURES: IntCounter = register_int_counter!(
-        "rift_cluster_source_scheduler_read_failures_total",
-        "Reconciles that could not read the source table"
-    )
-    .expect("rift_cluster_source_scheduler_read_failures_total registers once");
 
     /// `rift_cluster_pull_on_miss_retries_total` — requests sent back through
     /// the matcher once by the lagging-follower net (#49). C16 reads it to prove
@@ -287,35 +210,6 @@ lazy_static! {
     )
     .expect("rift_cluster_cas_conflicts_total registers once");
 
-    /// `rift_cluster_source_polls_total{outcome}` — scheduled tracking-source
-    /// polls the leader performed (#135), by what they did.
-    ///
-    /// `unchanged` should dominate a healthy fleet: it is the digest short
-    /// circuit firing, which is what makes polling cost no log growth. A rising
-    /// `error` rate is the signal an upstream source host is unreachable —
-    /// deliberately visible here rather than as a log entry per failure, which
-    /// would turn someone else's outage into fleet-wide write traffic.
-    ///
-    /// Only the leader increments this, so summing across the fleet counts each
-    /// poll once — which is also how you catch a fleet that has grown a second
-    /// poller.
-    static ref SOURCE_POLLS: IntCounterVec = register_int_counter_vec!(
-        "rift_cluster_source_polls_total",
-        "Scheduled tracking-source polls, by outcome",
-        &["outcome"]
-    )
-    .expect("rift_cluster_source_polls_total registers once");
-
-    /// `rift_cluster_source_poll_seconds` — wall-clock of a scheduled poll,
-    /// fetch included. Buckets reach far past any healthy fetch because the
-    /// interesting tail is an upstream host that has started hanging.
-    static ref SOURCE_POLL_SECONDS: Histogram = register_histogram!(
-        "rift_cluster_source_poll_seconds",
-        "Duration of a scheduled tracking-source poll, fetch included",
-        vec![0.01, 0.05, 0.1, 0.5, 1.0, 5.0, 15.0, 30.0, 60.0]
-    )
-    .expect("rift_cluster_source_poll_seconds registers once");
-
     /// `rift_cluster_config_revision{port}` — the log index that last wrote
     /// each applied config. Two nodes disagreeing here have not converged; C7
     /// reads it per port to ask whether a joining node has applied *this*
@@ -354,29 +248,6 @@ pub(crate) fn intent_unparked() {
     INTENTS_PENDING.dec();
 }
 
-/// A blob fetch crossed the escalation window (#439, D-48). Counted once per stall.
-pub(crate) fn blob_fetch_stalled() {
-    BLOB_FETCH_STALLED.set(1);
-    BLOB_FETCH_STALLS.inc();
-}
-
-/// The stalled fetch was satisfied; apply resumes.
-pub(crate) fn blob_fetch_recovered() {
-    BLOB_FETCH_STALLED.set(0);
-}
-
-/// Resample the tombstoned-but-not-yet-purged count from the blob GC sweep that just ran (#480).
-pub(crate) fn blob_gc_retained(kept: u64) {
-    BLOB_GC_RETAINED.set(i64::try_from(kept).unwrap_or(i64::MAX));
-}
-
-/// `reason` ∈ `member_incapable` / `member_unobserved` — closed at the call site
-/// (`admin_front::fan_out_then_submit`, which is why this is `pub` rather than `pub(crate)`:
-/// that call site lives in the `rift-cluster-server` crate, not this one).
-pub fn blob_sideload_deferred(reason: &str) {
-    BLOB_SIDELOAD_DEFERRED.with_label_values(&[reason]).inc();
-}
-
 /// Resample the pending-intents depth from the ledger itself. The inc/dec pair
 /// drifts across a restart (the gauge resets, the ledger persists), so every
 /// replay sweep sets the truth.
@@ -409,23 +280,6 @@ pub(crate) fn flow_replayed(entries: usize) {
 /// sites, so an unexpected label cannot explode cardinality.
 pub(crate) fn flow_read(path: &str) {
     FLOW_READS.with_label_values(&[path]).inc();
-}
-
-/// Record one scheduled tracking-source poll (#135). `outcome` is
-/// `applied` | `unchanged` | `skipped` | `error`.
-pub(crate) fn source_poll(outcome: &str, elapsed: std::time::Duration) {
-    SOURCE_POLLS.with_label_values(&[outcome]).inc();
-    SOURCE_POLL_SECONDS.observe(elapsed.as_secs_f64());
-}
-
-/// Set on every reconcile, including to zero — a gauge that is only ever
-/// *raised* would keep reporting a repaired row as broken.
-pub(crate) fn source_scheduler_corrupt_rows(count: usize) {
-    SOURCE_SCHEDULER_CORRUPT_ROWS.set(count as f64);
-}
-
-pub(crate) fn source_scheduler_read_failure() {
-    SOURCE_SCHEDULER_READ_FAILURES.inc();
 }
 
 pub(crate) fn flow_conflict(reason: &str) {

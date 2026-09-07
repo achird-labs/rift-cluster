@@ -19,7 +19,7 @@ describe("runBulk", () => {
     // The property the whole module exists for. A batch that halts leaves the operator with a
     // partially-applied set and no record of which part.
     const call = vi.fn(async (port: number) => {
-      if (port === 2) throw new Error("port 2 is owned by source `mocks` and cannot be deleted");
+      if (port === 2) throw new Error("port 2 is bound elsewhere and cannot be deleted");
       return applied;
     });
 
@@ -30,7 +30,7 @@ describe("runBulk", () => {
     expect(result.refused).toBe(1);
     expect(result.results[1]).toEqual({
       port: 2,
-      outcome: { kind: "refused", detail: "port 2 is owned by source `mocks` and cannot be deleted" },
+      outcome: { kind: "refused", detail: "port 2 is bound elsewhere and cannot be deleted" },
     });
   });
 

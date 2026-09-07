@@ -284,14 +284,13 @@ pub mod seams {
     /// The shared parse path every provider must route its bytes through, so a
     /// document behaves identically whichever source delivered it.
     ///
-    /// The cluster `git:`/`s3:`/`registry:` providers (#136) are exactly the
-    /// third-party sources [`parse_remote_document`]'s own doc anticipates:
-    /// they hand back bytes, and format sniffing, the Mountebank document
-    /// shapes and the `intercept`/`routes` block rules all run here. Its two
-    /// fail-closed differences from the `--configfile` path — EJS
-    /// `include`/`stringify` refused, `_rift.script` `file:` references refused
-    /// — are the reason a provider must not parse for itself: a document
-    /// fetched from a git host has no author who already holds local access.
+    /// The `--imposters` bootstrap (D-72) reads its documents through here: format sniffing,
+    /// the Mountebank document shapes and the `intercept`/`routes` block rules all run in one
+    /// place, so a document behaves the same whether it arrived as a file or over HTTP. Its two
+    /// fail-closed differences from the `--configfile` path — EJS `include`/`stringify` refused,
+    /// `_rift.script` `file:` references refused — are the reason a source must not parse for
+    /// itself: a document fetched from a remote host has no author who already holds local
+    /// access.
     pub use rift_http_proxy::config_loader::{LoadedConfig, parse_remote_document};
 
     /// The front door's route table (issue #19 / U-11): content-based routing

@@ -62,7 +62,7 @@ slug.
 tenant-aware serving. A resource op naming a non-`default` tenant is validated,
 committed and stored against `(tenant, …)`, and `TenantDelete` cascades over
 it — but the read and sync paths (`desired_configs`, `desired_routes`,
-`read_config`, `configured_ports`, `sources`) still filter to `default`, so
+`read_config`, `configured_ports`) still filter to `default`, so
 nothing binds it and no operator surface reports it. T1's exit criterion —
 *no observable change* — holds because the admin HTTP front constructs
 `TenantId::default()` at every call site, so nothing reachable over the API can
@@ -406,7 +406,7 @@ hash was produced with, and verification reads them from there.
 **The T2 default-tenant guard did not apply here, and issue #182 has since
 removed it entirely.** T2 refused any decided tenant other than `default`,
 because resource *serving* was still default-only — a restriction about
-`sm_configs`/`sm_routes`/`sm_sources`, stored per tenant but read back through
+`sm_configs`/`sm_routes`, stored per tenant but read back through
 default-only paths. The tenancy tables were never like that — `tenant`,
 `tenant_principals` and `principal_bindings` all take the tenant as an argument
 and honour it — so keeping the guard over them would have 404'd the entire
@@ -524,8 +524,8 @@ port ownership at one choke point rather than refused wholesale.** The gap this
 entry originally recorded — `desired_configs`/`desired_routes` bound only
 `default`'s data into the local engine, so `authorize_action` answered every
 non-default decision with §8.4's indistinguishable 404 regardless of what the
-principal actually held — is closed. `read_config`, `route_table`, `sources`,
-and `source` (and the `RaftNode` wrappers around them) are tenant-addressed
+principal actually held — is closed. `read_config` and `route_table`
+(and the `RaftNode` wrappers around them) are tenant-addressed
 now, and `desired_configs` syncs the **union of every tenant's** configs into
 the engine rather than filtering to `default`. That union is sound only because
 **ports are fleet-unique across tenants** (RFC-002 §3.2): a port names exactly
@@ -626,21 +626,16 @@ answers traffic regardless of which tenant owns it. The ownership gate governs
 *administration* of a port, not traffic through it, and nothing above touches
 that boundary.
 
-**Remaining scope limit.** The source-pull path
-(`crates/rift-cluster/src/sources/`) still operates on `TenantId::default()`
-explicitly; making source configuration itself tenant-aware was out of scope
-for #182 and is not implied by anything above.
-
 ### What the export sink shipped, and why it is gone (issue #164, retired by D-71)
 
 T4 derived the audit stream; an optional, off-by-default export sink carried it
 off the fleet to somewhere the customer owned — an `https://` webhook (JSON
-Lines) or an `s3://<bucket>/<prefix>` (one object per batch), leader-only,
+Lines) or an object-store prefix (one object per batch), leader-only,
 checkpointed, at-least-once. **#546 removed it along with the projection it
-shipped.** The sink's credential-hygiene rule survives it and is the part worth
-keeping in mind: a control-plane record may carry an `auth_ref` — the *name* of a
-credential, never a credential — and `control::require_credential_free_uri`
-enforces that for the source providers that remain.
+shipped**, and #549 removed the last control-plane record that could name a
+third-party credential at all. The rule it stood for is worth keeping in mind
+anyway: a control-plane record carries the *name* of a credential, never a
+credential. Today no record carries either.
 
 ## Cluster-internal security
 
@@ -744,12 +739,11 @@ HMAC-signed cookie (`HttpOnly`, `Secure`, `SameSite=Strict`, 8-hour `Max-Age`). 
 it is a fleet-wide control-plane record, so **every node verifies from its own applied state and a
 login is not a Raft write** — only the first mint and any rotation are.
 
-That record carries an actual secret into the replicated log, which `SourcePut` refuses to do. The
-distinction is what the secret means *outside* the fleet:
+That record carries an actual secret into the replicated log — the one op that does, and
+deliberately. The distinction is what the secret means *outside* the fleet:
 
-- that op carries the **name** of an operator credential for a third-party system (a bucket, a git
-  host); replicating one would spread power that exists somewhere else, so only a reference
-  travels;
+- an op naming a credential for a third-party system would spread power that exists somewhere
+  else, so no op ever did (and since #549 there is no op that could);
 - this key is **fleet-internal and meaningless anywhere else**, and cannot be stored hashed the way
   a principal's API key is (§3.2, argon2id), because verifying an HMAC requires the key itself — a
   digest would make the cookie unverifiable by anyone, including us.

@@ -426,7 +426,7 @@ impl RpcClient {
     ///
     /// [`Self::call`] is wrong for a Raft replication transfer twice over:
     /// openraft is already the retry loop, so a second attempt here re-sends the
-    /// whole body (8 MiB, for a dataset at its quota), and the fixed
+    /// whole body (several MiB, for a config document at the front's cap), and the fixed
     /// `request_timeout` is far too short for an entry that size once the
     /// transfer is allowed to outlive openraft's 50 ms RPC deadline (#411).
     ///
@@ -1069,7 +1069,7 @@ mod tests {
     /// `attempt` in a larger timeout leaves the smaller inner bound governing,
     /// so transfers silently cap at whatever fits in `request_timeout` — which
     /// is exactly what shipped in the first cut of this fix: on a 3-node
-    /// cluster a 4 MiB dataset committed in 1.1 s while 8 MiB never committed
+    /// cluster a 4 MiB entry committed in 1.1 s while 8 MiB never committed
     /// at all, because a 2 s inner bound cut every attempt that ran longer.
     #[tokio::test]
     async fn call_once_deadline_outlives_a_shorter_request_timeout() {

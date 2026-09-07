@@ -32,7 +32,6 @@ async fn start() -> Fixture {
         routes: cluster_api::routes(rift_cluster::Router::new(), slot.clone(), readiness.clone()),
         engine: None,
         snapshot_log_entries: None,
-        advertise_as_digest_only_incapable: false,
     };
     let node = Arc::new(RaftNode::start(config).await.expect("node starts"));
     slot.set(&node).expect("the slot is bound exactly once");

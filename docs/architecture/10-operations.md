@@ -93,7 +93,7 @@ flowchart TB
 | `GET /_cluster/ring?key=…` | computed owner + m_idx — "who owns this flow right now". *Designed (RFC-001 §10, phase 2); not served by this build* |
 | `GET /_cluster/kv/:flow_id` | owner value vs local replica — the *why is my scenario stuck* endpoint. *Designed (RFC-001 §10, phase 2); not served by this build* |
 | `GET /_cluster/ops/:op_id` | intent state: pending / applied / failed (Chapter 4) |
-| `GET /_cluster/health` | rolled-up diagnostics — including `blob_fetch_stall`, non-`null` while this node's apply is parked on a sideloaded blob it cannot fetch from any member (#439). Since **D-51** (#486) a member can also serve a referenced blob out of applied state, so a stall now means the blob is referenced by *this* node's parked entry and by no live state anywhere — in practice a digest whose own delete sits behind the parked entry (#480). The fleet projection `GET /_fleet/health` adds `blob_fetch_stalls_fleet`, one row per stalled voter. A stall is *degraded*, not *not-ready*: the node stays in the load balancer and self-heals when a holder returns, but every committed write behind the parked entry is unapplied on that node until it does |
+| `GET /_cluster/health` | rolled-up diagnostics for this node; `GET /_fleet/health` is the fleet projection of the same |
 
 **Metrics** (Prometheus, served by the standard metrics port).
 
@@ -126,60 +126,6 @@ The condition itself is `isolated` on `GET /_cluster/status` and `GET
 /_cluster/health` (#470): `1` while this node cannot see the quorum and is refusing
 owner-side operations — proxyOnce claims under D-40, flow-KV owner writes and strong
 reads under D-17.
-
-`rift_cluster_blob_fetch_stalled` (gauge, `1` while this node's apply is parked
-on a blob no member can supply — the metric form of `blob_fetch_stall` above)
-and `rift_cluster_blob_fetch_stalls_total` (counter, one per stall onset — a
-rising count on a fleet with no partitions says a blob is being reaped before
-its op commits, which is the #438 pin failing) are the readings for #439. A
-stall that outlives every plausible transient is a lost blob, which is an
-operator's problem, not a retry's.
-
-`rift_cluster_blob_gc_retained` (#480) is a gauge: the number of unreferenced
-blobs this node is holding back under the tombstone rules — because its own log
-has not been purged past the index at which they stopped being referenced
-(**D-52** rule A), or because some member of the fleet has not yet *applied* past
-it (**D-55** rule C). Not a fault signal: a non-zero value is retention working
-as designed, and it falls to zero on its own as the log compacts and the fleet
-catches up. A value that stays high while `purged` advances *and* every member is
-caught up is the one shape that would suggest the tombstone table is not being
-cleared.
-
-Rule C is read, not gossiped: each GC sweep (every 60 s) asks every member —
-voters and learners — for its applied index over the cluster port, and **fails
-closed** when any of them cannot be read. The sweep then logs, at `warn`,
-`blob gc: fleet applied floor unknown` naming the member ids it could not reach,
-and retains every tombstoned blob on this node until they answer or leave the
-membership. That line repeating once a minute is the expected shape of a fleet
-with a down member, not a GC fault: it clears on its own when the member returns
-(and applies the deletes it missed) or is evicted (D-21/D-26). What it costs in
-the meantime is disk that grows with delete churn for as long as the member is
-down — every dataset or spec deleted or overwritten during the outage stays on
-every holder, and the tombstone table stops being pruned for the same window —
-and it is **not** capped by the dataset quota, which bounds live data only. So
-treat the line as a clock, not as noise: once it has repeated for longer than
-you would tolerate that member being absent, evict it. A member that will never
-return has to be evicted anyway; this is one more reason not to leave it in the
-membership.
-
-Two things this changes for the `blob_fetch_stall` runbook above. A stall now
-means the blob is held by nobody *and* referenced by no live state anywhere —
-in practice a digest whose own delete sits behind the parked entry — because a
-blob that is merely unreferenced is retained until the log passes it, and one
-that is being actively requested is never reaped at all. And **compaction is not
-a remedy**: a parked apply blocks openraft's state-machine worker, so the
-snapshot that would let the node skip the blob queues behind the park and never
-runs (D-48 as amended by D-52). Waiting does not clear a stall; a holder
-returning, or the out-of-band repair, does.
-
-**A stalled node still stops cleanly** (D-56). Restarting one is a legitimate
-step — it releases nothing you need and costs nothing — but it is not a repair:
-the node replays the same entry and parks again, and the stall reappears, because
-the blob is still held by nobody. The log line to expect on the way down is
-`blob fetch abandoned: node is shutting down`, at info level. If `shutdown`
-instead reports `raft core did not release storage within 2s`, the shutdown
-signal did not reach the parked fetch — that is a defect worth an issue, not an
-operational condition.
 
 A cursor reset that did not reach every member (**D-57**) is **named in a log
 line**, not counted: the `sequencer reset did not reach every member` warning
@@ -244,44 +190,6 @@ crashes on genuinely new required semantics), and graceful leave means no
 election and no ownership guess per step. Sequence cursors still reset on
 ownership moves (D-8) — schedule upgrades between test runs, stated in the
 docs rather than discovered in one.
-
-**Sideloaded blobs (#439, D-49; gated since #481, D-53): nothing to do.** A
-roll no longer has an ordering requirement. The write path strips a
-`DatasetPut`/`SpecPut`'s bytes only once every member of the committed ∪
-effective configuration is known to apply a digest-only op — a capability the
-fan-out learns for free from the `?stat` probe it already makes. Until then
-the op is committed **with its bytes**, the shape every build can decode, so a
-mixed fleet is slower for the duration of the roll and never wedged.
-
-*This paragraph used to say the opposite* — "upgrade the whole fleet before the
-first dataset or spec write", on the grounds that an old build "fails closed at
-apply". That description was wrong, and wrong in the dangerous direction. Log
-entries are decoded in the **log store**, not at apply
-(`RedbLogStore::try_get_log_entries`), and a decode failure there is a
-`StorageError` that is fatal to openraft's core: the node's Raft runtime stops.
-One routine write during a roll therefore took down every not-yet-upgraded
-member, and if those were a majority, the fleet lost quorum. Recorded here
-because a fleet still running a build older than #481 has that behaviour, and
-the runbook that told operators it was a soft failure was the reason it looked
-safe.
-
-**Watch `rift_cluster_blob_sideload_deferred_total`.** Non-zero during a roll is
-the mechanism working. Non-zero *after* one is the state worth acting on: some
-member is not known capable, so every write is carrying its bytes on the log —
-the load the #432 epic exists to remove. The warning that accompanies it names
-the members. The usual cause is a member that is down and has never been probed
-by the current leader; since membership changes only through a node joining or
-leaving (D-21), a permanently dead member holds the fleet in this state until it
-is removed. A leader failover also clears the learned set, so a single deferred
-write immediately after one is expected and self-correcting.
-
-A member whose build cannot serve blobs *at all* (pre-#437) is separately
-reported as *skewed* in the fan-out refusal and in `blob_fetch_stall`, distinct
-from a partition, so a half-finished roll still reads as what it is.
-
-**Downgrades across this boundary are out of contract.** An observed capability
-is remembered for as long as the member stays in the membership, so restarting a
-member in place onto an older binary is not something the gate can catch.
 
 ## Sizing rules of thumb
 

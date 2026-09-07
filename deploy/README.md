@@ -8,7 +8,6 @@ The artifacts, in increasing order of how much they promise:
 | `Dockerfile` | The `rift-cluster-server` image, **with the web console** | Built and run by `compose/verify.sh`, which asks every node for `/console` |
 | `compose/docker-compose.yml` | The same 3-node cluster, built from a checkout | Stood up and asserted by `compose/verify.sh` |
 | `compose/front-door-demo.yml` | The "no nginx" front-door demo (one node, two virtual services) | Stood up by hand — see below |
-| `compose/sources-demo.yml` | The imposter-sources demo (three nodes + a config server) | Stood up by hand — see below; the properties it shows are asserted by chaos scenarios C20–C23 |
 | `k8s/statefulset.yaml` | A production-shaped StatefulSet. Kept for shops that refuse Helm; **the chart is the maintained path** | Schema only (`kubeconform -strict`) — see the caveat below |
 | `helm/rift-cluster/` | The same topology as a chart, parameterized. Published as an OCI chart by the release lane | Schema only, but across a values matrix — `helm lint` + `helm template` + `kubeconform -strict` in CI, plus an assertion that the grace period stays derived. Same caveat below |
 
@@ -205,119 +204,6 @@ Tear it down the same way as the cluster demo:
 docker compose -f deploy/compose/front-door-demo.yml down -v
 ```
 
-## Imposter sources demo
-
-Mocks that live somewhere else. `compose/sources-demo.yml` is the smallest thing
-that shows the shape a central-registry deployment already has: **one environment
-variable** says where the mocks come from, every node in the fleet serves them,
-and rolling the fleet onto new content later is **one call** rather than a
-redeploy.
-
-```yaml
-RIFT_IMPOSTERS: "http://source-origin:6600/imposters.json,file:/seed/local.json"
-```
-
-Two schemes in one list on purpose — some mocks come from a config server the
-whole organisation shares, some are baked in beside the app. Under `--cluster`
-the flag is sugar for declaring **pinned sources**, so both go through the
-replicated log and reach every node.
-
-`source-origin` is the config server: a fourth `rift-cluster-server`, run
-un-clustered, whose imposter's response body *is* the config document. That is
-why the demo needs no second image — and it is what makes the second half work,
-since changing what the fleet should be serving becomes an ordinary admin-API
-call rather than a volume edit and a restart.
-
-```sh
-docker compose -f deploy/compose/sources-demo.yml up --build
-```
-
-Once all three report ready, every node serves both sources' imposters:
-
-```sh
-$ curl -s localhost:17001/ ; curl -s localhost:27001/ ; curl -s localhost:37001/
-payments v1
-payments v1
-payments v1
-
-$ curl -s localhost:27002/
-local seed
-```
-
-### Rolling the fleet with one call
-
-The `/admin/sources*` endpoints ride the **cluster port**, not the admin API: a
-source is a control-plane object authenticated with the cluster credential
-(`--cluster-secret`), so plain `curl` cannot reach them — every request carries
-an HMAC over its method, path and body. `cluster-curl` is the one-file client
-for exactly that, and it lives in the crate that defines the format so the two
-cannot drift:
-
-```sh
-$ cargo run -q -p rift-cluster --example cluster-curl -- \
-    --secret local-development-cluster-secret \
-    GET http://127.0.0.1:15790/admin/sources
-```
-
-Each source is named by an id derived from its URI, so it is stable across
-restarts and identical on every node. For the HTTP source above that is
-`http-source-origin-6600-imposters-json-7d18d4d6`.
-
-Now change what the config server serves — an ordinary admin write against the
-origin, no restart:
-
-```sh
-$ curl -s -X PUT localhost:16525/imposters/6600/stubs \
-    -H 'Content-Type: application/json' \
-    -d '{"stubs":[{"predicates":[{"equals":{"path":"/imposters.json"}}],
-         "responses":[{"is":{"statusCode":200,
-           "body":"{\"imposters\":[{\"port\":7001,\"protocol\":\"http\",\"name\":\"payments\",\"stubs\":[{\"responses\":[{\"is\":{\"statusCode\":200,\"body\":\"payments v2\\n\"}}]}]}]}"
-         }}]}]}' > /dev/null
-```
-
-Nothing has changed in the fleet yet — a `pinned` source is pulled when you ask,
-never on a timer. One call does it:
-
-```sh
-$ cargo run -q -p rift-cluster --example cluster-curl -- \
-    --secret local-development-cluster-secret \
-    POST http://127.0.0.1:15790/admin/sources/http-source-origin-6600-imposters-json-7d18d4d6/pull
-{"revision":16,"digest":"61079cc5…","unchanged":false,"skipped":false,"changed":[7001]}
-```
-
-And every node has it — including the two that never received the call:
-
-```sh
-$ curl -s localhost:17001/ ; curl -s localhost:27001/ ; curl -s localhost:37001/
-payments v2
-payments v2
-payments v2
-```
-
-The fleet fetched the document **once**, on the node that took the call; the
-other two applied the bytes it submitted, because a fetch never happens in the
-apply path. That is the property container scenario
-`c20_source_pull_converges_and_fetches_once` asserts as an equality against the
-config server's own request counter, rather than leaving it as a claim in prose.
-
-(Boot is the one place three fetches are expected and correct: `--imposters` is
-per node, so each one independently declares the same sources — by an id derived
-from the URI, hence identical — and pulls them. The second and third pulls hit
-the digest short circuit and write nothing. Fetch-once is a property of *a
-pull*, not of a fleet's lifetime.)
-
-A second pull with nothing changed writes no log entry at all and answers
-`"unchanged": true` — which is what makes a `tracking` source (re-fetched on
-`pollSecs`, by the **leader only**) affordable at a 30-second cadence. See
-`docs/rift-cluster-server.md`'s "Imposter sources" section for the full surface:
-tracking mode, drift, `onDrift`, provenance, and the credentialed providers.
-
-Tear it down the same way as the other demos:
-
-```sh
-docker compose -f deploy/compose/sources-demo.yml down -v
-```
-
 ## The rule these manifests exist to encode
 
 On SIGTERM a node **fails readiness first**, keeps serving in-flight work for
@@ -454,10 +340,10 @@ build the smokes rejected — only the exact version tag exists before they run.
 
 Every tag above is actually two images (#270), selected by a `-static` suffix:
 
-| Flavor | Base | Tags | `git+` imposter sources | Shell | OS packages |
-|---|---|---|---|---|---|
-| default | `debian:bookworm-slim` | `vX.Y.Z`, `latest` | Yes | Yes | the usual Debian slim set |
-| `-static` | `FROM scratch` (musl) | `vX.Y.Z-static`, `latest-static` | No | No | zero |
+| Flavor | Base | Tags | Shell | OS packages |
+|---|---|---|---|---|
+| default | `debian:bookworm-slim` | `vX.Y.Z`, `latest` | Yes | the usual Debian slim set |
+| `-static` | `FROM scratch` (musl) | `vX.Y.Z-static`, `latest-static` | No | zero |
 
 ```sh
 docker pull ghcr.io/achird-labs/rift-cluster-server:vX.Y.Z-static
@@ -465,19 +351,8 @@ docker pull ghcr.io/achird-labs/rift-cluster-server:vX.Y.Z-static
 
 The static flavor trades the OS away entirely — no package manager, no libc dynamic loader, no
 shell, nothing but the binary, a CA bundle, and a passwd entry for its non-root user — for the
-narrowest attack surface this image can have. That trade is possible at all only because
-`git+https:`/`git+file:` imposter sourcing became a detected *capability* rather than a boot
-requirement: a static image with no git now boots and serves, logging exactly `git not found;
-git+ imposter sources disabled in this image` at WARN instead of refusing to start. Four real
-limitations follow from the same trade, worth knowing before picking it:
-
-- **No `git+` imposter sources.** A `git+https:` or `git+file:` declaration fails at declaration
-  time, not at boot, with:
-
-  > `git+https:` sources are unavailable: no `git` binary on PATH; install git, or use the
-  > default (non-static) image if this is `-static`
-
-  Use the default flavor for any node that declares one.
+narrowest attack surface this image can have. Two real limitations follow from that trade, worth
+knowing before picking it:
 
 - **No shell.** There is no `docker exec … sh` on this image — there is nothing to exec into.
   This also rules it out for Kubernetes today: the StatefulSet runs `/bin/sh -c` as its container
@@ -495,14 +370,6 @@ limitations follow from the same trade, worth knowing before picking it:
   is markedly slower under allocation-heavy, highly concurrent load. Benchmark numbers therefore
   do not transfer between flavors — that is an allocator difference, not a regression, but a
   surprising one if the flavor switch is forgotten between runs.
-
-- **Mixed-flavor fleets are not supported.** Replicated *applies* never fetch — a follower
-  running the static flavor applies git-sourced bytes from its leader just fine, byte for byte,
-  the same as any other apply. But boot-time declarations, a `refresh-now` on whichever node
-  receives the call, and leader-only `tracking`-mode polls all fetch **locally**, on the node
-  that handles them — and in a fleet, that can be any node. So the rule is simple: **a fleet
-  that uses `git+` sources runs the default flavor everywhere**; mixing flavors is only safe for
-  a fleet that declares no `git+` source at all.
 
 ## Images and the upstream pin
 

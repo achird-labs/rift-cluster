@@ -97,7 +97,7 @@ on membership change, O(N) fine at our scale.
 ### D-4 — Config bodies via content-addressed RPC fetch, not gossip
 - **Status:** amended
 - **Decided:** 2026-07-01 · RFC-001 v2
-- **Code:** crates/rift-cluster/src/raft/store.rs, crates/rift-cluster/src/blobs/mod.rs
+- **Code:** crates/rift-cluster/src/raft/store.rs
 
 Gossiping full configs blows the SWIM payload budget and re-floods every round; digests converge
 fast and bodies transfer once per node.
@@ -310,12 +310,16 @@ on ownership move) and D-12 (Redis-strict path) both still stand. The residual w
 partitioned node that has not applied the entry deposing it) is closed by the isolated-owner rule:
 no leader heartbeat within `3 × election_timeout` ⇒ reject owner-side stateful ops.
 
-### D-18 — Every member holds every live blob
-- **Status:** active
+### ~~D-18 — Every member holds every live blob~~
+- **Status:** superseded
 - **Decided:** 2026-08-24 · ADR-001 · #432, rift-cluster#458
+- **Superseded by:** D-72
 - **Amends:** RFC-005 §3.2
 - **Implemented by:** #437, #438 (merged), #439 (open), #440 (open), #441 (open — the RFC/chapter revision)
-- **Code:** crates/rift-cluster/src/blobs/mod.rs, crates/rift-cluster-server/src/admin_front.rs
+
+Superseded by D-72 (#549): the blob store is gone. It existed to carry stored specs and datasets,
+and with both removed there is no content-addressed tier for a completeness rule to hold over.
+Retained for history.
 
 The content-addressed blob store (#437) is quorum-complete on each node; an object store (#448)
 is an opt-in cache/backup tier that is never consulted on the serving path and never a condition
@@ -342,11 +346,16 @@ failure, and a blob no member holds can never apply, stalling the log fleet-wide
 bounds dataset bytes by quota precisely so the corpus is consensus-worthy small and fully
 replicated; a corpus that outgrows a voter's disk is a redesign with numbers, not a tier.
 
-### D-19 — The blob fan-out quorum is joint consensus
-- **Status:** active
+### ~~D-19 — The blob fan-out quorum is joint consensus~~
+- **Status:** superseded
 - **Decided:** 2026-08-24 · ADR-001 · #438
+- **Superseded by:** D-72
 - **Implemented by:** #438
-- **Code:** crates/rift-cluster/src/raft/network.rs, crates/rift-cluster-server/src/admin_front.rs
+
+Superseded by D-72 (#549): there is no blob fan-out. `QuorumTargets`, `joint_voters` and
+`joint_members` went with it — they had no other caller. The joint-consensus *reasoning* is not
+wrong and is worth re-reading if the fleet ever grows another out-of-band transfer; it is the
+mechanism, not the argument, that this entry loses. Retained for history.
 
 A majority of *both* the committed and the effective voter configuration, read in a single
 `with_raft_state` closure so the pair cannot be assembled from two membership epochs. Neither
@@ -419,12 +428,20 @@ evidence the peer is down (#442).
 *Why it is registered:* three earlier fixes (keepalive during chunks, ticker, grace) each looked
 correct and each failed for this unmeasured reason. Instrument both ends before changing timers.
 
-### D-23 — The bytes leave the log: blobs are sideloaded, ops carry digests
-- **Status:** active
+### ~~D-23 — The bytes leave the log: blobs are sideloaded, ops carry digests~~
+- **Status:** superseded
 - **Decided:** 2026-08-24 · #432 (epic), RCA "Bytes on the Log"
+- **Superseded by:** D-72
 - **Amends:** RFC-005 §3.2, RFC-004 §4.1
-- **Implemented by:** #436, #437, #438, #439, #440; prose revision #441 (this PR)
-- **Code:** crates/rift-cluster/src/blobs/mod.rs, crates/rift-cluster/src/raft/store.rs, crates/rift-cluster/src/raft/blob_source.rs
+- **Implemented by:** #436, #437, #438, #439, #440; prose revision #441
+
+Superseded by D-72 (#549) — by removing the payloads rather than by putting them back. Only
+`SpecPut` and `DatasetPut` ever carried a blob, and both ops are gone; every remaining op is
+metadata-sized JSON, so the sideload path, the digest-only shape and `/internal/v1/blob/{digest}`
+have nothing left to carry. **The measurement behind this entry stands and is the reason it must
+not be undone casually:** 4–64 MiB entries broke openraft 0.9's heartbeat, snapshot and admission
+assumptions (#411, #430, #431, #433), and the single-large-entry ceiling that finding established
+(RFC-001 §7.3) still applies to anything that would put bulk on the log again. Retained for history.
 
 RFC-004/005 put 4–64 MiB blobs through a Raft log and snapshot whose timers, health tracker,
 snapshot encoding and admission protocol all assume KiB entries; openraft 0.9 opens a silent
@@ -499,21 +516,26 @@ A peer's hostname is re-resolved on every send and every returned address is tri
 resolver's (RFC 6724) order. A prefer-IPv4 knob was rejected: it encodes one network's bug into
 every deployment and hides dual-stack misconfiguration instead of surfacing it.
 
-### D-29 — Deleting a source orphans its imposters; never cascades
-- **Status:** active
+### ~~D-29 — Deleting a source orphans its imposters; never cascades~~
+- **Status:** superseded
 - **Decided:** 2026-08 · #253
-- **Code:** crates/rift-cluster/src/control.rs, crates/rift-cluster/src/sources/mod.rs
+- **Superseded by:** D-72
 
-`SourceDelete` removes the source record and stops polling; imposters it created stay, now
-unowned by any source. Cascading would delete live mocks on an admin's bookkeeping change. No
-separate `Action::SourceWrite` — sources are authorized under the existing config actions, by
-precedent.
+Superseded by D-72 (#549): there are no source records to delete. The half of this entry that
+outlived it is the instinct behind it — a bookkeeping change must not delete live mocks — which
+is why the one-shot import replaced tracking rather than being bolted onto it. Retained for
+history.
 
-### D-30 — Object-store offload is untrusted, opt-in, and never on the serving path
-- **Status:** pending
+### ~~D-30 — Object-store offload is untrusted, opt-in, and never on the serving path~~
+- **Status:** superseded
 - **Decided:** 2026-08-24 · #448 (tracking), #456, #457
-- **Implemented by:** #456 (open), #457 (open)
-- **Code:** crates/rift-cluster/src/blobs/mod.rs
+- **Superseded by:** D-72
+- **Implemented by:** #456, #457 — both closed as out of scope on 2026-09-06
+
+Superseded by D-72 (#549) before it was ever built: it refined D-18's blob-store completeness
+rule, and there is no blob store. The `--as-new-fleet` reasoning it records is about snapshot
+restore, not about blobs, and would need re-deciding on its own terms if that work returns.
+Retained for history.
 
 Refines D-18. Bytes read back from a bucket are untrusted until their digest is verified — an
 acceptance criterion, not an optimization. Cache (mirror) and backup want opposite retention
@@ -521,10 +543,17 @@ policies and are separate tiers. Restoring a fleet from a snapshot backup requir
 `--as-new-fleet`: it rewrites membership to a single voter and bumps the term, so a restored
 node can never be mistaken for a member of the fleet it was copied from.
 
-### D-31 — `PollStatus` is node-local; `SourceRecord` is fleet-replicated
-- **Status:** active
+### ~~D-31 — `PollStatus` is node-local; `SourceRecord` is fleet-replicated~~
+- **Status:** superseded
 - **Decided:** 2026-08 · #233, #239
-- **Code:** crates/rift-cluster/src/sources/scheduler.rs, crates/rift-cluster/src/sources/mod.rs, crates/rift-cluster-server/src/admin_front.rs
+- **Superseded by:** D-72
+
+Superseded by D-72 (#549): neither shape exists — there is no poll and no source record. **The
+rule it states is general and still binds every surface this fleet publishes:** a node-local
+observation must never be flattened into a shape a reader will take for fleet state. It is the
+past-state-as-present error, and the `nodeLocal` split it introduced is the pattern the remaining
+fleet reads (`/_fleet/members`, `/_cluster/health`) still follow. Retained for history, and worth
+reading before adding any new fan-out.
 
 What a source *is* (URL, credentials ref, interval) is a Raft value; when *this node* last polled
 it and what it saw is not. A response that flattens the two into one shape would present a
@@ -557,10 +586,16 @@ nothing and risks nothing by using it.
 serves no console even when clustered. `tests/passthrough.rs` pins the first, `tests/console_off.rs`
 the second — same decision, two gates.
 
-### D-34 — `git+` sources are a detected capability in the `-static` image
-- **Status:** active
+### ~~D-34 — `git+` sources are a detected capability in the `-static` image~~
+- **Status:** superseded
 - **Decided:** 2026-08 · #270
-- **Code:** crates/rift-cluster/src/sources/git.rs
+- **Superseded by:** D-72
+
+Superseded by D-72 (#549): there is no `git+` provider on either flavor, so the two images no
+longer differ in what they can fetch and the runtime stage no longer installs git. The rule that
+survives — **fail loudly at declaration, not at first use** — is why `--imposters git+…` is
+refused at startup by name rather than left to error on a fetch nobody watches. Retained for
+history.
 
 The musl/`FROM scratch` image cannot carry a git binary. A `git+` source on such a node fails
 loudly at source creation with a capability error rather than at the first poll; the capability
@@ -768,14 +803,19 @@ cross-node sequencing should carry an explicit `id`.
 *Deferred, not done:* the peek-amplification benchmark RFC-001 §11.3 asks Phase 4 for, and a
 container chaos scenario — both additive verification on a working feature (#476).
 
-### D-48 — A blob no member can supply parks apply and reports degraded; the node never halts
+### ~~D-48 — A blob no member can supply parks apply and reports degraded; the node never halts~~
 > **Amended by D-56** (2026-08-28, #513): "never gives up" holds while the node is **up**. A
 > shutdown ends a parked fetch, because the park holds the storage handle the node must release
 > to stop.
-- **Status:** active
+- **Status:** superseded
 - **Decided:** 2026-08-25 · #439 (user ruling)
+- **Superseded by:** D-72
 - **Implemented by:** #439
-- **Code:** crates/rift-cluster/src/raft/blob_source.rs, crates/rift-cluster-server/src/cluster_api.rs, crates/rift-cluster-server/src/fleet.rs
+
+Superseded by D-72 (#549): nothing fetches on apply, so apply cannot park. `/_cluster/health`'s
+`blob_fetch_stall` and the fleet roll-up `blob_fetch_stalls_fleet` are gone with it —
+`parked_intents` and `parked_intents_fleet` are a **different** mechanism (the R4 write ledger,
+which predates blobs and covers every write path) and are untouched. Retained for history.
 
 Refines D-23. Fetch-on-apply asks the write's origin first, then every other joint voter
 (D-19's set — the one no single membership change can empty), and **never gives up**: after
@@ -821,13 +861,20 @@ drops the redb handle: `RaftNode::shutdown`'s storage-release wait timed out and
 with the file lock still held, and reopening the data directory in the same process failed with
 `Database already open`. D-56 signals the fetch on shutdown so the worker can exit.
 
-### D-49 — Payload fields stay optional on the wire; the bytes leave the op at submit, after the quorum
+### ~~D-49 — Payload fields stay optional on the wire; the bytes leave the op at submit, after the quorum~~
 > **Amended by D-53** (2026-08-27): a quorum ack is no longer sufficient to strip — every member
 > must also be known to apply a digest-only op.
-- **Status:** active
+- **Status:** superseded
 - **Decided:** 2026-08-25 · #439
+- **Superseded by:** D-72
 - **Implemented by:** #439
-- **Code:** crates/rift-cluster/src/control.rs, crates/rift-cluster/src/raft/store.rs, crates/rift-cluster-server/src/admin_front.rs
+
+Superseded by D-72 (#549): the two ops whose payloads this made optional no longer exist, so
+there is no strip and no `origin`. This entry's compatibility argument — a Raft log entry is
+plain `serde_json` with no envelope version, so a field cannot simply vanish from a shape already
+on disk — **still governs every op that remains**, and is exactly why #549 is a deliberate
+log-format break (a fleet upgrading across it starts from a fresh `cluster-state-dir`) rather
+than a silent one. Retained for history.
 
 Refines D-23. `SpecPut.document` and `DatasetPut.csv` become `Option<String>` with
 `#[serde(default)]`, plus `origin: NodeId` — **not removed**. Raft log entries are plain
@@ -851,11 +898,17 @@ are resolved *before* `begin_write()`, and the apply arms treat absent-from-both
 as a hard error rather than a default: a replica that applied an empty document while its peers
 applied the real one is exactly the divergence content addressing exists to prevent.
 
-### D-50 — Snapshots carry a manifest of digests; the joiner fetches the bytes on install
-- **Status:** active
+### ~~D-50 — Snapshots carry a manifest of digests; the joiner fetches the bytes on install~~
+- **Status:** superseded
 - **Decided:** 2026-08-26 · #440 (#432 child 5)
+- **Superseded by:** D-72
 - **Implemented by:** #440
-- **Code:** crates/rift-cluster/src/raft/store.rs
+
+Superseded by D-72 (#549): `SnapshotPayload` no longer carries `spec_blobs`/`dataset_blobs` — nor
+`sources`, `specs` or `datasets` — so there is no manifest and no fetch pre-pass on install. What
+this entry established and #549 keeps: a snapshot install must not hold the redb write transaction
+across network I/O, and it must never silently write an empty table where a populated one was
+expected. Retained for history.
 
 Refines D-23 (the bytes leave the log) — the snapshot half of it, as D-49 is the log-entry half.
 `SnapshotPayload`'s `spec_blobs`/`dataset_blobs` become the **manifest** — `(digest hex, byte
@@ -899,12 +952,15 @@ member wedging on a digest-only op it cannot decode — is **#481**, and is trac
 `active`. The `install_snapshot_timeout` / `snapshot_max_chunk_size` knobs stay (#428): a KiB-sized
 install removes the pressure on the deadline, not the restart-from-offset-0 correctness argument.
 
-### D-51 — A member serves a referenced blob from applied state when its transport store misses
-- **Status:** active
+### ~~D-51 — A member serves a referenced blob from applied state when its transport store misses~~
+- **Status:** superseded
 - **Decided:** 2026-08-27 · #486 (#432/#440 follow-up); amended 2026-08-28 · #501
+- **Superseded by:** D-72
 - **Refines:** D-18, D-48, D-50
 - **Implemented by:** #486, #501
-- **Code:** crates/rift-cluster/src/blobs/routes.rs, crates/rift-cluster/src/raft/store.rs, crates/rift-cluster/src/raft/node.rs
+
+Superseded by D-72 (#549): there is no blob route and no `sm_*_blobs` table to fall back to.
+Retained for history.
 
 `GET /internal/v1/blob/{digest}` answers a chunk read from `sm_spec_blobs`/`sm_dataset_blobs`
 when this node's blob transport store does not have the bytes. Applied state is therefore a
@@ -987,16 +1043,21 @@ replica parked on a `PUT` whose `DELETE` sits behind it in the log therefore sti
 **#480**, and it is what `a_blob_no_member_holds_parks_apply_and_recovers_when_a_holder_returns`
 now has to construct deliberately in order to pin D-48 at all.
 
-### D-52 — Blob GC retains an unreferenced digest until this node's log is purged past it, and never while a peer is asking for it
+### ~~D-52 — Blob GC retains an unreferenced digest until this node's log is purged past it, and never while a peer is asking for it~~
 > **Amended by D-55** (2026-08-28, #504): a third rule, C, retains a tombstoned digest until
 > every member has applied past it. The residual below — a follower whose log is ahead of its
 > applied index — is closed by it, and the "no channel" premise the rejection rested on is
 > corrected in place.
-- **Status:** active
+- **Status:** superseded
 - **Decided:** 2026-08-27 · #480 (#432 follow-up)
+- **Superseded by:** D-72
 - **Refines:** D-18, D-48, D-50
 - **Implemented by:** #480
-- **Code:** crates/rift-cluster/src/blobs/mod.rs, crates/rift-cluster/src/raft/store.rs, crates/rift-cluster/src/raft/node.rs
+
+Superseded by D-72 (#549): there is no blob store to collect, no `sm_blob_tombstones` table and no
+GC sweep. Worth keeping in view for its own sake: this entry's "no channel exists" premise was
+wrong twice (corrected by #504/#505 — `/internal/v1/applied` already carried it), which is the
+standing reminder to grep the internal routes before designing a new one. Retained for history.
 
 Two local rules. No new gossip, no leader-driven GC, no fleet-minimum index to disseminate.
 
@@ -1108,12 +1169,18 @@ freed.
 back under rule A, counted by `gc` itself rather than re-derived, so the gauge cannot drift from the
 rule it reports on.
 
-### D-53 — The bytes leave the op only when every member is known to apply a digest-only one
-- **Status:** active
+### ~~D-53 — The bytes leave the op only when every member is known to apply a digest-only one~~
+- **Status:** superseded
 - **Decided:** 2026-08-27 · #481 (#432 follow-up)
+- **Superseded by:** D-72
 - **Refines:** D-19, D-23, D-49
 - **Implemented by:** #481
-- **Code:** crates/rift-cluster/src/raft/node.rs, crates/rift-cluster-server/src/admin_front.rs
+
+Superseded by D-72 (#549): no op carries a payload to strip, so there is no capability to probe.
+The rolling-upgrade hazard it guarded against — handing a member an entry its build cannot decode
+— is not gone in general, and #549 answers it the blunt way for this change: removing the nine op
+variants is a deliberate log-format break, so a fleet upgrading across it starts from a fresh
+`cluster-state-dir` rather than negotiating. Retained for history.
 
 `fan_out_then_submit` strips a `DatasetPut`/`SpecPut`'s payload only when every member of the
 committed ∪ effective configuration is **known** to apply digest-only ops. Otherwise it submits the
@@ -1220,12 +1287,19 @@ listener is upstream, which remains true; "D-11 would have to move first" was #4
 yet" and "never", a preference nobody is building is a claim the docs cannot keep true — #467, #489
 and this issue are three corrections of the same one sentence, in three different places.
 
-### D-55 — Blob GC retains a tombstoned digest until every member has applied past it
-- **Status:** active
+### ~~D-55 — Blob GC retains a tombstoned digest until every member has applied past it~~
+- **Status:** superseded
 - **Decided:** 2026-08-28 · #504 (D-52 residual)
+- **Superseded by:** D-72
 - **Refines:** D-52; also D-18, D-48, D-50, D-53
 - **Implemented by:** #504
-- **Code:** crates/rift-cluster/src/blobs/mod.rs, crates/rift-cluster/src/raft/network.rs, crates/rift-cluster/src/raft/node.rs, crates/rift-cluster/src/raft/store.rs
+
+Superseded by D-72 (#549): there is no blob GC, so no retention rule. `network::fleet_applied_floor`
+and `FleetAppliedFloor` — this entry's whole mechanism — went with it; blob GC was their only
+caller. `/internal/v1/applied` itself stays, because the write barrier uses it. Retained for
+history: the fail-closed reading it settled (a member that cannot be asked withholds the floor
+rather than being counted as caught up) is the shape any future fleet-minimum aggregate should
+take.
 
 D-52 keyed retention on this node's own purge point (rule A) and on a peer actively asking (rule B),
 and recorded as a residual the one replica neither rule sees: **a follower whose log is ahead of its
@@ -1301,12 +1375,19 @@ write-back, or wiping the state dir before rejoin so it takes a snapshot instead
 the sequence above — it needs a parked node to be gracefully evicted — and `blob_fetch_stall`
 surfaces it.
 
-### D-56 — Shutdown ends a parked blob fetch; the entry re-applies on restart
-- **Status:** active
+### ~~D-56 — Shutdown ends a parked blob fetch; the entry re-applies on restart~~
+- **Status:** superseded
 - **Decided:** 2026-08-28 · #513 (found while implementing D-55/#504)
+- **Superseded by:** D-72
 - **Refines:** D-48; also D-16, D-23
 - **Implemented by:** #513
-- **Code:** crates/rift-cluster/src/raft/blob_source.rs, crates/rift-cluster/src/raft/node.rs, crates/rift-cluster/src/blobs/mod.rs, crates/rift-cluster/src/raft/store.rs
+
+Superseded by D-72 (#549): apply awaits nothing, so it cannot park and there is no shutdown signal
+to send — the `watch<bool>` and its receiver are gone. **The mechanism it documents is not gone
+and is worth keeping in view:** openraft's state-machine worker awaits `Apply` inline and owns the
+redb handle, so anything that makes `apply` block indefinitely will again make a node impossible
+to stop and its data directory impossible to reopen. Retained for history, as the standing reason
+`apply` stays synchronous and infallible.
 
 D-48 says a blob no member can supply parks the apply and the node **never gives up**. That is
 right while the node is running, and it is what makes the park recoverable at all (D-52 rule B is
@@ -2376,3 +2457,88 @@ still cites decisions, and still leaks — D-68 exists because tenancy reached t
 
 *Rejected:* sharding imposters across nodes. The fleet stays replicated (D-20's core claim); the
 router routes to the local imposter, never across nodes.
+
+---
+
+### D-72 — Imposter import is one-shot: `--imposters` and `POST /specs/compile` become ordinary `PutImposter` ops; the cluster retains no source, spec or dataset
+
+- **Status:** active
+- **Decided:** 2026-09-07 · RFC-007 §3.2 · #549
+- **Supersedes:** D-18, D-19, D-23, D-29, D-30, D-31, D-34, D-48, D-49, D-50, D-51, D-52, D-53, D-55, D-56
+- **Amends:** RFC-004 §3.4
+- **Implemented by:** #549
+- **Code:** crates/rift-cluster-server/src/admin_front.rs, crates/rift-cluster-server/src/compose.rs
+
+An imposter reaches the fleet through **one** path: `ControlOp::PutImposter` on the replicated
+log. Compiling an OpenAPI document and reading a `--imposters` URI are both *ways of producing
+one*, not second config planes with their own records, schedulers and replication tier.
+
+**What is gone.** Tracking imposter sources — the `git+https:`/`git+file:`/`s3:`/`registry:`
+providers, the `auth_ref` credential resolver, the leader-only poll scheduler, drift policy, the
+`sm_sources` table and the whole `/admin/sources*` surface. Datasets — `sm_datasets`, the CSV
+spool, the `_rift.dataset` binding compile-down, the three dataset quotas and
+`/admin/tenants/{id}/datasets*`. Stored specs — `sm_specs`, the drift diff, edit-time validation
+and its `Rift-Spec-Warnings` header, and `/specs`, `/specs/{id}`, `/specs/{id}/compile`,
+`/specs/{id}/deploy`. And the content-addressed blob store beneath all of it: the transport store,
+the fan-out, the sideload/strip, fetch-on-apply, tombstones and GC, the snapshot manifest, and
+`/internal/v1/blob/{digest}`. Nine `ControlOp` variants leave with them.
+
+**What replaces the two things anyone actually used.**
+
+*`POST /specs/compile?port=<u16>[&name=<text>]`* takes an OpenAPI 3.0 document (JSON or YAML,
+≤ `rift_cluster_spec::MAX_SPEC_BYTES` = 4 MiB) and answers the compiled imposter JSON plus the
+operation index — **and stores nothing**: no record, no op, no table read. The caller `PUT
+/imposters` the `imposter` field, which is the same admission gate every other config passes.
+`rift-cluster-spec` itself is untouched (RFC-004 §3.1–§3.3 stay live).
+
+*`--imposters <uri>` under `--cluster`* is a one-shot bootstrap. At startup each URI is resolved
+through upstream's own `SourceRegistry` (U-12: `file:` and `http(s):`, the only schemes left), the
+documents parsed by upstream's config loader, and each imposter submitted as a plain
+`PutImposter`. The flag is still `take()`n from the CLI before `ServerBuilder` sees it, for the
+reason it always was: upstream's `start()` would create the imposters in this node's manager,
+outside the replicated log, and the reconciler would then delete them — the operator watches their
+imposters appear and vanish with no error anywhere.
+
+**`port` is required on the compile endpoint**, unlike the store-backed compile it replaces. That
+one could fall back to the spec's single bound port because a stored spec had bindings; this one
+has no record to infer from, and a portless compiled imposter cannot be `PUT` under `--cluster` at
+all (an auto-assigned port cannot replicate). Answering with a document the very next call refuses
+would be a worse default than asking.
+
+**Idempotence is in the `op_id`, not in a record.** Each bootstrap imposter is submitted under
+`Uuid::new_v5(NAMESPACE_URL, "rift-cluster/bootstrap-imposter\n{uri}\n{port}\n{digest}")`, where
+`digest` is the sha256 of the fetched document's canonical config set. A restart, or a second node
+booting against the same file, re-derives the same `op_id` and collapses in the state machine's
+dedup table; an *edited* document hashes differently and applies. That is what the source record's
+`applied_digest` short circuit used to buy, obtained without a replicated record — and it is why
+the digest is over the whole document rather than per imposter: an imposter removed from the
+document must change the identity of what the document declares.
+
+**Authorized as `imposter.write`.** A compile is the first half of an imposter write and the only
+reason to call it is to make one; putting it below that would let a reader have the fleet do a
+writer's work. `Action::{SourceRead, SpecRead, SpecWrite, SpecDelete, DatasetRead, DatasetWrite,
+DatasetDelete}` are removed rather than renamed.
+
+**No warning channel.** The compiler's warnings *are* its refusals — an unsupported version, an
+external `$ref`, a parse failure, its own self-check — and they render as `400`. A `200` therefore
+means the output passed the contract it just emitted, and an always-empty `warnings: []` was
+rejected as a field that says nothing.
+
+**This is a deliberate log-format break.** `ControlOp` is externally-tagged `serde_json` with no
+envelope version and no catch-all arm, so a node replaying a log holding any of the nine removed
+variants fails to start rather than skipping them. Pre-release that is the right trade and is why
+the removal is clean; a fleet upgrading across this commit starts from a fresh
+`cluster-state-dir`. D-49's compatibility reasoning is what makes this a decision rather than an
+oversight.
+
+*Rejected:* keeping the `/specs` store and removing only the tracking sources. The store is what
+the blob tier existed for — eleven decisions about replication, GC, snapshot manifests and
+rolling-upgrade capability, all in service of holding documents the caller already has.
+
+*Rejected:* keeping `--imposters` as sugar for a pinned source record. It preserves the source
+table, the puller and the provider registry to serve a flag that is read once at boot.
+
+*Rejected:* a `warnings` array on the compile response for symmetry with the retired
+`Rift-Spec-Warnings` header. The header reported a *deployed* imposter drifting from the spec that
+generated it; with nothing stored there is no baseline to drift from, so the field would be
+provably empty.

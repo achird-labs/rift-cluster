@@ -270,6 +270,12 @@ whether it came from a spec, a Git repo, or a hand `PUT`.
 
 ### 3.4 A spec is a source kind
 
+> **Retired by D-71** (RFC-007 §3.2, #549)
+
+> **Amended by D-72** (RFC-007 §3.2, #549): imposter import is one-shot. There is no
+> source kind, no `openapi+…` scheme and no poll: `POST /specs/compile` compiles a
+> document and returns the imposter JSON, which the caller then `PUT /imposters`.
+
 Chapter 13's `ImposterSource` SPI (#20 / U-12) is scheme-dispatched;
 this RFC adds two schemes:
 
@@ -303,6 +309,8 @@ machinery at all.
 
 ### 3.5 Drift and diff on re-import
 
+> **Retired by D-71** (RFC-007 §3.2, #549)
+
 Re-import (a new `PUT /specs/:id`, or a source pull with a changed digest)
 never silently overwrites. The flow:
 
@@ -331,6 +339,8 @@ apply time — the same observable #20 defines for source-owned imposters, so
 dashboards need one concept, not two.
 
 ### 3.6 Traffic validation
+
+> **Retired by D-71** (RFC-007 §3.2, #549)
 
 Modes, per imposter: `off` (default) · `soft` · `hard` ·
 `hard-spec-compliant`.
@@ -413,6 +423,8 @@ counted, and visible in `/readyz` detail if persistent.
 
 ## 4. Data model
 
+> **Retired by D-71** (RFC-007 §3.2, #549)
+
 ### 4.1 On consensus (Raft state machine) — small, must-agree
 
 > **Amended by D-23** (2026-08-24, epic #432): spec *bytes* no longer ride the log. `SpecPut`
@@ -423,6 +435,9 @@ counted, and visible in `/readyz` detail if persistent.
 > #430, #431). The ordering argument survives: log order still guarantees the bytes are local
 > before any config referencing them applies. The prose rewrite is #441; until it lands, read
 > `bytes` below as `digest`.
+>
+> **D-23 is itself superseded by D-72** (#549). Neither shape is live: there is no `SpecPut`,
+> no blob store and no sideload. The callout stays as the record of the reversal it made.
 
 New `ControlOp` variants (joining the closed set at `control.rs:89`, tags
 frozen by the same stability test at `control.rs:460`):
@@ -517,6 +532,8 @@ target port; holding `SpecWrite` alone must not be a back door into
 imposter mutation.
 
 ## 5. Admin API surface
+
+> **Retired by D-71** (RFC-007 §3.2, #549)
 
 On the admin port, terminated by the clustered front like
 `/front-door/routes` (`admin_front.rs:348–349` sets the precedent for an

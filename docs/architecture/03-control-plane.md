@@ -40,8 +40,7 @@ flowchart TB
         SM["State machine (apply loop)"]
         DB[("redb — cluster-state-dir<br/>raft_log · raft_vote · snapshot meta<br/>sm_configs · sm_tenants · sm_principals<br/>sm_bindings · sm_op_dedup · pending_intents")]
         IM["ImposterManager (OSS engine)"]
-        RPC["cluster RPC (hyper + HMAC)<br/>/internal/v1/raft/append · vote · snapshot<br/>/internal/v1/blob/{digest} (PUT · GET)"]
-        BLOBS[("blobs — data-dir/blobs<br/>content-addressed, node-local<br/>staging/ + refcount GC")]
+        RPC["cluster RPC (hyper + HMAC)<br/>/internal/v1/raft/append · vote · snapshot"]
     end
 
     RN -- "append entries (fsync'd)" --> DB
@@ -49,7 +48,6 @@ flowchart TB
     SM -- "sm_* updates" --> DB
     SM -- "apply_config / set_enabled" --> IM
     RN <-- "to peers" --> RPC
-    RPC -- "resumable blob transfer" --> BLOBS
 ```
 
 - **Log and vote storage** commit with `redb`'s `Durability::Immediate` —
@@ -78,49 +76,12 @@ flowchart TB
   commits, so the row never points at a payload that is not already durable
   (#436; Chapter 9). Config bodies ride in log entries (small JSON); snapshots are the
   compaction story, replacing v2's content-addressed body fetch entirely.
-  The deliberately larger payloads — an OpenAPI spec up to 4 MiB (RFC-004 §4.1,
-  #278) and a dataset up to the tenant's `maxDatasetBytes`, default 8 MiB
-  (RFC-005 §3.2, #285) — **no longer ride the log** (epic #432): every node
-  still needs *identical* bytes, but content-addressing is what guarantees that,
-  so a `SpecPut`/`DatasetPut` commits a digest and the bytes are sideloaded
-  through the blob transfer store below — fanned out to a quorum before propose
-  (#438) and fetched on apply by any member that lacks them (#439). Snapshots
-  carry a manifest of those digests, not the bytes, and a joiner fetches what it
-  lacks on install (#440). A dataset still keeps one derived artefact: apply
-  materializes `<data-dir>/datasets/<digest>.csv` from the resolved bytes before
-  inserting the record, so the file is on every node before any config that names
-  it. That file is derived state — rebuilt from `sm_dataset_blobs` on restart,
-  never fetched from a peer.
-- **Blob transfer store** (#437, epic #432) — `<data-dir>/blobs/<digest>`, a
-  per-node content-addressed store fed by `PUT`/`GET /internal/v1/blob/{digest}`
-  over the same signed cluster port as the Raft routes. Writes are chunked and
-  resumable, verified against the digest before an atomic rename makes them
-  visible, and reclaimed by a grace-windowed sweep over what the applied state
-  still references. The store itself **replicates nothing** — it has no mechanism
-  of its own for putting a blob on another node, so two nodes holding different
-  blob sets is expected rather than divergence. What routes through it today is
-  the pre-propose fan-out (#438): the accepting node stores the blob and puts it
-  on a joint-consensus quorum (D-19) before the referencing op is submitted.
-
-  That is not in tension with **ADR-001 D-18** ("every member holds every live
-  blob"): D-18's completeness is established by the write path, never by the
-  store — #438 fans a blob to a joint-consensus quorum *before* the op is
-  proposed, and #439 fetches on apply for any member the fan-out missed, so a
-  commit implies quorum-durability and every member converges to holding every
-  live blob. A joiner catching up by snapshot fetches the manifest's blobs the
-  same way (#440, D-50). The bytes have left the log; this store is now the
-  primary carrier for them.
-
-  Not the *only* carrier, though. A `GET` this store cannot answer falls back to
-  `sm_spec_blobs`/`sm_dataset_blobs` (#486, **D-51**), so every member that still
-  references a blob can serve it even if its own `blobs/` directory never held
-  the bytes or has since been wiped — which is what makes D-18's "holds" mean
-  *can serve*, by construction rather than by how the bytes arrived. The fallback
-  reaches the referenced set only: a row is dropped in the same transaction that
-  drops its last reference, so it can never serve something the fleet has reaped.
-  A `?stat` probe deliberately does **not** consult it — that probe is what the
-  fan-out uses to decide it may skip a peer, and it must keep meaning "this
-  store has the bytes".
+  **Everything the log carries is small JSON** (D-71, #549): the one class of
+  payload that was not — a multi-megabyte uploaded document — no longer enters the
+  cluster at all. An OpenAPI document is compiled to imposter JSON by a stateless
+  endpoint (`POST /specs/compile`, `docs/rift-cluster-server.md`) and the *result*
+  is written as an ordinary `ControlOp::PutImposter`; nothing is retained but the
+  imposter.
 
 ## Membership lifecycle
 

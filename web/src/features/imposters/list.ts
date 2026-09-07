@@ -19,11 +19,8 @@ type Imposter = components["schemas"]["Imposter"];
 /** How a row's stub list answers "does this imposter have a recording?". */
 export type RecordingFilter = "all" | "has" | "none";
 export type StateFilter = "all" | "enabled" | "disabled";
-export type OwnerFilter = "all" | "source" | "hand";
 export type SortKey = "port" | "name" | "stubs";
 export type SortDirection = "asc" | "desc";
-
-export type DriftFilter = "all" | "drifted";
 
 /**
  * Whether an imposter's bind status (#369) fails on at least one voter.
@@ -39,24 +36,6 @@ export type ImposterQuery = {
   text: string;
   state: StateFilter;
   recording: RecordingFilter;
-  /**
-   * Source-owned vs hand-created. Decided by joining `GET /admin/sources` — every `SourceRecord`
-   * carries the `ports` it currently owns, so the union of those ports IS the source-owned set.
-   *
-   * The join needs a capability the list itself does not (`source.read`), so a principal without it
-   * is not offered the filter at all rather than shown one that silently answers "hand-created" for
-   * everything. `sourceOwned` being `null` — refused, unread, or still loading — means exactly that.
-   */
-  owner: OwnerFilter;
-  /**
-   * Imposters whose owning source has drifted — hand-edited since its last pull.
-   *
-   * A separate dimension from `owner` rather than a third value of it, because they answer
-   * different questions and an operator wants both at once: `owner: "source"` is "who created
-   * this", `drifted: "drifted"` is "and has someone edited it behind the source's back". Folding
-   * them together would make "source-owned AND drifted" unaskable.
-   */
-  drifted: DriftFilter;
   /** #369 — see `BindFilter`. */
   bind: BindFilter;
   sort: SortKey;
@@ -67,8 +46,6 @@ export const EMPTY_QUERY: ImposterQuery = {
   text: "",
   state: "all",
   recording: "all",
-  owner: "all",
-  drifted: "all",
   bind: "all",
   sort: "port",
   direction: "asc",
@@ -79,8 +56,6 @@ export function isEmptyQuery(query: ImposterQuery): boolean {
     query.text === EMPTY_QUERY.text &&
     query.state === EMPTY_QUERY.state &&
     query.recording === EMPTY_QUERY.recording &&
-    query.owner === EMPTY_QUERY.owner &&
-    query.drifted === EMPTY_QUERY.drifted &&
     query.bind === EMPTY_QUERY.bind &&
     query.sort === EMPTY_QUERY.sort &&
     query.direction === EMPTY_QUERY.direction
@@ -102,8 +77,6 @@ export function encodeQuery(query: ImposterQuery): string {
   if (query.text.trim() !== "") params.set("q", query.text);
   if (query.state !== EMPTY_QUERY.state) params.set("state", query.state);
   if (query.recording !== EMPTY_QUERY.recording) params.set("rec", query.recording);
-  if (query.owner !== EMPTY_QUERY.owner) params.set("owner", query.owner);
-  if (query.drifted !== EMPTY_QUERY.drifted) params.set("drifted", query.drifted);
   if (query.bind !== EMPTY_QUERY.bind) params.set("bind", query.bind);
   if (query.sort !== EMPTY_QUERY.sort) params.set("sort", query.sort);
   if (query.direction !== EMPTY_QUERY.direction) params.set("dir", query.direction);
@@ -120,8 +93,6 @@ export function decodeQuery(search: string): ImposterQuery {
     text: params.get("q") ?? EMPTY_QUERY.text,
     state: oneOf(params.get("state"), ["all", "enabled", "disabled"], EMPTY_QUERY.state),
     recording: oneOf(params.get("rec"), ["all", "has", "none"], EMPTY_QUERY.recording),
-    owner: oneOf(params.get("owner"), ["all", "source", "hand"], EMPTY_QUERY.owner),
-    drifted: oneOf(params.get("drifted"), ["all", "drifted"], EMPTY_QUERY.drifted),
     bind: oneOf(params.get("bind"), ["all", "failed"], EMPTY_QUERY.bind),
     sort: oneOf(params.get("sort"), ["port", "name", "stubs"], EMPTY_QUERY.sort),
     direction: oneOf(params.get("dir"), ["asc", "desc"], EMPTY_QUERY.direction),
@@ -183,26 +154,10 @@ function matchesRecording(imposter: Imposter, filter: RecordingFilter): boolean 
 }
 
 /**
- * `sourceOwned` is the union of every declared source's `ports`, or `null` when this session has no
- * reading of them. `null` makes the owner filter a no-op rather than a wrong answer: with nothing to
- * join against, "hand-created" would match every imposter including the source-owned ones.
- */
-function matchesOwner(
-  imposter: Imposter,
-  filter: OwnerFilter,
-  sourceOwned: ReadonlySet<number> | null,
-): boolean {
-  if (filter === "all" || sourceOwned === null) return true;
-  const owned = imposter.port !== undefined && sourceOwned.has(imposter.port);
-  return filter === "source" ? owned : !owned;
-}
-
-/**
- * `fleet` is `null` for exactly the reasons `sourceOwned` is: refused (`fleet.read` withheld), not
- * yet loaded, or the caller does not have one to offer. A port with no fleet reading to check is
- * `unknown`, never `failed` — the same `driftedPorts === null → false` rule `visibleImposters`
- * documents further down, chosen for the same reason: an operator asking for failures must never
- * see "none" stand in for "could not check", nor "everything" stand in for it either.
+ * `fleet` is `null` when the reading is refused (`fleet.read` withheld), not yet loaded, or the
+ * caller does not have one to offer. A port with no fleet reading to check is
+ * `unknown`, never `failed`: an operator asking for failures must never see "none" stand in for
+ * "could not check", nor "everything" stand in for it either.
  */
 function matchesBind(imposter: Imposter, filter: BindFilter, fleet: FleetView | null): boolean {
   if (filter === "all") return true;
@@ -213,7 +168,6 @@ function matchesBind(imposter: Imposter, filter: BindFilter, fleet: FleetView | 
 export function filterImposters(
   imposters: readonly Imposter[],
   query: ImposterQuery,
-  sourceOwned: ReadonlySet<number> | null = null,
   fleet: FleetView | null = null,
 ): Imposter[] {
   return imposters.filter(
@@ -221,16 +175,8 @@ export function filterImposters(
       matchesText(imposter, query.text) &&
       matchesState(imposter, query.state) &&
       matchesRecording(imposter, query.recording) &&
-      matchesOwner(imposter, query.owner, sourceOwned) &&
       matchesBind(imposter, query.bind, fleet),
   );
-}
-
-/** The ports every declared source currently owns — the join the owner filter is built on. */
-export function sourceOwnedPorts(
-  sources: readonly { ports: number[] }[] | undefined,
-): ReadonlySet<number> | null {
-  return sources === undefined ? null : new Set(sources.flatMap((source) => source.ports));
 }
 
 /**
@@ -243,7 +189,6 @@ export function sourceOwnedPorts(
 export function unclassifiedCount(
   imposters: readonly Imposter[],
   query: ImposterQuery,
-  sourceOwned: ReadonlySet<number> | null = null,
   fleet: FleetView | null = null,
 ): number {
   if (query.recording === "all") return 0;
@@ -251,12 +196,12 @@ export function unclassifiedCount(
    * Every other filter first, then the unknowns among what survives.
    *
    * Expressed as "filter with recording disabled, then count the unknowns" rather than by repeating
-   * the conjunction: an earlier version repeated it and omitted `owner`, so a row excluded because
-   * the operator asked for hand-created only was reported as "not shown because we could not read
-   * its stubs" — the count that exists to name the right reason, naming the wrong one. Deriving it
-   * from `filterImposters` means a filter added later cannot be forgotten here.
+   * the conjunction: an earlier version repeated it and omitted a filter, so a row excluded because
+   * the operator asked for something else was reported as "not shown because we could not read its
+   * stubs" — the count that exists to name the right reason, naming the wrong one. Deriving it from
+   * `filterImposters` means a filter added later cannot be forgotten here.
    */
-  return filterImposters(imposters, { ...query, recording: "all" }, sourceOwned, fleet).filter(
+  return filterImposters(imposters, { ...query, recording: "all" }, fleet).filter(
     (imposter) => classifyRecording(imposter) === "unknown",
   ).length;
 }
@@ -281,11 +226,10 @@ export function unclassifiedCount(
 export function bindUnclassifiedCount(
   imposters: readonly Imposter[],
   query: ImposterQuery,
-  sourceOwned: ReadonlySet<number> | null = null,
   fleet: FleetView | null = null,
 ): number {
   if (query.bind === "all") return 0;
-  const admitted = filterImposters(imposters, { ...query, bind: "all" }, sourceOwned, fleet);
+  const admitted = filterImposters(imposters, { ...query, bind: "all" }, fleet);
   if (fleet === null) return admitted.length;
   return admitted.filter(
     (imposter) => imposter.port !== undefined && bindVerdict(fleet, imposter.port) === "unknown",
@@ -341,35 +285,9 @@ export function sortImposters(
 export function visibleImposters(
   imposters: readonly Imposter[],
   query: ImposterQuery,
-  sourceOwned: ReadonlySet<number> | null = null,
-  driftedPorts: ReadonlySet<number> | null = null,
   fleet: FleetView | null = null,
 ): Imposter[] {
-  const matched = filterImposters(imposters, query, sourceOwned, fleet).filter((imposter) => {
-    if (query.drifted === "all") return true;
-    /*
-     * `null` is "the drift set could not be read" — the same shape `sourceOwned` uses — and it
-     * matches nothing rather than everything. Answering "all of them are drifted" for a principal
-     * refused `source.read` would be the loudest possible wrong answer.
-     */
-    if (driftedPorts === null) return false;
-    return imposter.port !== undefined && driftedPorts.has(imposter.port);
-  });
-  return sortImposters(matched, query.sort, query.direction);
-}
-
-/**
- * The ports owned by a source that has drifted.
- *
- * Same join as `sourceOwnedPorts`, narrowed to the sources reporting `drifted` — so it inherits the
- * same `null` meaning: the read was refused or has not happened, which is not the same fact as no
- * source having drifted.
- */
-export function driftedPorts(
-  sources: readonly { ports?: number[]; drifted?: boolean }[] | undefined,
-): ReadonlySet<number> | null {
-  if (sources === undefined) return null;
-  return new Set(sources.filter((source) => source.drifted === true).flatMap((s) => s.ports ?? []));
+  return sortImposters(filterImposters(imposters, query, fleet), query.sort, query.direction);
 }
 
 /**

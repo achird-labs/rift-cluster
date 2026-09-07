@@ -14,12 +14,6 @@ export const API_PATHS = {
   session: "/session",
   frontDoorRoutes: "/front-door/routes",
   /**
-   * The tenant's declared imposter sources, with this node's poll status kept structurally apart.
-   * No member-path builder: the screen has no per-source route, so `#/sources/mocks` falls back
-   * (see `routing.ts`).
-   */
-  sources: "/admin/sources",
-  /**
    * The tenant's recorded requests across every imposter, merged server-side (#362) — replaces the
    * console's own N-way fan-out over `requestsPath(port)`. One read, one cursor, one stated coverage.
    */

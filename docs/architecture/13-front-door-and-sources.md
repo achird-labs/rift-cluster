@@ -1,11 +1,19 @@
-# Chapter 13 — The Front Door & Imposter Sources
+# Chapter 13 — The Front Door
 
-Two capabilities lifted from studying how teams actually wrap mock servers in
-production (the Mimemo/Solo pattern: nginx hiding Mountebank behind one port,
-and an `IMPOSTERS` variable pulling mock definitions from a registry, GitHub,
-or disk). RiftCluster absorbs both into the product so the wrapper layer — its
-proxy, its glue scripts, its config drift — stops existing. Tracked as issues
-#19 (front door, upstream seam U-11) and #20 (sources, upstream seam U-12).
+A capability lifted from studying how teams actually wrap mock servers in
+production (the nginx-hiding-Mountebank-behind-one-port pattern). RiftCluster
+absorbs it into the product so the wrapper layer — its proxy, its glue scripts,
+its config drift — stops existing. Tracked as issue #19 (front door, upstream
+seam U-11).
+
+> **Retired by D-71** (RFC-007 §3.2, #549): this chapter used to carry a second
+> half on *imposter sources* — tracking source records, the `git+`/`s3:`/
+> `registry:` providers, the leader poll scheduler, drift policy and `authRef`.
+> All of it is gone. Imposters now arrive one of two ways: an ordinary
+> `PUT /imposters`, or the one-shot `--imposters <uri>` bootstrap at startup
+> (`file:` and `http(s):` only, through upstream's own `SourceRegistry` — U-12),
+> which submits each document as a plain `ControlOp::PutImposter` and keeps no
+> record of where it came from. See `docs/rift-cluster-server.md`.
 
 ## The front door: many imposters, one port, zero client cooperation
 
@@ -74,134 +82,9 @@ Design points that carry weight (full spec in #19):
   is a read-only decoration on the response — it is not part of the stored
   table, and a `PUT` body claiming `installed: true` is ignored.
 
-## Imposter sources: mocks come from somewhere
-
-The second wrapper habit: mock definitions live in GitHub, a registry, S3, or
-a laptop — and the serving fleet should *pull* them, at bootstrap and on
-demand, rather than having CI push file contents through ad-hoc scripts. The
-SPI (#20) makes source resolution pluggable:
-
-```mermaid
-flowchart TB
-    subgraph providers["ImposterSource providers (scheme-dispatched)"]
-        F["file: — local file/dir<br/>(upstream built-in)"]
-        H["https: — raw URL, ETag-aware<br/>(upstream built-in)"]
-        G["git+https: — repo#ref:path<br/>(cluster)"]
-        S3["s3:// — bucket/key<br/>(cluster)"]
-        R["registry:// — service-ids<br/>(cluster, central-registry pattern)"]
-    end
-
-    providers --> PULL
-
-    subgraph cluster["cluster-correct pull (the part nginx-era wrappers get wrong)"]
-        PULL["ONE fetch — leader poll or<br/>explicit POST /admin/sources/:id/pull"]
-        PULL --> DG{digest changed?}
-        DG -- no --> NOP["no-op: zero log growth"]
-        DG -- yes --> OP["SourcePullResult {configs, version, digest}<br/>= a normal control-plane write"]
-        OP --> AP["committed → applied on every node via<br/>incremental apply_config · provenance stamped"]
-    end
-```
-
-The one rule that makes this cluster-correct: **fetching never happens in the
-apply path.** Two nodes fetching the same URL can receive different bytes; so
-exactly one fetch happens, its result enters the log as data, and every node
-applies identical bytes. Everything else follows from machinery already built:
-pulls are ops (op-id dedup makes retries safe, Chapter 4), provenance
-(`source id + version`) lands on each config record, and a manual edit to a
-source-owned imposter flips a visible `drifted` flag whose fate on the next
-pull is a per-source policy (`overwrite | skip | fail`) — Solo's silent
-re-pull clobber, made declared and observable.
-
-**Correction (#137).** An earlier draft of this section also claimed "the
-barrier makes a pull fleet-visible at its 2xx". It does not, and the
-distinction matters to anyone scripting against this path.
-`--cluster-write-barrier` is a property of the **admin front**
-(`crates/rift-cluster-server/src/admin_front.rs`), and it does not extend to a
-source pull on either port. `SourcePuller::pull` submits the op and then awaits
-only *this* node's local apply (#99), so its 2xx means "committed, and the node
-you asked has it".
-
-**Updated (#253).** The source *write* verbs — `POST /admin/sources`,
-`DELETE /admin/sources/{id}` and `POST /admin/sources/{id}/pull` — are now served
-on **both** ports. They began on the cluster port under the node-to-node cluster
-credential, where they still are and still write the default tenant; #253
-promoted them to the RBAC'd admin front, where they are authorized as
-`imposter.write` / `imposter.delete` (the names these ops already carry, rather
-than a new `SourceWrite` nothing else would recognise) and write the **caller's
-resolved tenant**. Both ports run the
-same `SourcePuller` methods, which is what keeps the two from drifting; the
-tenant is the only difference between them. The fleet follows within a replication round, which is what
-`c20_source_pull_converges_and_fetches_once` polls for rather than asserting at
-2xx-return. Read-your-write across the fleet on this path would be a barrier the
-source handler has to take, not one it already has.
-
-**Updated (#288).** A pull is not a way to admit `flowState.contextScope:
-"fleet"`. RFC-005 S1 gates that scope on `FleetAdmin` at admission, and nothing
-about a pull proves the role — the scheduler re-pulls with no principal, and
-the manual verb is a plain `imposter.write` — so `SourcePuller::pull` refuses a
-document whose imposter sets it, before the write, once the admin plane is
-enforced (an admin credential configured or any principal existing — the same
-predicate the front's bypass reads; composition tells the puller the credential
-half). The refusal names the port and the way in (`PUT /imposters` as a
-`FleetAdmin`, or `tenant` scope in the document); configs an earlier pull
-admitted keep serving.
-
-**Deleting a source orphans; it never cascades (D-29).** `DELETE
-/admin/sources/{id}` commits a `SourceDelete`, which removes the source record
-and — on the leader — stops polling it. The imposters that source pulled in
-stay bound and keep serving; the apply step only clears their provenance
-(`source` becomes unset), so nothing points at a record that no longer exists.
-Cascading would turn an admin's bookkeeping change into a fleet-wide teardown
-of live mocks. Deleting an absent id is applied, not failed, like
-`DeleteImposter`. Sources have no action of their own: they are authorized
-under `imposter.write` / `imposter.delete` (above), and there is deliberately
-no `SourceWrite`.
-
-**Two kinds of fact, two shapes (D-31).** What a source *is* — `SourceRecord`:
-URI, mode, `authRef`, `onDrift`, poll interval, the `last` applied version and
-digest, the drift flag — is a Raft value, byte-identical on every converged
-node; diffing two nodes' `GET /admin/sources` answers is how an operator checks
-a `SourcePut` converged. What *this node* last saw when it polled is not:
-`PollStatus` (`sources/scheduler.rs`) is an in-memory, leader-local map of the
-last poll error per `(tenant, id)`, and a failed poll never writes a log entry
-— an upstream outage is exactly when fleet-wide writes are unwanted. The admin
-front therefore answers in two halves: `sources`/`source` verbatim from the
-projection, and `nodeLocal` — `nodeId` plus `pollErrors` — for the node that
-answered. Flattening `lastPollError` into the record would report one node's
-view as fleet state. The cluster-port read *does* flat-merge it, and that is
-not a contradiction: there the caller addressed one node explicitly.
-
-**`git+` is a detected capability, not a build fact (D-34).** The
-`git+https:`/`git+file:` provider shells out to a `git` binary, and the musl
-`FROM scratch` `-static` image has none. Composition probes once at startup
-(`GitSource::probe`, i.e. `git --version`) and acts on *which* failure it got.
-`NotFound` boots the node with `git+https`/`git+file` registered as
-**unavailable** schemes — still nameable, so a `git+` declaration is refused
-at source creation with the cause and the fix rather than with "no such
-scheme", and rather than at the first poll; an unknown-scheme refusal lists
-what is unavailable in this build too. Any other probe failure (a git that is
-present but unusable) refuses the boot: a broken git is a broken host, not an
-image flavor, and degrading it would leave a fleet that quietly never fetches.
-
-**Verified, not asserted.** Container scenarios C20–C23
-(`tests/cluster-chaos/tests/scenarios.rs`) hold this section to its claims: a
-pull converges fleet-wide and the config server counts **exactly one** request
-for it (`== 1`, never `>= 1`); a tracking source is polled by the leader alone,
-and still is after that leader is killed; sources, provenance and drift flags
-survive a full-fleet restart; and a hand edit shows as drift on every node
-before the next pull overwrites it. Each was also shown red under a named
-mutant — see the chaos README's "C20–C23" section.
-
-Sources are tenant-owned and quota-counted like every other write, and a pull
-emits a structured `tracing` line naming the principal, the source and the
-resolved version: "who moved the payment mocks to which commit, when" is a log
-query, not a Slack archaeology session.
-
 ## What this buys, concretely
 
-The Mimemo/Solo deployment — nginx + a Node management service + Mountebank +
-glue for GitHub/registry pulls, per environment — collapses to `rift-cluster-server`
-with a route table and two source records. Same single exposed port, same
-pull-from-anywhere ergonomics, plus everything the wrapper never had: fleet
-HA, replicated routes and configs with read-after-write semantics, drift
-visibility, and RBAC.
+The nginx + Node-management-service + Mountebank deployment, per environment,
+collapses to `rift-cluster-server` with a route table. Same single exposed port,
+plus everything the wrapper never had: fleet HA, and replicated routes and
+configs with read-after-write semantics.

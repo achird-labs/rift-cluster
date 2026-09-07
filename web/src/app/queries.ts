@@ -76,8 +76,6 @@ type PrincipalCreate = components["schemas"]["PrincipalCreate"];
 type PrincipalUpdate = components["schemas"]["PrincipalUpdate"];
 type IssuedPrincipal = components["schemas"]["IssuedPrincipal"];
 type Role = components["schemas"]["Role"];
-type SourceRecord = components["schemas"]["SourceRecord"];
-type SourcesNodeLocal = components["schemas"]["SourcesNodeLocal"];
 type FleetRequestPage = components["schemas"]["FleetRequestPage"];
 export type FleetJournalCoverage = components["schemas"]["FleetJournalCoverage"];
 
@@ -101,9 +99,9 @@ function key(parts: readonly unknown[], tenant: string | null): unknown[] {
  * budget. The sum is then a floor, not a total — and a floor presented as a total is the reading an
  * operator would act on.
  *
- * Shaped like `useSources` rather than merged into the array: the two facts have different scopes,
- * and a caller that does not care about coverage should have to ignore it explicitly rather than
- * never learn it exists.
+ * Carried beside the array rather than merged into it: the two facts have different scopes, and a
+ * caller that does not care about coverage should have to ignore it explicitly rather than never
+ * learn it exists.
  */
 export type ImposterList = { imposters: Imposter[]; partial: boolean };
 
@@ -118,172 +116,6 @@ export function useImposters(): UseQueryResult<ImposterList> {
       return { imposters: read.data.imposters ?? [], partial: read.partial };
     },
     ...POLLED,
-  });
-}
-
-/**
- * The tenant's declared imposter sources, plus this node's own poll status.
- *
- * The two halves are read together, in one round trip, and kept apart in the return type rather
- * than merged: `sources` is the fleet-replicated projection, `nodeLocal` is true of the answering
- * node only. Flattening a poll error onto its source's record would render one node's transient
- * failure as a fleet-wide fact — see `Sources.tsx`.
- */
-export function useSources(options: { enabled?: boolean } = {}): UseQueryResult<{
-  sources: SourceRecord[];
-  nodeLocal: SourcesNodeLocal;
-}> {
-  const { tenant } = useSession();
-  return useQuery({
-    // `source.read` is its own action server-side, so a principal that lacks it must not issue the
-    // read at all — a 403 on a screen whose own read succeeded is noise, not information. The
-    // imposter list passes `false`; `Sources.tsx` is only reachable with the capability and passes
-    // nothing, keeping its existing behaviour exactly.
-    enabled: options.enabled ?? true,
-    queryKey: key(["sources"], tenant),
-    queryFn: async () => {
-      // Both keys are **required** by the contract — unlike `/imposters`, whose `imposters?` is
-      // genuinely optional. So there is no `?? []` here: an absent `sources` would be a contract
-      // violation, and defaulting it would turn a broken read into the confident on-screen claim
-      // "no sources declared for this tenant". Let it surface instead.
-      return apiGet<{ sources: SourceRecord[]; nodeLocal: SourcesNodeLocal }>(API_PATHS.sources, {
-        tenant,
-      });
-    },
-    ...POLLED,
-  });
-}
-
-/**
- * Upsert a source declaration — `POST /admin/sources`. There is no separate create route: an id
- * already declared is replaced in place and a new one is created, which is why the console offers
- * one form for both rather than two (`Sources.tsx`'s `SourceForm`).
- *
- * Field casing follows every other admin-plane write body in this file (`TenantWrite`,
- * `PrincipalCreate`, …): camelCase, matching `SourceRecord`'s own read-side fields — and matching the
- * vocabulary `control.rs::validate`'s own refusals already use on the wire (its poll-interval
- * refusal reads `"pollSecs {secs} is below the {MIN_POLL_SECS}s floor"`, camelCase, even though the
- * Rust field behind it is `poll_secs`). This route lands in parallel with this change; if it ships
- * a different casing, this type and the two hooks below are the only place to fix.
- */
-export type SourceWrite = {
-  id: string;
-  uri: string;
-  mode: SourceRecord["mode"];
-  authRef?: string;
-  onDrift: SourceRecord["onDrift"];
-  pollSecs?: number;
-};
-
-export function useUpsertSource(): UseMutationResult<CommitOutcome, Error, SourceWrite> {
-  const { tenant } = useSession();
-  const client = useQueryClient();
-  return useMutation({
-    mutationFn: async (body) => {
-      // Unkeyed (#389): the contract does not declare `Idempotency-Key` on this route, and
-      // the fleet would ignore one — see `UNDECLARED` in features/writes/idempotency.ts.
-      const sent = await apiSend("POST", API_PATHS.sources, body, { tenant });
-      const outcome = await settle(sent, { tenant });
-      if (outcome.kind === "failed") throw new Error(outcome.detail);
-      return outcome;
-    },
-    onSettled: () => client.invalidateQueries({ queryKey: ["sources"] }),
-  });
-}
-
-/**
- * Forget a source — `DELETE /admin/sources/{id}`.
- *
- * This never cascades: the apply path leaves a forgotten source's imposters exactly as they are,
- * only dropping their provenance, so its ports keep serving with no source left to reapply them
- * from. `Sources.tsx`'s confirm dialog states that in as many words — "delete" reads as "undeploy"
- * to an operator who has not read the apply path.
- */
-export function useDeleteSource(): UseMutationResult<CommitOutcome, Error, { id: string }> {
-  const { tenant } = useSession();
-  const client = useQueryClient();
-  return useMutation({
-    mutationFn: async ({ id }) => {
-      // Unkeyed (#389): the contract does not declare `Idempotency-Key` on this route, and
-      // the fleet would ignore one — see `UNDECLARED` in features/writes/idempotency.ts.
-      const sent = await apiSend(
-        "DELETE",
-        `${API_PATHS.sources}/${encodeURIComponent(id)}`,
-        undefined,
-        { tenant },
-      );
-      const outcome = await settle(sent, { tenant });
-      if (outcome.kind === "failed") throw new Error(outcome.detail);
-      return outcome;
-    },
-    onSettled: () => client.invalidateQueries({ queryKey: ["sources"] }),
-  });
-}
-
-/**
- * What one pull reported: which ports it changed, which it looked at and left alone, and whether it
- * ran at all.
- *
- * Transcribed from `PullReport` in the OpenAPI document this change extends — NOT guessed. An
- * earlier draft invented `changedPorts`/`unchangedPorts`, which meant a pull that had just replaced
- * a port rendered as "no ports changed": the screen confidently reported the opposite of what
- * happened. The real shape is `changed` (the ports created, replaced or removed), with `unchanged`
- * and `skipped` as BOOLEANS that mean different things — `unchanged` wrote no log entry at all,
- * while `skipped` committed a decision not to apply a drifted source.
- *
- * Still read defensively, because a screen must not throw on a malformed body — but defensive is
- * not the same as speculative, and the field names come from the contract.
- */
-export type SourcePullReport = {
-  revision: number | null;
-  version: string | null;
-  changed: number[];
-  unchanged: boolean;
-  skipped: boolean;
-  /** Server-authored text about what the pull did NOT apply. Dropping it hides the caveat. */
-  warnings: string[];
-};
-
-function readPullReport(body: unknown): SourcePullReport {
-  const record = (body ?? {}) as Record<string, unknown>;
-  const strings = (value: unknown): string[] =>
-    Array.isArray(value) ? value.filter((entry): entry is string => typeof entry === "string") : [];
-  return {
-    revision: typeof record.revision === "number" ? record.revision : null,
-    version: typeof record.version === "string" ? record.version : null,
-    changed: Array.isArray(record.changed)
-      ? record.changed.filter((entry): entry is number => typeof entry === "number")
-      : [],
-    unchanged: record.unchanged === true,
-    skipped: record.skipped === true,
-    warnings: strings(record.warnings),
-  };
-}
-
-/**
- * Pull one source now — `POST /admin/sources/{id}/pull`.
- *
- * Returns the parsed report directly rather than a `CommitOutcome`: the whole point of "refresh
- * now" is to show the operator what the pull just did, so `applied()` is the right assertion here —
- * a report that has not landed yet is not a report, and a route that answered `202` for this would
- * be a contract this hook does not yet understand, not a case to quietly paper over.
- */
-export function usePullSource(): UseMutationResult<SourcePullReport, Error, { id: string }> {
-  const { tenant } = useSession();
-  const client = useQueryClient();
-  return useMutation({
-    mutationFn: async ({ id }) => {
-      // Unkeyed (#389): the contract does not declare `Idempotency-Key` on this route, and
-      // the fleet would ignore one — see `UNDECLARED` in features/writes/idempotency.ts.
-      const sent = await apiSend<unknown>(
-        "POST",
-        `${API_PATHS.sources}/${encodeURIComponent(id)}/pull`,
-        undefined,
-        { tenant },
-      );
-      return readPullReport(applied(sent));
-    },
-    onSettled: () => client.invalidateQueries({ queryKey: ["sources"] }),
   });
 }
 
@@ -947,8 +779,8 @@ export type FleetRequestRow = FleetRequestPage["requests"][number];
  * The fleet-wide request journal — one read (#362), not the N-way client fan-out it replaces.
  *
  * The admin front now does the merge itself: `GET /admin/requests` walks every imposter the
- * caller's tenant owns and hands back one ordered page, so this hook is a single `apiGet` in the
- * same shape as `useSources` — no `useQueries`, no per-port cap, no client-side union.
+ * caller's tenant owns and hands back one ordered page, so this hook is a single `apiGet` — no
+ * `useQueries`, no per-port cap, no client-side union.
  *
  * `coverage` is carried rather than dropped, same reasoning as `useImposters`' `partial`: the
  * server may cap how many imposters one page walks (`coverage.capped`/`coverage.omitted`), and a

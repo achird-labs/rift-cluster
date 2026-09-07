@@ -68,30 +68,10 @@ pub enum Action {
     /// log line (`as_str`) has to be able to say that is what happened rather
     /// than naming it as an ordinary read.
     ImposterTry,
-    SourceRead,
     VerifyRun,
     StreamSubscribe,
     TenantManage,
     ClusterAdmin,
-    /// List, read, or dry-run compile a spec (RFC-004 §4.3, issue #278) — landed with S2 because a
-    /// terminated route cannot ship without its action.
-    SpecRead,
-    /// Import (`PUT /specs/{id}`) or deploy a spec.
-    ///
-    /// Deploy additionally requires [`Action::ImposterWrite`] on the target port — checked in
-    /// `admin_front::terminate_spec_deploy`, not here, because the port lives in the request body
-    /// rather than the route. `SpecWrite` alone must not become a back door into imposter
-    /// mutation just because every role that holds it today also holds `ImposterWrite`.
-    SpecWrite,
-    /// `DELETE /specs/{id}`.
-    SpecDelete,
-    /// Read a dataset's listing, its version history, or its bytes (RFC-005 §5, #287).
-    DatasetRead,
-    /// Upload a new version of a dataset. Editor-tier: a new table of rows redefines what every
-    /// stub bound to that dataset answers.
-    DatasetWrite,
-    /// Delete a dataset. Editor-tier for the same reason, and refused outright while bound.
-    DatasetDelete,
 }
 
 impl Action {
@@ -100,7 +80,7 @@ impl Action {
     ///
     /// Kept beside the enum so the two cannot drift: `every_action_is_listed`
     /// fails if a variant is added without extending this.
-    pub const ALL: [Action; 26] = [
+    pub const ALL: [Action; 19] = [
         Action::ImposterRead,
         Action::ImposterWrite,
         Action::ImposterDelete,
@@ -116,17 +96,10 @@ impl Action {
         Action::FlowStateRead,
         Action::FlowStateClear,
         Action::ImposterTry,
-        Action::SourceRead,
         Action::VerifyRun,
         Action::StreamSubscribe,
         Action::TenantManage,
         Action::ClusterAdmin,
-        Action::SpecRead,
-        Action::SpecWrite,
-        Action::SpecDelete,
-        Action::DatasetRead,
-        Action::DatasetWrite,
-        Action::DatasetDelete,
     ];
 
     /// A stable string for refusals and logs.
@@ -148,20 +121,10 @@ impl Action {
             Action::FlowStateRead => "flowState.read",
             Action::FlowStateClear => "flowState.clear",
             Action::ImposterTry => "imposter.try",
-            Action::SourceRead => "source.read",
             Action::VerifyRun => "verify.run",
             Action::StreamSubscribe => "stream.subscribe",
             Action::TenantManage => "tenant.manage",
             Action::ClusterAdmin => "cluster.admin",
-            Action::SpecRead => "spec.read",
-            Action::SpecWrite => "spec.write",
-            Action::SpecDelete => "spec.delete",
-            // `write`, not `put`, and not by accident: every other resource's write action is
-            // `<resource>.write`. Issue #287's prose asks for `"dataset.put"`, which would make
-            // this the only action in the system spelled differently from its siblings.
-            Action::DatasetRead => "dataset.read",
-            Action::DatasetWrite => "dataset.write",
-            Action::DatasetDelete => "dataset.delete",
         }
     }
 }
@@ -188,21 +151,7 @@ pub fn role_allows(role: Role, action: Action) -> bool {
                 | Action::SavedRequestsRead
                 | Action::ScenarioRead
                 | Action::FlowStateRead
-                // A source declaration is config an imposter was built from,
-                // not a credential: `auth_ref` is a name (control.rs refuses
-                // URIs carrying secrets), so reading it sits with the other
-                // Viewer reads. *Writing* one is a different power and gets
-                // its own action when the write surface ships (#239 scoped
-                // reads only).
-                | Action::SourceRead
                 | Action::StreamSubscribe
-                // Reading a spec (listing, fetching, or dry-run compiling it) is the same power as
-                // reading the imposter it describes — a Viewer may see what a mock was built from.
-                | Action::SpecRead
-                // RFC-005 §5 (issue #287): a dataset is the table of rows a bound stub serves, so
-                // reading one is the same power as reading the stub it feeds, the content read
-                // included.
-                | Action::DatasetRead
         ),
         Role::Operator => {
             role_allows(Role::Viewer, action)
@@ -226,19 +175,6 @@ pub fn role_allows(role: Role, action: Action) -> bool {
                         | Action::SpaceStubWrite
                         | Action::ScenarioWrite
                         | Action::VerifyRun
-                        // RFC-004 §4.3 (issue #278): importing or deploying a spec redefines what
-                        // an imposter answers, which is the Operator/Editor line — and `SpecWrite`
-                        // alone must not be a back door into imposter mutation, so `deploy` also
-                        // requires `ImposterWrite` on the target port (checked in the front, not
-                        // here).
-                        | Action::SpecWrite
-                        | Action::SpecDelete
-                        // RFC-005 §5 (issue #287): a dataset is the table of rows a bound stub
-                        // serves, so replacing or removing one redefines what that stub answers —
-                        // the same Operator/Editor line `SpecWrite` sits on. Reading one is a
-                        // Viewer's business.
-                        | Action::DatasetWrite
-                        | Action::DatasetDelete
                 )
         }
         Role::TenantAdmin => {
@@ -368,10 +304,11 @@ mod tests {
     fn every_action_is_listed_in_all() {
         assert_eq!(
             Action::ALL.len(),
-            26,
-            "RFC-002 §4.1 defines 21 actions less `AuditRead` (removed by D-71, #546), RFC-004 \
-             §4.3 adds three (issue #278) and RFC-005 §5 adds three more (issue #287); ALL must \
-             carry every one"
+            19,
+            "RFC-002 §4.1 defines 21 actions less `AuditRead` (removed by D-71, #546) and less \
+             `SourceRead` (removed by D-72, #549); RFC-004 §4.3's three spec actions and RFC-005 \
+             §5's three dataset actions went with D-72 too — a compile is authorized as \
+             `imposter.write`. ALL must carry every one that is left"
         );
         let unique: std::collections::BTreeSet<_> = Action::ALL.iter().collect();
         assert_eq!(unique.len(), Action::ALL.len(), "ALL contains a duplicate");
@@ -381,15 +318,6 @@ mod tests {
             Action::ALL.len(),
             "two actions share a slug — a refusal could not tell them apart"
         );
-    }
-
-    /// The spec actions' slugs are part of the contract (#278): `role {r:?} does not grant
-    /// {slug}` refusals name them.
-    #[test]
-    fn spec_action_slugs_are_stable() {
-        assert_eq!(Action::SpecRead.as_str(), "spec.read");
-        assert_eq!(Action::SpecWrite.as_str(), "spec.write");
-        assert_eq!(Action::SpecDelete.as_str(), "spec.delete");
     }
 
     /// The whole of RFC-002 §4.2, asserted cell by cell.
@@ -404,9 +332,6 @@ mod tests {
             Action::SavedRequestsRead,
             Action::ScenarioRead,
             Action::FlowStateRead,
-            Action::SourceRead,
-            Action::SpecRead,
-            Action::DatasetRead,
             Action::StreamSubscribe,
         ];
         let operator_adds = [
@@ -424,14 +349,6 @@ mod tests {
             Action::SpaceStubWrite,
             Action::ScenarioWrite,
             Action::VerifyRun,
-            // RFC-004 §4.3 (issue #278): importing or deploying a spec redefines what an
-            // imposter answers, which is the Operator/Editor line — and `SpecWrite` alone
-            // must not be a back door into imposter mutation, so `deploy` also requires
-            // `ImposterWrite` on the target port (checked in the front, not here).
-            Action::SpecWrite,
-            Action::SpecDelete,
-            Action::DatasetWrite,
-            Action::DatasetDelete,
         ];
         let tenant_admin_adds = [Action::TenantManage];
 
@@ -676,47 +593,5 @@ mod tests {
         // In its own tenant it still behaves as the role says, which is the
         // conservative reading: the row is malformed, not a reason to panic.
         assert!(decide(&bogus, Action::ImposterWrite, &tenant("acme")).is_allowed());
-    }
-
-    /// The three dataset actions sit on the read/disturb/redefine ladder where #287 puts them.
-    ///
-    /// Asserted per-role rather than through the big matrix so the *reason* survives: a dataset is
-    /// a table of rows that stubs serve, so reading one is a Viewer's business, and replacing or
-    /// removing one redefines what every bound stub answers — an Editor's.
-    #[test]
-    fn a_viewer_reads_datasets_but_only_an_editor_redefines_them() {
-        assert!(role_allows(Role::Viewer, Action::DatasetRead));
-        assert!(!role_allows(Role::Viewer, Action::DatasetWrite));
-        assert!(!role_allows(Role::Viewer, Action::DatasetDelete));
-
-        for action in [
-            Action::DatasetRead,
-            Action::DatasetWrite,
-            Action::DatasetDelete,
-        ] {
-            assert!(role_allows(Role::Editor, action), "{action:?}");
-        }
-    }
-
-    /// The dataset actions' verbs match every other resource's: `write`, not `put`. Issue #287's
-    /// prose asks for `"dataset.put"`, which would be the only action in the system spelled
-    /// differently from its siblings (`spec.write`, `imposter.write`).
-    #[test]
-    fn dataset_action_strings_use_the_shared_verbs() {
-        assert_eq!(Action::DatasetRead.as_str(), "dataset.read");
-        assert_eq!(Action::DatasetWrite.as_str(), "dataset.write");
-        assert_eq!(Action::DatasetDelete.as_str(), "dataset.delete");
-    }
-
-    /// All three join `Action::ALL`, which is what makes the role matrix exhaustive.
-    #[test]
-    fn every_dataset_action_is_in_action_all() {
-        for action in [
-            Action::DatasetRead,
-            Action::DatasetWrite,
-            Action::DatasetDelete,
-        ] {
-            assert!(Action::ALL.contains(&action), "{action:?} missing from ALL");
-        }
     }
 }

@@ -152,10 +152,6 @@ export function ExportDialog({
               No flow state, no scenario positions, no recorded requests — those are runtime, and an
               import starts every flow at its initial state
             </Line>
-            <Line ok={false}>
-              No provenance: source ids and revisions are fleet-local, so an import arrives
-              hand-authored
-            </Line>
           </ul>
         </div>
 
