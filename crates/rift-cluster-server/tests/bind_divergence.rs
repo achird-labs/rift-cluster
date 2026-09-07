@@ -99,8 +99,8 @@ async fn squat(port: u16) -> tokio::net::TcpListener {
 
 /// Whether the node reports a local engine failure for `port`.
 ///
-/// Read off the node rather than scraped from `/metrics`: this is the exact state the
-/// `rift_cluster_bind_failures` gauge and the read-side header are both derived from, so asserting
+/// Read off the node rather than from `/_fleet/members`: this is the exact state the
+/// `bind_failures` field there and the read-side header are both derived from, so asserting
 /// it pins the cause instead of one of its two projections.
 fn reports_bind_failure(server: &ComposedServer, port: u16) -> bool {
     server

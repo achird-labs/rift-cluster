@@ -136,7 +136,7 @@ impl ClusterConfig {
     }
 
     /// Whether this node runs its cluster port without authentication.
-    /// Surfaced as `rift_cluster_insecure` so a fleet can be audited for it.
+    /// Logged loudly at startup so a fleet can be audited for it.
     #[must_use]
     pub fn is_insecure(&self) -> bool {
         self.enabled && self.secret.as_ref().is_none_or(|s| s.is_empty())

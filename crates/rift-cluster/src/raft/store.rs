@@ -6371,9 +6371,6 @@ impl RedbStateMachine {
             })
             .await;
         }
-        if self.engine.is_some() {
-            crate::metrics::observe_apply_failures(&self.apply_failures.lock());
-        }
     }
 
     /// One action against the engine / route table. Runs inside the caller's

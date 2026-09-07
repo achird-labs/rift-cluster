@@ -842,8 +842,8 @@ pub(crate) struct SinceReply {
     ///
     /// That is the honest answer, because the condition it reports is itself permanent: those
     /// entries are not late, they are gone. But it makes a restarted node a *sustained* source of
-    /// `Rift-Cluster-Partial`, which is not what `RiftJournalReadsDegraded`'s runbook used to
-    /// assume, and that alert's description was corrected alongside this change.
+    /// `Rift-Cluster-Partial` for as long as that port stays quiet, which a reader of the header
+    /// has to expect.
     #[serde(default)]
     pub asker_cached_min: u64,
 }
@@ -1647,7 +1647,6 @@ impl JournalNet {
                                     error = %e,
                                     "journal anti-entropy: bad reply"
                                 );
-                                crate::metrics::journal_peer_pull_failure(&peer.to_string());
                                 (peer, port, None)
                             }
                         },
@@ -1661,7 +1660,6 @@ impl JournalNet {
                                 error = %e,
                                 "journal anti-entropy: peer unreachable"
                             );
-                            crate::metrics::journal_peer_pull_failure(&peer.to_string());
                             (peer, port, None)
                         }
                     }
@@ -1727,7 +1725,6 @@ impl JournalNet {
                             port,
                             "journal anti-entropy: peer pull lost to budget"
                         );
-                        crate::metrics::journal_peer_pull_failure(&peer.to_string());
                         degraded.insert(port, true);
                     }
                 }
@@ -1745,7 +1742,7 @@ impl JournalNet {
     /// The front door's merge-on-read entry point (issue #223): freshen `port`'s slices from
     /// every other roster voter within `budget`, then run the pure [`merge_shards`] the 15 gate
     /// tests already prove convergent. This is the only place that calls it outside those tests
-    /// and the only place that records the observability they deliberately keep out of scope —
+    /// and the only place that records the accounting they deliberately keep out of scope —
     /// `merge_shards` stays a function of its inputs alone.
     #[must_use]
     pub async fn merge_read(&self, port: u16, budget: Duration) -> MergeOutcome {
@@ -1763,7 +1760,7 @@ impl JournalNet {
     /// The cursored form of [`Self::merge_read`] (issue #225): the same fleet-wide merge, resumed
     /// from a vector cursor and answering with the token that fetches the next page. See
     /// [`merge_shards_since`] for the walk's semantics — this adds the network fan-out and the
-    /// observability, exactly as [`Self::merge_read`] did before it.
+    /// accounting, exactly as [`Self::merge_read`] did before it.
     ///
     /// `cursor: None` is a **baseline** read, not a cursor at position zero; the difference is
     /// the truncation bit, and [`merge_shards_since`]'s doc says why.
@@ -1775,20 +1772,7 @@ impl JournalNet {
         budget: Duration,
     ) -> MergeSince {
         let partial = self.pull_since_budgeted(port, budget).await;
-        // Timed from *after* the fan-out, not around it (issue #319). The
-        // histogram's own registration calls this "an in-memory sort … not I/O"
-        // and sizes its buckets to top out at 0.5 s on that basis, but the timer
-        // started before `pull_since_budgeted` — a network phase bounded by a 2 s
-        // budget. So the metric contradicted both its doc and its buckets, and
-        // p95/p99 pinned flat at 0.5 s exactly when the fan-out was degrading,
-        // because `histogram_quantile` returns the highest finite bucket bound
-        // once a quantile lands in `+Inf`. The panel went blind at the moment it
-        // mattered. Measuring the fan-out against its budget is a real want, but
-        // it is a different series with different buckets — #228's C29 asks for
-        // exactly that, and reusing this one for it is what broke it.
-        let start = std::time::Instant::now();
         let page = merge_shards_since(&self.slices_for(port), partial, cursor);
-        crate::metrics::journal_merge_observed(start.elapsed());
         if page.partial {
             crate::metrics::journal_partial_read();
         }
@@ -1813,10 +1797,9 @@ impl JournalNet {
     ///   writer discovering the entries it lost, so here the answer really is short, and stays
     ///   short until the peers' caches evict that range.
     ///
-    /// Every failure is logged at `warn` with `peer`, `port` and the real `error`, and counted by
-    /// [`crate::metrics::journal_peer_pull_failure`] — issue #223 review, B5. Before this, the
-    /// `Err(_)` arms below discarded the error entirely, so the one path that produces a
-    /// user-visible `Rift-Cluster-Partial` produced no metric and no trail: an operator could not
+    /// Every failure is logged at `warn` with `peer`, `port` and the real `error` — issue #223
+    /// review, B5. Before this, the `Err(_)` arms below discarded the error entirely, so the one
+    /// path that produces a user-visible `Rift-Cluster-Partial` left no trail: an operator could not
     /// tell a partition (heals on its own) from a `SinceReply` decode failure (version skew,
     /// which will not) from a budget that is simply too small. The budget-expiry sweep at the end
     /// closes the same gap for a peer whose task was still outstanding when `timeout` fired —
@@ -1891,7 +1874,6 @@ impl JournalNet {
                     Ok((peer, Err(e))) => {
                         answered.insert(peer);
                         tracing::warn!(peer, port, error = %e, "journal merge-on-read: peer pull failed");
-                        crate::metrics::journal_peer_pull_failure(&peer.to_string());
                         partial = true;
                     }
                     Err(e) => {
@@ -1911,7 +1893,6 @@ impl JournalNet {
                     port,
                     "journal merge-on-read: peer pull lost to budget"
                 );
-                crate::metrics::journal_peer_pull_failure(&peer.to_string());
             }
         }
         partial
@@ -1929,9 +1910,8 @@ impl JournalNet {
     /// [`Self::merge_read`].
     ///
     /// Failure handling mirrors [`Self::pull_since_budgeted`] (issue #223 review, B5): every
-    /// `Err` is logged at `warn` with the real error and counted by
-    /// [`crate::metrics::journal_peer_pull_failure`], and a peer whose task was still
-    /// outstanding when `budget` expired is swept and counted the same way, not left silent just
+    /// `Err` is logged at `warn` with the real error, and a peer whose task was still
+    /// outstanding when `budget` expired is swept and logged the same way, not left silent just
     /// because it was aborted rather than errored.
     #[must_use]
     pub async fn fleet_counts(&self, ports: &[u16], budget: Duration) -> (HashMap<u16, u64>, bool) {
@@ -2023,7 +2003,6 @@ impl JournalNet {
                     Ok((peer, Err(e))) => {
                         answered.insert(peer);
                         tracing::warn!(peer, error = %e, "journal counts: peer pull failed");
-                        crate::metrics::journal_peer_pull_failure(&peer.to_string());
                         partial = true;
                     }
                     Err(e) => {
@@ -2039,7 +2018,6 @@ impl JournalNet {
             set.abort_all();
             for &peer in peers.iter().filter(|peer| !answered.contains(peer)) {
                 tracing::warn!(peer, "journal counts: peer pull lost to budget");
-                crate::metrics::journal_peer_pull_failure(&peer.to_string());
             }
         }
 

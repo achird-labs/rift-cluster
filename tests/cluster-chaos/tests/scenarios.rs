@@ -27,15 +27,16 @@ use cluster_chaos::{
     SEQUENCING_HOST_PORTS, SEQUENCING_IMPOSTER_PORT, SOURCES_CLUSTER_HOST_PORTS,
     SOURCES_ORIGIN_BASE_URL, TENANCY_A_HOST_PORTS, TENANCY_A_IMPOSTER_PORT, TENANCY_B_HOST_PORTS,
     TENANCY_B_IMPOSTER_PORT, TENANCY_FLEET_KEY, add_toxic, admin_as, admin_with_key, append_stub,
-    backend_failing_health_check, chaos_artifact, clear_toxics, cluster_config, cluster_imposters,
-    committed_config, config_revision, create_tenant, declare_source, exec_probe, get_data_plane,
-    get_data_plane_with, get_json, imposter_ports, metric, mint_principal, origin_publish,
-    origin_republish, origin_request_count, probe, provenance_of, published_host_ports,
-    pull_source, put_imposter, put_imposter_config, put_imposter_with_key, put_routes, put_stubs,
-    read_source, source_document, toxic_count, wait_admin_reachable, wait_admin_reachable_with_key,
-    wait_backend_ejected, wait_converged, wait_converged_on, wait_converged_with_key,
-    wait_origin_ready, wait_ports_free_in, wait_revisions_agree, wait_revisions_agree_on,
-    wait_single_leader, wait_sources_reachable, wait_voters,
+    backend_failing_health_check, chaos_artifact, claims_leadership, clear_toxics, cluster_config,
+    cluster_imposters, committed_config, config_revision, create_tenant, declare_source,
+    exec_probe, fleet_members, get_data_plane, get_data_plane_with, get_json, imposter_ports,
+    metric, mint_principal, origin_publish, origin_republish, origin_request_count, probe,
+    provenance_of, published_host_ports, pull_source, put_imposter, put_imposter_config,
+    put_imposter_with_key, put_routes, put_stubs, read_source, source_document, toxic_count,
+    voter_count, wait_admin_reachable, wait_admin_reachable_with_key, wait_backend_ejected,
+    wait_converged, wait_converged_on, wait_converged_with_key, wait_origin_ready,
+    wait_ports_free_in, wait_revisions_agree, wait_revisions_agree_on, wait_single_leader,
+    wait_single_leader_with_key, wait_sources_reachable, wait_voters,
 };
 
 /// The imposter port a scenario configures. Inside the container network
@@ -59,14 +60,13 @@ const C14_STORM_WRITES: u16 = 100;
 /// How long the fleet may take to accept writes again after its leader is
 /// killed — the operator-visible form of the issue's "new leader <= 3s".
 ///
-/// **Why this and not the leader gauge or `/_cluster/members`.** The gauge
-/// (`rift_cluster_members{state="leader"}`) is resampled on a ~5s timer and so
-/// cannot resolve a three-second bound at all; reading a quantity coarser than
-/// the bound is the mistake #94 fixed in C6. `GET /_cluster/members` *does*
-/// serve openraft's live metrics, but it rides the **cluster port** behind the
-/// HMAC credential (docs/rift-cluster-server.md, "These ride the cluster port"), so
-/// the harness cannot reach it. A write is what is left, and it is also what a
-/// client actually experiences.
+/// **Why this and not `/_fleet/members`.** The membership view is live and the
+/// harness reads it on the admin port (`fleet_members`), so it *could* time the
+/// election itself. But a node named `current_leader` there is not yet a leader
+/// that accepts writes — the barrier below is paid after the election — and a
+/// write is what a client actually experiences. (`GET /_cluster/members` rides
+/// the **cluster port** behind the HMAC credential — docs/rift-cluster-server.md,
+/// "These ride the cluster port" — so the harness never reads that one.)
 ///
 /// **Derived, and deliberately larger than 3s.** A post-kill write pays the
 /// election *and* the write barrier: with the default `ready-nodes` barrier the
@@ -124,9 +124,10 @@ const LADDER_BASE_PORT: u16 = 6200;
 /// toxics, not evidence of a fault. What separates correct from flapping is the
 /// rate.
 ///
-/// The leader gauge resamples on a ~5s timer, so the 60s window yields at most
-/// ~12 samples and therefore at most 11 observable transitions. A fleet
-/// re-electing continuously shows a different leader in nearly every sample --
+/// Leadership is sampled every [`C6_LEADER_SAMPLE_INTERVAL`] (~5 s), so the 60s
+/// window yields at most ~12 samples and therefore at most 11 observable
+/// transitions. A fleet re-electing continuously shows a different leader in
+/// nearly every sample --
 /// 8-11 -- while near-threshold elections under these toxics show 0-4. This
 /// bound is the top of the in-spec regime, which leaves it a wide margin below
 /// the flapping floor and none above: a 5th election in one window is treated
@@ -139,6 +140,16 @@ const LADDER_BASE_PORT: u16 = 6200;
 /// it is derived from are fixed in `raft/node.rs` rather than exposed as a
 /// `NodeConfig` knob — widening them so a count bound holds was the rejected fix.
 const C6_MAX_LEADER_TRANSITIONS: usize = 4;
+
+/// How often C6 samples who leads.
+///
+/// The retired `rift_cluster_members{state="leader"}` gauge was resampled on a
+/// ~5 s timer, and [`C6_MAX_LEADER_TRANSITIONS`] was derived from that
+/// resolution. The harness now reads `/_fleet/members`, which is live, so it
+/// imposes the same cadence itself — deliberately, so the derivation above
+/// still holds (D-42; #548). Sampling faster would count brief mid-election
+/// windows the gauge never saw, and would need the bound re-derived, not nudged.
+const C6_LEADER_SAMPLE_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Observed leadership transitions in a sequence of distinct leader samples.
 ///
@@ -154,7 +165,7 @@ fn leader_transitions(samples: &[usize]) -> usize {
 /// Runs in ordinary CI: C6 itself needs a container runtime, so without this
 /// the bound's arithmetic would only ever be exercised by the nightly tier.
 ///
-/// Pins D-42: the bound is a rate over the ~5 s gauge resolution — a fleet
+/// Pins D-42: the bound is a rate over the ~5 s leadership sampling interval — a fleet
 /// showing 0–4 transitions in the 60 s window (near-threshold elections under
 /// the toxics) passes, one showing a new leader in nearly every sample fails,
 /// and a count-of-zero assertion would reject the correct fleet.
@@ -956,7 +967,7 @@ async fn test_graceful_leave() {
     let cluster = Cluster::up().await.expect("fleet comes up");
     let survivors: Vec<_> = NODES.iter().filter(|n| n.name != "rift-3").collect();
 
-    wait_voters(&NODES[0], 3.0, CONVERGE_TIMEOUT)
+    wait_voters(&NODES[0], 3, CONVERGE_TIMEOUT)
         .await
         .expect("three voters before the leave, or the assertion after proves nothing");
 
@@ -1009,7 +1020,7 @@ async fn test_graceful_leave() {
     tokio::time::sleep(Duration::from_millis(600)).await;
     cluster.stop("rift-3").expect("SIGTERM rift-3");
 
-    wait_voters(&NODES[0], 2.0, CONVERGE_TIMEOUT)
+    wait_voters(&NODES[0], 2, CONVERGE_TIMEOUT)
         .await
         .expect("a graceful leave must shrink the voter set the survivors see");
 
@@ -1345,7 +1356,7 @@ async fn c5_rolling_restart_never_stops_accepting_writes() {
             .await
             .unwrap_or_else(|e| panic!("{} did not rejoin after its roll: {e}", rolled.name));
 
-        wait_voters(other, 3.0, CONVERGE_TIMEOUT)
+        wait_voters(other, 3, CONVERGE_TIMEOUT)
             .await
             .unwrap_or_else(|e| panic!("voter set did not recover after {}: {e}", rolled.name));
     }
@@ -1401,7 +1412,7 @@ async fn whole_fleet_sigterm_then_cold_start_converges() {
         .expect("the whole fleet must come back after a graceful stop");
 
     for node in &NODES {
-        wait_voters(node, 3.0, CONVERGE_TIMEOUT)
+        wait_voters(node, 3, CONVERGE_TIMEOUT)
             .await
             .unwrap_or_else(|e| panic!("{} did not converge on 3 voters: {e}", node.name));
     }
@@ -1633,37 +1644,46 @@ async fn c6_loss_and_jitter_do_not_flap_or_lose_writes() {
     let window = Duration::from_secs(60);
     let started = std::time::Instant::now();
     let mut next_write = std::time::Instant::now();
+    let mut next_leader_sample = std::time::Instant::now();
     let mut leader_samples: Vec<usize> = Vec::new();
 
     while started.elapsed() < window {
+        let mut bodies = Vec::with_capacity(NODES.len());
         for node in &NODES {
-            let voters = metric(node.metrics, r#"rift_cluster_members{state="voter"}"#)
+            // The toxics sit on the cluster links; this read reaches the admin port
+            // from the host, so a failure here is a harness fault, not the product's.
+            let body = fleet_members(node.admin, None)
                 .await
-                .unwrap_or(f64::NAN);
+                .unwrap_or_else(|e| panic!("{}: /_fleet/members did not answer: {e}", node.name));
+            let voters = voter_count(&body);
             assert_eq!(
-                voters, 3.0,
-                "{} saw the voter set change to {voters} under load -- membership \
+                voters,
+                Some(3),
+                "{} saw the voter set change to {voters:?} under load -- membership \
                  must not flap just because links are slow",
                 node.name
             );
+            bodies.push(body);
         }
 
-        // Who currently claims leadership. The gauge is resampled on a 5s timer,
-        // so this bounds resolution rather than catching every transition; it is
-        // enough to catch a fleet that is re-electing continuously.
-        let mut leaders = Vec::new();
-        for (i, node) in NODES.iter().enumerate() {
-            if metric(node.metrics, r#"rift_cluster_members{state="leader"}"#)
-                .await
-                .is_ok_and(|v| v == 1.0)
+        // Who currently claims leadership, sampled every C6_LEADER_SAMPLE_INTERVAL
+        // rather than on every pass: `/_fleet/members` is live, and the bound
+        // below was derived for ~5 s resolution (D-42). This bounds resolution
+        // rather than catching every transition; it is enough to catch a fleet
+        // that is re-electing continuously.
+        if std::time::Instant::now() >= next_leader_sample {
+            let leaders: Vec<usize> = bodies
+                .iter()
+                .enumerate()
+                .filter(|(_, body)| claims_leadership(body))
+                .map(|(i, _)| i)
+                .collect();
+            if let [only] = leaders[..]
+                && leader_samples.last() != Some(&only)
             {
-                leaders.push(i);
+                leader_samples.push(only);
             }
-        }
-        if let [only] = leaders[..]
-            && leader_samples.last() != Some(&only)
-        {
-            leader_samples.push(only);
+            next_leader_sample = std::time::Instant::now() + C6_LEADER_SAMPLE_INTERVAL;
         }
 
         if std::time::Instant::now() >= next_write {
@@ -1899,17 +1919,24 @@ async fn test_reconcile_preserves_state() {
     );
 
     for node in &NODES {
-        // `unwrap_or(0.0)` is correct here and must stay — unlike the `intents_pending` check
-        // above, which reads an unlabelled `Gauge` that is always emitted. `bind_failures` is a
-        // `GaugeVec{port}`, and `observe_apply_failures` `reset()`s it before setting the failing
-        // ports, so a healthy node publishes **no series at all** for `port="0"` and `metric()`
-        // reports the family as absent. Absence is the domain-optional "no failures" answer, not a
-        // swallowed error. (Treating it as one was tried, and turned this into a hard failure on a
-        // perfectly healthy fleet.)
-        let failures = metric(node.metrics, r#"rift_cluster_bind_failures{port="0"}"#)
+        // Read off `bind_failures` on `/_fleet/members` (#369): this node's own map of
+        // port → reason, `{}` on a healthy node. Absence is still the "no failures" answer,
+        // as it was when this read a `GaugeVec` that published no series for a healthy
+        // port: the field is `null` when the node's bind status could not be determined at
+        // all (`bind_status_unavailable`), which is not a bind failure and not what this
+        // scenario is about, so only a non-empty map fails it. The read itself failing is
+        // a harness fault, never a clean pass.
+        let body = fleet_members(node.admin, None)
             .await
-            .unwrap_or(0.0);
-        assert_eq!(failures, 0.0, "{} reported a bind failure", node.name);
+            .unwrap_or_else(|e| panic!("{}: /_fleet/members did not answer: {e}", node.name));
+        assert!(
+            body["bind_failures"]
+                .as_object()
+                .is_none_or(serde_json::Map::is_empty),
+            "{} reported a bind failure: {}",
+            node.name,
+            body["bind_failures"]
+        );
     }
     drop(cluster);
 }
@@ -2937,10 +2964,10 @@ async fn wait_container_healthy(name: &str, timeout: Duration) -> anyhow::Result
 /// convergence of the *config*, not of the bind.
 ///
 /// The bind failure is still reported, not hidden: rift-2's own
-/// `rift_cluster_bind_failures` gauge for this port is checked before the
-/// dividend, so a scenario run against a node that silently stopped reporting
-/// degraded state would fail here rather than being masked by the dispatch
-/// passing anyway.
+/// `bind_failures` on `/_fleet/members` (#369) must name this port before the
+/// dividend is checked, so a scenario run against a node that silently stopped
+/// reporting degraded state would fail here rather than being masked by the
+/// dispatch passing anyway.
 ///
 /// Two dispatch checks, not one, because divergence is the claim: rift-2 (the
 /// squatted node, `FRONT_DOOR_HOST_PORTS[1]`) must serve the imposter
@@ -2988,21 +3015,19 @@ async fn c19_front_door_routes_around_bind_divergence() {
     // single-shot timing assertions are its main flake source. A bounded poll asserts the same
     // thing without pinning the order of two events nothing guarantees the order of.
     //
-    // A scrape error is distinguished from a genuine `0`: collapsing both into `0.0` would let a
-    // fleet that never exposed the gauge at all fail with "did not report the bind failure", which
-    // sends the next reader looking in the wrong place.
-    // Polled, not read once. `wait_converged` proves the *config* reached every node's map, which
-    // is a different event from the local apply having recorded its bind outcome, and this tier's
-    // single-shot timing assertions are its main flake source.
-    //
-    // An absent family counts as "not yet", not as an error: `bind_failures` is a `GaugeVec{port}`
-    // that `observe_apply_failures` `reset()`s, so before the failure is recorded this series does
-    // not exist at all. Failing on absence would abort the poll on exactly the state it is waiting
-    // to leave.
+    // An absent entry counts as "not yet", not as an error: `bind_failures` on `/_fleet/members`
+    // is this node's live map of failing ports (#369), so before the failure is recorded the port
+    // is simply not in it. Failing on absence would abort the poll on exactly the state it is
+    // waiting to leave. A read that errors is retried the same way — the deadline is what turns a
+    // node that never answers into a failure, and its message names the port it waited for.
     let deadline = std::time::Instant::now() + CONVERGE_TIMEOUT;
-    let family = format!(r#"rift_cluster_bind_failures{{port="{C19_IMPOSTER_PORT}"}}"#);
+    let squatted = C19_IMPOSTER_PORT.to_string();
     loop {
-        if metric(NODES[1].metrics, &family).await.unwrap_or(0.0) == 1.0 {
+        if fleet_members(NODES[1].admin, None).await.is_ok_and(|body| {
+            body["bind_failures"]
+                .get(&squatted)
+                .is_some_and(|r| !r.is_null())
+        }) {
             break;
         }
         assert!(
@@ -3324,7 +3349,7 @@ const C21_MAX_FETCHES: u64 = 12;
 /// `rift_cluster_source_polls_total` is asserted alongside the origin's counter
 /// on purpose: only the leader increments it, so the fleet-wide sum is an
 /// independent second opinion on the same claim, read from the product's own
-/// observability rather than from the thing being polled.
+/// instrumentation rather than from the thing being polled.
 ///
 /// Mutation: deleting the `if !is_leader { … }` arm from
 /// `SourceScheduler::supervise` (`crates/rift-cluster/src/sources/scheduler.rs`),
@@ -3503,8 +3528,8 @@ async fn c21_fleet_poll_count() -> u64 {
 /// Poll until exactly one of the *surviving* nodes reports itself leader.
 ///
 /// [`wait_single_leader`] cannot serve here: it reads all three nodes, and the
-/// killed one stops answering rather than reporting zero, so the scenario would
-/// be waiting on a metrics endpoint that is gone.
+/// killed one stops answering rather than reporting `is_leader: false`, so the
+/// scenario would be waiting on an admin port that is gone.
 async fn c21_wait_surviving_leader(dead: usize) -> usize {
     let deadline = std::time::Instant::now() + Duration::from_secs(60);
     loop {
@@ -3513,9 +3538,9 @@ async fn c21_wait_surviving_leader(dead: usize) -> usize {
             if i == dead {
                 continue;
             }
-            if metric(node.metrics, r#"rift_cluster_members{state="leader"}"#)
+            if fleet_members(node.admin, None)
                 .await
-                .is_ok_and(|v| v == 1.0)
+                .is_ok_and(|body| claims_leadership(&body))
             {
                 leaders.push(i);
             }
@@ -4189,7 +4214,7 @@ async fn c24_rbac_enforcement_is_identical_through_any_node() {
     let _cluster = Cluster::up_with_overlays(&["tenancy.overlay.yml"])
         .await
         .expect("fleet comes up");
-    wait_single_leader(CONVERGE_TIMEOUT)
+    wait_single_leader_with_key(CONVERGE_TIMEOUT, Some(TENANCY_FLEET_KEY))
         .await
         .expect("a leader settles");
 
@@ -4352,7 +4377,7 @@ async fn c25_key_revocation_survives_a_partition() {
     let cluster = Cluster::up_with_overlays(&["chaos.overlay.yml", "tenancy.overlay.yml"])
         .await
         .expect("fleet comes up");
-    let leader = wait_single_leader(CONVERGE_TIMEOUT)
+    let leader = wait_single_leader_with_key(CONVERGE_TIMEOUT, Some(TENANCY_FLEET_KEY))
         .await
         .expect("a leader settles");
 
@@ -4564,7 +4589,7 @@ async fn c26_audit_chain_survives_a_full_cluster_restart() {
     ])
     .await
     .expect("fleet comes up");
-    let leader = wait_single_leader(CONVERGE_TIMEOUT)
+    let leader = wait_single_leader_with_key(CONVERGE_TIMEOUT, Some(TENANCY_FLEET_KEY))
         .await
         .expect("a leader settles");
 
@@ -4876,7 +4901,7 @@ async fn c27_tenancy_isolates_ownership_but_not_the_data_plane() {
     let _cluster = Cluster::up_with_overlays(&["tenancy.overlay.yml"])
         .await
         .expect("fleet comes up");
-    wait_single_leader(CONVERGE_TIMEOUT)
+    wait_single_leader_with_key(CONVERGE_TIMEOUT, Some(TENANCY_FLEET_KEY))
         .await
         .expect("a leader settles");
 
@@ -5408,7 +5433,7 @@ async fn c28_fleet_journal_is_exact_under_node_kill() {
     // came back, which the volatility contract says they do not.
     cluster.start(victim.name).expect("restart the victim");
     for node in &NODES {
-        wait_voters(node, 3.0, CONVERGE_TIMEOUT)
+        wait_voters(node, 3, CONVERGE_TIMEOUT)
             .await
             .unwrap_or_else(|e| panic!("{} did not reconverge on 3 voters: {e}", node.name));
     }
@@ -6080,7 +6105,7 @@ async fn c10_proxy_once_survives_owner_and_leader_kills() {
             .start(NODES[victim_index].name)
             .unwrap_or_else(|e| panic!("restart the {phase} victim: {e}"));
         for node in &NODES {
-            wait_voters(node, 3.0, CONVERGE_TIMEOUT)
+            wait_voters(node, 3, CONVERGE_TIMEOUT)
                 .await
                 .unwrap_or_else(|e| panic!("{} did not reconverge: {e}", node.name));
         }
@@ -6421,7 +6446,7 @@ async fn c30_vector_cursor_walk_survives_membership_change() {
         .start(NODES[victim_index].name)
         .expect("restart the victim");
     for node in &NODES {
-        wait_voters(node, 3.0, CONVERGE_TIMEOUT)
+        wait_voters(node, 3, CONVERGE_TIMEOUT)
             .await
             .unwrap_or_else(|e| panic!("{} did not reconverge: {e}", node.name));
     }
@@ -6640,7 +6665,7 @@ async fn c29_partial_reads_answer_within_budget_and_count_themselves() {
     // Heal and re-assert the standing gate: stamp gone, sets identical.
     cluster.heal(minority).expect("heal the partition");
     for node in &NODES {
-        wait_voters(node, 3.0, CONVERGE_TIMEOUT)
+        wait_voters(node, 3, CONVERGE_TIMEOUT)
             .await
             .unwrap_or_else(|e| panic!("{} did not reconverge on 3 voters: {e}", node.name));
     }
@@ -6670,45 +6695,6 @@ async fn c29_partial_reads_answer_within_budget_and_count_themselves() {
         );
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
-}
-
-/// The observability runtime lane's assertions are opt-in, and the opt-in is a
-/// single workflow line (issue #316).
-///
-/// `verify.sh` gates its Prometheus and Grafana assertions on
-/// `[ "${RIFT_OBSERVABILITY:-0}" = "1" ]` and otherwise runs the plain 3-node
-/// smoke and exits 0. So dropping that `env:` line — or typo'ing the value to
-/// `"true"` — leaves a job that still passes, on the same PRs, having asserted
-/// nothing about Prometheus or Grafana. That is precisely the fail-green shape
-/// #316 was filed to remove, relocated from "the script is never invoked" to
-/// "the script is invoked with its assertions switched off", and nothing else
-/// in the tree would notice.
-///
-/// Pinned the same way `the_chaos_runner_expands_skips_as_an_array` pins the
-/// chaos runner: read the workflow text and assert the load-bearing literal.
-#[test]
-fn the_observability_runtime_lane_actually_enables_its_assertions() {
-    let ci = read_workflow("ci.yml");
-    let job = ci
-        .split("observability-runtime:")
-        .nth(1)
-        .expect("ci.yml has no observability-runtime job");
-
-    assert!(
-        job.contains("deploy/compose/verify.sh"),
-        "the lane must invoke verify.sh — it is where the runtime assertions live"
-    );
-    assert!(
-        job.contains(r#"RIFT_OBSERVABILITY: "1""#),
-        "verify.sh checks `${{RIFT_OBSERVABILITY:-0}} = 1`; without exactly that \
-         value the lane runs the plain smoke and asserts nothing about \
-         Prometheus or Grafana while still going green"
-    );
-    assert!(
-        job.contains("--job observability"),
-        "the lane must use its own watched set; defaulting to cluster-smoke's \
-         would run it on every cluster source change"
-    );
 }
 
 /// The sequencing imposter C33 drives: three responses, cycled fleet-wide.

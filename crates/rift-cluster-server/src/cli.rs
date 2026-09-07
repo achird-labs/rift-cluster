@@ -64,8 +64,8 @@ pub struct ClusterArgs {
     )]
     pub cluster_secret_file: Option<PathBuf>,
 
-    /// Run the cluster port unauthenticated (requires no secret; audited as
-    /// rift_cluster_insecure)
+    /// Run the cluster port unauthenticated (requires no secret; logged loudly
+    /// at startup so a fleet can be audited for it)
     #[arg(long, env = "RIFT_CLUSTER_INSECURE")]
     pub cluster_insecure: bool,
 

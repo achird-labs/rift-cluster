@@ -113,9 +113,9 @@ const ISOLATION_WINDOW_MS: u64 = 3 * ELECTION_TIMEOUT_MAX_MS;
 /// - **Someone else leads** → not isolated. Hearing another node's leadership *is* the evidence of
 ///   contact with the quorum.
 ///
-/// Extracted from [`RaftNode::is_isolated`] by #470: the condition became observable
-/// (`rift_cluster_isolated`) at the same time it was already load-bearing for D-17 and D-40, and
-/// two readings of one safety rule is one more than a rule can safely have.
+/// Extracted from [`RaftNode::is_isolated`] by #470: the condition became observable (the
+/// `isolated` field of `/_cluster/status`) at the same time it was already load-bearing for
+/// D-17 and D-40, and two readings of one safety rule is one more than a rule can safely have.
 #[must_use]
 fn isolated_from(
     me: NodeId,
@@ -315,9 +315,9 @@ pub struct StatusReport {
     /// the isolated-owner rule (RFC-001 §7.2), the same condition [`RaftNode::is_isolated`]
     /// enforces, via the same [`isolated_from`].
     ///
-    /// Carried on the report rather than left to a second `is_isolated()` call so that the gauge
-    /// (`rift_cluster_isolated`, #470) and the `/_cluster/status` field describe *one* sample. Two
-    /// calls a few microseconds apart can straddle an election and disagree, which on a
+    /// Carried on the report rather than left to a second `is_isolated()` call so that every
+    /// reader of one report — `/_cluster/status`, `/_cluster/health` (#470) — describes *one*
+    /// sample. Two calls a few microseconds apart can straddle an election and disagree, which on a
     /// safety-critical condition is the one thing an operator must not be shown.
     pub isolated: bool,
 }
@@ -1101,7 +1101,7 @@ impl RaftNode {
                 tracing::warn!(
                     node_id = config.node_id,
                     bind = %config.bind,
-                    rift_cluster_insecure = true,
+                    insecure = true,
                     "cluster port started WITHOUT authentication (no secret)"
                 );
                 (None, None)
@@ -2030,7 +2030,6 @@ impl RaftNode {
             let Some(addr) = next.take() else { break };
             let body = serde_json::to_vec(&request)
                 .map_err(|e| NodeError::Write(format!("encode forwarded write: {e}")))?;
-            crate::metrics::write_forwarded();
             match self.call_any(&addr, "POST", CLUSTER_WRITE_PATH, body).await {
                 Ok(reply) => {
                     let reply: WriteReply = serde_json::from_slice(&reply)
@@ -2197,7 +2196,6 @@ impl RaftNode {
                 pending.remove(&id);
             }
             if pending.is_empty() || tokio::time::Instant::now() >= deadline {
-                crate::metrics::barrier_observed(pending.len());
                 return pending.into_keys().collect();
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
@@ -3085,14 +3083,7 @@ where
     Fut: Future<Output = Result<T, RpcError>>,
 {
     let mut target = seed.to_owned();
-    for attempt in 0..max_attempts {
-        // Counted here rather than where the hint arrives: the last hint of an
-        // exhausted chase is never acted on, and a counter of "joins forwarded"
-        // that includes a forward that never happened is a lie an operator
-        // would read as one more round trip than the fleet actually made.
-        if attempt > 0 {
-            crate::metrics::join_forwarded();
-        }
+    for _ in 0..max_attempts {
         let error = match send(target.clone()).await {
             Ok(value) => return Ok(value),
             Err(error) => error,
@@ -5441,8 +5432,8 @@ mod tests {
     // `is_isolated` reads a live metrics watch, so before #470 the rule could only be
     // exercised by standing a cluster up and partitioning it — which is why the arm that
     // matters most (a leader with *no* quorum ack yet) had no direct test at all. The rule is
-    // now a pure function of its three inputs, so every arm is reachable, and the gauge
-    // `rift_cluster_isolated` reports the same function these pin.
+    // now a pure function of its three inputs, so every arm is reachable, and the `isolated`
+    // field of `/_cluster/health` reports the same function these pin.
 
     const ME: NodeId = 1;
     const OTHER: NodeId = 2;

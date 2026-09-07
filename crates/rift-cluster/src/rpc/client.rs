@@ -17,7 +17,6 @@ use super::AuthError;
 use super::auth::{AUTH_HEADER, SignedRequest, Signer};
 use super::routes::{PROTO_HEADER, PROTO_VERSION};
 use super::{DEFAULT_CONNECT_TIMEOUT, DEFAULT_REQUEST_TIMEOUT, RpcError};
-use crate::metrics;
 
 /// Locally observed peer liveness.
 ///
@@ -347,9 +346,7 @@ impl RpcClient {
         if !self.health.is_healthy(peer) {
             // Fast-fail: resolve now rather than parking the caller for the
             // full deadline against a peer the local view already knows is gone.
-            let err = RpcError::Transport(format!("peer {peer} is not healthy"));
-            metrics::rpc_failure(err.reason());
-            return Err(err);
+            return Err(RpcError::Transport(format!("peer {peer} is not healthy")));
         }
 
         let mut attempt = 0;
@@ -384,7 +381,6 @@ impl RpcClient {
                     if e.is_liveness_failure() {
                         self.health.record_failure(peer);
                     }
-                    metrics::rpc_failure(e.reason());
                     return Err(e);
                 }
             }
@@ -445,9 +441,7 @@ impl RpcClient {
         deadline: Duration,
     ) -> Result<Vec<u8>, RpcError> {
         if !self.health.is_healthy(peer) {
-            let err = RpcError::Transport(format!("peer {peer} is not healthy"));
-            metrics::rpc_failure(err.reason());
-            return Err(err);
+            return Err(RpcError::Transport(format!("peer {peer} is not healthy")));
         }
 
         // `deadline` twice, deliberately: `attempt` applies it to the request
@@ -498,7 +492,6 @@ impl RpcClient {
         if err.is_liveness_failure() && !matches!(err, RpcError::Timeout) {
             self.health.record_failure(peer);
         }
-        metrics::rpc_failure(err.reason());
     }
 
     /// One request/response exchange, bounded by `deadline`.

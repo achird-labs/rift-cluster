@@ -25,8 +25,8 @@ curl -sSLO https://raw.githubusercontent.com/achird-labs/rift-cluster/master/dep
 docker compose -f cluster.yml up -d
 
 curl -s localhost:12526/readyz     # rift-1 probes
-curl -s localhost:12525/imposters  # rift-1 admin API
-curl -s localhost:19090/metrics | grep rift_cluster
+curl -s localhost:12525/imposters       # rift-1 admin API
+curl -s localhost:12525/_fleet/members  # voters, leader, this node's bind failures
 open http://localhost:12525/console
 ```
 
@@ -112,10 +112,12 @@ deploy/compose/verify.sh          # the built-from-source variant
 ```
 
 Builds the image, starts three nodes, and asserts: all three report `/readyz`
-200; the cluster has **three voters and exactly one leader** (read from
-`rift_cluster_members`, so a split brain fails the check rather than passing as
-"three healthy nodes"); the admin API answers on every node; and the image
-reports its own identity, including the embedded upstream Rift.
+200; the cluster has **three voters and one agreed leader** (read from `GET
+/_fleet/members` on each node's admin port — a split brain fails the check rather
+than passing as "three healthy nodes", because two nodes naming different leaders
+never agree); the admin API answers on every node; the console SPA shell is
+served on every node; and the image reports its own identity, including the
+embedded upstream Rift.
 
 ```sh
 deploy/compose/smoke.sh                   # the core smoke check (RFC-007 §5)
@@ -155,8 +157,8 @@ proof, and it splits in two because the halves can run in different places:
   with it, and the file cannot age into naming a release nobody can pull.
 - The full run needs a published image, so its only honest home is the **release
   lane**, after the tag is pushed (`release.yml`, job `image-manifest`). It pulls
-  and asserts readiness on all three, three voters and exactly one leader from
-  `rift_cluster_members`, and the console SPA shell on every node — against the
+  and asserts readiness on all three, three voters and one agreed leader from
+  `GET /_fleet/members`, and the console SPA shell on every node — against the
   artifact users will actually get. On a real release it runs with no version
   override at all, so the pin *in the file* is the thing under test; only a
   prerelease, whose tag legitimately cannot match the pin, passes one in.

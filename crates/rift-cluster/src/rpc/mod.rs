@@ -107,7 +107,7 @@ pub enum RpcError {
 }
 
 impl RpcError {
-    /// Stable label for `rift_cluster_rpc_failures_total{reason}`.
+    /// Stable machine-readable label for this error, carried as `error` in the RPC error body.
     #[must_use]
     pub fn reason(&self) -> &'static str {
         match self {

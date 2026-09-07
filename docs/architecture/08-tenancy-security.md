@@ -757,8 +757,8 @@ pulls) shares one model:
   `X-Rift-Cluster-Auth: t=<ts>,n=<nonce>,mac=HMAC-SHA256(secret, ts‖nonce‖method‖path‖body)`,
   ±30 s skew window, bounded nonce cache that **fails closed** on overflow.
   Startup refuses clustering without a secret unless `--cluster-insecure` is
-  passed, which logs loudly and sets a metric (`rift_cluster_insecure 1`) so a
-  fleet can be audited for it.
+  passed, which logs loudly at startup (`cluster port started WITHOUT
+  authentication`, with `insecure = true`) so a fleet can be audited for it.
 - **Integrity and authenticity, not confidentiality** — the threat model is
   "no unauthenticated peer joins or injects ops", with confidentiality
   delegated to network isolation (VPC/namespace/WireGuard). mTLS between nodes

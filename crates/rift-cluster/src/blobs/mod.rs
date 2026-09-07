@@ -887,7 +887,7 @@ impl BlobStore {
             }
             Err(e) => return Err(e.into()),
         };
-        // A watermark that will not parse is pure observability data, not
+        // A watermark that will not parse is pure reporting data, not
         // authority: failing here would make every future sweep on this node
         // return an error and reclaim nothing, so a corrupt counter file would
         // cost the disk it was meant to help account for. Loud, and recovered
@@ -2171,7 +2171,7 @@ mod tests {
 
     #[test]
     fn a_corrupt_watermark_does_not_wedge_gc_forever() {
-        // The watermark is observability data. If an unparseable one made every
+        // The watermark is reporting data. If an unparseable one made every
         // future sweep return an error, a corrupt counter file would cost the
         // disk it exists to account for.
         let (store, _dir) = store();

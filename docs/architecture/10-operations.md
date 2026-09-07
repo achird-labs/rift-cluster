@@ -1,6 +1,6 @@
 # Chapter 10 — Operations
 
-Running the cluster: bootstrap, Kubernetes, probes, observability, upgrades,
+Running the cluster: bootstrap, Kubernetes, probes, diagnostics, upgrades,
 backups, and sizing. The operator experience is a design goal, not an
 afterthought — the target user runs ephemeral CI fleets and perimeter-bound
 on-prem environments, usually without a dedicated platform team.
@@ -81,7 +81,7 @@ flowchart TB
 - Cluster port stays ClusterIP-internal; secret via K8s Secret →
   `--cluster-secret-file`.
 
-## Observability
+## Diagnostics and metrics
 
 **Endpoints** (cluster port, authenticated; probes excepted):
 
@@ -96,63 +96,55 @@ flowchart TB
 | `GET /_cluster/health` | rolled-up diagnostics — including `blob_fetch_stall`, non-`null` while this node's apply is parked on a sideloaded blob it cannot fetch from any member (#439). Since **D-51** (#486) a member can also serve a referenced blob out of applied state, so a stall now means the blob is referenced by *this* node's parked entry and by no live state anywhere — in practice a digest whose own delete sits behind the parked entry (#480). The fleet projection `GET /_fleet/health` adds `blob_fetch_stalls_fleet`, one row per stalled voter. A stall is *degraded*, not *not-ready*: the node stays in the load balancer and self-heals when a holder returns, but every committed write behind the parked entry is unapplied on that node until it does |
 | `GET /_cluster/route-hits` | this node's per-route dispatch counts, in memory since process start — the node-local input the admin port's `GET /front-door/route-hits` sums across the fleet |
 
-**Metrics that page** (Prometheus, served by the standard metrics port).
+**Metrics** (Prometheus, served by the standard metrics port).
 
-This list mixes families that exist today with families that were designed here
-and never registered. The distinction is not pedantry: an alert rule naming an
-unregistered family is not a loud failure but a silent one — the expression
-evaluates to no data forever, so the alert never fires and reads as health. The
-shipped alert pack in `deploy/observability/` therefore references only the
-first group, and `scripts/check-observability-families.sh` enforces that.
+> **Retired by D-71** (RFC-007 §3.2, #548): the operator observability pack —
+> `deploy/observability/`'s Grafana dashboards, the Prometheus recording and alert
+> rules and their `promtool` tests, the compose overlay, and the CI lanes that
+> checked them — is removed, along with every `rift_cluster_*` family nothing read
+> but a dashboard. Nothing below pages: no alert rule ships with this repository.
 
-*Registered, and alerted on by the shipped pack:*
-`rift_cluster_intents_pending` (stuck > minutes = quorum loss),
-`rift_cluster_insecure` (should be 0 everywhere, forever),
-`rift_cluster_members{state}`, `rift_cluster_barrier_timeouts_total`,
-`rift_cluster_bind_failures`, `rift_cluster_no_principals`, the
-`rift_cluster_audit_export_*` family, and
-`rift_cluster_source_scheduler_read_failures_total` /
-`rift_cluster_source_scheduler_corrupt_rows`.
+What is left is **correctness instrumentation**, not an operator product. Each
+surviving family is read by a chaos scenario or an in-process test to pin a claim
+no state endpoint can answer — a *count of things that happened* has no state
+equivalent — and the authoritative list, with its reader beside each entry, is the
+module doc of `crates/rift-cluster/src/metrics.rs`. It is served on the standard
+metrics port because that is where the tests already read it.
 
-*Registered by #470, alert threshold still to be chosen:*
-`rift_cluster_proxy_claims_total{outcome="refused"}` is the proxyOnce reading of the
-same condition: a claim the cluster could not serialize, answered `503` and **not**
-forwarded to the upstream (D-66). Unlike the gauge it is a counter of *refused
-requests*, so it measures the blast radius of a partition on proxy traffic rather
-than its duration.
+**Membership, leadership and bind state come from `GET /_fleet/members`**, not from
+metrics. A voter list and an agreed `current_leader` are stronger facts than the
+`rift_cluster_members{state}` gauges that used to sum to them, and they are read off
+the node's Raft state at request time rather than resampled on a 5 s timer, so there
+is no sampler to race. `bind_failures` on the same body is the per-port successor to
+the bind-failure gauge (#369). `deploy/compose/verify.sh`, `deploy/compose/smoke.sh`
+and the chaos harness all assert on that view.
 
-`rift_cluster_isolated` (gauge, `1` while this node cannot see the quorum and is
-refusing owner-side operations — proxyOnce claims under D-40, flow-KV owner
-writes and strong reads under D-17). This is the *condition*, not a symptom, and
-it is deliberately the thing to alert on: the symptom counters are incomplete by
-design (`rift_cluster_cas_conflicts_total{reason="isolated"}` counts write
-refusals only, so a read-heavy workload can trip the rule continuously and move
-nothing). `isolated == 1 for 2m` is the obvious rule — longer than an election,
-short enough to catch a real partition — but a threshold shipped without being
-tried against a real fleet's election noise is a page nobody trusts, so the
-choice is left explicit rather than guessed. Note the gauge publishes `0` on a
-healthy node rather than being absent, so such a rule is falsifiable from the
-first scrape.
+For a partition, `rift_cluster_proxy_claims_total{outcome="refused"}` is the
+proxyOnce reading: a claim the cluster could not serialize, answered `503` and
+**not** forwarded to the upstream (D-66) — a counter of *refused requests*, so it
+measures the blast radius of a partition on proxy traffic rather than its duration.
+The condition itself is `isolated` on `GET /_cluster/status` and `GET
+/_cluster/health` (#470): `1` while this node cannot see the quorum and is refusing
+owner-side operations — proxyOnce claims under D-40, flow-KV owner writes and strong
+reads under D-17.
 
-*Registered by #439, alert threshold still to be chosen:*
 `rift_cluster_blob_fetch_stalled` (gauge, `1` while this node's apply is parked
-on a blob no member can supply — the metric form of `blob_fetch_stall` above;
-`stalled for > 5m` is the obvious rule, and a stall that outlives every
-plausible transient is a lost blob, which is an operator's problem, not a
-retry's) and `rift_cluster_blob_fetch_stalls_total` (counter, one per stall
-onset — a rising count on a fleet with no partitions says a blob is being
-reaped before its op commits, which is the #438 pin failing).
+on a blob no member can supply — the metric form of `blob_fetch_stall` above)
+and `rift_cluster_blob_fetch_stalls_total` (counter, one per stall onset — a
+rising count on a fleet with no partitions says a blob is being reaped before
+its op commits, which is the #438 pin failing) are the readings for #439. A
+stall that outlives every plausible transient is a lost blob, which is an
+operator's problem, not a retry's.
 
-*Registered by #480, no alert:* `rift_cluster_blob_gc_retained` (gauge, the
-number of unreferenced blobs this node is holding back under the tombstone
-rules — because its own log has not been purged past the index at which they
-stopped being referenced (**D-52** rule A), or because some member of the fleet
-has not yet *applied* past it (**D-55** rule C)). Not a fault signal: a non-zero
-value is retention working as designed, and it falls to zero on its own as the
-log compacts and the fleet catches up. Worth a dashboard line rather than an
-alert, because a value that stays high while `purged` advances *and* every
-member is caught up is the one shape that would suggest the tombstone table is
-not being cleared.
+`rift_cluster_blob_gc_retained` (#480) is a gauge: the number of unreferenced
+blobs this node is holding back under the tombstone rules — because its own log
+has not been purged past the index at which they stopped being referenced
+(**D-52** rule A), or because some member of the fleet has not yet *applied* past
+it (**D-55** rule C). Not a fault signal: a non-zero value is retention working
+as designed, and it falls to zero on its own as the log compacts and the fleet
+catches up. A value that stays high while `purged` advances *and* every member is
+caught up is the one shape that would suggest the tombstone table is not being
+cleared.
 
 Rule C is read, not gossiped: each GC sweep (every 60 s) asks every member —
 voters and learners — for its applied index over the cluster port, and **fails
@@ -190,16 +182,15 @@ instead reports `raft core did not release storage within 2s`, the shutdown
 signal did not reach the parked fetch — that is a defect worth an issue, not an
 operational condition.
 
-*Registered by #514, no alert yet:* `rift_cluster_sequence_resets_incomplete_total`
-(counter, cursor resets that did not reach every member — **D-57**). Unlike
-`rift_cluster_sequence_fallbacks_total`, which counts a decision degrading as
-designed, this one is a fault signal: the member named in the `sequencer reset
-did not reach every member` warning beside it is still cycling responses for a
-stub that was deleted or replaced, and it will keep doing so until it is asked
-again or the membership changes. A non-zero value with no member down is worth
-looking at; the warning names which member to look at.
+A cursor reset that did not reach every member (**D-57**) is **named in a log
+line**, not counted: the `sequencer reset did not reach every member` warning
+names the member that is still cycling responses for a stub that was deleted or
+replaced, and it will keep doing so until it is asked again or the membership
+changes. That warning is the signal — a counter of the same event told you it
+happened without telling you where, which is why the count went with the rest of
+the retired families (D-71) and the warning stayed.
 
-*Registered by #476, no alert yet:* `rift_cluster_sequence_decisions_total{op,path}`
+`rift_cluster_sequence_decisions_total{op,path}` (#476)
 (counter, every cursor decision by operation and answering path — **D-63**).
 `op` is `next` or `peek`; `path` is `owner` (this node owns the cursor, no hop),
 `forward` (one RPC to the owner), `local` (the imposter never opted in — D-10's
@@ -210,22 +201,12 @@ sequencing counterpart of the same ratio on `rift_cluster_flow_reads_total`. And
 **`op="peek"` should never move**: the serving path issues one `next` per decision
 and peeks only from the debug response preview, so a rising `peek` means a code
 path now pays an owner round trip per cursor reference — the amplification
-RFC-001 §11.3 once assumed, arriving for real. Neither is a paging signal; both
-are what to look at when sequencing is suspected of costing more than one RPC.
+RFC-001 §11.3 once assumed, arriving for real. Both are what to look at when
+sequencing is suspected of costing more than one RPC.
 
-*Registered, but not alerted on:* `rift_cluster_flow_wal_lag_ops` (async
-durability backlog). It is a legitimate paging signal, but it appears in
-neither the alert pack nor the shipped dashboards yet: nobody has chosen a
-threshold that is meaningful across deployments, and an alert with an
-arbitrary one trains people to ignore it.
-
-*Aspirational — designed, not registered, deliberately absent from the pack:*
-`rift_cluster_raft_leader_changes_total` (flapping = network trouble),
-`rift_cluster_applied_index_lag` per node (barrier stragglers),
-`rift_cluster_degraded_ops_total{feature}` (any nonzero during a strict test
-run is a finding), `rift_cluster_bridge_rejected_total` (owner black-hole
-shedding). Leader flapping is the sharpest of these and has no substitute today;
-`RiftClusterNoLeader` catches the outage but not the flap that preceded it.
+`rift_cluster_flow_wal_lag_ops` is the async durability backlog — the `async`
+loss window, measured. The flow-shard tests read it for exactly that; nobody has
+chosen a threshold for it that would be meaningful across deployments.
 
 ## Runbooks (sketches; full versions ship with the harness)
 

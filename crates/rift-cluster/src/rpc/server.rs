@@ -14,7 +14,6 @@ use tokio::net::TcpListener;
 use super::RpcError;
 use super::auth::{AUTH_HEADER, SignedRequest, Verifier};
 use super::routes::{PROTO_HEADER, Router, negotiate};
-use crate::metrics;
 
 /// Default cap on an accepted request body. Cluster payloads are small control
 /// messages; an unbounded reader is a memory bomb, and the *reader* is capped
@@ -144,10 +143,7 @@ async fn handle(config: Arc<RpcServerConfig>, req: Request<Incoming>) -> Respons
             .header("content-type", "application/json")
             .body(Full::new(Bytes::from(body)))
             .unwrap_or_else(|_| error_response(&RpcError::Handler("malformed response".into()))),
-        Err(e) => {
-            metrics::rpc_failure(e.reason());
-            error_response(&e)
-        }
+        Err(e) => error_response(&e),
     }
 }
 

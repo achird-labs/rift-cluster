@@ -201,7 +201,7 @@ pub fn routes(
                 // `bind_failure` is what makes this endpoint the per-`(port, node)` view RFC-001
                 // §7.4.6 promises. Bind status is a node-local observation — it cannot ride the
                 // deterministic raft apply — so it is reported by each node about itself, here and
-                // in `rift_cluster_bind_failures`, rather than replicated. Absent (`null`) is the
+                // on `/_fleet/members` (`bind_failures`), rather than replicated. Absent (`null`) is the
                 // healthy answer; present means the node holds the config and serves the imposter
                 // in-process but never bound its port.
                 //
@@ -443,8 +443,8 @@ pub(crate) fn health_body(node: &RaftNode, readiness: &Readiness) -> serde_json:
         "ready": readiness.state().is_ready(),
         "state": readiness.state().as_str(),
         "pending_gates": readiness.pending(),
-        // Same rule as `rift_cluster_isolated` (#470), via the same `isolated_from`: an operator
-        // comparing the gauge against this field must never be shown two different answers.
+        // Same rule as `StatusReport::isolated` (#470), via the same `isolated_from`: an operator
+        // comparing `/_cluster/status` against this field must never be shown two different answers.
         "isolated": node.is_isolated(),
         // This node's own parked-write backlog (issue #360): writes it accepted under
         // `--cluster-admin-async` and has not replayed. A magnitude, so a number.

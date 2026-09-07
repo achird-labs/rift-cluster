@@ -680,8 +680,6 @@ impl FlowShard {
                 .collect()
         };
 
-        metrics::flow_flows_evicted(victims.len());
-
         // The durable copy is cleared best-effort in the background: eviction is
         // a capacity decision, and blocking a write on it would make the shard
         // slowest exactly when it is fullest. A crash before these land means
@@ -889,10 +887,8 @@ async fn writer_loop(
                 // expired keys AND, being Immediate, makes every preceding `None`
                 // commit durable — redb's documented contract and the whole
                 // mechanism behind `Async`.
-                let started = std::time::Instant::now();
                 match commit_deletes(&db, &expired) {
                     Ok(()) => {
-                        metrics::flow_fsync_observed(started.elapsed());
                         unsynced = 0;
                         metrics::flow_wal_lag(0);
                     }
@@ -910,7 +906,6 @@ fn commit_batch(
     batch: &[WriteRequest],
     level: redb::Durability,
 ) -> Result<(), String> {
-    let started = std::time::Instant::now();
     let mut txn = db.begin_write().map_err(|e| e.to_string())?;
     txn.set_durability(level).map_err(|e| e.to_string())?;
 
@@ -964,11 +959,6 @@ fn commit_batch(
     }
 
     txn.commit().map_err(|e| e.to_string())?;
-    // `redb::Durability` is not `PartialEq`, so the caller's intent is carried
-    // rather than re-derived from the value.
-    if matches!(level, redb::Durability::Immediate) {
-        metrics::flow_fsync_observed(started.elapsed());
-    }
     Ok(())
 }
 

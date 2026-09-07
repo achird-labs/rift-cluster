@@ -26,7 +26,6 @@ use std::time::Duration;
 
 use tokio::sync::Semaphore;
 
-use crate::metrics;
 use crate::rpc::RpcError;
 
 /// Which permit pool a caller draws from.
@@ -134,7 +133,7 @@ impl Bridge {
         }
     }
 
-    /// Free permits in a class — the gauge behind `rift_cluster_bridge_inflight`.
+    /// Free permits in a class.
     #[must_use]
     pub fn available_permits(&self, class: CallerClass) -> usize {
         self.permits(class).available_permits()
@@ -155,10 +154,8 @@ impl Bridge {
             // Shed immediately: queueing here would convert an owner outage
             // into data-plane thread exhaustion, which is the failure this
             // bound exists to prevent.
-            metrics::bridge_rejected();
             return Err(RpcError::Shed);
         };
-        metrics::bridge_inflight_inc();
 
         // Capacity 1 and a matching receiver: the sender never blocks, so a
         // caller that has already timed out cannot wedge the cluster-io task.
@@ -184,7 +181,7 @@ impl Bridge {
             let _ = tx.send(outcome);
         });
 
-        let result = match rx.recv_timeout(deadline) {
+        match rx.recv_timeout(deadline) {
             Ok(outcome) => outcome,
             Err(RecvTimeoutError::Timeout) => Err(RpcError::Timeout),
             // The task was dropped without sending — treat as transport loss
@@ -192,9 +189,7 @@ impl Bridge {
             Err(RecvTimeoutError::Disconnected) => Err(RpcError::Transport(
                 "cluster-io task ended without a result".into(),
             )),
-        };
-        metrics::bridge_inflight_dec();
-        result
+        }
     }
 }
 

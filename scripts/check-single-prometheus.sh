@@ -3,8 +3,8 @@
 #
 # Why this is worth a CI step of its own:
 #
-# `rift-cluster` registers its fleet gauges (`rift_cluster_members`,
-# `rift_cluster_ring_epoch`, `rift_cluster_insecure`) into the `prometheus`
+# `rift-cluster` registers its test-read families (`rift_cluster_config_revision`,
+# `rift_cluster_intents_pending`, … — see `crates/rift-cluster/src/metrics.rs`) into the `prometheus`
 # crate's *global default registry*, because that is precisely what the
 # open-source metrics server serves — `collect_metrics()` is a thin wrapper
 # over `prometheus::gather()`. Registering there is what makes the cluster
