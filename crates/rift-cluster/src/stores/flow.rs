@@ -554,6 +554,74 @@ impl FlowNet {
         self.shard.get(flow_id, key).map(|entry| entry.value)
     }
 
+    /// The ports whose imposter-scoped namespace (`i<port>:`,
+    /// [`ContextScope::Imposter`]) this node's shard holds at least one flow
+    /// under — owned or replicated, live or tombstoned. The reconcile-time half
+    /// of #565: the state machine compares it against the applied config set
+    /// to find the namespaces of imposters deleted while this node was not
+    /// applying (down, or installing a snapshot with an empty engine), and
+    /// clears them with [`Self::clear_imposter_scope`].
+    ///
+    /// Fleet-scoped (`f:`) and tenant-scoped (`t<tenant>:`) flows name no port
+    /// and never appear here — those namespaces are shared by construction and
+    /// outlive any one imposter (D-5 amendment).
+    #[must_use]
+    pub fn imposter_ports_held(&self) -> std::collections::BTreeSet<u16> {
+        self.shard
+            .flow_ids()
+            .iter()
+            .filter_map(|id| imposter_port(id))
+            .collect()
+    }
+
+    /// Drop every flow this node holds in `port`'s imposter-scoped namespace
+    /// (#565, the D-5 amendment): an imposter's state is the imposter's, and a
+    /// deleted imposter has none. Returns how many flows were dropped; no state
+    /// is a no-op.
+    ///
+    /// Per node and local, deliberately — not routed to an owner and not
+    /// replicated. Every node applies the same committed `DeleteImposter`, so
+    /// every holder clears its own copy at the same log index; that is the same
+    /// per-node discipline the config reconcile itself runs under, and it is
+    /// what makes the clear deterministic and once-per-node. The primitive is
+    /// [`FlowShard::clear_flow`], the one `WriteOp::ClearFlow` (the flow-state
+    /// `DELETE`, the space teardown) and its replica apply both land on; the
+    /// #120 semantics carry over — a whole-flow drop, no per-key tombstones,
+    /// because a lagging holder clears its own copy when it applies the same
+    /// entry, and the ordinary write path never pushes for a port no engine
+    /// serves.
+    ///
+    /// Only `i<port>:`. A `fleet`- or `tenant`-scoped flow is not this
+    /// imposter's to drop, and ports are fleet-unique across tenants (RFC-002
+    /// §3.2), so `i<port>:` can never be another tenant's namespace.
+    ///
+    /// `Async` durability: the imposter whose knob would have chosen is gone,
+    /// and this is a rare admin-path write. A crash inside the fsync interval
+    /// is covered by the reconcile-time sweep on restart, which finds the
+    /// namespace orphaned and drops it again.
+    pub async fn clear_imposter_scope(&self, port: u16) -> usize {
+        let prefix = ContextScope::Imposter.prefix_for(Some(port), None);
+        let mut dropped = 0;
+        for flow_id in self.shard.flow_ids() {
+            if !flow_id.starts_with(&prefix) {
+                continue;
+            }
+            dropped += 1;
+            // The memory mirror is already dropped by the time the durable
+            // write can fail, so the node serves the right answer either way;
+            // the failure is named so a persistent one is not silent.
+            if let Err(e) = self.shard.clear_flow(&flow_id, Durability::Async).await {
+                tracing::error!(
+                    port,
+                    flow = %flow_id,
+                    error = %e,
+                    "clearing a deleted imposter's flow state did not persist"
+                );
+            }
+        }
+        dropped
+    }
+
     /// The owner-side write path — the only code that mutates owned flow
     /// state, whether the op arrived locally or over the wire.
     async fn owner_write(self: &Arc<Self>, req: WriteReq) -> WriteReply {

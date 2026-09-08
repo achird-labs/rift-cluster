@@ -656,6 +656,11 @@ pub async fn start_with_runtimes(
         // config, including the ones a join replays, or the sequencer answers an
         // `owner`-mode imposter from local cursors until the next config change.
         Arc::clone(&sequencing),
+        // And once more (#565): a committed `DeleteImposter` drops the port's flow
+        // state on this node from the apply loop, so a delete this node replays
+        // on join clears exactly like a live one. The net is bound to the node
+        // below, after `start` returns — the state machine only reaches its shard.
+        Arc::clone(&flow_net),
     )
     .await
     {

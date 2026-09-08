@@ -52,6 +52,7 @@ use crate::rpc::{
     Authority, DnsResolver, PeerResolver, Router, RpcClient, RpcClientConfig, RpcError, RpcServer,
     RpcServerConfig, Signer, TrackedPeerHealth, Verifier,
 };
+use crate::stores::flow::FlowNet;
 use crate::stores::journal::ClusterJournal;
 
 /// Log-file name for the Raft storage inside the node's data directory.
@@ -607,7 +608,7 @@ impl RaftNode {
     /// does not form or join a cluster; call [`RaftNode::cluster_init`] to
     /// bootstrap a new one or [`RaftNode::join_via`] to attach to an existing one.
     pub async fn start(config: NodeConfig) -> Result<Self, NodeError> {
-        Self::start_inner(config, None, None, None).await
+        Self::start_inner(config, None, None, None, None).await
     }
 
     /// Like [`Self::start`], with the front door's compiled-route handle and this node's local
@@ -623,12 +624,14 @@ impl RaftNode {
         front_door_routes: Arc<ArcSwap<CompiledRoutes>>,
         journal: Arc<ClusterJournal>,
         sequencing: Arc<crate::stores::SequencingRegistry>,
+        flow_net: Arc<FlowNet>,
     ) -> Result<Self, NodeError> {
         Self::start_inner(
             config,
             Some(front_door_routes),
             Some(journal),
             Some(sequencing),
+            Some(flow_net),
         )
         .await
     }
@@ -638,6 +641,7 @@ impl RaftNode {
         front_door_routes: Option<Arc<ArcSwap<CompiledRoutes>>>,
         journal: Option<Arc<ClusterJournal>>,
         sequencing: Option<Arc<crate::stores::SequencingRegistry>>,
+        flow_net: Option<Arc<FlowNet>>,
     ) -> Result<Self, NodeError> {
         let (log_store, state_machine) = store::new(config.data_dir.join(RAFT_DB_FILE))
             .await
@@ -652,6 +656,13 @@ impl RaftNode {
         };
         let state_machine = match &sequencing {
             Some(registry) => state_machine.with_sequencing_registry(Arc::clone(registry)),
+            None => state_machine,
+        };
+        // #565: a committed delete drops the port's flow state on this node from the apply
+        // loop, so — same contract as the engine — the shard is attached before `Raft::new`
+        // and a replayed or snapshot-installed delete clears exactly like a live one.
+        let state_machine = match flow_net {
+            Some(flow_net) => state_machine.with_flow_net(flow_net),
             None => state_machine,
         };
         let state_machine = match &journal {
