@@ -612,7 +612,6 @@ dependencies = [
  "anyhow",
  "httpdate",
  "reqwest",
- "rift-cluster",
  "serde_json",
  "tokio",
 ]
@@ -2650,7 +2649,6 @@ dependencies = [
  "hyper",
  "hyper-util",
  "lazy_static",
- "libc",
  "openraft",
  "parking_lot",
  "prometheus",

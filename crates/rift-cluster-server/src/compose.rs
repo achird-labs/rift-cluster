@@ -15,7 +15,6 @@ use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use arc_swap::ArcSwap;
-use rift_cluster::sources;
 use rift_cluster::stores::{
     ClusterJournal, ClusterProxyStore, ClusteredFlowStoreProvider, ClusteredSequencer,
     DEFAULT_ANTI_ENTROPY_INTERVAL, FlowBindConfig, FlowNet, FlowShard, JournalNet, ProxyBindConfig,
@@ -23,13 +22,14 @@ use rift_cluster::stores::{
     seq_routes, spawn_anti_entropy,
 };
 use rift_cluster::{
-    Authority, ClusterDecorator, LeaveOutcome, NodeConfig, NodeError, NodeIdentity, OnDrift,
-    PullOnMissInterceptor, RaftNode, SourcePuller, SourceScheduler, metrics,
+    Authority, ClusterDecorator, ControlOp, ControlOutcome, ControlRequest, DEFAULT_TENANT,
+    LeaveOutcome, NodeConfig, NodeError, NodeIdentity, PullOnMissInterceptor, RaftNode, TenantId,
+    metrics,
 };
 use rift_cluster_base::seams::{
-    CompiledRoutes, FileSource, HttpSource, ImposterManager, OutboundTls, RunningFrontDoor,
-    RunningServer, ServerBuilder, SourceRef, SourceRegistry, TlsDefaults, bind_front_door,
-    build_upstream_client, parse_uri_list,
+    CompiledRoutes, FileSource, HttpSource, ImposterConfig, ImposterManager, OutboundTls,
+    RunningFrontDoor, RunningServer, ServerBuilder, SourceRef, SourceRegistry, TlsDefaults,
+    bind_front_door, build_upstream_client, parse_uri_list,
 };
 
 use crate::admin_front::{self, AdminFront, FrontConfig};
@@ -167,12 +167,6 @@ pub struct ComposedServer {
     /// Reconciles the engine and satisfies [`GATE_RECONCILED`]; aborted on
     /// shutdown for the same reason as the sampler.
     reconciler: Option<tokio::task::JoinHandle<()>>,
-    /// The tracking-source poll scheduler (#135). Aborted on shutdown for the
-    /// same reason as the sampler — and more urgently: it holds an
-    /// `Arc<RaftNode>` while waiting on the leadership watch, so a task left
-    /// running delays the node's `Drop`, which is what releases the cluster
-    /// port and the redb lock.
-    source_scheduler: Option<tokio::task::JoinHandle<()>>,
     /// Replays parked intents on leader changes (issue #9 R4); same lifecycle
     /// rules as the reconciler.
     intent_replayer: Option<tokio::task::JoinHandle<()>>,
@@ -282,9 +276,6 @@ impl ComposedServer {
         }
         if let Some(replayer) = self.intent_replayer {
             replayer.abort();
-        }
-        if let Some(scheduler) = self.source_scheduler {
-            scheduler.abort();
         }
         if let Some(probes) = self.probes {
             probes.shutdown().await;
@@ -455,7 +446,6 @@ pub async fn start_with_runtimes(
             front_door: None,
             metrics_sampler: None,
             reconciler: None,
-            source_scheduler: None,
             intent_replayer: None,
             cluster_addr: None,
             manager: None,
@@ -614,12 +604,9 @@ pub async fn start_with_runtimes(
     // `GET /front-door/routes` must answer identically on every node.
     let front_door_routes = Arc::new(ArcSwap::from_pointee(CompiledRoutes::default()));
 
-    // Imposter sources (issue #134). Built before the node for the same reason
-    // the flow net and the pull-on-miss hook are: its routes go into the
-    // `NodeConfig.routes` seam that binds the cluster port, whose address the
-    // node then advertises — so the node can only arrive afterwards, through
-    // `bind` below. The registry is this node's own view of which schemes it
-    // can fetch; deterministic op validation deliberately does not consult it.
+    // Upstream's own source registry (U-12), for the one-shot `--imposters` bootstrap below
+    // (D-72). `file:` and `http(s):` only: this reads documents at startup and never again, so
+    // there is no scheduler, no credential resolver and no cloud provider to register.
     let source_registry = match build_source_registry(cli.oss.no_parse) {
         Ok(built) => built,
         Err(e) => {
@@ -627,14 +614,6 @@ pub async fn start_with_runtimes(
             return Err(e.context("registering the built-in imposter sources"));
         }
     };
-    // The puller's fleet-scope gate (#288) needs the same "is the admin plane enforced" answer the
-    // front's bypass computes; the principal half it reads live, the credential half only this
-    // composition knows. `cli.oss.api_key` is still set here — it is cleared further down, after
-    // the front captured it.
-    let puller = Arc::new(
-        SourcePuller::new(source_registry)
-            .with_admin_credential_configured(cli.oss.api_key.is_some()),
-    );
 
     let slot = NodeSlot::default();
     let node = match RaftNode::start_with_front_door_routes(
@@ -651,28 +630,21 @@ pub async fn start_with_runtimes(
             // Seeded with the flow routes: the registry ships empty and the state
             // backends register their own endpoints (its design contract), and the
             // operator surface layers its routes on top. `journal_routes` is folded in
-            // with `merge` rather than nested in the same chain: unlike `flow_routes`,
-            // `cluster_api::routes` and `sources::routes`, it builds its own table from
-            // scratch instead of accepting a base to extend (issue #223's network layer,
-            // #147/#152's Phase 4a, predates this composition and its own signature is
-            // frozen), so this is the seam that brings the two tables together.
-            routes: sources::routes(
-                cluster_api::routes(
-                    flow_routes(Arc::clone(&flow_net)),
-                    slot.clone(),
-                    Arc::clone(&readiness),
-                ),
-                Arc::clone(&puller),
+            // with `merge` rather than nested in the same chain: unlike `flow_routes`
+            // and `cluster_api::routes`, it builds its own table from scratch instead of
+            // accepting a base to extend (issue #223's network layer, #147/#152's Phase 4a,
+            // predates this composition and its own signature is frozen), so this is the
+            // seam that brings the two tables together.
+            routes: cluster_api::routes(
+                flow_routes(Arc::clone(&flow_net)),
+                slot.clone(),
+                Arc::clone(&readiness),
             )
             .merge(journal_routes(Arc::clone(&journal_net)))
             .merge(proxy_routes(Arc::clone(&proxy_net)))
             .merge(seq_routes(Arc::clone(&sequencer))),
             engine: Some(Arc::clone(&manager)),
             snapshot_log_entries: cli.cluster.cluster_snapshot_log_entries,
-            // A hidden testability knob (#481), not an operator flag — a shipped fleet never
-            // sets this, so nothing in `cli` drives it, in the same style as
-            // `NodeConfig::advertise_as_digest_only_incapable`'s own doc comment describes.
-            advertise_as_digest_only_incapable: false,
         },
         Arc::clone(&front_door_routes),
         // Bound before `Raft::new` (issue #224), the same before-construction contract as
@@ -714,28 +686,6 @@ pub async fn start_with_runtimes(
         }
         return Err(anyhow::Error::new(e).context("starting the proxy-claim bridge"));
     }
-    if let Err(e) = puller.bind(&node) {
-        probes.shutdown().await;
-        if let Err(e) = node.shutdown().await {
-            tracing::error!(error = %e, "cluster node shutdown reported an error");
-        }
-        return Err(anyhow::Error::new(e).context("binding the source puller to the node"));
-    }
-    // The tracking-source poll scheduler (#135). Started on the ambient
-    // runtime, like the metrics sampler and the intent replayer — never a bare
-    // `Runtime` of its own (#120: one dropped from inside async context panics
-    // the process on shutdown). It polls only while this node is the Raft
-    // leader.
-    //
-    // Its handle is aborted on every path that shuts the node down, here and in
-    // `ComposedServer::shutdown`. `Weak` handles are not sufficient on their
-    // own: the supervisor upgrades to an `Arc<RaftNode>` for the duration of
-    // each leadership wait, so a task left running holds the node past its
-    // shutdown — and the node's `Drop` is what frees the cluster port and the
-    // redb lock, which a retried `start` immediately needs.
-    let (poll_status, source_scheduler) =
-        SourceScheduler::spawn(&tokio::runtime::Handle::current(), &node, &puller);
-    puller.attach_poll_status(&poll_status);
 
     // Attach the membership the shard cap divides by. Infallible and immediate — unlike
     // the flow bridge there is no runtime to start, so there is nothing to unwind. Until
@@ -759,7 +709,6 @@ pub async fn start_with_runtimes(
         tracing::error!(error = %e, "starting the response-sequencer bridge");
     }
     if let Err(e) = flow_net.bind(&node, FlowBindConfig::default()) {
-        source_scheduler.abort();
         probes.shutdown().await;
         if let Err(e) = node.shutdown().await {
             tracing::error!(error = %e, "cluster node shutdown reported an error");
@@ -780,7 +729,7 @@ pub async fn start_with_runtimes(
         &readiness,
         Arc::clone(&manager),
         front_door_routes,
-        Arc::clone(&puller),
+        source_registry,
         Arc::clone(&journal_net),
         Arc::clone(&flow_net),
     )
@@ -793,7 +742,6 @@ pub async fn start_with_runtimes(
             front_door,
             metrics_sampler: Some(spawn_metrics_sampler(Arc::clone(&node))),
             reconciler: Some(reconciler),
-            source_scheduler: Some(source_scheduler),
             intent_replayer: Some(spawn_intent_replayer(Arc::clone(&node))),
             node: Some(node),
             cluster_addr: Some(cluster_addr),
@@ -804,7 +752,6 @@ pub async fn start_with_runtimes(
             state_dir: Some(state_dir),
         }),
         Err(e) => {
-            source_scheduler.abort();
             probes.shutdown().await;
             if let Err(e) = node.shutdown().await {
                 tracing::error!(error = %e, "cluster node shutdown reported an error");
@@ -824,7 +771,7 @@ async fn attach_data_plane(
     readiness: &Arc<Readiness>,
     manager: Arc<ImposterManager>,
     front_door_routes: Arc<ArcSwap<CompiledRoutes>>,
-    puller: Arc<SourcePuller>,
+    source_registry: SourceRegistry,
     journal_net: Arc<JournalNet>,
     flow_net: Arc<FlowNet>,
 ) -> anyhow::Result<(
@@ -893,12 +840,12 @@ async fn attach_data_plane(
     // would fetch these URIs and create the imposters *in this node's manager*,
     // outside the replicated log — and the reconciler, which treats the
     // replicated set as authoritative, would then delete them again. Under
-    // `--cluster` the flag becomes sugar for declaring pinned sources, so the
-    // same URIs land through the log and reach every node.
+    // `--cluster` the flag becomes a one-shot import through the log
+    // (`bootstrap_imposters`, D-72), so the same URIs reach every node.
     //
-    // `--configfile` is refused rather than desugared because it names a local
-    // path: the other nodes have no such file, and a source only replicates
-    // usefully when every node can fetch it.
+    // `--configfile` is refused rather than desugared because it names a local path the *other*
+    // nodes do not have — and a `--imposters file:` URI has the same property, which is why the
+    // bootstrap replicates what it read rather than asking each node to read it.
     let bootstrap_sources = cli.oss.imposters.take().as_deref().map(parse_uri_list);
     let barrier = cli.cluster.cluster_write_barrier;
     let barrier_timeout = Duration::from_secs(cli.cluster.cluster_write_barrier_timeout);
@@ -969,7 +916,6 @@ async fn attach_data_plane(
             barrier_timeout,
             admin_async,
             readiness: Arc::clone(readiness),
-            puller: Arc::clone(&puller),
             journal_net: Arc::clone(&journal_net),
             flow_net: Arc::clone(&flow_net),
             fleet_journal_port_cap,
@@ -991,7 +937,7 @@ async fn attach_data_plane(
     };
 
     if let Some(refs) = bootstrap_sources
-        && let Err(e) = bootstrap_imposter_sources(&puller, &refs).await
+        && let Err(e) = bootstrap_imposters(node, &source_registry, &refs).await
     {
         // Same teardown discipline as every other failure past a live node:
         // `start` is an embedding seam callers retry, so a half-composed server
@@ -1012,171 +958,178 @@ async fn attach_data_plane(
     ))
 }
 
-/// Why a node with no `git` refuses a `git+` declaration, and what to do about it.
+/// The schemes a clustered node resolves a `--imposters` URI from: upstream's own `file:` and
+/// `http(s):` (U-12), and nothing else.
 ///
-/// Rendered verbatim into the refusal, so it names the cause *and* the fix: an
-/// operator meeting this has typed a URI that is valid on a node with git, and
-/// "your image has no git" is not something they can infer from "unsupported
-/// scheme".
-///
-/// Phrased as the **observed fact** ("no `git` binary on PATH") rather than as
-/// the flavor ("this is the -static image"), because nothing here can actually
-/// tell the two apart. The degrade arm fires on any `ErrorKind::NotFound` from
-/// spawning `git` — which is the `-static` image, but is equally a derived
-/// image that removed git, or a node booted with a broken `PATH`. Telling a
-/// default-flavor operator to "use the default image" would be advice for a
-/// situation they are not in; naming the missing binary is true in every case,
-/// and the flavor hint stays as a conditional aside.
-///
-/// Two test copies of this text exist that the compiler cannot tie back here —
-/// `rift_cluster::sources::tests::NO_GIT` and an inline literal in
-/// `tests/sources_front.rs` — because both live outside this crate and this
-/// const is private. They assert on substrings, so a reword here does not break
-/// them loudly; it makes them assert less than they claim to. Change all three.
-const NO_GIT_REASON: &str = "no `git` binary on PATH; install git, or use the default (non-static) image if this is `-static`";
-
-/// Register `git+` according to what this host actually has (#270).
-///
-/// Split out from [`build_source_registry`] and handed the probe result rather
-/// than probing itself, so the three arms are unit-testable on a host that does
-/// have git — the absent arm is the one that ships in the `-static` image and
-/// would otherwise be exercised for the first time in production.
-///
-/// The arms are deliberately asymmetric (D-34):
-/// - **present** → register the provider, byte-identical to before.
-/// - **absent** → boot and serve, log once, register the schemes as
-///   unavailable. Losing `git+` must not cost an operator the other 99% of a
-///   mock fleet.
-/// - **unusable** → still refuse the boot. A broken git is a broken host, not a
-///   flavor without git, and degrading it would turn an operator's
-///   misconfiguration into a fleet that quietly never fetches.
-fn register_git_provider(
-    providers: &mut sources::SourceProviders,
-    resolver: &Arc<dyn sources::auth::CredentialResolver>,
-    probe: Result<(), sources::git::GitProbeError>,
-) -> anyhow::Result<()> {
-    match probe {
-        // `probed` rather than `new`: this function was *handed* the probe
-        // result, and re-running `git --version` here would spawn a second
-        // subprocess to re-learn what the caller already established.
-        Ok(()) => providers.register_credentialed(Arc::new(sources::git::GitSource::probed(
-            Arc::clone(resolver),
-        ))),
-        Err(sources::git::GitProbeError::NotFound(_)) => {
-            tracing::warn!(
-                schemes = ?sources::git::GIT_SCHEMES,
-                "git not found; git+ imposter sources disabled in this image"
-            );
-            providers.register_unavailable(sources::git::GIT_SCHEMES, NO_GIT_REASON)
-        }
-        // Every non-absent probe failure refuses the boot. Written as a
-        // catch-all rather than one arm per variant on purpose: a future probe
-        // failure mode must default to refusing, never to degrading.
-        Err(e) => Err(e.into()),
-    }
+/// #549 removed the cluster's own `git+https:` / `git+file:` / `s3:` / `registry:` providers with
+/// the tracking-source machinery they existed for, so there is no credential resolver and no
+/// scheme this registry can serve that upstream does not. A URI naming one of the removed schemes
+/// is refused at startup by [`bootstrap_imposters`], by name rather than as a generic parse
+/// failure.
+fn build_source_registry(no_parse: bool) -> anyhow::Result<SourceRegistry> {
+    let mut registry = SourceRegistry::new();
+    registry.register(Arc::new(FileSource::new(no_parse)))?;
+    registry.register(Arc::new(HttpSource::new()?))?;
+    Ok(registry)
 }
 
-/// Every scheme a clustered node can fetch a source from: upstream's `file:`
-/// and `http(s):`, plus the cluster `git+https:`/`git+file:`, `s3:` and
-/// `registry:` providers (#136).
+/// Schemes this build once served through the cluster's own source providers, and no longer does
+/// (#549). Named in the startup refusal so an operator upgrading across this change learns what
+/// happened instead of reading "unsupported scheme" about a URI that worked yesterday.
+const RETIRED_SOURCE_SCHEMES: &[&str] = &["git+https", "git+file", "git+ssh", "s3", "registry"];
+
+/// Read every `--imposters` URI once, at startup, and submit what it declares as ordinary
+/// `PutImposter` ops (D-72, #549).
 ///
-/// The three cluster providers share one [`sources::auth::StandardResolver`]
-/// (environment, then a mounted secrets directory — see that module's doc),
-/// configured from environment variables rather than new CLI flags. This is
-/// deliberately the minimum plumbing this build needs, not a config
-/// subsystem:
+/// **One shot, not a subscription.** The fleet keeps no record that these imposters came from a
+/// URI: there is no source row, no scheduler, no drift baseline and no poll status. The URI is
+/// read exactly once per node start, and what it produced is replicated config like any other.
 ///
-/// - `RIFT_SOURCE_SECRETS_DIR` — a directory of `<auth_ref>`-named files, the
-///   shape a Kubernetes secret mounts as. Unset means a credential can only
-///   come from a `RIFT_SOURCE_AUTH_<REF>` environment variable.
-/// - `RIFT_S3_ENDPOINT` — overrides the S3 endpoint (MinIO, an in-VPC
-///   gateway, a test stub); unset means the real
-///   `https://s3.{region}.amazonaws.com`.
-/// - `RIFT_S3_REGION` — the SigV4 region; defaults to `us-east-1` when unset.
-/// - `RIFT_SOURCE_REGISTRY_ENDPOINT` / `RIFT_SOURCE_REGISTRY_POINTER` — the
-///   `registry:` provider's base URL and the RFC 6901 pointer into each
-///   response that names the imposters array. The provider is registered
-///   only when an endpoint is configured: a `registry:` scheme with nothing
-///   to reach is not a provider worth having, it is a pull failure waiting to
-///   happen on the first source that names it.
-fn build_source_registry(no_parse: bool) -> anyhow::Result<sources::SourceProviders> {
-    let mut upstream = SourceRegistry::new();
-    upstream.register(Arc::new(FileSource::new(no_parse)))?;
-    upstream.register(Arc::new(HttpSource::new()?))?;
-    let mut providers = sources::SourceProviders::new(upstream);
-
-    let secrets_dir = std::env::var("RIFT_SOURCE_SECRETS_DIR")
-        .ok()
-        .map(PathBuf::from);
-    let resolver: Arc<dyn sources::auth::CredentialResolver> =
-        Arc::new(sources::auth::StandardResolver::new(secrets_dir));
-
-    register_git_provider(&mut providers, &resolver, sources::git::GitSource::probe())?;
-
-    let s3_config = sources::s3::S3Config {
-        endpoint: std::env::var("RIFT_S3_ENDPOINT").ok(),
-        region: std::env::var("RIFT_S3_REGION").unwrap_or_else(|_| "us-east-1".to_owned()),
-    };
-    providers.register_credentialed(Arc::new(sources::s3::S3Source::new(
-        Arc::clone(&resolver),
-        s3_config.clone(),
-    )?))?;
-
-    if let Ok(endpoint) = std::env::var("RIFT_SOURCE_REGISTRY_ENDPOINT") {
-        let imposters_pointer = std::env::var("RIFT_SOURCE_REGISTRY_POINTER")
-            .unwrap_or_else(|_| "/imposters".to_owned());
-        providers.register_credentialed(Arc::new(sources::registry::RegistrySource::new(
-            Arc::clone(&resolver),
-            sources::registry::RegistryConfig {
-                endpoint,
-                imposters_pointer,
-            },
-        )?))?;
-    }
-
-    Ok(providers)
-}
-
-/// Turn `--imposters` into declared sources and pull each once.
+/// **Why this is not just upstream's own `--imposters`.** `attach_data_plane` `take()`s the flag
+/// before handing the CLI to `ServerBuilder`, because upstream's `start()` would fetch these URIs
+/// and create the imposters *in this node's manager*, outside the replicated log — and the
+/// reconciler, which treats the replicated set as authoritative, would then delete them again.
+/// The operator would watch their imposters appear and vanish with no error anywhere. Under
+/// `--cluster` the flag therefore means "put these through the log", which is what this does.
 ///
-/// Failing the start is deliberate: an operator who passed `--imposters` asked
-/// for those imposters to be serving, and a node that comes up healthy without
-/// them is the silent half-configured fleet this whole path exists to avoid.
-/// The one exception is a source that is already declared and unchanged — the
-/// digest short circuit makes that a no-op, which is what makes a restart or a
-/// second node's boot idempotent rather than a re-apply.
-async fn bootstrap_imposter_sources(
-    puller: &SourcePuller,
+/// **Idempotent across restarts and across nodes.** Each imposter's `op_id` is derived from
+/// `(uri, port, digest of the document it came from)`, so the same document read again — by this
+/// node after a restart, or by a second node booting against the same file — mints the same
+/// `op_id` and collapses in the state machine's dedup table instead of re-applying. A document
+/// that *changed* hashes differently and applies, which is the behaviour an operator editing a
+/// bootstrap file expects.
+///
+/// **Failing the start is deliberate**, as it was before: an operator who passed `--imposters`
+/// asked for those imposters to be serving, and a node that comes up healthy without them is the
+/// silent half-configured fleet this path exists to avoid.
+async fn bootstrap_imposters(
+    node: &Arc<RaftNode>,
+    registry: &SourceRegistry,
     refs: &[SourceRef],
 ) -> anyhow::Result<()> {
     for source_ref in refs {
-        let id = sources::bootstrap_id(&source_ref.uri);
-        let report = puller
-            .declare_and_pull(&id, &source_ref.uri, OnDrift::Overwrite)
-            .await
-            .with_context(|| {
-                format!(
-                    "bootstrapping imposter source {} as source {id:?}",
-                    source_ref.uri
-                )
-            })?;
-        for warning in &report.warnings {
-            tracing::warn!(source_id = %id, "{warning}");
+        let uri = source_ref.uri.as_str();
+        let scheme = source_ref.scheme();
+        if RETIRED_SOURCE_SCHEMES.contains(&scheme) {
+            anyhow::bail!(
+                "--imposters {uri}: the `{scheme}:` scheme was removed with tracking imposter \
+                 sources (#549). Fetch the document yourself and pass it as a local file \
+                 (`--imposters file:<path>`) or serve it over HTTP, or PUT the imposters through \
+                 the admin API."
+            );
         }
-        if report.unchanged {
-            tracing::info!(
-                source_id = %id, uri = %source_ref.uri,
-                "imposter source already applied at this content; nothing to do"
+        let Some(provider) = registry.get(scheme) else {
+            anyhow::bail!(
+                "--imposters {uri}: no source serves the `{scheme}:` scheme; this build reads \
+                 {}",
+                registry.schemes().join(", ")
             );
-        } else {
-            tracing::info!(
-                source_id = %id, uri = %source_ref.uri,
-                revision = report.revision, ports = ?report.changed,
-                "imposter source applied"
+        };
+        let fetched = provider
+            .fetch(source_ref)
+            .await
+            .with_context(|| format!("reading --imposters {uri}"))?;
+        // The cluster refuses the TLS-MITM intercept listener fleet-wide
+        // (`ConfigError::InterceptUnsupported`): its state is per-node and is not replicated. A
+        // document that declares one is refused rather than applied-minus-the-block, which would
+        // leave the operator with a listener they configured and never got.
+        if fetched.intercept.is_some() {
+            anyhow::bail!(
+                "--imposters {uri} declares an `intercept` block, which a clustered fleet cannot \
+                 honour: intercept state is per-node and is not replicated"
             );
+        }
+        // Routes are their own replicated object with their own op (#131). A bootstrap does not
+        // quietly rewrite the front door's table, but the operator is told their block did
+        // nothing rather than left to wonder.
+        if fetched.routes.is_some() {
+            tracing::warn!(
+                %uri,
+                "--imposters document declares a `routes` block, which the bootstrap does not \
+                 apply; replicate routes with PUT /front-door/routes"
+            );
+        }
+        // One digest over the whole document's config set, so every imposter it declares is
+        // keyed to the *document* it came from. Per-imposter would make an edit to one imposter
+        // re-submit only that one — attractive, but it also means removing an imposter from the
+        // document leaves the others' ids unchanged and hides that the document moved at all.
+        let digest = document_digest(&fetched.configs)
+            .with_context(|| format!("hashing the document at --imposters {uri}"))?;
+        for config in fetched.configs {
+            let Some(port) = config.port else {
+                anyhow::bail!(
+                    "--imposters {uri} declares an imposter with no explicit port: an \
+                     auto-assigned port cannot replicate, because every node would pick a \
+                     different one"
+                );
+            };
+            let op_id = bootstrap_op_id(uri, port, &digest);
+            let request = ControlRequest {
+                op_id,
+                principal: None,
+                issued_at_secs: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0),
+                expected_revision: None,
+                op: ControlOp::PutImposter {
+                    tenant: TenantId::new(DEFAULT_TENANT),
+                    config: Box::new(config),
+                },
+            };
+            // Refused here, before the write, so a config that could never apply does not occupy
+            // a log entry on every replica first — the same order every other write path takes.
+            if let Err(reason) = rift_cluster::control::validate(&request.op) {
+                anyhow::bail!(
+                    "--imposters {uri}: imposter on port {port} is not replicable: {reason}"
+                );
+            }
+            let response = node
+                .submit(request)
+                .await
+                .with_context(|| format!("--imposters {uri}: submitting port {port}"))?;
+            match response.outcome {
+                ControlOutcome::Applied => tracing::info!(
+                    %uri, port, revision = response.revision, %op_id,
+                    "bootstrap imposter committed"
+                ),
+                // A committed refusal: the write succeeded, the state machine declined it (a port
+                // another tenant holds, a quota). The operator's to resolve, and loud, because a
+                // node that boots without the imposters it was told to serve is the failure this
+                // whole path exists to prevent.
+                ControlOutcome::Failed { reason } => anyhow::bail!(
+                    "--imposters {uri}: the cluster refused the imposter on port {port}: {reason}"
+                ),
+            }
         }
     }
     Ok(())
+}
+
+/// A stable hash of one fetched document's config set — the third component of a bootstrap
+/// `op_id`.
+///
+/// Over the *serialized configs* rather than the raw bytes: two spellings of the same document
+/// (JSON vs YAML, reordered keys, different indentation) declare the same fleet state and must
+/// not re-submit. `ImposterConfig`'s own serialization is the canonical form both sides of that
+/// comparison already agree on.
+fn document_digest(configs: &[ImposterConfig]) -> anyhow::Result<String> {
+    use sha2::{Digest as _, Sha256};
+    let encoded = serde_json::to_vec(configs)?;
+    Ok(format!("{:x}", Sha256::digest(&encoded)))
+}
+
+/// The `op_id` a bootstrap imposter is submitted under: a UUIDv5 over `(uri, port, digest)`.
+///
+/// Deterministic rather than random, which is the whole mechanism: the state machine's dedup
+/// table is keyed on `op_id`, so a restart re-deriving the same three components submits an op
+/// the fleet has already applied and it collapses instead of re-applying. Namespaced under
+/// `NAMESPACE_URL` because the first component is one.
+fn bootstrap_op_id(uri: &str, port: u16, digest: &str) -> uuid::Uuid {
+    uuid::Uuid::new_v5(
+        &uuid::Uuid::NAMESPACE_URL,
+        format!("rift-cluster/bootstrap-imposter\n{uri}\n{port}\n{digest}").as_bytes(),
+    )
 }
 
 /// Parse `--front-door`'s value the same way upstream's own (private)
@@ -1546,11 +1499,6 @@ fn spawn_intent_replayer(node: Arc<RaftNode>) -> tokio::task::JoinHandle<()> {
     })
 }
 
-/// How soon a replay sweep asks to run again after a blob fan-out fell short of a quorum.
-/// Comfortably inside the peer-health cooldown (5 s), so a leader that has just come back is
-/// retried a few times as its mark clears, and far inside the 30 s periodic sweep.
-const REPLAY_SHORTFALL_RETRY: Duration = Duration::from_secs(1);
-
 async fn drain_parked_intents(node: &RaftNode) {
     let intents = match node.parked_intents() {
         Ok(intents) => intents,
@@ -1562,33 +1510,7 @@ async fn drain_parked_intents(node: &RaftNode) {
     metrics::intents_pending_sampled(intents.len());
     for request in intents {
         let op_id = request.op_id;
-        // The parked copy still carries its bytes (D-49), so a replay is a full write: the
-        // blob goes to a joint quorum first, the payload comes off, and only then is the op
-        // proposed — exactly as the front door does it. Submitting the parked request as-is
-        // would put the whole payload back on the log, which is what #439 exists to stop.
-        let submitted = match admin_front::fan_out_then_submit(node, request, |r| node.submit(r))
-            .await
-        {
-            Ok(submitted) => submitted,
-            // Short of a joint quorum for the blob. Not this op's own fault, so it stays
-            // parked and the sweep moves on — a non-blob intent behind it may still commit.
-            //
-            // Usually momentary: the drain that fires on "a leader appeared" runs while the
-            // follower's peer-health tracker may still hold that leader in the cooldown its
-            // own election attempts tripped, so the fan-out fast-fails without dialling.
-            // Left to the periodic sweep, that is a 30 s park for a write the fleet can take
-            // in a second — so ask for another drain shortly instead.
-            Err(reason) => {
-                tracing::warn!(%op_id, %reason, "blob fan-out short of quorum on replay; intent stays parked, retrying shortly");
-                let waker = node.replay_waker();
-                tokio::spawn(async move {
-                    tokio::time::sleep(REPLAY_SHORTFALL_RETRY).await;
-                    waker.notify_one();
-                });
-                continue;
-            }
-        };
-        match submitted {
+        match node.submit(request).await {
             // Terminal either way — an op the state machine refused is refused
             // identically on every replay, so it retires like a success and
             // stays queryable through GET /_cluster/ops/:id. An unpark that
@@ -2003,127 +1925,5 @@ mod tests {
             .expect("the leave completes")
             .expect("the serve task did not panic")
             .expect("a clean admin-plane stop is not an error");
-    }
-
-    // -- git as a detected capability (#270) --------------------------------
-    //
-    // The three arms are tested against a *supplied* probe result rather than a
-    // manipulated `PATH`, for two reasons: `PATH` is process-global and these
-    // tests run in parallel, and the arm that ships in the `-static` image is
-    // precisely the one no developer machine can reach by accident. The
-    // end-to-end proof that a real gitless image boots and serves is the
-    // release lane's static smoke; this is the proof that the decision it
-    // depends on is the right one in all three cases.
-
-    use std::sync::Arc;
-
-    use super::{register_git_provider, sources};
-
-    fn empty_providers() -> (
-        sources::SourceProviders,
-        Arc<dyn sources::auth::CredentialResolver>,
-    ) {
-        let resolver: Arc<dyn sources::auth::CredentialResolver> =
-            Arc::new(sources::auth::StandardResolver::new(None));
-        (sources::SourceProviders::default(), resolver)
-    }
-
-    /// Pins D-34: with no git binary the node boots and serves, and `git+` is
-    /// registered as an unavailable — named — capability rather than vanishing.
-    #[test]
-    fn git_absent_still_composes_and_leaves_the_scheme_explained() {
-        let (mut providers, resolver) = empty_providers();
-
-        register_git_provider(
-            &mut providers,
-            &resolver,
-            Err(sources::git::GitProbeError::NotFound(std::io::Error::from(
-                std::io::ErrorKind::NotFound,
-            ))),
-        )
-        .expect("a gitless image must compose, not refuse to boot");
-
-        assert_eq!(
-            providers.unavailable_schemes(),
-            vec!["git+file".to_owned(), "git+https".to_owned()],
-            "dropping the provider must not drop the schemes from view"
-        );
-        let refusal = providers
-            .scheme_refusal("git+https://example.com/r#main:m.json")
-            .expect("a git+ declaration is refused on a gitless node");
-        assert!(refusal.contains("no `git` binary on PATH"), "{refusal}");
-        assert!(
-            refusal.contains("use the default (non-static) image"),
-            "{refusal}"
-        );
-    }
-
-    /// Every non-absent probe failure refuses the boot — asserted per variant,
-    /// not just for a representative one. `NotFound` is the *only* arm allowed
-    /// to degrade, and a future variant that quietly joined the degrading side
-    /// is exactly the regression this issue exists to prevent.
-    /// Pins D-34: only absence degrades; a git that is present but unusable
-    /// refuses the boot, so the capability is probed rather than inferred from
-    /// the image flavor.
-    #[test]
-    fn every_probe_failure_that_is_not_absence_refuses_the_boot() {
-        for probe_failure in [
-            sources::git::GitProbeError::ExitedUnsuccessfully {
-                status: "exit status: 127".to_owned(),
-                stderr: "git: command not usable".to_owned(),
-            },
-            // A git that is present but cannot be executed — not executable,
-            // or blocked by a sandbox. Distinct from absence, and must not be
-            // mistaken for it.
-            sources::git::GitProbeError::SpawnFailed(std::io::Error::from(
-                std::io::ErrorKind::PermissionDenied,
-            )),
-        ] {
-            let label = probe_failure.to_string();
-            let (mut providers, resolver) = empty_providers();
-
-            let err = register_git_provider(&mut providers, &resolver, Err(probe_failure))
-                .expect_err(
-                    "a git that exists but does not work is a broken host, not a flavor without \
-                     git",
-                );
-
-            assert!(
-                err.to_string().contains("git --version"),
-                "the refusal must name the probe that failed: {err} (from {label})"
-            );
-            assert!(
-                providers.unavailable_schemes().is_empty(),
-                "a refused boot must not ALSO leave git+ registered as merely unavailable — that \
-                 would turn a hard misconfiguration into a soft one on any caller that ignored \
-                 the error (from {label})"
-            );
-        }
-    }
-
-    #[test]
-    fn git_present_registers_the_provider_exactly_as_before() {
-        if sources::git::GitSource::probe().is_err() {
-            // The default flavor's arm needs a real git. `provider_tests.rs`
-            // owns the unguarded assertion that CI has one, so a silent skip
-            // here cannot hide a gitless test environment.
-            return;
-        }
-        let (mut providers, resolver) = empty_providers();
-
-        register_git_provider(&mut providers, &resolver, Ok(())).expect("git is present");
-
-        assert!(providers.schemes().contains(&"git+https".to_owned()));
-        assert!(providers.schemes().contains(&"git+file".to_owned()));
-        assert!(
-            providers.unavailable_schemes().is_empty(),
-            "nothing is unavailable when git is present"
-        );
-        assert!(
-            providers
-                .scheme_refusal("git+https://example.com/r#main:m.json")
-                .is_none(),
-            "the default flavor must refuse nothing it refused before"
-        );
     }
 }

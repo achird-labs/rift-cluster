@@ -247,21 +247,21 @@ describe("RBAC-correct visibility", () => {
  * Columns the table renders that are NOT imposter fields, enumerated so they cannot grow silently.
  *
  * `contract.ts` governs columns whose value comes out of the imposter document — that is what its
- * `keyof Declared<Imposter>` key type enforces. This one does not:
+ * `keyof Declared<Imposter>` key type enforces. Nothing is exempt from it today: the list is empty.
  *
- * - `Provenance` is a **join** against `/admin/sources` — `ports` and `drifted` are that endpoint's
- *   declared fields, read through `sourceOwnedPorts` and `driftedPorts`, never off the imposter.
+ * `Provenance` used to be here, a join against `/admin/sources`. #549 removed tracking sources from
+ * the cluster, so there is no endpoint left to join against and the column went with them.
  *
- * There was an `Owner` column here too, pending on #359. It is gone: an imposter has no owner.
- * Config and stubs are replicated to every node, so every node serves them; only a *flow* is owned,
- * and a port has as many owners as it has flows. A column that can never be filled is a promise
- * rather than a roadmap, so it was removed rather than left pending.
+ * There was an `Owner` column here too, pending on #359. It is gone for a different reason: an
+ * imposter has no owner. Config and stubs are replicated to every node, so every node serves them;
+ * only a *flow* is owned, and a port has as many owners as it has flows. A column that can never be
+ * filled is a promise rather than a roadmap, so it was removed rather than left pending.
  *
- * Listing them here keeps the property the test below exists for: a column added without a source
- * still fails, because it would have to be added to this array first and that is a sentence someone
- * has to justify.
+ * Keeping the array (empty) keeps the property the test below exists for: a column whose value does
+ * not come off the imposter document still fails, because it would have to be added here first and
+ * that is a sentence someone has to justify.
  */
-const DERIVED_COLUMNS = ["Provenance"] as const;
+const DERIVED_COLUMNS: readonly string[] = [];
 
 describe("every rendered cell comes from the declared column table", () => {
   // Pins D-20: an imposter has no owner, so no `Owner` column may render — a column that is not
@@ -310,8 +310,7 @@ describe("every rendered cell comes from the declared column table", () => {
 });
 
 describe("an imposter with no name", () => {
-  // `name` is optional on `POST /imposters`, and imported configs and imposter sources routinely
-  // omit it. The name cell is the list's ONLY route to the detail screen, so a nameless imposter
+  // `name` is optional on `POST /imposters`, and imported configs routinely omit it. The name cell is the list's ONLY route to the detail screen, so a nameless imposter
   // that renders an unlinked `—` is unreachable: no stub editing, no recording panel, no export,
   // and a row that silently ignores clicks with nothing on screen to say why.
   const NAMELESS = {

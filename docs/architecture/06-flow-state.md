@@ -58,9 +58,7 @@ overwrite each other's flow state by naming the same id. That is inherent to wha
 `tenant` scope is for — which is why admitting a config that sets it requires
 `FleetAdmin` (RFC-005 §S1, issue #288): the admin front refuses any other
 principal's client-supplied config carrying the knob with a `400` before
-anything commits, and the source puller refuses a document carrying it once the
-admin plane is enforced (a credential configured or any principal existing) — a
-pull has no principal to hold the role. Under the open
+anything commits. Under the open
 admin plane (no principal) nothing gates, as nothing else does. The gate is on
 *setting* the scope: a stub edit on an admitted fleet-scoped imposter is not
 gated, and a store built before its config row is visible renders `t??:` only

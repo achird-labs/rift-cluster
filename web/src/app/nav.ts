@@ -72,6 +72,10 @@ export function groupOf(entry: NavEntry): NavGroup {
  * The unbuilt half is the point. Omitting those entries would present C4's two screens as the
  * whole console; a 404 on a nav click would be worse still. A greyed entry carrying its issue
  * number answers "where is X?" without anyone having to ask.
+ *
+ * The list currently has no planned entries: `specs` was the last one, and #549 removed the stored
+ * spec surface it was promising. The mechanism stays — an empty roadmap is a state, not a reason to
+ * delete the shape RFC-006 §4 asks for — and `PlannedEntry` is what the next unbuilt screen uses.
  */
 export const NAV: readonly NavEntry[] = [
   {
@@ -129,18 +133,6 @@ export const NAV: readonly NavEntry[] = [
   },
   {
     kind: "live",
-    id: "sources",
-    label: "Sources",
-    // #233 shipped: the backend has carried sources, provenance and drift for a while, and this
-    // entry used to tell an operator "not yet shipped, see #233" while pointing at the very issue
-    // that built the screen it was missing.
-    route: { screen: "sources" },
-    requires: "source.read",
-    group: "fleet",
-    glyph: "▤",
-  },
-  {
-    kind: "live",
     id: "administration",
     label: "Tenancy & principals",
     short: "Tenancy",
@@ -155,14 +147,6 @@ export const NAV: readonly NavEntry[] = [
     requires: "tenant.manage",
     group: "administration",
     glyph: "◇",
-  },
-  {
-    kind: "planned",
-    id: "specs",
-    label: "Specs",
-    issue: 148,
-    note: "OpenAPI import, drift and contract validation (RFC-004).",
-    glyph: "○",
   },
 ];
 

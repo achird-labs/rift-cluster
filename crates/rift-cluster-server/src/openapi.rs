@@ -334,21 +334,7 @@ mod parity {
                 RouteKey::new(&Method::DELETE, "/front-door/routes/{routeId}")
             }
             Terminated::Tenancy(route) => tenancy_contract_route(route),
-            Terminated::SourceList => RouteKey::new(&Method::GET, "/admin/sources"),
-            Terminated::SourceRead(_) => RouteKey::new(&Method::GET, "/admin/sources/{sourceId}"),
-            Terminated::SourcePut => RouteKey::new(&Method::POST, "/admin/sources"),
-            Terminated::SourceDelete(_) => {
-                RouteKey::new(&Method::DELETE, "/admin/sources/{sourceId}")
-            }
-            Terminated::SourcePull(_) => {
-                RouteKey::new(&Method::POST, "/admin/sources/{sourceId}/pull")
-            }
-            Terminated::SpecList => RouteKey::new(&Method::GET, "/specs"),
-            Terminated::SpecRead(_) => RouteKey::new(&Method::GET, "/specs/{specId}"),
-            Terminated::SpecPut(_) => RouteKey::new(&Method::PUT, "/specs/{specId}"),
-            Terminated::SpecDelete { .. } => RouteKey::new(&Method::DELETE, "/specs/{specId}"),
-            Terminated::SpecCompile(_) => RouteKey::new(&Method::POST, "/specs/{specId}/compile"),
-            Terminated::SpecDeploy(_) => RouteKey::new(&Method::POST, "/specs/{specId}/deploy"),
+            Terminated::SpecCompile => RouteKey::new(&Method::POST, "/specs/compile"),
         }
     }
 
@@ -362,24 +348,6 @@ mod parity {
             Route::TenantRead(_) => RouteKey::new(&Method::GET, "/admin/tenants/{tenantId}"),
             Route::TenantPut(_) => RouteKey::new(&Method::PUT, "/admin/tenants/{tenantId}"),
             Route::TenantDelete(_) => RouteKey::new(&Method::DELETE, "/admin/tenants/{tenantId}"),
-            Route::DatasetUpload(_) => {
-                RouteKey::new(&Method::POST, "/admin/tenants/{tenantId}/datasets")
-            }
-            Route::DatasetList(_) => {
-                RouteKey::new(&Method::GET, "/admin/tenants/{tenantId}/datasets")
-            }
-            Route::DatasetHistory(_, _) => RouteKey::new(
-                &Method::GET,
-                "/admin/tenants/{tenantId}/datasets/{datasetName}",
-            ),
-            Route::DatasetContent(_, _, _) => RouteKey::new(
-                &Method::GET,
-                "/admin/tenants/{tenantId}/datasets/{datasetName}/{version}/content",
-            ),
-            Route::DatasetDelete(_, _) => RouteKey::new(
-                &Method::DELETE,
-                "/admin/tenants/{tenantId}/datasets/{datasetName}",
-            ),
             Route::PrincipalCreate(_) => {
                 RouteKey::new(&Method::POST, "/admin/tenants/{tenantId}/principals")
             }
@@ -447,18 +415,6 @@ mod parity {
             Terminated::Tenancy(Route::TenantRead(tenant.clone())),
             Terminated::Tenancy(Route::TenantPut(tenant.clone())),
             Terminated::Tenancy(Route::TenantDelete(tenant.clone())),
-            Terminated::Tenancy(Route::DatasetUpload(tenant.clone())),
-            Terminated::Tenancy(Route::DatasetList(tenant.clone())),
-            Terminated::Tenancy(Route::DatasetHistory(
-                tenant.clone(),
-                "customers".to_owned(),
-            )),
-            Terminated::Tenancy(Route::DatasetContent(
-                tenant.clone(),
-                "customers".to_owned(),
-                3,
-            )),
-            Terminated::Tenancy(Route::DatasetDelete(tenant.clone(), "customers".to_owned())),
             Terminated::Tenancy(Route::PrincipalCreate(tenant.clone())),
             Terminated::Tenancy(Route::PrincipalList(tenant.clone())),
             Terminated::Tenancy(Route::PrincipalPut(tenant.clone(), principal.clone())),
@@ -466,20 +422,7 @@ mod parity {
             Terminated::Tenancy(Route::BindingPut(tenant.clone(), principal.clone())),
             Terminated::Tenancy(Route::BindingDelete(tenant, principal)),
             Terminated::Tenancy(Route::FleetNamePut),
-            Terminated::SourceList,
-            Terminated::SourceRead("payments".to_owned()),
-            Terminated::SourcePut,
-            Terminated::SourceDelete("payments".to_owned()),
-            Terminated::SourcePull("payments".to_owned()),
-            Terminated::SpecList,
-            Terminated::SpecRead("petstore".to_owned()),
-            Terminated::SpecPut("petstore".to_owned()),
-            Terminated::SpecDelete {
-                id: "petstore".to_owned(),
-                force: false,
-            },
-            Terminated::SpecCompile("petstore".to_owned()),
-            Terminated::SpecDeploy("petstore".to_owned()),
+            Terminated::SpecCompile,
         ]
     }
 
@@ -591,12 +534,6 @@ mod parity {
             // all, so a placeholder like "op-1" would probe a different code path than the live route.
             .replace("{opId}", "0189dcf0-0454-4e0b-a10c-8a8f8dccce1f")
             .replace("{key}", "k")
-            .replace("{specId}", "petstore")
-            .replace("{datasetName}", "customers")
-            // A number, for the same reason `{opId}` is a real UUID: the dataset content route
-            // parses this segment, and a non-numeric placeholder would probe the *absence* of a
-            // route rather than the route itself.
-            .replace("{version}", "3")
     }
 
     /// Does the front terminate this request itself, rather than proxying it?

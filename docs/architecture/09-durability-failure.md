@@ -128,32 +128,18 @@ read it are asserting.
 | Journal / count read | all peers | merge of reachable shards + `Rift-Cluster-Partial: true` | Partial-and-says-so beats blocked |
 | Journal read **from a crash-restarted writer** | all peers | merge, still `Rift-Cluster-Partial: true` while peers cache entries of its own lost shard (#349) | The entries are gone for good, not late — a knowingly short answer must say so |
 | Admin config read | — (local applied state) | served, possibly behind; revision comparable | Staleness is measurable, not hidden |
-| Admin write **carrying a large payload** (spec ≤ 4 MiB, dataset ≤ 8 MiB) | Raft quorum | commits in `O(size / link speed)`; below ~1 MiB/s the intent parks and replays | The bytes ride the log — a big entry is slow, not impossible (#411) |
 
 ## The replication ceiling
 
-The log carries metadata; blobs are quorum-replicated out of band (epic #432,
-D-23). A spec document up to 4 MiB (RFC-004 S2) and a dataset up to a
-tenant-configurable 8 MiB (RFC-005 §4) no longer ride a log entry: a
-`SpecPut`/`DatasetPut` commits a digest and a size — under 4 KiB — and the bytes
-travel through the content-addressed blob store (`/internal/v1/blob/{digest}`,
-#437), fanned out to a joint-consensus quorum *before* the referencing op is
-proposed (#438, D-18/D-19) and fetched on apply by any member the fan-out missed
-(#439, D-48/D-49). Snapshots became manifests of digests the joiner fetches on
-install (#440, D-50). So the log entry is small again by construction, and the
-large-payload concerns this section used to open with have moved off the log
-onto a transport built for them.
+**The log carries metadata, and nothing else** (D-71, #549). Every op is small
+JSON: the only payloads that were ever measured in MiB — an uploaded OpenAPI
+document, a CSV table — no longer enter the cluster at all, and neither does the
+out-of-band transport that once carried them. What follows describes the log's
+own large-entry path (#411): it still exists and still bounds any entry the
+transport cap admits, but nothing routine takes it any more.
 
-The blob transport is **resumable**: a transfer is chunked at 4 MiB
-(`BLOB_CHUNK_MAX_BYTES`), receiver-verified against the digest, and a stalled or
-restarted transfer resumes from its last committed chunk rather than from byte 0
-— which is what lets an 8 MiB blob cross a real link and commit (#453) where an
-8 MiB *log entry* never did (below). Everything from here down describes the
-log's own large-entry path (#411): it still exists, still bounds any entry the
-transport cap admits, and is simply no longer the path the data quotas take.
-
-What bounds a log entry's size is the transport's own body cap (32 MiB), which
-sits above every quota. What bounds its *latency* is the link:
+What bounds a log entry's size is the transport's own body cap (32 MiB). What
+bounds its *latency* is the link:
 
 - A large entry commits in **`O(size / link speed)`**, not in one heartbeat.
   openraft grants each AppendEntries RPC only `heartbeat_interval` (50 ms), so
@@ -184,17 +170,15 @@ sends a follower nothing else while a large entry is in flight nor anything at
 all during a snapshot install. A window longer than `election_timeout_min`
 (150 ms) makes a **voter** campaign, and once its term has moved the leader —
 which rejects a candidate without adopting its term — never reconciles with it.
-Two independent fixes closed it, and #432 removed what opened it in the first
-place. #431 supplies a per-peer liveness heartbeat that bypasses the health
-tracker, a 50 ms reconnect backoff, and a restart grace for a node that already
-belongs to a cluster, so a voter no longer campaigns through a legitimate
-transfer; a stale replication core reading a range the new leader's conflict had
-truncated — the openraft 0.9.24 panic behind #430 — is tolerated from 0.9.25
-(#435). And because spec/dataset bytes and snapshot payloads no longer ride the
-log (#439/#440), the multi-MiB entries and multi-MiB `InstallSnapshotRequest`s
-that used to make the window *routine* are gone: a digest-only entry and a
-manifest snapshot are both back in KiB, and their bytes cross the blob transport
-without touching a follower's election timer at all.
+Two independent fixes closed it, and removing the multi-MiB payloads removed what
+opened it in the first place. #431 supplies a per-peer liveness heartbeat that
+bypasses the health tracker, a 50 ms reconnect backoff, and a restart grace for a
+node that already belongs to a cluster, so a voter no longer campaigns through a
+legitimate transfer; a stale replication core reading a range the new leader's
+conflict had truncated — the openraft 0.9.24 panic behind #430 — is tolerated
+from 0.9.25 (#435). And with every op back in KiB (D-71, #549), the multi-MiB
+entries and multi-MiB `InstallSnapshotRequest`s that used to make the window
+*routine* no longer exist.
 
 ## Scenario walkthroughs
 
@@ -245,9 +229,9 @@ majority of voters** is the honest limit of a self-contained cluster: configs
 survive only as `--datadir` exports/backups (Chapter 10's backup runbook);
 this is stated rather than hedged.
 
-That catch-up moves the *whole* state machine, datasets and spec documents
-included, so it is measured in MiB rather than KiB — and it costs roughly 4× its
-size on the wire, because snapshot chunks ride the JSON cluster port as byte
+That catch-up moves the *whole* state machine — imposter configs, tenancy,
+bindings, dedup — and it costs roughly 4× its size on the wire, because snapshot
+chunks ride the JSON cluster port as byte
 arrays. The transfer is bounded **per chunk**, not per snapshot: a chunk that
 misses its deadline abandons the entire transfer back to offset 0, so the bounds
 are deliberately generous rather than tight (#428). Two apply, and the smaller
@@ -263,28 +247,21 @@ join still fails the deployment exactly as before.
 **What a snapshot costs to store, measured (#436).** The payload is written as a plain file beside
 redb rather than inlined into a `redb` row as a JSON integer array, which is what made the stored
 artifact ~3.7× the bytes it carried. Measured after the change, on loopback: a fleet holding 4 MiB
-of datasets stores **1.00×** its raw bytes, and one holding 16 MiB likewise **1.00×**.
+of state stores **1.00×** its raw bytes, and one holding 16 MiB likewise **1.00×**.
 
 **Fresh-joiner catch-up, before and after (#436),** same probe on both sides, 1 voter → 2:
 
-| fleet state | before (#436) | after file-backed (#436) | after manifest (#440) |
-|---|---|---|---|
-| 4 MiB | 3.1 s | **2.2 s** | seconds |
-| 16 MiB | 12.3 s | **8.8 s** | seconds |
-| 64 MiB | never converges | still never converges | **converges — bytes fetched out of band** |
+| fleet state | before (#436) | after file-backed (#436) |
+|---|---|---|
+| 4 MiB | 3.1 s | **2.2 s** |
+| 16 MiB | 12.3 s | **8.8 s** |
 
-The 64 MiB row was the honest headline until #440: binary, file-backed snapshots (#436) cut what a
-snapshot costs to *store* and to *install*, but did not move the ceiling, because the payload was
-still chunked onto the wire as a JSON integer array by openraft's own `InstallSnapshotRequest` — the
-same silent window a multi-MiB entry opens (above), now opened by the install instead. #440 removes
-the payload from that path entirely: the snapshot is a **manifest** of digests and sizes (KiB), and
-the joiner fetches each blob it lacks over the resumable blob transport (#437) — a snapshot names no
-single origin, so it asks every joint voter, parking and retrying if none can yet supply it (D-48) —
-*before* the install commits. The `InstallSnapshotRequest` no longer
-carries the dataset bytes, so the ceiling it imposed is gone; a 64 MiB fleet's catch-up is now
-bounded by the same per-blob resumable transport that carries an 8 MiB blob (#453), not by a
-snapshot that restarts from byte 0. Measured multi-MiB catch-up is seconds; the 64 MiB case
-converges by the same construction rather than by a fresh end-to-end measurement at that size.
+Those figures were measured against a state machine that could reach tens of MiB. It no longer can:
+the state machine holds imposter configs, tenancy and dedup — small JSON, all of it — so a snapshot
+is bounded by how many imposters a fleet runs, not by an upload quota (D-71, #549). The
+`InstallSnapshotRequest` path is still openraft's own, still chunked as a JSON integer array, and
+still the reason a snapshot is measured rather than assumed; what changed is that nothing puts MiB
+of payload into it any more.
 
 **Producing a snapshot costs the leader CPU, but never its runtime (#444).** The chapter above
 describes what a catch-up costs the *joiner*; the other half is what building one costs the node
@@ -304,26 +281,9 @@ joiner present** so the leader-side cost is isolated from anything on the instal
 
 **The write path still has this shape, in one place.** `RaftLogStorage::append` is synchronous on a
 runtime worker — it commits and fsyncs every entry before acknowledging it — and is not hoisted: a
-blocking-pool hop per committed entry buys latency for nothing on the hot path, and #432's move to
-digest-only entries (#439) already shrank each entry to KiB, so the serde and fsync it carries are
-small. `apply` no longer carries a dataset's CSV at all: a digest-only op resolves its bytes in a
-pre-transaction fetch (D-49) that runs off both the redb write transaction and the runtime worker
-(the blob is stored via `spawn_blocking`, #444), and only the spool materialisation — plain file
-I/O bounded by the blob's size — remains, done after the durable commit. A heartbeat gap during a
-write is that residual, not a regression of the fix above.
-
-**Catch-up no longer has a size ceiling below the documented quotas (#440).**
-Before #432's snapshot child, a fleet holding a few MiB of state caught a node up
-in seconds (measured: ~4 MiB in 8 s on loopback) but a fleet at RFC-005's 64 MiB
-per-tenant dataset ceiling did **not** catch a node up at all — the joiner
-applied nothing even given minutes, because the whole payload was chunked through
-`InstallSnapshotRequest` and restarted from byte 0 on any stall. Manifest
-snapshots removed that path: the joiner installs a KiB manifest and fetches the
-bytes it lacks over the resumable blob transport (#437, #440), so RFC-005 §4's
-quotas now describe state a replacement node can actually be brought up to hold,
-and an operator near them should expect a joiner to converge in
-`O(state / link speed)` rather than to fail. The per-blob transport is the only
-remaining bound, and it is the same one the live write path already runs at.
+blocking-pool hop per committed entry buys latency for nothing on the hot path, and every entry is
+KiB of JSON (D-71, #549), so the serde and fsync it carries are small. `apply` writes `sm_*` tables
+and calls the local engine; it carries no bulk payload of any kind.
 
 A related case, and the one more likely to be met in practice: the scenario
 above is a node that comes back **empty**. A node that returns still holding its

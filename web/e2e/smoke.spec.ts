@@ -14,7 +14,6 @@ const SCREENS = [
   { hash: "/requests", heading: /request log/i },
   { hash: "/routes", heading: /front-door routes/i },
   { hash: "/scenarios", heading: /scenarios & state/i },
-  { hash: "/sources", heading: /sources/i },
 ] as const;
 
 test.describe("the shipped console loads", () => {

@@ -21,11 +21,11 @@
 #   `runtime`        (the production default — pass `--target runtime` explicitly: since
 #                     issue #228 the file's LAST stage is the chaos suite's
 #                     `runtime-faketime`, so a bare untargeted build no longer produces
-#                     this) — `debian:bookworm-slim`, carries `git` so
-#                     `git+https:`/`git+file:` imposter sources work.
+#                     this) — `debian:bookworm-slim`, with a shell and the usual slim
+#                     package set.
 #   `runtime-static` (`-static` tag suffix) — `FROM scratch`, a musl binary and nothing
-#                     else: no shell, no package manager, no git. Smaller and a narrower
-#                     attack surface, at the cost of `git+` sources — see `deploy/README.md`'s
+#                     else: no shell, no package manager. Smaller and a narrower attack
+#                     surface, at the cost of the shell — see `deploy/README.md`'s
 #                     image-flavors table for the full trade-off.
 #
 # `runtime` stays the LAST stage in this file on purpose: `cluster-smoke` and every local
@@ -352,23 +352,13 @@ RUN mkdir -p /var/lib/rift && chown 10001:10001 /var/lib/rift
 # The `-static` flavor's whole reason to exist (#270): zero OS packages, zero shell, zero attack
 # surface beyond the binary itself. `FROM scratch` has no package manager, no libc dynamic
 # loader, no coreutils — nothing but what is explicitly COPYed in below.
-#
-# This is possible now, and was not before #270's Rust half: `git+https:`/`git+file:` imposter
-# sourcing used to be probed with `git --version` at startup and treated a missing git as a
-# reason to refuse to boot, which would have made a gitless scratch image fail before it ever
-# served a request. It is now a detected CAPABILITY instead of a boot requirement — the server
-# boots and serves, logs exactly `git not found; git+ imposter sources disabled in this image`
-# at WARN, and the two `git+` schemes fail at DECLARATION time (`` `git+https:` sources are
-# unavailable: no `git` binary on PATH; install git, or use the default (non-static) image if this is `-static` ``) rather than at
-# boot. See `runtime` below for the flavor that keeps git and pays for it in image size and
-# package surface instead.
 FROM scratch AS runtime-static
 
 COPY --from=builder-static /rift-cluster-server-static /usr/local/bin/rift-cluster-server
 
-# Outbound TLS (proxied imposters, HTTPS config sources) needs a CA bundle even with no git and
-# no package manager to fetch one from at runtime. `builder-static` installed `ca-certificates`
-# purely to produce this file for the COPY below.
+# Outbound TLS (proxied imposters) needs a CA bundle even with no package manager to fetch one
+# from at runtime. `builder-static` installed `ca-certificates` purely to produce this file for
+# the COPY below.
 COPY --from=builder-static /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 
 COPY --from=builder-static /etc/passwd.rift /etc/passwd
@@ -406,25 +396,19 @@ ENTRYPOINT ["/usr/local/bin/rift-cluster-server"]
 # NO LONGER the last stage in the file (issue #228): `runtime-faketime` — the chaos
 # suite's clock-skew flavor, which must build FROM this stage — sits after it, so an
 # untargeted build now resolves to *that*. The invariant therefore inverted: every build
-# site in the repo pins `target:` explicitly (the base compose, both demo composes, the
-# sources overlay, release.yml's matrix, and the README's build command), and
+# site in the repo pins `target:` explicitly (the base compose, the demo compose, the
+# chaos tier's overlays, release.yml's matrix, and the README's build command), and
 # `every_dockerfile_build_site_pins_a_target` in the chaos suite's `scenarios.rs` fails
 # the build of any compose file that forgets — appending a stage can never again silently
 # change what anyone builds.
 FROM debian:bookworm-slim AS runtime
 
-# ca-certificates is needed for outbound TLS (proxied imposters, HTTPS config
-# sources). `git` is needed by the `git+https:`/`git+file:` imposter source
-# (#136), which shells out to it rather than linking libgit2. This — the
-# default — flavor ships git, so `git+` sources work exactly as before; the
-# `-static` flavor (`runtime-static` above) does not, and declaring a `git+`
-# source against it fails at declaration time rather than at boot — see that
-# stage's comment and `deploy/README.md`'s image-flavors table. Nothing else
+# ca-certificates is needed for outbound TLS (proxied imposters). Nothing else
 # is installed on purpose — in particular no curl: the health check below
 # execs the binary's own `healthcheck` subcommand, which is exactly why
 # upstream put it in the binary.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates git \
+    && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --system --create-home --uid 10001 rift
 

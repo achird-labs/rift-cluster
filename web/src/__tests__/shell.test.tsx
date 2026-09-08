@@ -5,7 +5,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { TENANT_HEADER } from "../api/client.ts";
 import { Shell } from "../app/Shell.tsx";
-import { ISSUE_URL, plannedEntries } from "../app/nav.ts";
+import { plannedEntries } from "../app/nav.ts";
 import { TENANT_STORAGE_KEY, initialTenant } from "../app/session.tsx";
 import { preferenceStore, resetPreferenceStore } from "../app/storage.ts";
 import { renderInApp, stubFetch, whoamiWith } from "./harness.tsx";
@@ -24,22 +24,19 @@ afterEach(() => {
 });
 
 describe("nav — a visible roadmap, not a 404", () => {
-  it("renders every planned screen as a disabled entry carrying its issue link", async () => {
+  it("greys out nothing, because nothing is currently promised-but-unbuilt", async () => {
+    // `specs` was the last planned chip and #549 removed the stored-spec surface behind it, so the
+    // roadmap is empty. Asserted both ways rather than deleted: `plannedEntries()` says the model
+    // holds none, and the rendered bar says none leaked in as a greyed entry that no longer links
+    // anywhere real. `Shell` still renders `PlannedEntry`, which is what the next unbuilt screen
+    // reaches for — RFC-006 §4 asks for a visible roadmap, and an empty one is a state, not a
+    // reason to delete the shape.
     stubFetch(QUIET);
     renderInApp(<Shell />, { whoami: whoamiWith("fleet-admin") });
 
-    for (const entry of plannedEntries()) {
-      const item = await screen.findByTestId(`nav-${entry.id}`);
-      expect(item.dataset.planned).toBe("true");
-      expect(item.textContent).toContain(entry.label);
-      expect(item.textContent).toContain(`#${entry.issue}`);
-
-      // Exactly one link, and it goes to the issue — never to a console route. That is the whole
-      // difference between "a visible roadmap" and "a nav entry that 404s".
-      const links = within(item).getAllByRole("link");
-      expect(links.length).toBe(1);
-      expect(links[0]?.getAttribute("href")).toBe(ISSUE_URL(entry.issue));
-    }
+    await screen.findByTestId("nav-imposters");
+    expect(plannedEntries()).toEqual([]);
+    expect(document.querySelectorAll('[data-planned="true"]').length).toBe(0);
   });
 
   it("navigates between the live screens without a page load", async () => {

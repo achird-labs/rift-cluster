@@ -80,16 +80,10 @@ tags:
       entirely.
   - name: session
     description: RFC-006 §5.3 browser session exchange — no upstream equivalent.
-  - name: sources
-    description: >
-      Issue #239's read-only imposter-source inspection — no upstream
-      equivalent. Declaring, deleting, and pulling sources stay on the
-      cluster port.
   - name: specs
     description: >
-      RFC-004 §5 (issue #278): OpenAPI specs as tenant-owned,
-      content-addressed control-plane objects — import, dry-run compile,
-      deploy, delete. No upstream equivalent.
+      The one-shot OpenAPI compile (D-72, issue #549) — a document in, a
+      compiled imposter out, nothing stored. No upstream equivalent.
   - name: meta
     description: Identity and contract introspection.
   - name: upstream-core
@@ -2598,206 +2592,6 @@ paths:
         '504':
           $ref: '#/components/responses/WriteTimeout'
 
-  /admin/tenants/{tenantId}/datasets:
-    parameters:
-      - $ref: '#/components/parameters/TenantId'
-    get:
-      operationId: listDatasets
-      summary: List this tenant's datasets
-      description: >
-        One row per dataset *name* — every version of a name is one table — carrying
-        the latest live version and how many live stubs bind it. A non-zero
-        `bindings` count means a delete will be refused with `409`.
-
-        `Rift-Cluster-Partial: true` means a stored config would not parse, so the
-        binding tally is short — the count is advisory, but a short one would
-        promise a delete that then `409`s, so it is reported rather than hidden.
-      tags: [datasets]
-      x-rift-origin: ee
-      responses:
-        '200':
-          description: The tenant's datasets.
-          content:
-            application/json:
-              schema:
-                type: array
-                items:
-                  type: object
-                  required: [name, latestVersion, rows, bytes, bindings]
-                  properties:
-                    name: { type: string }
-                    latestVersion: { type: integer, format: int64 }
-                    rows: { type: integer, format: int64 }
-                    bytes: { type: integer, format: int64 }
-                    bindings:
-                      type: integer
-                      description: Live stubs binding this dataset. Non-zero blocks a delete.
-        '403': { $ref: '#/components/responses/Forbidden' }
-        '404':
-          description: >
-            No such dataset, or the caller is not bound to the tenant named — the
-            two are deliberately indistinguishable (RFC-002 §8.4), body included,
-            so this cannot be used to discover whether a dataset exists in another
-            tenant.
-    post:
-      operationId: uploadDataset
-      summary: Upload a new version of a dataset
-      description: >
-        The body is the CSV itself (`text/csv`). Its name, key columns and
-        delimiter travel beside it, as `X-Rift-Dataset-*` headers or as query
-        parameters; headers win when both are present.
-
-        Every version of a name is a new version — an upload never mutates a
-        serving stub, because a `_rift.dataset` binding pins the version it
-        resolved (RFC-005 §3.3, issue #286).
-
-        The response deliberately omits the assigned version: it is allocated at
-        apply, and reporting one here would mean guessing `latest + 1`, which two
-        concurrent uploads of the same name would both get wrong. `GET
-        /admin/tenants/{tenantId}/datasets/{datasetName}` has it.
-
-        Bounded by the admin plane's 16 MiB body limit before any quota check runs.
-      tags: [datasets]
-      x-rift-origin: ee
-      parameters:
-        - $ref: '#/components/parameters/CsrfHeader'
-        - in: header
-          name: X-Rift-Dataset-Name
-          schema: { type: string }
-          description: The dataset's name. Or `?name=`.
-        - in: header
-          name: X-Rift-Dataset-Key-Columns
-          schema: { type: string }
-          description: >
-            Comma-separated columns a lookup may key on. Or `?keyColumns=`. Each
-            must be unique across rows — validated before the upload commits.
-        - in: header
-          name: X-Rift-Dataset-Delimiter
-          schema: { type: string, maxLength: 1, default: ',' }
-          description: Exactly one character. Or `?delimiter=`.
-      requestBody:
-        required: true
-        content:
-          text/csv:
-            schema: { type: string }
-      responses:
-        '201':
-          description: Committed; the bytes are on every node.
-          content:
-            application/json:
-              schema:
-                type: object
-                required: [name, digest, rows]
-                properties:
-                  name: { type: string }
-                  digest:
-                    type: string
-                    description: sha256 of the exact bytes uploaded.
-                  rows: { type: integer, format: int64 }
-        '400':
-          description: >
-            The record did not describe the document — a duplicate key, a key
-            column not in the header, an unsplittable delimiter — or a quota was
-            exceeded. The body names which.
-        '403': { $ref: '#/components/responses/Forbidden' }
-        '404':
-          description: >
-            No such dataset, or the caller is not bound to the tenant named — the
-            two are deliberately indistinguishable (RFC-002 §8.4), body included,
-            so this cannot be used to discover whether a dataset exists in another
-            tenant.
-        '413': { description: The CSV exceeded the admin plane's body limit. }
-  /admin/tenants/{tenantId}/datasets/{datasetName}:
-    parameters:
-      - $ref: '#/components/parameters/TenantId'
-      - $ref: '#/components/parameters/DatasetName'
-    get:
-      operationId: readDatasetHistory
-      summary: One dataset's version history
-      description: >
-        Every live version, newest first, plus how many live stubs bind the
-        dataset.
-
-        A dataset this tenant does not have answers `404` — byte-identical to a
-        cross-tenant probe, so a caller cannot tell "no such dataset" from "not
-        yours" (RFC-002 §8.4).
-      tags: [datasets]
-      x-rift-origin: ee
-      responses:
-        '200':
-          description: The dataset's versions.
-          content:
-            application/json:
-              schema:
-                type: object
-                required: [name, versions, bindings]
-                properties:
-                  name: { type: string }
-                  bindings: { type: integer }
-                  versions:
-                    type: array
-                    items: { type: object }
-        '403': { $ref: '#/components/responses/Forbidden' }
-        '404':
-          description: >
-            No such dataset, or the caller is not bound to the tenant named — the
-            two are deliberately indistinguishable (RFC-002 §8.4), body included,
-            so this cannot be used to discover whether a dataset exists in another
-            tenant.
-    delete:
-      operationId: deleteDataset
-      summary: Delete a dataset
-      description: >
-        Tombstones every live version of the name. **Refused with `409` while any
-        live stub binds it** — a mock never breaks because its data was removed
-        underneath it. That rule is enforced at apply on every replica, not at the
-        front, so a binding committed concurrently with this call still refuses it.
-      tags: [datasets]
-      x-rift-origin: ee
-      parameters:
-        - $ref: '#/components/parameters/CsrfHeader'
-      responses:
-        '204': { description: Deleted. }
-        '403': { $ref: '#/components/responses/Forbidden' }
-        '404':
-          description: >
-            No such dataset, or the caller is not bound to the tenant named — the
-            two are deliberately indistinguishable (RFC-002 §8.4), body included,
-            so this cannot be used to discover whether a dataset exists in another
-            tenant.
-        '409': { description: A live stub still binds this dataset. The body names the port. }
-  /admin/tenants/{tenantId}/datasets/{datasetName}/{version}/content:
-    parameters:
-      - $ref: '#/components/parameters/TenantId'
-      - $ref: '#/components/parameters/DatasetName'
-      - in: path
-        name: version
-        required: true
-        schema: { type: integer, format: int64 }
-        description: A concrete version. A non-numeric value is `404`, never coerced.
-    get:
-      operationId: readDatasetContent
-      summary: Download a dataset version's bytes
-      description: >
-        The stored bytes of one dataset version, exactly as uploaded. Listings
-        and version history describe a dataset; this is the one route that hands
-        back its content, which is a bulk export of whatever the operator
-        uploaded and is routinely PII.
-      tags: [datasets]
-      x-rift-origin: ee
-      responses:
-        '200':
-          description: The CSV, exactly as uploaded.
-          content:
-            text/csv:
-              schema: { type: string }
-        '403': { $ref: '#/components/responses/Forbidden' }
-        '404':
-          description: >
-            No such dataset, or the caller is not bound to the tenant named — the
-            two are deliberately indistinguishable (RFC-002 §8.4), body included,
-            so this cannot be used to discover whether a dataset exists in another
-            tenant.
   /admin/tenants/{tenantId}/principals:
     parameters:
       - $ref: '#/components/parameters/TenantId'
@@ -3195,561 +2989,87 @@ paths:
           $ref: '#/components/responses/Forbidden'
 
   # ---------------------------------------------------------------------
-  # ee: imposter sources (issue #239 read surface; #253 promotes the write
-  # verbs the cluster port already served — declare, delete, pull now — to
-  # this RBAC'd front, tenant-resolved rather than fixed to `default`)
+  # ee: the one-shot OpenAPI compile (D-72, issue #549) — what replaced the
+  # stored `/specs` surface, its blob table and its drift diff
   # ---------------------------------------------------------------------
-  /admin/sources:
-    get:
-      operationId: listSources
-      summary: The tenant's imposter sources, with this node's poll status apart
-      description: >
-        Terminates. The `sources` half is the fleet-replicated projection,
-        id-ascending and byte-identical on every converged node — diffing two
-        nodes' answers is how an operator checks a `SourcePut` has converged.
-        The `nodeLocal` half is true of the answering node only: a poll
-        failure is deliberately never replicated (a log entry per failure is
-        the log growth the digest short-circuit exists to prevent), so it may
-        differ across the fleet and is kept structurally apart rather than
-        flattened into the record. Requires `source.read` (Viewer and up).
-      tags: [sources]
-      x-rift-origin: ee
-      parameters:
-        - $ref: '#/components/parameters/TenantHeader'
-      responses:
-        '200':
-          description: The tenant's declared sources, plus this node's poll status.
-          content:
-            application/json:
-              schema:
-                type: object
-                required: [sources, nodeLocal]
-                properties:
-                  sources:
-                    type: array
-                    items:
-                      $ref: '#/components/schemas/SourceRecord'
-                  nodeLocal:
-                    $ref: '#/components/schemas/SourcesNodeLocal'
-        '401':
-          $ref: '#/components/responses/Unauthorized'
-        '404':
-          description: Caller holds no binding in the tenant in view (RFC-002 §8.4 — not a 403).
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/Error'
-        '500':
-          $ref: '#/components/responses/InternalError'
+  /specs/compile:
     post:
-      operationId: putSource
-      summary: Declare (upsert by id) an imposter source
+      operationId: compileSpec
+      summary: Compile an OpenAPI document into an imposter config, storing nothing
       description: >
-        Terminates: commits a `SourcePut` op and answers `200` with the
-        stored record. An upsert, not a create-vs-replace distinction — the
-        same `id` re-declared replaces the prior declaration. Requires
-        `imposter.write` (Editor and up) — deliberately not a dedicated
-        `source.write`: it is exactly as consequential as `PUT
-        /imposters`, because that is what a pull ultimately produces, and
-        the read side above is the lighter, separately-gated
-        `source.read`. A `uri` carrying embedded userinfo
-        (`user:pass@host`) is refused before the write reaches the
-        replicated log — name a credential with `authRef` instead. No
-        `If-Match`: a source row has no revision surface of its own to
-        condition on, and this is an idempotent upsert, not a
-        read-modify-write.
-      tags: [sources]
+        Terminates, and **stores nothing** (D-72, issue #549). The body is an
+        OpenAPI 3.0 document — JSON or YAML, sniffed rather than declared — and
+        the answer is the compiled imposter JSON, byte for byte what the caller
+        then sends as `PUT /imposters`, plus the operation index the compiler
+        built it from so a client can show what it is about to deploy.
+
+
+        **Stateless, and that is the whole point.** No record is kept, no
+        `ControlOp` is minted and no applied state is read: the cluster retains
+        nothing about the document, and the compiled imposter reaches the log
+        through the one path every other config takes — the caller's own
+        `PUT /imposters`. This replaced the stored `/specs` surface (import,
+        drift, deploy), which no longer exists.
+
+
+        **`port` is required.** There is no stored record to infer a binding
+        from, and a compiled imposter with no port cannot be replicated at all,
+        so answering with a portless document would hand the caller something
+        the very next `PUT /imposters` would refuse.
+
+
+        The compiler's refusals — an unsupported version, an external `$ref`, a
+        parse failure, its own self-check — are this route's `400` verbatim.
+        There is no separate warning channel: a document the compiler would warn
+        about is one it refuses, so a `200` here means the output passed the
+        contract it just emitted.
+
+
+        Authorized as `imposter.write` (Editor and up): the caller is being
+        handed a config to deploy, and the compile is the first half of that
+        write.
+      tags: [specs]
       x-rift-origin: ee
       parameters:
         - $ref: '#/components/parameters/TenantHeader'
         - $ref: '#/components/parameters/CsrfHeader'
+        - name: port
+          in: query
+          required: true
+          description: >
+            The port the compiled imposter binds. Required, for the reason in
+            the description — a portless imposter cannot replicate.
+          schema:
+            type: integer
+            format: int32
+            minimum: 1
+            maximum: 65535
+        - name: name
+          in: query
+          required: false
+          description: >
+            Name for the compiled imposter. Absent — or empty, which reads the
+            same — leaves the field off the compiled config entirely.
+          schema:
+            type: string
       requestBody:
         required: true
+        description: >
+          The OpenAPI 3.0 document itself, carried opaquely: an arbitrary
+          document, not a modelled object, so the schema is `string` under either
+          media type. The media type is not consulted at all — JSON and YAML are
+          sniffed from the bytes — so it is declarative here, not a switch. At
+          most **4 MiB** (4194304 bytes); a larger body answers `413`.
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/SourceWrite'
-      responses:
-        '200':
-          description: The source as stored (an upsert, so this is also the shape a replace answers).
-          headers:
-            Rift-Cluster-Op-Id:
-              $ref: '#/components/headers/RiftClusterOpId'
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/SourceRecord'
-        '400':
-          $ref: '#/components/responses/BadData'
-        '401':
-          $ref: '#/components/responses/Unauthorized'
-        '403':
-          $ref: '#/components/responses/Forbidden'
-        '404':
-          description: Caller holds no binding in the tenant named by `X-Rift-Tenant` (RFC-002 §8.4 — not a 403).
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/Error'
-        '500':
-          $ref: '#/components/responses/InternalError'
-        '503':
-          $ref: '#/components/responses/Unavailable'
-
-  /admin/sources/{sourceId}:
-    get:
-      operationId: getSource
-      summary: One imposter source
-      description: >
-        Terminates. The same two-part shape as the list — see `GET
-        /admin/sources` for why the replicated record and this node's poll
-        status never merge. Requires `source.read` (Viewer and up).
-      tags: [sources]
-      x-rift-origin: ee
-      parameters:
-        - $ref: '#/components/parameters/TenantHeader'
-        - name: sourceId
-          in: path
-          required: true
-          description: The source's declared id, unique within its tenant.
-          schema:
-            type: string
-      responses:
-        '200':
-          description: The source, plus this node's poll status for it.
-          content:
-            application/json:
-              schema:
-                type: object
-                required: [source, nodeLocal]
-                properties:
-                  source:
-                    $ref: '#/components/schemas/SourceRecord'
-                  nodeLocal:
-                    $ref: '#/components/schemas/SourcesNodeLocal'
-        '401':
-          $ref: '#/components/responses/Unauthorized'
-        '404':
-          description: >
-            No such source in the tenant in view. Byte-identical whether the
-            id never existed, exists in another tenant, or the caller holds
-            no binding here at all (RFC-002 §8.4).
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/Error'
-        '500':
-          $ref: '#/components/responses/InternalError'
-    delete:
-      operationId: deleteSource
-      summary: Stop tracking a source
-      description: >
-        Terminates: commits a `SourceDelete` op and answers `200` with the
-        committed revision. Idempotent — deleting an absent id commits and
-        answers the same as deleting one that exists, exactly like
-        `DeleteImposter`, so there is no "unknown source" 404 the way a
-        pull of an absent id has. The imposters this source owned stay
-        bound; only their provenance is cleared — orphaned, never torn
-        down. Requires `imposter.delete` (Editor and up). No `If-Match` —
-        see `putSource`'s description for why.
-      tags: [sources]
-      x-rift-origin: ee
-      parameters:
-        - $ref: '#/components/parameters/TenantHeader'
-        - $ref: '#/components/parameters/CsrfHeader'
-        - name: sourceId
-          in: path
-          required: true
-          description: The source's declared id, unique within its tenant.
-          schema:
-            type: string
-      responses:
-        '200':
-          description: The source is no longer tracked.
-          headers:
-            Rift-Cluster-Op-Id:
-              $ref: '#/components/headers/RiftClusterOpId'
-          content:
-            application/json:
-              schema:
-                type: object
-                required: [revision]
-                properties:
-                  revision:
-                    type: integer
-                    format: int64
-                    description: The log index this delete committed at.
-        '401':
-          $ref: '#/components/responses/Unauthorized'
-        '403':
-          $ref: '#/components/responses/Forbidden'
-        '404':
-          description: Caller holds no binding in the tenant named by `X-Rift-Tenant` (RFC-002 §8.4 — not a 403).
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/Error'
-        '500':
-          $ref: '#/components/responses/InternalError'
-        '503':
-          $ref: '#/components/responses/Unavailable'
-
-  /admin/sources/{sourceId}/pull:
-    post:
-      operationId: pullSource
-      summary: Fetch a source now and apply what it produced
-      description: >
-        Terminates: fetches the source's `uri` outside the replicated log
-        (fetching is not deterministic), then commits what was fetched as a
-        `SourcePullResult` op — an ordinary validated write every replica
-        applies identically. Identical content to what the source last
-        applied writes no log entry at all (`unchanged: true`) rather than
-        re-churning state on every poll of a stable document. Requires
-        `imposter.write` (Editor and up) — the same action `putSource`
-        does, and for the same reason: a pull is what actually produces the
-        `PUT /imposters`-equivalent write. No `If-Match` — see
-        `putSource`'s description.
-
-
-        A pull is **not** a way to admit `flowState.contextScope: "fleet"`
-        (RFC-005 S1, issue #288): a pull carries no principal to hold
-        `FleetAdmin` — the scheduler has none, and this route needs only
-        `imposter.write` — so once the admin plane is enforced (an `--api-key`
-        is configured or any principal exists — the same predicate the
-        front's bypass reads), a document whose imposter sets it is refused
-        before the write with a `400` naming the port and the way in
-        (`PUT /imposters` as a `FleetAdmin`, or `"tenant"` scope in the
-        document). Nothing is committed; what an earlier pull admitted keeps
-        serving. Under the open admin plane nothing gates, as nothing else
-        does.
-      tags: [sources]
-      x-rift-origin: ee
-      parameters:
-        - $ref: '#/components/parameters/TenantHeader'
-        - $ref: '#/components/parameters/CsrfHeader'
-        - name: sourceId
-          in: path
-          required: true
-          description: The source's declared id, unique within its tenant.
-          schema:
-            type: string
-      responses:
-        '200':
-          description: >
-            What the pull did. Carries no `Rift-Cluster-Op-Id`: unlike
-            `putSource`/`deleteSource`, this route's underlying write path
-            is shared byte-for-byte with the cluster port's pre-existing
-            pull (issue #134) and does not surface the op id it minted
-            internally — `revision` in the body is what a client
-            correlates a pull with instead.
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/PullReport'
-        '400':
-          $ref: '#/components/responses/BadData'
-        '401':
-          $ref: '#/components/responses/Unauthorized'
-        '403':
-          $ref: '#/components/responses/Forbidden'
-        '404':
-          description: >
-            No such source in the tenant in view. Byte-identical whether the
-            id never existed, exists in another tenant, or the caller holds
-            no binding here at all (RFC-002 §8.4).
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/Error'
-        '500':
-          $ref: '#/components/responses/InternalError'
-        '502':
-          description: The source's own host refused or failed the fetch; the cluster's write path was never reached.
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/Error'
-        '503':
-          $ref: '#/components/responses/Unavailable'
-
-  # ---------------------------------------------------------------------
-  # ee: identity / contract introspection
-  # ---------------------------------------------------------------------
-  # ---------------------------------------------------------------------
-  # ee: specs (RFC-004 §5, issue #278)
-  # ---------------------------------------------------------------------
-  /specs:
-    get:
-      operationId: listSpecs
-      summary: The tenant's imported specs
-      description: >
-        Terminates. Answers from local applied state: id, digest, format,
-        the ports the spec is currently deployed to, and whether any of
-        those ports has been hand-edited since (`drifted`). Never carries
-        the documents themselves — `GET /specs/{specId}` does. Requires
-        `spec.read` (Viewer and up).
-      tags: [specs]
-      x-rift-origin: ee
-      parameters:
-        - $ref: '#/components/parameters/TenantHeader'
-      responses:
-        '200':
-          description: The tenant's specs, id-ascending.
-          content:
-            application/json:
-              schema:
-                type: object
-                required: [specs]
-                properties:
-                  specs:
-                    type: array
-                    items:
-                      $ref: '#/components/schemas/SpecRecord'
-        '401':
-          $ref: '#/components/responses/Unauthorized'
-        '404':
-          description: Caller holds no binding in the tenant in view (RFC-002 §8.4 — not a 403).
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/Error'
-        '500':
-          $ref: '#/components/responses/InternalError'
-
-  /specs/{specId}:
-    parameters:
-      - $ref: '#/components/parameters/TenantHeader'
-      - $ref: '#/components/parameters/SpecId'
-    get:
-      operationId: getSpec
-      summary: One spec — the stored document plus its metadata
-      description: >
-        Terminates. The record `listSpecs` shows, plus `document`: the
-        spec bytes exactly as imported (the digest is sha256 over them).
-        Requires `spec.read` (Viewer and up).
-      tags: [specs]
-      x-rift-origin: ee
-      responses:
-        '200':
-          description: The spec.
-          content:
-            application/json:
-              schema:
-                allOf:
-                  - $ref: '#/components/schemas/SpecRecord'
-                  - type: object
-                    required: [document]
-                    properties:
-                      document:
-                        type: string
-                        description: The imported OpenAPI document, verbatim (JSON or YAML text).
-        '401':
-          $ref: '#/components/responses/Unauthorized'
-        '404':
-          $ref: '#/components/responses/SpecNotFound'
-        '500':
-          $ref: '#/components/responses/InternalError'
-    put:
-      operationId: putSpec
-      summary: Import (or re-import) an OpenAPI 3.0 spec under this id
-      description: >
-        Terminates. The body is the spec document itself — JSON or YAML,
-        UTF-8, at most 4 MiB. It is **compiled on the accepting node before
-        anything is committed**: a document that does not compile is
-        refused with the compiler's own reason and writes nothing, so the
-        replicated log only ever carries specs every node can compile
-        identically (`rift-cluster-spec` is a pure function of the bytes).
-        Commits a `SpecPut` op carrying the bytes; every node stores them
-        content-addressed by digest, so two specs with identical bytes share
-        one blob. A re-import whose bytes are unchanged answers `200` with
-        `unchanged: true` and **writes no log entry at all** — retries and
-        unchanged polls cost zero log growth. Deploying is a separate step
-        (`deploySpec`); the drift report on re-import arrives with S3
-        (#279). No `If-Match`: a spec record has no imposter revision to
-        condition on. Requires `spec.write` (Editor and up).
-      tags: [specs]
-      x-rift-origin: ee
-      parameters:
-        - $ref: '#/components/parameters/IdempotencyKey'
-        - $ref: '#/components/parameters/CsrfHeader'
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              type: object
-              additionalProperties: true
-              description: >
-                An OpenAPI 3.0.x document. Free-form here by nature — its
-                shape is OpenAPI's own, and the compiler is what decides
-                whether it is acceptable.
+              type: string
           application/yaml:
             schema:
               type: string
-              description: An OpenAPI 3.0.x document.
-      responses:
-        '201':
-          description: A spec with this id did not exist; it is now stored on every node.
-          headers:
-            Rift-Cluster-Revision:
-              $ref: '#/components/headers/RiftClusterRevision'
-            Rift-Cluster-Op-Id:
-              $ref: '#/components/headers/RiftClusterOpId'
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/SpecWriteResult'
-        '200':
-          description: >
-            The id already existed. `unchanged: true` means the bytes were
-            identical to what is stored and nothing was written (no cluster
-            headers); `unchanged: false` means a re-import replaced the
-            document.
-          headers:
-            Rift-Cluster-Revision:
-              $ref: '#/components/headers/RiftClusterRevision'
-            Rift-Cluster-Op-Id:
-              $ref: '#/components/headers/RiftClusterOpId'
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/SpecWriteResult'
-        '202':
-          $ref: '#/components/responses/AcceptedParked'
-        '400':
-          description: >
-            The document is not UTF-8 text, does not compile as OpenAPI 3.0.x
-            (unsupported version, external `$ref`, parse error, self-check
-            failure — the compiler's message is carried verbatim), or the id
-            is not a usable path segment.
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/Error'
-        '401':
-          $ref: '#/components/responses/Unauthorized'
-        '403':
-          $ref: '#/components/responses/Forbidden'
-        '404':
-          description: Caller holds no binding in the tenant named by `X-Rift-Tenant` (RFC-002 §8.4 — not a 403).
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/Error'
-        '413':
-          description: The document exceeds the 4 MiB pre-commit cap (RFC-004 §4.1) — refused before it is parsed.
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/Error'
-        '500':
-          $ref: '#/components/responses/InternalError'
-        '503':
-          $ref: '#/components/responses/Unavailable'
-        '504':
-          $ref: '#/components/responses/WriteTimeout'
-    delete:
-      operationId: deleteSpec
-      summary: Delete a spec
-      description: >
-        Terminates. Refuses with `409` while any imposter is still bound to
-        the spec (deployed from it), unless `?force` is given — then every
-        bound port is unbound first (`SpecUnbind`) and the record removed
-        (`SpecDelete`) in one mutation. Unbinding never tears an imposter
-        down: it keeps serving, it just no longer carries provenance. The
-        stored bytes go with the last spec record that references them.
-        Requires `spec.delete` (Editor and up).
-      tags: [specs]
-      x-rift-origin: ee
-      parameters:
-        - $ref: '#/components/parameters/IdempotencyKey'
-        - $ref: '#/components/parameters/CsrfHeader'
-        - name: force
-          in: query
-          required: false
-          allowEmptyValue: true
-          description: >
-            Unbind every deployed port first instead of refusing with `409`.
-            A flag: `?force`, `?force=true` and `?force=1` force;
-            `?force=false` / `?force=0` do not.
-          schema:
-            type: boolean
       responses:
         '200':
-          description: The spec is gone on every node.
-          headers:
-            Rift-Cluster-Revision:
-              $ref: '#/components/headers/RiftClusterRevision'
-            Rift-Cluster-Op-Id:
-              $ref: '#/components/headers/RiftClusterOpId'
-          content:
-            application/json:
-              schema:
-                type: object
-                required: [id, digest, unboundPorts]
-                properties:
-                  id:
-                    type: string
-                  digest:
-                    type: string
-                    description: sha256 hex of the document that was stored.
-                  unboundPorts:
-                    type: array
-                    items:
-                      type: integer
-                    description: The ports `?force` unbound, ascending; empty without `?force`.
-        '202':
-          $ref: '#/components/responses/AcceptedParked'
-        '401':
-          $ref: '#/components/responses/Unauthorized'
-        '403':
-          $ref: '#/components/responses/Forbidden'
-        '404':
-          $ref: '#/components/responses/SpecNotFound'
-        '409':
-          description: The spec is still bound to at least one port and `?force` was not given; the message names the ports.
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/Error'
-        '500':
-          $ref: '#/components/responses/InternalError'
-        '503':
-          $ref: '#/components/responses/Unavailable'
-        '504':
-          $ref: '#/components/responses/WriteTimeout'
-
-  /specs/{specId}/compile:
-    post:
-      operationId: compileSpec
-      summary: Dry run — compile the stored spec and diff it against what is deployed
-      description: >
-        Terminates and **commits nothing**. Compiles the stored document for
-        the requested port (or the spec's single bound port, or an
-        auto-assigned one) and answers with the imposter JSON that
-        `deploySpec` would commit, the operation index, and a stub-id-level
-        diff against the config currently deployed on the target port —
-        `null` when there is no target port. Requires `spec.read` (Viewer
-        and up): a dry run is a read.
-      tags: [specs]
-      x-rift-origin: ee
-      parameters:
-        - $ref: '#/components/parameters/TenantHeader'
-        - $ref: '#/components/parameters/CsrfHeader'
-        - $ref: '#/components/parameters/SpecId'
-      requestBody:
-        required: false
-        content:
-          application/json:
-            schema:
-              type: object
-              properties:
-                port:
-                  type: integer
-                  description: Compile for this port and diff against it. Defaults to the spec's single bound port, if any.
-      responses:
-        '200':
-          description: The compiled imposter and the diff.
+          description: The compiled imposter, and the operation index it was built from.
           content:
             application/json:
               schema:
@@ -3758,93 +3078,18 @@ paths:
           $ref: '#/components/responses/BadData'
         '401':
           $ref: '#/components/responses/Unauthorized'
-        '404':
-          $ref: '#/components/responses/SpecNotFound'
-        '500':
-          $ref: '#/components/responses/InternalError'
-
-  /specs/{specId}/deploy:
-    post:
-      operationId: deploySpec
-      summary: Compile the stored spec and deploy it as the imposter on a port
-      description: >
-        Terminates. Compiles the stored document for `port` on the accepting
-        node and commits **two ops under one barrier**: an ordinary
-        `PutImposter` carrying the compiled config — the same code path as
-        `PUT /imposters`, so park/replay, `Idempotency-Key` dedup,
-        `If-Match` against the imposter's revision and the write barrier are
-        all inherited — followed by `SpecBind`, which stamps the imposter's
-        provenance `{specId, digest}` and resets its drift baseline. After
-        the 2xx every ready node serves the compiled mock. Answers `201`
-        when the port had no imposter, `200` when it replaced one. Requires
-        `spec.write` **and** `imposter.write` (Editor and up): holding
-        `spec.write` alone must not be a back door into imposter mutation.
-        The drift `policy` (`overwrite | skip | fail`) arrives with S3
-        (#279); sending one now is refused rather than ignored.
-      tags: [specs]
-      x-rift-origin: ee
-      parameters:
-        - $ref: '#/components/parameters/TenantHeader'
-        - $ref: '#/components/parameters/IfMatch'
-        - $ref: '#/components/parameters/IdempotencyKey'
-        - $ref: '#/components/parameters/CsrfHeader'
-        - $ref: '#/components/parameters/SpecId'
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              type: object
-              required: [port]
-              properties:
-                port:
-                  type: integer
-                  description: The port the compiled imposter serves on. Fleet-unique across tenants.
-      responses:
-        '201':
-          description: Created the imposter on `port`; the response is the stored imposter (as `getImposter` shows it).
-          headers:
-            Rift-Cluster-Revision:
-              $ref: '#/components/headers/RiftClusterRevision'
-            Rift-Cluster-Op-Id:
-              $ref: '#/components/headers/RiftClusterOpId'
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/Imposter'
-        '200':
-          description: Replaced the imposter that was on `port`.
-          headers:
-            Rift-Cluster-Revision:
-              $ref: '#/components/headers/RiftClusterRevision'
-            Rift-Cluster-Op-Id:
-              $ref: '#/components/headers/RiftClusterOpId'
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/Imposter'
-        '202':
-          $ref: '#/components/responses/AcceptedParked'
-        '400':
-          description: No `port`, a `policy` (S3), or the stored document no longer compiles for this port.
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/Error'
-        '401':
-          $ref: '#/components/responses/Unauthorized'
         '403':
           $ref: '#/components/responses/Forbidden'
-        '404':
-          $ref: '#/components/responses/SpecNotFound'
-        '409':
-          $ref: '#/components/responses/RevisionConflict'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
         '500':
           $ref: '#/components/responses/InternalError'
         '503':
           $ref: '#/components/responses/Unavailable'
-        '504':
-          $ref: '#/components/responses/WriteTimeout'
+
+  # ---------------------------------------------------------------------
+  # ee: identity / contract introspection
+  # ---------------------------------------------------------------------
 
   /admin/whoami:
     get:
@@ -4533,16 +3778,6 @@ components:
       schema:
         type: string
         example: acme
-    SpecId:
-      name: specId
-      in: path
-      required: true
-      description: >
-        The spec's id, chosen by the importer, unique within its tenant. A
-        non-empty name of at most 128 characters drawn from
-        `[A-Za-z0-9._-]` — matched literally, undecoded.
-      schema:
-        type: string
     Port:
       name: port
       in: path
@@ -4557,16 +3792,6 @@ components:
       in: path
       required: true
       description: The tenant record's id.
-      schema:
-        type: string
-    DatasetName:
-      name: datasetName
-      in: path
-      required: true
-      description: >
-        The dataset's name, unique per tenant. Not percent-decoded by the router,
-        so an escaped separator stays part of the name rather than becoming a path
-        segment.
       schema:
         type: string
     PrincipalId:
@@ -4757,27 +3982,6 @@ components:
       schema:
         type: boolean
         enum: [true]
-    RiftSpecWarnings:
-      description: >
-        Edit-time spec validation (RFC-004 §3.2, issue #278). Present on a
-        successful config-mutating write (`PUT`/`POST /imposters/{port}`,
-        stub add/replace) to an imposter that is **bound to a spec**, when a
-        static `is` body of a stub whose id the compiler emitted
-        (`spec:<operationId>:<status>`) violates the response schema that
-        operation declares. Each entry is `<stubId> <json-pointer>: <what>`,
-        `; `-separated, capped at ten (then `; +N more`) and at 2 KiB
-        (then `...`), visible ASCII only. Templated bodies (`{{…}}`),
-        responses with `_behaviors`, and non-`is` responses are skipped —
-        runtime validation is S4/S6's job. **Warn, never refuse**: a
-        deliberately divergent stub is a legitimate fixture. Absent when
-        nothing is bound or nothing violates — so absence means "checked and
-        clean": if the check itself could not run for a bound port (a storage
-        read failed, the bound document no longer compiles) the header says
-        so with a `port <n>: spec validation unavailable (<why>)` entry
-        instead of staying silent.
-      schema:
-        type: string
-        example: 'spec:showPetById:200 /id: expected integer, got string'
 
   responses:
     BadData:
@@ -4823,16 +4027,6 @@ components:
             $ref: '#/components/schemas/Error'
     PayloadTooLarge:
       description: Request body exceeded the configured maximum size.
-      content:
-        application/json:
-          schema:
-            $ref: '#/components/schemas/Error'
-    SpecNotFound:
-      description: >
-        No such spec in the tenant in view. Byte-identical whether the id
-        never existed, exists in another tenant, or the caller holds no
-        binding here at all (RFC-002 §8.4): the message names only the id
-        the caller typed.
       content:
         application/json:
           schema:
@@ -5658,13 +4852,11 @@ components:
     Quotas:
       type: object
       description: >
-        The three original fields are required when `quotas` is present — they
-        carry no `serde(default)`, so a present-but-partial object fails
-        deserialization with `missing field` and answers `400`; only an entirely
-        absent `quotas` is defaulted (`TenantBody.quotas` is `serde(default)`).
-        The three dataset ceilings (RFC-005 §4, issue #285) are the exception:
-        they default when absent, because tenant records committed before they
-        existed must keep decoding.
+        Every field is required when `quotas` is present — none carries
+        `serde(default)`, so a present-but-partial object fails
+        deserialization with `missing field` and answers `400`; only an
+        entirely absent `quotas` is defaulted (`TenantBody.quotas` is
+        `serde(default)`).
       required: [maxImposters, maxStubsPerImposter, maxFlowEntries]
       properties:
         maxImposters:
@@ -5677,20 +4869,6 @@ components:
           type: integer
           format: int64
           default: 100000
-        maxDatasets:
-          type: integer
-          default: 50
-          description: "Distinct live dataset names the tenant may hold. Enforced at apply (issue #285)."
-        maxDatasetBytes:
-          type: integer
-          format: int64
-          default: 8388608
-          description: Largest single dataset version, in bytes (8 MiB). Enforced at apply.
-        maxDatasetTotalBytes:
-          type: integer
-          format: int64
-          default: 67108864
-          description: Sum of every live dataset version's bytes the tenant may hold (64 MiB). Enforced at apply.
 
     Role:
       type: string
@@ -5774,246 +4952,22 @@ components:
             chrome text a human reads rather than an id anything parses
             back.
 
-    SourceRecord:
-      type: object
-      description: >
-        One imposter source as the fleet has agreed on it — the replicated
-        projection, identical on every converged node. Deliberately carries
-        nothing node-local, so two nodes' answers stay byte-comparable as a
-        convergence check.
-      required: [id, uri, mode, onDrift, drifted, ports, revision]
-      properties:
-        id:
-          type: string
-          description: The source's declared id, unique within its tenant.
-        uri:
-          type: string
-          description: The URI the fleet pulls imposters from.
-        mode:
-          type: string
-          enum: [pinned, tracking]
-          description: Explicit pulls only, or scheduled polls on `pollSecs`.
-        authRef:
-          type: string
-          description: >
-            The **name** of a credential, never the credential — a URI
-            carrying embedded credentials is refused before it can enter the
-            replicated log.
-        onDrift:
-          type: string
-          enum: [overwrite, skip, fail]
-          description: What a pull does when the source's imposters were hand-edited since it last applied.
-        pollSecs:
-          type: integer
-          format: int64
-          description: Poll interval for a `tracking` source; absent for `pinned`.
-        drifted:
-          type: boolean
-          description: An operator has edited this source's imposters by hand since it last applied.
-        lastVersion:
-          type: string
-          description: The version label the last pull reported, when the source names one.
-        lastDigest:
-          type: string
-          description: Digest of the content the last pull saw.
-        lastPulledAtSecs:
-          type: integer
-          format: int64
-          description: When the last pull committed, in UNIX seconds.
-        lastOutcome:
-          type: string
-          enum: [applied, skipped]
-          description: How the last pull ended; absent when the source has never pulled.
-        ports:
-          type: array
-          items:
-            type: integer
-          description: The ports this source currently owns, ascending.
-        revision:
-          type: integer
-          format: int64
-          description: The log index that last wrote this record.
-
-    SourceWrite:
-      type: object
-      description: >
-        A source declaration: `POST /admin/sources` upserts by `id`. Fields
-        left out take their documented defaults (`mode: pinned`, `onDrift:
-        overwrite`) — the same defaults the server applies when they are
-        absent from the wire — so a minimal `{id, uri}` body is a complete,
-        valid declaration.
-      required: [id, uri]
-      properties:
-        id:
-          type: string
-          description: >
-            The source's id; unique within the caller's tenant, at most 128
-            characters drawn from `[A-Za-z0-9._-]`.
-        uri:
-          type: string
-          description: >
-            The URI to pull from. Must not carry embedded userinfo
-            (`user:pass@host`) — refused before the write ever reaches the
-            replicated log, not even as a committed-but-failed entry; name
-            a credential with `authRef` instead.
-        mode:
-          type: string
-          enum: [pinned, tracking]
-          description: Explicit pulls only (the default), or scheduled polls on `pollSecs`.
-        authRef:
-          type: string
-          description: >
-            The **name** of a credential resolved at fetch time, never the
-            credential itself. Refused if the URI's scheme has no provider
-            that consumes one.
-        onDrift:
-          type: string
-          enum: [overwrite, skip, fail]
-          description: What a pull does when this source's imposters were hand-edited since it last applied.
-        pollSecs:
-          type: integer
-          format: int64
-          description: >
-            Poll interval for a `tracking` source; refused on any other
-            mode, and refused below the server's poll-interval floor.
-
-    PullReport:
-      type: object
-      description: >
-        What one pull did, as reported by `POST /admin/sources/{sourceId}/pull`.
-      required: [revision, digest, unchanged, skipped, changed]
-      properties:
-        revision:
-          type: integer
-          format: int64
-          description: >
-            The applying log index, or the source's last one when the
-            digest short-circuit meant nothing was written.
-        version:
-          type: string
-          description: The version label the source's document reported, when it names one.
-        digest:
-          type: string
-          description: Content digest of what was fetched.
-        unchanged:
-          type: boolean
-          description: >
-            True when the fetched content matched what the source last
-            applied, so no log entry was written.
-        skipped:
-          type: boolean
-          description: >
-            True when the pull committed a decision *not* to apply — a
-            drifted source under `onDrift: skip`. Distinct from
-            `unchanged`: a skip did reach the log, and the fleet does not
-            hold this content.
-        changed:
-          type: array
-          items:
-            type: integer
-          description: The ports this pull created, replaced or removed. Empty when nothing was applied.
-        warnings:
-          type: array
-          items:
-            type: string
-          description: >
-            Anything the document declared that a clustered pull does not
-            apply (e.g. a `routes` or `intercept` block). Absent entirely
-            when empty, never `[]`.
-
-    SourcesNodeLocal:
-      type: object
-      description: >
-        The answering node's own view — **not** a fleet fact. A poll failure
-        is a property of one node's reach to an external host at one moment
-        and is deliberately never replicated, so this half can differ across
-        the fleet; it is kept apart from the record precisely so that it
-        cannot be mistaken for one more replicated field.
-      required: [nodeId, pollErrors]
-      properties:
-        nodeId:
-          type: string
-          description: >
-            The cluster node that answered this request. A **string**, not an
-            integer, for the same reason as `FleetMembers.node_id`: a raft id
-            is a `u64`, JSON numbers are IEEE-754 doubles wherever the reader
-            is JavaScript, and every id above 2^53-1 is silently rounded on
-            the way in. This endpoint was missed when the fleet projections
-            were fixed, and went on reporting a node that does not exist.
-        pollErrors:
-          type: object
-          additionalProperties:
-            type: string
-          description: >
-            Last poll error per source id, for sources this node has seen
-            fail. Empty when nothing is failing — an explicit empty map, not
-            an absent field. Polls run on the leader, so a follower's map is
-            usually empty. Scoped to the tenant of the request: the scheduler
-            polls every tenant's tracking sources, and a source id is unique
-            only within its tenant.
-
-    SpecRecord:
-      type: object
-      description: >
-        One imported spec as the fleet has agreed on it — the replicated
-        projection, identical on every converged node.
-      required: [id, format, digest, source, ports, drifted, revision]
-      properties:
-        id:
-          type: string
-          description: The spec's id, unique within its tenant.
-        format:
-          type: string
-          enum: [json, yaml]
-          description: How the document was written, sniffed at import (YAML is a superset, so this is informational).
-        digest:
-          type: string
-          description: sha256 hex over the document bytes exactly as imported — what a re-import compares to decide `unchanged`.
-        source:
-          type: string
-          enum: [inline]
-          description: Where the document came from. `inline` is a `PUT /specs/{specId}` body; source-backed kinds arrive with S8.
-        ports:
-          type: array
-          items:
-            type: integer
-          description: The ports currently deployed from this spec (carrying its provenance), ascending.
-        drifted:
-          type: boolean
-          description: At least one bound port has had a config-mutating write since it was deployed. A redeploy resets it.
-        revision:
-          type: integer
-          format: int64
-          description: The log index that last wrote this record.
-
-    SpecWriteResult:
-      type: object
-      description: What `putSpec` did.
-      required: [id, digest, format, unchanged]
-      properties:
-        id:
-          type: string
-        digest:
-          type: string
-          description: sha256 hex of the document now stored.
-        format:
-          type: string
-          enum: [json, yaml]
-        unchanged:
-          type: boolean
-          description: The bytes matched what was already stored; nothing was written.
-        revision:
-          type: integer
-          format: int64
-          description: On an unchanged re-import, the revision of the record that already held these bytes.
-
     SpecCompileResult:
       type: object
-      description: A dry-run compilation.
-      required: [imposter, operations, diff]
+      description: >
+        What a one-shot compile produced (D-72, issue #549). Nothing here was
+        stored: `imposter` is a document handed back to the caller, who deploys
+        it — or does not — with `PUT /imposters`.
+      required: [imposter, operations]
       properties:
         imposter:
-          $ref: '#/components/schemas/Imposter'
+          type: object
+          additionalProperties: true
+          description: >
+            The compiled imposter config, byte for byte what a client then sends
+            as `PUT /imposters`. Carried opaquely rather than modelled here, so
+            a compiler that learns to emit a field does not need this contract
+            changed before it can hand it over.
         operations:
           type: array
           description: The compiler's operation index, in emitted order.
@@ -6033,37 +4987,6 @@ components:
                 type: array
                 items:
                   type: string
-        diff:
-          nullable: true
-          description: >
-            The compiled stubs against the config deployed on the target
-            port, keyed by stub id — `null` when there is no target port
-            (none requested and none bound). This is a byte-level stub
-            diff; the per-operation drift classification (added / removed /
-            changed / hand-edited / hand-added) is S3 (#279).
-          type: object
-          required: [port, deployed, added, removed, changed]
-          properties:
-            port:
-              type: integer
-            deployed:
-              type: boolean
-              description: Whether an imposter is currently deployed on `port` at all.
-            added:
-              type: array
-              items:
-                type: string
-              description: Compiled stub ids not present in the deployed config.
-            removed:
-              type: array
-              items:
-                type: string
-              description: Deployed stub ids the compiler no longer emits (`spec:`-prefixed ids only — hand-added stubs are never listed).
-            changed:
-              type: array
-              items:
-                type: string
-              description: Stub ids present on both sides whose canonical JSON differs.
 
     WhoAmI:
       type: object
@@ -6400,102 +5323,6 @@ components:
             missing an unknown addend is not a sum. When a *peer* fails to
             answer, the field is present but is a **floor**, and the response
             carries `Rift-Cluster-Partial` to say so.
-        blob_fetch_stall:
-          nullable: true
-          description: >
-            **This node's** apply loop is parked on a content-addressed blob
-            it cannot obtain from any member (#439). `null` when it is not —
-            and always present on a build that reports it, so an old-build
-            node (which omits the key) is distinguishable from a healthy one.
-
-
-            A stall is *degraded*, not *not-ready*: the node keeps serving
-            reads and keeps its `ready`/`state` — pulling it from the load
-            balancer would only widen whatever partition caused the stall.
-            It never exits over this and never gives up; the field clears
-            itself the moment any holder comes back. It becomes visible after
-            the fetch has gone unsatisfied for 30 s (`BLOB_FETCH_ESCALATE_AFTER`),
-            at which point the node also logs at error level and sets
-            `rift_cluster_blob_fetch_stalled` to `1`.
-
-
-            Until it clears, every committed entry behind the parked one on
-            **this node** is unapplied: the fleet has committed writes this
-            node does not yet reflect. That is the failure mode ADR-001 D-18
-            names, made visible rather than silent.
-          type: object
-          required: [digest, stalled_for_secs, origin, tried, skewed]
-          properties:
-            digest:
-              type: string
-              description: The sha256 hex the parked op names.
-            stalled_for_secs:
-              type: integer
-              format: int64
-              description: >
-                Seconds since the fetch first went unsatisfied — a duration
-                recomputed on every read, so it grows until the stall clears.
-            origin:
-              type: string
-              description: >
-                Node id of the member that accepted the write and was asked
-                first. A string for the same reason as `FleetMembers.node_id`.
-            tried:
-              type: array
-              items:
-                type: string
-              description: >
-                Node ids asked in the most recent round, whether or not they
-                answered. A round asks the origin, then every other joint
-                voter.
-            skewed:
-              type: array
-              items:
-                type: string
-              description: >
-                Members whose **build cannot serve blobs at all** — they
-                answered the transport's unknown-route class rather than
-                not-found. Named separately because "3 nodes, 2 tried, 1
-                skewed" is an upgrade in progress, while "3 nodes, 2 tried"
-                with no skew is a partition; collapsing them makes a
-                half-upgraded fleet look like a network fault.
-            last_error:
-              type: string
-              nullable: true
-              description: >
-                The last **refusal** a member answered with in the most recent
-                round — a peer that answered but would not serve the blob (a
-                credential or request-shape problem, or bytes that did not hash
-                to the digest). `null` when every member merely lacked the blob
-                or did not answer, which is the partition shape. Carried
-                separately because a refusal is what an operator can act on,
-                and flattening it into "no member holds the blob" would hide it.
-        blob_fetch_stalls_fleet:
-          type: array
-          description: >
-            Every voter currently reporting a `blob_fetch_stall`, this node's
-            own included, read back off the same body rather than recomputed
-            so the two can never disagree (#439). Present on `/_fleet/health`
-            only — `/_cluster/health` is node-local for the same reason
-            `parked_intents_fleet` is.
-
-
-            A peer that fails to answer, or that answers **without the key**
-            (an old build), is *unknown*, not stalled: it contributes no
-            row, and the response carries `Rift-Cluster-Partial` to say the
-            list is a floor. An empty array under a partial response
-            therefore does not mean "no stalls".
-          items:
-            type: object
-            required: [node_id, digest, stalled_for_secs]
-            properties:
-              node_id:
-                type: string
-              digest:
-                type: string
-              stalled_for_secs:
-                type: integer
-                format: int64
         isolated:
           type: boolean
           description: Whether this node currently sees itself as network-isolated from the rest of the fleet.

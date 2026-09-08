@@ -55,7 +55,7 @@ test.describe("accessibility", () => {
     expect(found, describeViolations(found)).toEqual([]);
   });
 
-  for (const hash of ["/imposters", "/cluster", "/requests", "/routes", "/scenarios", "/sources"]) {
+  for (const hash of ["/imposters", "/cluster", "/requests", "/routes", "/scenarios"]) {
     test(`the ${hash} screen`, async ({ page }) => {
       await signIn(page, "fleet-admin");
       await goToScreen(page, hash);

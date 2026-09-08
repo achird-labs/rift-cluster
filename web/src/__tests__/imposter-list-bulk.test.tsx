@@ -131,33 +131,6 @@ describe("filtering", () => {
   });
 });
 
-describe("source provenance", () => {
-  it("offers the origin filter and narrows by it when sources are readable", async () => {
-    stubFetch({
-      ...base(),
-      "/admin/sources": {
-        json: { sources: [{ id: "mocks", uri: "git+https://x/y", mode: "pinned", onDrift: "skip", drifted: false, ports: [4545], revision: 1 }], nodeLocal: {} },
-      },
-    });
-    await rendered();
-
-    await userEvent.selectOptions(await screen.findByTestId("imposter-filter-owner"), "source");
-    await waitFor(() => expect(visiblePorts()).toEqual([4545]));
-
-    await userEvent.selectOptions(screen.getByTestId("imposter-filter-owner"), "hand");
-    await waitFor(() => expect(visiblePorts()).toEqual([4546, 4547]));
-  });
-
-  it("does not offer the origin filter to a principal who cannot read sources", async () => {
-    // Hidden, not broken. Without the join the filter could only ever answer "hand-created" for
-    // everything, which is a wrong answer dressed as a real one.
-    stubFetch(base());
-    await rendered("viewer");
-
-    expect(screen.queryByTestId("imposter-filter-owner")).toBeNull();
-  });
-});
-
 describe("sorting", () => {
   it("sorts by a column and flips direction on a second click", async () => {
     stubFetch(base());
@@ -300,8 +273,7 @@ describe("selection", () => {
 
   it("drops a tick when its imposter leaves the fleet, so a REUSED port is not silently selected", async () => {
     /*
-     * Ports are identity here and they are reused constantly — a source pull, an import, another
-     * operator. Ticking 4545, watching it be deleted, and seeing a *different* imposter appear at
+     * Ports are identity here and they are reused constantly — an import, or another operator. Ticking 4545, watching it be deleted, and seeing a *different* imposter appear at
      * 4545 must not leave the new one ticked and one click from a bulk delete nobody asked for.
      * `effective` intersecting with the visible rows keeps the count honest and is exactly what
      * would hide this.
@@ -379,7 +351,7 @@ describe("bulk actions", () => {
       ...base(),
       "/imposters/4545": { status: 200 },
       "/imposters/4547": { status: 200 },
-      "/imposters/4546": { status: 409, json: { message: "owned by source `mocks`" } },
+      "/imposters/4546": { status: 409, json: { message: "bound elsewhere" } },
     });
     await rendered();
 

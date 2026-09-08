@@ -75,7 +75,7 @@ The effective tag is computed here, so an explicit `image.tag` is what gets chec
 {{- fail "image.tag must be quoted. An unquoted YAML number (`tag: 1.2`) parses as a float, not a string — and quoting is the fix, not something the chart can do for you: coercing 1.10 back to a string would yield the tag `1.1`, which resolves to a different image than the one you asked for." -}}
 {{- end -}}
 {{- if hasSuffix "-static" $tag -}}
-{{- fail "image.tag: the `-static` flavor is FROM scratch — no shell — and this chart runs a shell script as EVERY pod's container command (the ordinal-0 bootstrap branch), so all pods would fail at exec. A -static fleet also serves no git+ imposter sources. Use the default flavor; see the image-flavors table in deploy/README.md." -}}
+{{- fail "image.tag: the `-static` flavor is FROM scratch — no shell — and this chart runs a shell script as EVERY pod's container command (the ordinal-0 bootstrap branch), so all pods would fail at exec. Use the default flavor; see the image-flavors table in deploy/README.md." -}}
 {{- end -}}
 {{- printf "%s:%s" .Values.image.repository $tag -}}
 {{- end -}}

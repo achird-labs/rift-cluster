@@ -83,8 +83,8 @@ use rift_cluster::stores::{
     JournalCursor, JournalNet, ResolvedKnobs,
 };
 use rift_cluster::{
-    ControlOutcome, ControlResponse, FLEET_SCOPE, KeyClass, NodeError, NodeId, OwnedKey, PullError,
-    RaftNode, SESSION_KEY_BYTES, SessionKey, SourcePuller, TenantId, metrics, routes_installed_for,
+    ControlOutcome, ControlResponse, FLEET_SCOPE, KeyClass, NodeError, NodeId, OwnedKey, RaftNode,
+    SESSION_KEY_BYTES, SessionKey, TenantId, routes_installed_for,
 };
 use rift_cluster_base::seams::{
     ErrorKind, ImposterConfig, RecordedRequest, RiftScriptConfig, RouteTable, SCOPE_HEADER,
@@ -92,12 +92,10 @@ use rift_cluster_base::seams::{
     error_response_typed, not_a_stub_reason, resolve_scripts, resolve_stub_scripts,
     tcp_fault_carrier, validate_stub, validate_stubs,
 };
-// The compiler crate (RFC-004 S2, issue #278): the front compiles specs on the accepting node
-// (PUT, deploy, edit-time warnings). `serde_json::Value` stays fully-qualified below, matching
-// this file's existing convention (no bare `use serde_json::Value`).
-use rift_cluster_spec::{
-    CompileOptions, MAX_SPEC_BYTES, STUB_ID_PREFIX, SpecDigest, compile, validate_stub_response,
-};
+// The compiler crate (RFC-004 §3.1–§3.3): `POST /specs/compile` runs it on the accepting node and
+// hands the result straight back, storing nothing (D-72, #549). `serde_json::Value` stays
+// fully-qualified below, matching this file's existing convention (no bare `use serde_json::Value`).
+use rift_cluster_spec::{CompileOptions, MAX_SPEC_BYTES, compile};
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
@@ -123,12 +121,6 @@ const MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
 /// the client gets the `timeout` error shape. Distinct from the barrier
 /// timeout, which begins after the commit and degrades to a warning.
 const WRITE_DEADLINE: Duration = Duration::from_secs(10);
-
-/// Edit-time spec validation, RFC-004 §3.2 / issue #278 — see [`spec_warnings`]. Its own header
-/// rather than a ride on [`HEADER_WARNINGS`]: that one already means "the fleet write itself is
-/// degraded" (an unreached node, a local engine failure), and this means something unrelated — a
-/// *successful* write whose static body disagrees with the spec that deployed it.
-const HEADER_SPEC_WARNINGS: &str = "rift-spec-warnings";
 
 /// Total budget for a merge-on-read fan-out to every other roster peer (issue #223): the merged
 /// journal read, its `numberOfRequests` decoration, and the transitional `DELETE savedRequests`
@@ -169,10 +161,6 @@ pub struct FrontConfig {
     /// issue #185) can report the same state `/readyz` does without a second latch to keep in
     /// sync.
     pub readiness: Arc<Readiness>,
-    /// This node's source puller, for the `nodeLocal` half of
-    /// `GET /admin/sources` (issue #239) — the last poll error per source is
-    /// deliberately node-local state, reachable only through it.
-    pub puller: Arc<SourcePuller>,
     /// This node's view of the fleet request journal (issue #223): the merged read, the
     /// `numberOfRequests` decoration, and the transitional `DELETE savedRequests` fan-out all
     /// reach the fleet through it.
@@ -303,8 +291,6 @@ struct FrontState {
     barrier_timeout: Duration,
     admin_async: bool,
     readiness: Arc<Readiness>,
-    /// See [`FrontConfig::puller`].
-    puller: Arc<SourcePuller>,
     /// See [`FrontConfig::journal_net`].
     journal_net: Arc<JournalNet>,
     /// See [`FrontConfig::flow_net`].
@@ -338,7 +324,6 @@ pub async fn bind(config: FrontConfig, node: &Arc<RaftNode>) -> std::io::Result<
         barrier_timeout: config.barrier_timeout,
         admin_async: config.admin_async,
         readiness: config.readiness,
-        puller: config.puller,
         journal_net: config.journal_net,
         flow_net: config.flow_net,
         fleet_journal_port_cap: config.fleet_journal_port_cap,
@@ -567,54 +552,14 @@ pub(crate) enum Terminated {
     /// **terminates**, reads included — there is no upstream `/admin/tenants`
     /// to proxy to, exactly as with `GET /front-door/routes`.
     Tenancy(tenancy::Route),
-    /// `GET /admin/sources` (issue #239): the fleet's source declarations for
-    /// the tenant in view. Terminates — the upstream admin has no source
-    /// surface; the cluster-port `/admin/sources` (issue #134) is a different
-    /// listener with a different trust model.
-    SourceList,
-    /// `GET /admin/sources/{id}` — one source record.
-    SourceRead(String),
-    /// `POST /admin/sources` (issue #253): declare (upsert by id) a source
-    /// under the caller's tenant. The cluster port already serves this verb,
-    /// default-tenant and under the cluster credential (issue #134); this
-    /// promotes it to the RBAC'd front, tenant-resolved from `X-Rift-Tenant`,
-    /// through the very same [`rift_cluster::SourcePuller::put`] the cluster
-    /// port now delegates to — so the two fronts cannot answer differently
-    /// for the same declaration.
-    SourcePut,
-    /// `DELETE /admin/sources/{id}` (issue #253). "Stop tracking this URI":
-    /// the source row is removed, but the imposters it created stay bound —
-    /// only their provenance is cleared. Orphaned, never torn down; see
-    /// [`rift_cluster::SourcePuller::delete`]'s doc.
-    SourceDelete(String),
-    /// `POST /admin/sources/{id}/pull` (issue #253): fetch the source now and
-    /// apply what it produced, under the caller's tenant rather than the
-    /// cluster port's fixed default.
-    SourcePull(String),
-    /// `GET /specs` (RFC-004 §4.3, issue #278): the tenant's imported specs, id-ascending, from
-    /// local applied state. Terminates for the same reason the source surface does — there is no
-    /// upstream `/specs` to proxy to, this is an EE-only projection.
-    SpecList,
-    /// `GET /specs/{id}` — one spec's record plus the document exactly as imported.
-    SpecRead(String),
-    /// `PUT /specs/{id}` — import (or re-import) an OpenAPI 3.0 document under this id. Compiled on
-    /// the accepting node before anything commits; an unchanged re-import writes no log entry.
-    SpecPut(String),
-    /// `DELETE /specs/{id}`. Refuses while bound to a port unless `force` — see `classify`'s
-    /// `?force` handling, the same shape as `SourceDelete`'s tenant-scoped pattern.
-    SpecDelete {
-        id: String,
-        force: bool,
-    },
-    /// `POST /specs/{id}/compile` — a dry run: compile the stored document and diff it against
-    /// what is deployed. Commits nothing, so it is authorized as a read (`Action::SpecRead`)
-    /// despite the verb.
-    SpecCompile(String),
-    /// `POST /specs/{id}/deploy` — compile the stored document for a port and commit it as that
-    /// port's imposter, stamping the spec's provenance in the same barrier. Requires
-    /// `Action::SpecWrite` **and** `Action::ImposterWrite` on the target port (the latter checked
-    /// in `terminate_spec_deploy`, not here — see `Action::SpecWrite`'s doc).
-    SpecDeploy(String),
+    /// `POST /specs/compile?port=…[&name=…]` (D-72, #549): compile an OpenAPI 3.0 document
+    /// into imposter JSON and hand it straight back. **Stateless** — nothing is stored, no
+    /// `ControlOp` is minted, no table is read. The caller `PUT /imposters` the result, which
+    /// is the one path a config takes into the log.
+    ///
+    /// Authorized as [`Action::ImposterWrite`] rather than a read: compiling is the first half
+    /// of an imposter write, and the only reason to call it is to make one.
+    SpecCompile,
 }
 
 /// The tenant a terminated route is authorized against, when the route names
@@ -668,16 +613,6 @@ fn addressed_port(kind: &Terminated) -> Option<u16> {
         | Terminated::PutRoutes
         | Terminated::DeleteRoute(_)
         | Terminated::Tenancy(_)
-        | Terminated::SourceList
-        | Terminated::SourceRead(_)
-        // A source names no imposter port of its own — the ports it owns are
-        // a *consequence* of a pull, not the address a write is made to. A
-        // cross-tenant source id is refused by tenant scoping alone (the
-        // source table is keyed `(tenant, id)`), the same way a cross-tenant
-        // tenancy-surface record is: there is no separate port to check
-        // ownership of the way an imposter write has one.
-        | Terminated::SourcePut
-        | Terminated::SourceDelete(_)
         // The fleet journal addresses *every* port the tenant owns, so there is no single port to
         // check ownership of (issue #362). Ownership is not skipped, it is inherent: the handler
         // derives its port set from `tenant_owned_ports`, so a port the caller's tenant does not
@@ -685,17 +620,10 @@ fn addressed_port(kind: &Terminated) -> Option<u16> {
         // single-port route, established by construction instead of by check.
         | Terminated::ReadFleetRequests
         | Terminated::StreamFleetRequests
-        | Terminated::SourcePull(_)
-        // A spec names no imposter port of its own, for the same reason a source does not: the
-        // ports it addresses (`SpecRecord::ports`) are a *consequence* of deploying it, not the
-        // address a write is made to. `SpecDeploy`'s port lives in the body and is checked against
-        // `Action::ImposterWrite` inside `terminate_spec_deploy` itself, not through this gate.
-        | Terminated::SpecList
-        | Terminated::SpecRead(_)
-        | Terminated::SpecPut(_)
-        | Terminated::SpecDelete { .. }
-        | Terminated::SpecCompile(_)
-        | Terminated::SpecDeploy(_) => None,
+        // A compile names a port in its query string, but it writes nothing to it — the
+        // ownership gate has no record to check, and the `PUT /imposters` that follows is
+        // where the port is actually claimed.
+        | Terminated::SpecCompile => None,
     }
 }
 
@@ -723,24 +651,9 @@ fn scope_for(kind: &Terminated) -> Option<TenantId> {
         | Terminated::TryImposter(_)
         | Terminated::PutRoutes
         | Terminated::DeleteRoute(_)
-        // Resource routes: the id names a record *within* the caller's
-        // tenant, so `X-Rift-Tenant` is the subject — unlike the tenancy
-        // surface, where the tenant is the path segment being administered.
-        | Terminated::SourceList
-        | Terminated::SourceRead(_)
-        | Terminated::SourcePut
-        | Terminated::SourceDelete(_)
         | Terminated::ReadFleetRequests
         | Terminated::StreamFleetRequests
-        | Terminated::SourcePull(_)
-        // A spec's id names a record within the caller's tenant, exactly like a source's — the
-        // header is the subject, not a path segment.
-        | Terminated::SpecList
-        | Terminated::SpecRead(_)
-        | Terminated::SpecPut(_)
-        | Terminated::SpecDelete { .. }
-        | Terminated::SpecCompile(_)
-        | Terminated::SpecDeploy(_) => None,
+        | Terminated::SpecCompile => None,
     }
 }
 
@@ -778,26 +691,11 @@ pub(crate) fn classify(method: &Method, path: &str, query: Option<&str>) -> Opti
     if let Some(route) = tenancy::classify(method, path, query) {
         return Some(Terminated::Tenancy(route));
     }
-    // The source inspection surface (issue #239): EE-only and terminating for
-    // the same reason as tenancy. Reads only — a recognized path with another
-    // method falls through to the proxy and answers upstream's own 404/405,
-    // exactly as tenancy::classify does for its half-matches.
-    if path == "/admin/sources" {
-        return match *method {
-            Method::GET => Some(Terminated::SourceList),
-            // `POST /admin/sources` (issue #253): declare (upsert by id) a
-            // source. There is no separate "create vs replace" distinction
-            // the way imposters have one — `SourcePut` is an upsert either
-            // way — so one variant covers both.
-            Method::POST => Some(Terminated::SourcePut),
-            _ => None,
-        };
-    }
     // The fleet request journal (issue #362), EE-only and terminating for tenancy's reason. Matched
     // before the `/admin/imposters/` and `/imposters/` prefixes below because it is not
     // port-addressed at all — it is the tenant's whole journal, and there is no port segment to
     // parse. A recognized path with another method falls through to the proxy and answers
-    // upstream's own 404/405, exactly as `/admin/sources` does for its half-matches.
+    // upstream's own 404/405, exactly as `tenancy::classify` does for its half-matches.
     if path == "/admin/requests" {
         return match *method {
             // `?match=` deliberately does not terminate here: see `Terminated::ReadFleetRequests`.
@@ -816,74 +714,13 @@ pub(crate) fn classify(method: &Method, path: &str, query: Option<&str>) -> Opti
             _ => None,
         };
     }
-    if let Some(id) = path.strip_prefix("/admin/sources/") {
-        // Percent-decoding is deliberately not done, for tenancy::classify's
-        // reason: a source id is validated printable-ASCII without `/`, so
-        // nothing legal needs escaping and `%2f` must not smuggle a segment.
+    // The one-shot OpenAPI import (D-72, #549): EE-only and terminating, because there is no
+    // upstream `/specs` to proxy to and nothing here reads or writes replicated state. A
+    // recognized path with another method falls through to `None`, exactly as the tenancy
+    // surface does for its half-matches.
+    if path == "/specs/compile" {
         return match *method {
-            Method::GET if !id.is_empty() && !id.contains('/') => {
-                Some(Terminated::SourceRead(id.to_owned()))
-            }
-            Method::DELETE if !id.is_empty() && !id.contains('/') => {
-                Some(Terminated::SourceDelete(id.to_owned()))
-            }
-            // `POST /admin/sources/{id}/pull`: `/pull` is a suffix on the id
-            // path rather than its own path segment, so an id that itself
-            // ends in `/pull` cannot be confused with the verb — stripping
-            // the suffix and then re-running the same empty/`/`-free check
-            // the other two arms use closes exactly that. Mirrors the
-            // cluster port's own `pull_source` (`sources/mod.rs`), which
-            // parses the identical shape for the identical reason.
-            Method::POST => match id.strip_suffix("/pull") {
-                Some(inner) if !inner.is_empty() && !inner.contains('/') => {
-                    Some(Terminated::SourcePull(inner.to_owned()))
-                }
-                _ => None,
-            },
-            _ => None,
-        };
-    }
-    // The specs surface (RFC-004 §4.3, issue #278): EE-only and terminating for the same reason
-    // sources and tenancy are. `/specs` itself only recognises `GET` — every other method falls
-    // through to `None` (and, for an unrecognized path shape, eventually the proxy) rather than
-    // being force-fit onto a variant here.
-    if path == "/specs" {
-        return match *method {
-            Method::GET => Some(Terminated::SpecList),
-            _ => None,
-        };
-    }
-    if let Some(id) = path.strip_prefix("/specs/") {
-        // Undecoded, no `/`, non-empty — `is_source_name`'s shape rule (`control::validate`
-        // enforces the charset/length at commit time), and the same reasoning as the source id
-        // parse just above: nothing legal needs percent-decoding, and `%2f` must not smuggle a
-        // segment.
-        return match *method {
-            Method::GET if !id.is_empty() && !id.contains('/') => {
-                Some(Terminated::SpecRead(id.to_owned()))
-            }
-            Method::PUT if !id.is_empty() && !id.contains('/') => {
-                Some(Terminated::SpecPut(id.to_owned()))
-            }
-            Method::DELETE if !id.is_empty() && !id.contains('/') => Some(Terminated::SpecDelete {
-                id: id.to_owned(),
-                force: query_flag(query, "force"),
-            }),
-            // `/compile` and `/deploy` are suffixes on the id path, exactly like `/pull` on a
-            // source id above — an id that itself ends in one of these cannot be confused with the
-            // verb, because stripping the suffix and re-running the same empty/`/`-free check
-            // closes exactly that.
-            Method::POST => match id.strip_suffix("/compile") {
-                Some(inner) if !inner.is_empty() && !inner.contains('/') => {
-                    Some(Terminated::SpecCompile(inner.to_owned()))
-                }
-                _ => match id.strip_suffix("/deploy") {
-                    Some(inner) if !inner.is_empty() && !inner.contains('/') => {
-                        Some(Terminated::SpecDeploy(inner.to_owned()))
-                    }
-                    _ => None,
-                },
-            },
+            Method::POST => Some(Terminated::SpecCompile),
             _ => None,
         };
     }
@@ -1045,18 +882,6 @@ fn has_query_param(query: Option<&str>, name: &str) -> bool {
 /// A valueless `?since` (no `=`) yields `Some("")`, not `None`: for a cursor those are different
 /// requests — "this token is empty" is a client bug worth a 400, while absence means "start from
 /// the beginning" — and collapsing them would turn the first into the second.
-/// A boolean query flag: `?force`, `?force=` , `?force=true` and `?force=1` are `true`;
-/// `?force=false` / `?force=0` are `false`, as is absence. Unlike [`has_query_param`] (presence
-/// only — right for `?match=`, whose value is the predicate), a flag the contract declares
-/// `type: boolean` must honour an explicit `false`: a client that spells "do not force" as
-/// `force=false` would otherwise get the destructive path it just declined.
-fn query_flag(query: Option<&str>, name: &str) -> bool {
-    match query_param(query, name) {
-        None => false,
-        Some(value) => !matches!(value.to_ascii_lowercase().as_str(), "false" | "0" | "no"),
-    }
-}
-
 fn query_param<'q>(query: Option<&'q str>, name: &str) -> Option<&'q str> {
     query
         .unwrap_or_default()
@@ -1142,31 +967,11 @@ fn action_for(kind: &Terminated) -> Action {
         Terminated::PutRoutes => Action::ImposterWrite,
         Terminated::DeleteRoute(_) => Action::ImposterWrite,
         Terminated::Tenancy(route) => route.action(),
-        Terminated::SourceList | Terminated::SourceRead(_) => Action::SourceRead,
-        // Deliberately NOT `Action::SourceRead` and deliberately NOT a new
-        // `Action::SourceWrite` (issue #253's explicit design decision, D-29):
-        // a pull commits as `SourcePullResult`, which ultimately produces the
-        // same `PutImposter`-shaped change a declare does, so both land on the
-        // write action rather than on a name nothing else in the system uses.
-        // The read/write split itself is deliberate too — reading a source is
-        // its own, lighter power (a
-        // Viewer may see what an imposter was built from, `role_allows`'s own
-        // comment on `Action::SourceRead`), while writing one is exactly as
-        // consequential as `PUT /imposters`, because that is what a pull
-        // ultimately produces.
-        Terminated::SourcePut | Terminated::SourcePull(_) => Action::ImposterWrite,
-        Terminated::SourceDelete(_) => Action::ImposterDelete,
-        // RFC-004 §4.3 (issue #278): listing, reading and dry-run compiling a spec are all reads —
-        // a compile commits nothing, it only shows what a deploy *would* commit.
-        Terminated::SpecList | Terminated::SpecRead(_) | Terminated::SpecCompile(_) => {
-            Action::SpecRead
-        }
-        // Importing redefines what a future deploy *would* answer; deploying redefines what an
-        // imposter answers *now* — both are `spec.write`. Deploy additionally requires
-        // `imposter.write` on the target port, checked in `terminate_spec_deploy` because the
-        // port lives in the body, not the route (see `Action::SpecWrite`'s doc).
-        Terminated::SpecPut(_) | Terminated::SpecDeploy(_) => Action::SpecWrite,
-        Terminated::SpecDelete { .. } => Action::SpecDelete,
+        // D-72: a compile commits nothing, but it is not a read either — it is the first half
+        // of `PUT /imposters`, and the compiled JSON is exactly what the caller will write.
+        // Authorizing it below that write would make it a way for a Viewer to have the fleet
+        // do a writer's work; there is no lighter power here worth its own action.
+        Terminated::SpecCompile => Action::ImposterWrite,
     }
 }
 
@@ -1431,16 +1236,6 @@ async fn handle(state: Arc<FrontState>, req: Request<Incoming>) -> Response<Fron
                         .then(|| space_read_target(&path))
                         .flatten()
                         .map(|(port, flow)| space_owner(&state, &tenant, port, &flow));
-                    // The node, for undoing D2's apply-time dataset compile-down on the way out
-                    // (issue #286). Both the single read and the listing: the engine holds a
-                    // compiled `lookup` whose CSV path is **node-local**, so leaving it in a
-                    // rendered config would make the same imposter read differently depending on
-                    // which node answered — and a `GET`-edit-`PUT` through the console would then
-                    // store that node's path as a hand-written lookup, wrong everywhere else.
-                    let dataset_render_node = (list_read
-                        || (req.method() == Method::GET && is_single_imposter_read(&path)))
-                    .then(|| state.node.upgrade())
-                    .flatten();
                     // The resolved `_rift` knobs (issue #370), read from the applied config before
                     // `proxy` moves `state` for the same reason as everything above. Single-imposter
                     // read only: the listing carries no knobs panel, and resolving them per entry
@@ -1469,9 +1264,6 @@ async fn handle(state: Arc<FrontState>, req: Request<Incoming>) -> Response<Fron
                     }
                     if let Some(knobs) = flow_knobs {
                         response = decorate_flow_state_resolved(response, knobs).await;
-                    }
-                    if let Some(node) = dataset_render_node {
-                        response = strip_compiled_dataset_lookups(response, &node).await;
                     }
                     if let Some(reason) = degraded {
                         set_header(&mut response, HEADER_BIND_FAILURES, &reason);
@@ -2138,163 +1930,6 @@ async fn ensure_session_key(
     }
 }
 
-/// The blob an op carries, if it carries one (#438).
-///
-/// Both ops still carry their bytes on the log until D-23 (#439) lands; this
-/// is the copy the fan-out sideloads to a quorum ahead of propose.
-///
-/// Only two ops do. Both already hold a digest that was derived from these
-/// exact bytes at mint time, so this re-uses it rather than re-hashing: a
-/// digest computed twice is two chances to disagree, and `control::validate`
-/// re-proves the record against its bytes on every replica anyway.
-fn op_blob(op: &ControlOp) -> Option<(&str, &[u8])> {
-    match op {
-        ControlOp::DatasetPut {
-            record,
-            csv: Some(csv),
-            ..
-        } => Some((record.digest.as_str(), csv.as_bytes())),
-        ControlOp::SpecPut {
-            meta,
-            document: Some(document),
-            ..
-        } => Some((meta.digest.as_str(), document.as_bytes())),
-        // Not a blob op — or a blob op already stripped by `fan_out_then_submit`. The second
-        // cannot reach here from a replay: parking happens before stripping at every site,
-        // so a parked intent always still carries its bytes.
-        _ => None,
-    }
-}
-
-/// Take the bytes off the op (#439, D-23): what is proposed carries the digest, the declared
-/// size and the accepting node, never the payload. Called only once a joint quorum holds the
-/// bytes — see [`fan_out_then_submit`], the sole caller.
-fn strip_blob(op: &mut ControlOp, accepted_by: u64) {
-    match op {
-        ControlOp::DatasetPut { csv, origin, .. } => {
-            *csv = None;
-            *origin = accepted_by;
-        }
-        ControlOp::SpecPut {
-            document, origin, ..
-        } => {
-            *document = None;
-            *origin = accepted_by;
-        }
-        _ => {}
-    }
-}
-
-/// Fan this op's blob out to a joint-consensus quorum, take the bytes off the op, and submit
-/// it — in one place, so nothing between "a quorum holds it" and "the op that references it
-/// committed" can be dropped by a caller (#438, #439; D-18, D-19, D-23, D-48).
-///
-/// Runs **after** the intent is parked and **before** submit, which is what makes a shortfall
-/// recoverable rather than lost: the parked intent still carries its bytes, so a replay
-/// (`compose::drain_parked_intents`) re-enters here and re-runs the fan-out, which is
-/// idempotent because `BlobTransfer::put` probes what the peer already staged and sends only
-/// the remainder.
-///
-/// Only once a majority of both the committed and the effective configuration holds the
-/// bytes — the joint rule D-19 fixes, read in one `with_raft_state` closure by
-/// `network::joint_voters` and decided by `QuorumTargets::satisfied_by` — **and** every member
-/// of that configuration (voters and learners alike) is confirmed able to apply a digest-only
-/// entry (`outcome.sideload_safe`, #481, D-53) are the bytes **stripped** from the op and `origin`
-/// stamped with this node. A byte quorum alone is not enough: a member outside it, or one
-/// running a build that cannot decode a digest-only reference, would take the fatal
-/// `StorageIOError` path in `RedbLogStore::try_get_log_entries` rather than a refused apply —
-/// so the shape stays unchanged (bytes carried, the pre-D-49 shape every build applies) until
-/// `sideload_safe` says otherwise. What a stripped entry carries is metadata-sized (D-23); a
-/// member the fan-out missed fetches on apply, asking this node first. The stripped (or
-/// unchanged) copy is what `submit` sees; the parked copy is untouched.
-///
-/// `submit` is the caller's own submit expression, with or without a deadline, because the
-/// three write paths differ there and nowhere else. It runs while the blob is pinned and the
-/// pin is released on return. There is no guard handed back and therefore none a caller can
-/// `let _ =` away — which is how the pin-hold gap #438 disclosed is closed structurally
-/// rather than by a test asserting nobody dropped it.
-///
-/// `Err` carries an operator-facing reason the blob did not reach a quorum; the caller must
-/// then leave the intent **parked** and ask for a replay. `Ok` carries whatever `submit`
-/// returned, untouched.
-pub(crate) async fn fan_out_then_submit<F, Fut>(
-    node: &RaftNode,
-    mut request: ControlRequest,
-    submit: F,
-) -> Result<Fut::Output, String>
-where
-    F: FnOnce(ControlRequest) -> Fut,
-    Fut: std::future::Future,
-{
-    let Some((digest, bytes)) = op_blob(&request.op) else {
-        return Ok(submit(request).await);
-    };
-    let digest = rift_cluster::blobs::BlobDigest::parse(digest)
-        .map_err(|e| format!("the op carries an unusable blob digest: {e}"))?;
-
-    let (outcome, pin) = node
-        .fan_out_blob(&digest, bytes)
-        .await
-        .map_err(|e| format!("blob fan-out failed: {e}"))?;
-
-    if !outcome.quorum {
-        // Naming the skewed peers separately matters for diagnosis: "3 nodes, 2
-        // acks, 1 cannot serve blobs" is an upgrade, while "3 nodes, 2 acks" with
-        // no skew is a partition. Collapsing them would make a half-upgraded fleet
-        // look like a network fault.
-        return Err(format!(
-            "the blob reached {} of the current voters, which is not a majority of both \
-             the committed and the effective configuration{}",
-            outcome.acks.len(),
-            if outcome.skewed.is_empty() {
-                String::new()
-            } else {
-                format!(
-                    " ({} member(s) run a build that cannot serve blobs)",
-                    outcome.skewed.len()
-                )
-            }
-        ));
-    }
-    tracing::debug!(
-        digest = digest.as_str(),
-        acks = outcome.acks.len(),
-        bytes_sent = outcome.bytes_sent,
-        joint = outcome.joint,
-        "blob fanned out to a quorum before propose"
-    );
-
-    // A byte quorum is not a decode quorum (#481): `outcome.quorum` says a majority holds the
-    // bytes, but a member outside that byte quorum (or one that answered `applies_digest_only:
-    // false`) may still be unable to *decode* a digest-only reference to them. Stripping is
-    // D-53: only safe once `sideload_safe` confirms every member of the committed ∪ effective
-    // configuration can apply one — otherwise this keeps the pre-D-49 shape every build
-    // applies, which every replica (whatever it runs) can always apply.
-    if outcome.sideload_safe {
-        strip_blob(&mut request.op, node.id());
-    } else {
-        // Exactly one increment per deferred write, so `sum by ()` over the labels still counts
-        // writes rather than reasons. `incapable` wins when both are present: it is the
-        // actionable one — a member that answered "I cannot" needs an upgrade or a removal, while
-        // an unobserved member may simply be a fresh join that the next fan-out resolves.
-        metrics::blob_sideload_deferred(if outcome.sideload_incapable.is_empty() {
-            "member_unobserved"
-        } else {
-            "member_incapable"
-        });
-        tracing::warn!(
-            digest = digest.as_str(),
-            incapable = ?outcome.sideload_incapable,
-            unobserved = ?outcome.sideload_unobserved,
-            "blob fan-out: keeping the op's bytes on the log; not every member is confirmed able \
-             to apply a digest-only entry"
-        );
-    }
-    let submitted = submit(request).await;
-    drop(pin);
-    Ok(submitted)
-}
-
 /// Render the `Set-Cookie` header for a freshly minted session token.
 ///
 /// `HttpOnly` (unreachable from `document.cookie`, so XSS cannot exfiltrate it), `Secure` (never
@@ -2685,66 +2320,6 @@ async fn decorate_space_owner(
     }
 }
 
-/// Remove the compiled dataset `lookup` from a rendered imposter (issue #286).
-///
-/// The engine executes a compiled `_behaviors.lookup` whose CSV path is node-local, so it must not
-/// appear in a rendered config: the same imposter would read differently per node, and an operator
-/// who edited a rendered document and `PUT` it back would store that node's filesystem path as a
-/// hand-written lookup. What is left is the operator's own `_rift.dataset` block, carrying the pin.
-///
-/// Additive-in-reverse, and takes the same failure polarity as [`decorate_flow_state_resolved`]: a
-/// body that will not parse passes through **unchanged and logged**. That is the safe direction
-/// here — the untouched body is the engine's own answer, which is complete and merely more verbose
-/// than intended, where a fabricated one would not be.
-async fn strip_compiled_dataset_lookups(
-    response: Response<FrontBody>,
-    node: &Arc<RaftNode>,
-) -> Response<FrontBody> {
-    let (parts, body) = response.into_parts();
-    if !parts.status.is_success() {
-        return Response::from_parts(parts, body);
-    }
-    let bytes = match body.collect().await {
-        Ok(collected) => collected.to_bytes(),
-        Err(e) => {
-            return internal(&format!(
-                "reading the imposter body to strip compiled dataset lookups: {e}"
-            ));
-        }
-    };
-    let body = match serde_json::from_slice::<serde_json::Value>(&bytes) {
-        Ok(mut document) => {
-            rift_cluster::datasets::strip_compiled(&mut document, |digest| node.spool_path(digest));
-            match serde_json::to_vec(&document) {
-                Ok(stripped) => Bytes::from(stripped),
-                Err(e) => {
-                    // The original bytes are valid and the status is untouched, so this is a safe
-                    // last resort — but it reverts to the *unstripped* body, which is the leak this
-                    // function exists to prevent. Logged for parity with the parse arm above, so it
-                    // cannot happen invisibly if `document` ever stops being trivially serializable.
-                    tracing::error!(
-                        error = %e,
-                        "the imposter body could not be re-serialized after stripping its \
-                         compiled dataset lookups; serving it unstripped"
-                    );
-                    bytes
-                }
-            }
-        }
-        Err(e) => {
-            tracing::error!(
-                error = %e,
-                "the imposter body could not be parsed to strip its compiled dataset lookups"
-            );
-            bytes
-        }
-    };
-    let mut response = buffered_response(parts.status, body, json_content_type())
-        .unwrap_or_else(|response| response);
-    carry_over_headers(&mut response, &parts.headers);
-    response
-}
-
 /// Add `_rift.flowStateResolved` to a proxied single-imposter read (issue #370).
 ///
 /// Additive, and so it takes [`decorate_space_owner`]'s failure polarity rather than
@@ -3096,6 +2671,129 @@ struct ReplaceStubsBody {
     stubs: Vec<Stub>,
 }
 
+/// `POST /specs/compile?port=<u16>[&name=<text>]` — the one-shot OpenAPI import (D-72, #549).
+///
+/// The body is an OpenAPI 3.0 document, JSON or YAML, at most
+/// [`rift_cluster_spec::MAX_SPEC_BYTES`]. The answer is the compiled imposter JSON — byte for
+/// byte what a client would `PUT /imposters` — plus the operation index the compiler built it
+/// from, so a caller can show what it is about to deploy.
+///
+/// **Stateless, and that is the whole point.** Nothing is stored, no `ControlOp` is minted, no
+/// applied-state table is read: the cluster retains nothing about the spec, and the imposter
+/// reaches the log through the one path every other config takes. That is what replaced the
+/// `/specs` store, its blob table, its drift diff and its edit-time validation (RFC-004
+/// §3.4–§3.6, retired by D-71).
+///
+/// **`port` is required**, unlike the store-backed compile it replaces. That one could fall back
+/// to the spec's single bound port, because a stored spec had bindings; this one has no record to
+/// infer from, and a compiled imposter with no port cannot be `PUT` under `--cluster` at all
+/// (`validate_replicable_config`: an auto-assigned port cannot replicate). Answering with a
+/// portless document would hand the caller something the very next call refuses.
+///
+/// The compiler's refusals — an unsupported version, an external `$ref`, a parse failure, its own
+/// self-check — become this route's `400` verbatim. There is no separate warning channel: a
+/// document the compiler would warn about is a document it refuses, so a `200` here means the
+/// output passed the contract it just emitted.
+async fn terminate_spec_compile(req: Request<Incoming>) -> Response<FrontBody> {
+    let query = req.uri().query().map(str::to_owned);
+    let port = match query_param(query.as_deref(), "port") {
+        Some(raw) => match raw.parse::<u16>() {
+            Ok(port) if port != 0 => port,
+            _ => {
+                return typed_error(
+                    StatusCode::BAD_REQUEST,
+                    ErrorKind::BadData,
+                    &format!("port {raw:?} is not a usable port number"),
+                );
+            }
+        },
+        None => {
+            return typed_error(
+                StatusCode::BAD_REQUEST,
+                ErrorKind::BadData,
+                "compile needs ?port=<number>: a compiled imposter with no port cannot be \
+                 replicated, so there is nothing useful to answer without one",
+            );
+        }
+    };
+    // Raw, with no percent-decoding, for [`query_param`]'s own reason — and an empty `?name=`
+    // reads as absent rather than as a name of zero characters, because the compiler omits the
+    // field entirely for `None` and an empty `name` is not a thing a caller means to ask for.
+    let name = query_param(query.as_deref(), "name")
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned);
+
+    // Bounded before it is parsed, for the reason `rift-cluster-spec`'s own cap exists: this is
+    // attacker-influenceable input. `Limited` caps the stream, so a body with no declared length
+    // is bounded too — but its own refusal is a transport error, and the cap that matters to the
+    // caller is the spec cap, so the length is re-checked below and answered by name.
+    let body = match Limited::new(req.into_body(), MAX_SPEC_BYTES + 1)
+        .collect()
+        .await
+    {
+        Ok(collected) => collected.to_bytes(),
+        Err(_) => {
+            return typed_error(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                ErrorKind::RequestTooLarge,
+                &format!("spec exceeds {MAX_SPEC_BYTES} bytes"),
+            );
+        }
+    };
+    if body.len() > MAX_SPEC_BYTES {
+        return typed_error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            ErrorKind::RequestTooLarge,
+            &format!("spec exceeds {MAX_SPEC_BYTES} bytes"),
+        );
+    }
+
+    let compiled = match compile(
+        &body,
+        &CompileOptions {
+            port: Some(port),
+            name,
+            max_bytes: MAX_SPEC_BYTES,
+        },
+    ) {
+        Ok(compiled) => compiled,
+        Err(e) => {
+            return typed_error(
+                StatusCode::BAD_REQUEST,
+                ErrorKind::BadData,
+                &format!("spec does not compile: {e}"),
+            );
+        }
+    };
+    let operations: Vec<serde_json::Value> = compiled
+        .operations
+        .iter()
+        .map(|op| {
+            serde_json::json!({
+                "id": op.id.as_str(),
+                "method": op.method,
+                "pathTemplate": op.path_template,
+                "stubIds": op.stub_ids,
+            })
+        })
+        .collect();
+    json_ok(
+        StatusCode::OK,
+        &serde_json::json!({
+            "imposter": compiled.imposter,
+            "operations": operations,
+        }),
+    )
+}
+
+/// A JSON success body. `buffered_response`'s `Err` is itself a client response (an oversize
+/// body), so either arm is the answer.
+fn json_ok(status: StatusCode, body: &serde_json::Value) -> Response<FrontBody> {
+    match buffered_response(status, Bytes::from(body.to_string()), json_content_type()) {
+        Ok(response) | Err(response) => response,
+    }
+}
+
 #[derive(Deserialize)]
 struct ReplaceAllBody {
     #[serde(default)]
@@ -3127,53 +2825,12 @@ async fn terminate(
         return terminate_tenancy(&state, &node, req, route, principal_id, &tenant).await;
     }
 
-    // So does the whole source surface (issue #239 for the reads, #253 for
-    // the three writes below): same shared gate, but none of the imposter
-    // write machinery below applies — a source is not an imposter record,
-    // has no `If-Match` surface, and needs no `_rift.script` resolution.
+    // So does the one-shot OpenAPI compile (D-72, #549): it holds no record, mints no op and
+    // reads no table, so none of the imposter write machinery below applies. It takes `req`
+    // directly because its whole input is the request body.
     match kind {
-        Terminated::SourceRead(id) => {
-            return terminate_sources(&state, &node, Some(id.as_str()), &tenant);
-        }
-        Terminated::SourceList => {
-            return terminate_sources(&state, &node, None, &tenant);
-        }
-        Terminated::SourcePut => {
-            return terminate_source_write(&state, req, SourceWrite::Put, principal_id, &tenant)
-                .await;
-        }
-        Terminated::SourceDelete(id) => {
-            return terminate_source_write(
-                &state,
-                req,
-                SourceWrite::Delete(id),
-                principal_id,
-                &tenant,
-            )
-            .await;
-        }
-        Terminated::SourcePull(id) => {
-            return terminate_source_write(
-                &state,
-                req,
-                SourceWrite::Pull(id),
-                principal_id,
-                &tenant,
-            )
-            .await;
-        }
-        // The spec reads (RFC-004 §4.3, issue #278) return here for the same reason the source
-        // reads do: they answer from local applied state and have nothing to commit.
-        Terminated::SpecList => {
-            return terminate_spec_read(&node, &tenant, None);
-        }
-        Terminated::SpecRead(id) => {
-            return terminate_spec_read(&node, &tenant, Some(id.as_str()));
-        }
-        // A dry-run compile needs the request body (the optional `{"port": ...}`), so it takes
-        // `req` directly and does its own collection, exactly as the source writes below do.
-        Terminated::SpecCompile(id) => {
-            return terminate_spec_compile(&node, req, id, &tenant).await;
+        Terminated::SpecCompile => {
+            return terminate_spec_compile(req).await;
         }
         // A try commits nothing — its whole result is what the imposter answered — so it returns
         // here for the same reason the source surface does.
@@ -3282,63 +2939,6 @@ async fn terminate(
             );
         }
     };
-
-    // The three spec writes (RFC-004 §4.3, issue #278) each need to inspect the stored record (and,
-    // for delete, decide 409-vs-force) before there is a `Mutation` to build at all, so they build
-    // their own and call `run_mutation` directly rather than routing through `build_mutation`'s
-    // single generic shape — same reasoning as the tenancy surface and the source writes above,
-    // just deferred to here because these three DO share the rest of the write machinery
-    // (`If-Match`, park/replay, the barrier, the cluster headers) that the early-return surfaces
-    // above do not.
-    match kind {
-        Terminated::SpecPut(id) => {
-            return terminate_spec_put(
-                &state,
-                &node,
-                &tenant,
-                id,
-                &body,
-                auth.as_deref(),
-                host.as_ref(),
-                idempotency.as_deref(),
-                if_match.as_deref(),
-                principal_id,
-            )
-            .await;
-        }
-        Terminated::SpecDelete { id, force } => {
-            return terminate_spec_delete(
-                &state,
-                &node,
-                &tenant,
-                id,
-                force,
-                auth.as_deref(),
-                host.as_ref(),
-                idempotency.as_deref(),
-                if_match.as_deref(),
-                principal_id,
-            )
-            .await;
-        }
-        Terminated::SpecDeploy(id) => {
-            return terminate_spec_deploy(
-                &state,
-                &node,
-                &tenant,
-                id,
-                &body,
-                auth.as_deref(),
-                host.as_ref(),
-                idempotency.as_deref(),
-                if_match.as_deref(),
-                principal_id,
-                &bindings,
-            )
-            .await;
-        }
-        _ => {}
-    }
 
     let is_batch = matches!(kind, Terminated::ReplaceAllImposters);
     let mutation = match build_mutation(
@@ -4263,8 +3863,6 @@ fn fleet_admin(bindings: &[(TenantId, Role)]) -> bool {
 ///
 /// Skipped under the no-principal bypass: with no principal there is no role to hold, so nothing
 /// is gated — the same open-admin-plane reasoning `authorize_action`'s own bypass arm documents.
-/// A source pull is the other admission path and is gated in `SourcePuller::pull` itself, where
-/// no principal is ever present to hold the role.
 // The Err IS the client response — this module's early-return channel.
 #[allow(clippy::result_large_err)]
 fn refuse_fleet_scope_without_fleet_admin<'a>(
@@ -4516,30 +4114,15 @@ async fn run_mutation(
     // cannot — including the tail of a multi-op sequence.
     let base = base_op_id(idempotency);
     let total = mutation.ops.len();
-    // Which ports the edit-time spec-warnings read below (issue #278) must check — computed here
-    // because `mutation.ops` is moved into `requests` two lines down.
-    let spec_warning_ports = spec_warning_ports(&mutation.ops);
     let requests: Vec<ControlRequest> = mutation
         .ops
         .into_iter()
         .enumerate()
         .map(|(index, op)| {
-            // A deploy commits `[PutImposter, SpecBind]` under one `If-Match`; the precondition is
-            // checked once, on the imposter write in front, and `SpecBind` has no target by design
-            // (`control::precondition_target` — see its own doc). Minting `expected_revision` for
-            // it would refuse the deploy inside `apply` for a precondition the client never named
-            // against that record. Deliberately narrowed to `SpecBind` and not to "every op without
-            // a target": the journal clears (`JournalClearGen`, `ProxyRecordedClear`) also have no
-            // target but *do* reach here with an `If-Match`, and their committed refusal (a `409`
-            // saying preconditions do not apply) is the contract a client conditioning a
-            // destructive clear relies on — dropping the header for them would apply the clear
-            // unconditionally and silently.
-            let op_revision =
-                expected_revision.filter(|_| !matches!(op, ControlOp::SpecBind { .. }));
             mint(
                 op_id_for(base, index, total),
                 op,
-                op_revision,
+                expected_revision,
                 principal_id.clone(),
             )
         })
@@ -4563,21 +4146,7 @@ async fn run_mutation(
         tokio::spawn(async move {
             for request in background {
                 let op_id = request.op_id;
-                // #438, inside the spawned task rather than before it: the
-                // caller already holds its 202, so the fan-out must not be
-                // awaited on the request path or the async contract changes.
-                // A shortfall leaves the intent parked for the replay loop,
-                // exactly as a failed submit does below.
-                let submitted = match fan_out_then_submit(&node, request, |r| node.submit(r)).await
-                {
-                    Ok(submitted) => submitted,
-                    Err(reason) => {
-                        tracing::warn!(%op_id, %reason, "async blob fan-out short of quorum; intent stays parked");
-                        node.request_replay();
-                        return;
-                    }
-                };
-                match submitted {
+                match node.submit(request).await {
                     Ok(_) => {
                         if let Err(e) = node.unpark_intent(&op_id) {
                             tracing::error!(%op_id, error = %e, "applied but could not unpark");
@@ -4614,29 +4183,7 @@ async fn run_mutation(
     let mut last: Option<(Uuid, ControlResponse)> = None;
     for request in requests {
         let op_id = request.op_id;
-        // #438, synchronous branch: same rule as the async one above and as the
-        // tenancy seam — fan out inside the parked window, and on a shortfall
-        // refuse with the op id rather than unparking.
-        let submitted = match fan_out_then_submit(node, request, |r| {
-            tokio::time::timeout(WRITE_DEADLINE, node.submit(r))
-        })
-        .await
-        {
-            Ok(submitted) => submitted,
-            Err(reason) => {
-                node.request_replay();
-                let mut response = typed_error(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    ErrorKind::Unavailable,
-                    &format!("blob not durable enough to commit (parked for replay): {reason}"),
-                );
-                response
-                    .headers_mut()
-                    .insert("retry-after", HeaderValue::from_static("1"));
-                set_header(&mut response, HEADER_OP_ID, &base.to_string());
-                return Err(response);
-            }
-        };
+        let submitted = tokio::time::timeout(WRITE_DEADLINE, node.submit(request)).await;
         let response = match submitted {
             Err(_) => {
                 // Parked, so not lost: the replay loop retries it, and is woken
@@ -4788,328 +4335,7 @@ async fn run_mutation(
         set_header(&mut response, HEADER_WARNINGS, &warnings.join(","));
     }
 
-    // Edit-time spec validation (RFC-004 §3.2, issue #278): read *after* the barrier, from this
-    // node's own applied state — the barrier already waited for the local apply, so what
-    // `spec_warnings` reads back here is guaranteed to be what this write just committed, not
-    // whatever was there before it.
-    //
-    // Compiling an OpenAPI document is CPU work — up to 4 MiB of YAML per bound port — so it runs
-    // off the request task rather than stalling this worker's other connections behind a write
-    // that has already committed. A join failure (the blocking pool refusing or a panic inside the
-    // compiler) is logged and yields no warnings: this pass may never turn a committed write into
-    // an error, and "no header" is the only response shape it is allowed to degrade to.
-    if !spec_warning_ports.is_empty() {
-        let (node, tenant) = (Arc::clone(node), tenant.clone());
-        let spec_violations = match tokio::task::spawn_blocking(move || {
-            spec_warnings(&node, &tenant, &spec_warning_ports)
-        })
-        .await
-        {
-            Ok(violations) => violations,
-            Err(e) => {
-                tracing::error!(error = %e, "edit-time spec validation did not run");
-                Vec::new()
-            }
-        };
-        if let Some(value) = spec_warnings_header(&spec_violations) {
-            set_header(&mut response, HEADER_SPEC_WARNINGS, &value);
-        }
-    }
     Ok(response)
-}
-
-/// The most entries a `Rift-Spec-Warnings` value carries before it says `+N more`, and the most
-/// bytes it may occupy: intermediaries commonly cap a response's header block at 8 KiB, and a
-/// warning that turned a successful write into a proxy's `502` would defeat its own purpose.
-const SPEC_WARNINGS_MAX_ENTRIES: usize = 10;
-const SPEC_WARNINGS_MAX_BYTES: usize = 2048;
-
-/// Render `violations` as the `Rift-Spec-Warnings` value, or `None` when there is nothing to say.
-///
-/// Visible ASCII only — a violation's detail echoes JSON values back, so anything outside the
-/// printable range is replaced rather than rejected (losing a byte of fidelity in a warning beats
-/// refusing a write that already committed) — capped at [`SPEC_WARNINGS_MAX_ENTRIES`] entries and
-/// [`SPEC_WARNINGS_MAX_BYTES`] bytes, with an explicit `; +N more` / `…` so a truncated value
-/// never reads as the whole story.
-fn spec_warnings_header(violations: &[String]) -> Option<String> {
-    if violations.is_empty() {
-        return None;
-    }
-    let mut value = violations
-        .iter()
-        .take(SPEC_WARNINGS_MAX_ENTRIES)
-        .map(String::as_str)
-        .collect::<Vec<_>>()
-        .join("; ");
-    if violations.len() > SPEC_WARNINGS_MAX_ENTRIES {
-        value.push_str(&format!(
-            "; +{} more",
-            violations.len() - SPEC_WARNINGS_MAX_ENTRIES
-        ));
-    }
-    let mut value: String = value
-        .chars()
-        .map(|c| if (' '..='~').contains(&c) { c } else { '?' })
-        .collect();
-    if value.len() > SPEC_WARNINGS_MAX_BYTES {
-        // ASCII by now, so a byte index is a char index and the cut cannot split a character.
-        value.truncate(SPEC_WARNINGS_MAX_BYTES - 3);
-        value.push_str("...");
-    }
-    Some(value)
-}
-
-/// `GET /admin/sources` / `GET /admin/sources/{id}` (issue #239).
-///
-/// The response deliberately keeps two kinds of fact in two shapes (D-31):
-///
-/// - **`sources` / `source`** is the replicated projection, verbatim. Every
-///   converged node answers it byte-identically, and `RedbStateMachine::
-///   sources` documents that diffing two nodes' answers is how an operator
-///   checks a `SourcePut` has converged — a property that survives only if
-///   nothing node-local is ever mixed into this half.
-/// - **`nodeLocal`** carries what is true of *this node only*: which node
-///   answered, and the last poll error per source. A poll failure is
-///   deliberately not replicated (`scheduler.rs::PollStatus`), so it can
-///   differ across the fleet — flattening it into the record would tell an
-///   operator the fleet is failing when one node is, or that it is healthy
-///   when only the node they happened to hit is.
-///
-/// The cluster-port `read_source` (sources/mod.rs) *does* flat-merge
-/// `lastPollError`, and that is not a contradiction: there the caller
-/// addressed one node explicitly, so "this node's view" is the question being
-/// asked. This surface sits behind one fleet address, where it is not.
-fn terminate_sources(
-    state: &Arc<FrontState>,
-    node: &Arc<RaftNode>,
-    id: Option<&str>,
-    tenant: &TenantId,
-) -> Response<FrontBody> {
-    let view = match id {
-        Some(id) => {
-            match node.source(tenant.as_str(), id) {
-                Ok(Some(record)) => SourcesView::One(record),
-                // Byte-identical to the cross-tenant refusal (RFC-002 §8.4):
-                // a source that exists in another tenant must be
-                // indistinguishable from one that never existed.
-                Ok(None) => return tenant_boundary_not_found(),
-                Err(e) => return internal(&e.to_string()),
-            }
-        }
-        None => match node.sources(tenant.as_str()) {
-            Ok(records) => SourcesView::List(records),
-            Err(e) => return internal(&e.to_string()),
-        },
-    };
-    // The poll-error lookup carries the authorized tenant: source ids are only
-    // unique within a tenant, and a bare-id lookup would answer with another
-    // tenant's failure string — see `PollStatus::last_error`'s key doc.
-    let body = match render_sources(node.id(), &view, |id| {
-        state.puller.last_poll_error(tenant.as_str(), id)
-    }) {
-        Ok(body) => body,
-        Err(e) => return internal(&format!("rendering sources: {e}")),
-    };
-    buffered_response(StatusCode::OK, Bytes::from(body), json_content_type())
-        .unwrap_or_else(|response| response)
-}
-
-/// Which of the two response shapes a sources read renders.
-enum SourcesView {
-    List(Vec<rift_cluster::SourceRecord>),
-    One(rift_cluster::SourceRecord),
-}
-
-impl SourcesView {
-    fn records(&self) -> &[rift_cluster::SourceRecord] {
-        match self {
-            SourcesView::List(records) => records,
-            SourcesView::One(record) => std::slice::from_ref(record),
-        }
-    }
-}
-
-/// Render the two-part sources body — see [`terminate_sources`] for why the
-/// parts must stay apart. The poll-error lookup is injected so the separation
-/// is unit-testable without a bound front or a live puller.
-fn render_sources(
-    node_id: rift_cluster::NodeId,
-    view: &SourcesView,
-    last_poll_error: impl Fn(&str) -> Option<String>,
-) -> serde_json::Result<Vec<u8>> {
-    let poll_errors: serde_json::Map<String, serde_json::Value> = view
-        .records()
-        .iter()
-        .filter_map(|record| {
-            last_poll_error(&record.id).map(|error| (record.id.clone(), error.into()))
-        })
-        .collect();
-    let node_local = serde_json::json!({
-        // A STRING, for the reason `cluster_api::node_id` documents at length: a `NodeId` is a
-        // `u64`, JSON numbers are IEEE-754 doubles wherever the reader is JavaScript, and every id
-        // above 2^53-1 arrives silently rounded. #332 fixed `/_fleet/*` and `/_cluster/*`; this
-        // endpoint carries the same id and was missed, so it went on reporting a node that does
-        // not exist.
-        "nodeId": node_id.to_string(),
-        "pollErrors": serde_json::Value::Object(poll_errors),
-    });
-    let body = match view {
-        SourcesView::List(records) => {
-            serde_json::json!({ "sources": records, "nodeLocal": node_local })
-        }
-        SourcesView::One(record) => {
-            serde_json::json!({ "source": record, "nodeLocal": node_local })
-        }
-    };
-    serde_json::to_vec(&body)
-}
-
-/// Which of the three source-write routes (issue #253) `terminate_source_write` is serving.
-///
-/// Carved out of `Terminated` at the `terminate` call site rather than matched there directly, so
-/// the match inside `terminate_source_write` is exhaustive with no wildcard arm — the same reason
-/// `action_for` has none. A route this function was never meant to receive is a compile error
-/// here, not a `_ => unreachable!()` waiting to fire in production.
-enum SourceWrite {
-    Put,
-    Delete(String),
-    Pull(String),
-}
-
-/// Serve one of the three RBAC'd source write routes (issue #253): `POST /admin/sources`,
-/// `DELETE /admin/sources/{id}`, `POST /admin/sources/{id}/pull`.
-///
-/// Follows `terminate_tenancy`'s shape — a direct control-plane submit with an `Rift-Cluster-Op-Id`
-/// header on the response — rather than `build_and_run`'s: that path is built around a single
-/// *imposter* record (`If-Match` against a port, `_rift.script` resolution, a post-commit re-read
-/// of the loopback admin), and none of it applies to a source, which upstream has no concept of at
-/// all. There is deliberately no `If-Match` here: a source row carries no revision surface of its
-/// own to condition on (`SourceRecord.revision` is *when it last wrote*, not something a client
-/// hands back as a precondition), and `SourcePut` is an idempotent upsert by id rather than a
-/// read-modify-write, so there is no lost update for a precondition to guard against.
-///
-/// All three commit through [`SourcePuller`], which does the actual parse -> validate -> submit ->
-/// read-back work identically for the cluster port's default-tenant twin of each route (see its own
-/// doc) — this function only supplies the tenant `authorize_action` already resolved and renders
-/// the result as an HTTP response.
-async fn terminate_source_write(
-    state: &Arc<FrontState>,
-    req: Request<Incoming>,
-    kind: SourceWrite,
-    principal_id: Option<String>,
-    tenant: &TenantId,
-) -> Response<FrontBody> {
-    // Collected unconditionally, like every other terminated write in this file (`terminate`'s own
-    // body read above `build_and_run`, `terminate_tenancy`'s) — `Delete` and `Pull` carry no body of
-    // their own, but draining it here rather than leaving it unread is what keeps a client that sent
-    // one anyway from stalling the connection's keep-alive.
-    let body = match Limited::new(req.into_body(), MAX_BODY_BYTES)
-        .collect()
-        .await
-    {
-        Ok(collected) => collected.to_bytes(),
-        Err(e) => {
-            return typed_error(
-                StatusCode::PAYLOAD_TOO_LARGE,
-                ErrorKind::RequestTooLarge,
-                &format!("admin request body refused: {e}"),
-            );
-        }
-    };
-
-    match kind {
-        SourceWrite::Put => {
-            let (record, op_id) = match state.puller.put(tenant.clone(), &body, principal_id).await
-            {
-                Ok(ok) => ok,
-                Err(e) => return source_write_error(e),
-            };
-            let payload = match serde_json::to_vec(&record) {
-                Ok(payload) => payload,
-                Err(e) => return internal(&e.to_string()),
-            };
-            let mut response = match buffered_response(
-                StatusCode::OK,
-                Bytes::from(payload),
-                json_content_type(),
-            ) {
-                Ok(response) | Err(response) => response,
-            };
-            set_header(&mut response, HEADER_OP_ID, &op_id.to_string());
-            response
-        }
-        SourceWrite::Delete(id) => {
-            let (revision, op_id) =
-                match state.puller.delete(tenant.clone(), &id, principal_id).await {
-                    Ok(ok) => ok,
-                    Err(e) => return source_write_error(e),
-                };
-            let payload = serde_json::json!({ "revision": revision }).to_string();
-            let mut response = match buffered_response(
-                StatusCode::OK,
-                Bytes::from(payload),
-                json_content_type(),
-            ) {
-                Ok(response) | Err(response) => response,
-            };
-            set_header(&mut response, HEADER_OP_ID, &op_id.to_string());
-            response
-        }
-        SourceWrite::Pull(id) => {
-            let report = match state.puller.pull(tenant.as_str(), &id, principal_id).await {
-                Ok(report) => report,
-                Err(e) => return source_write_error(e),
-            };
-            let payload = match serde_json::to_vec(&report) {
-                Ok(payload) => payload,
-                Err(e) => return internal(&e.to_string()),
-            };
-            // No `Rift-Cluster-Op-Id` here, unlike the two arms above: `pull` is the
-            // pre-existing cluster-port method (kept byte-for-byte so its behaviour towards its
-            // existing caller is unchanged — issue #253's explicit constraint), and it does not
-            // surface the op id it minted internally for the write it committed. A client that
-            // needs to correlate a pull has the report's own `revision`; the `Unavailable` error
-            // path below still names an op id to poll, from `PullError` itself.
-            match buffered_response(StatusCode::OK, Bytes::from(payload), json_content_type()) {
-                Ok(response) | Err(response) => response,
-            }
-        }
-    }
-}
-
-/// Map a [`PullError`] from one of the three source-write routes onto the front's status classes —
-/// the cluster port's own `pull_error` (`rift-cluster`'s `sources` module) draws the identical
-/// distinction, reproduced here because this front renders `Response<FrontBody>`, not `RpcError`,
-/// and putting a dependency on the front's HTTP types into `rift-cluster` (a crate with no `hyper`
-/// dependency at all) to share one function would be the wrong direction for it.
-fn source_write_error(e: PullError) -> Response<FrontBody> {
-    match e {
-        // Byte-identical to `terminate_sources`'s own cross-tenant/absent 404 (RFC-002 §8.4): a
-        // pull of an id that does not exist in the caller's tenant must not be distinguishable from
-        // one that belongs to someone else. `put`/`delete` never produce this variant — an upsert
-        // has no "unknown" case, and a delete is idempotent when absent (`SourcePuller::delete`'s
-        // own doc) — only `pull` reads the record first and can find nothing there.
-        PullError::UnknownSource(_) => tenant_boundary_not_found(),
-        PullError::BadRequest(detail) => refusal_response(&detail),
-        // The fetch itself failed against the source's own host — the upstream's fault, not this
-        // cluster's, and worth retrying. Mirrors `sources::pull_error`'s identical reasoning for the
-        // cluster port.
-        PullError::Fetch { id, detail } => typed_error(
-            StatusCode::BAD_GATEWAY,
-            ErrorKind::UpstreamFailure,
-            &format!("fetching source {id:?}: {detail}"),
-        ),
-        PullError::Unavailable { detail, op_id } => {
-            let mut response = typed_error(
-                StatusCode::SERVICE_UNAVAILABLE,
-                ErrorKind::Unavailable,
-                &detail,
-            );
-            set_header(&mut response, HEADER_OP_ID, &op_id.to_string());
-            response
-        }
-        PullError::Internal(detail) => internal(&detail),
-    }
 }
 
 /// Total budget for one try exchange (issue #335) — the in-process handshake, the send, and
@@ -5774,27 +5000,6 @@ async fn terminate_tenancy(
         );
     }
 
-    // Parsed here, where both the headers and the query are in hand — `classify` sees only the
-    // path and query, and `dispatch` sees neither.
-    let upload = if matches!(route, tenancy::Route::DatasetUpload(_)) {
-        match tenancy::DatasetUploadMeta::parse(
-            |name| {
-                req.headers()
-                    .get(name)
-                    .and_then(|v| v.to_str().ok())
-                    .map(str::to_owned)
-            },
-            req.uri().query(),
-        ) {
-            Ok(meta) => Some(meta),
-            Err(reason) => {
-                return typed_error(StatusCode::BAD_REQUEST, ErrorKind::BadData, &reason);
-            }
-        }
-    } else {
-        None
-    };
-
     let body = match Limited::new(req.into_body(), MAX_BODY_BYTES)
         .collect()
         .await
@@ -5809,7 +5014,7 @@ async fn terminate_tenancy(
         }
     };
 
-    let outcome = match tenancy::dispatch(node, route, &body, upload, &state.flow_net).await {
+    let outcome = match tenancy::dispatch(node, route, &body, &state.flow_net).await {
         Ok(outcome) => outcome,
         Err(tenancy::TenancyError::BadRequest(reason)) => {
             return typed_error(StatusCode::BAD_REQUEST, ErrorKind::BadData, &reason);
@@ -5834,18 +5039,6 @@ async fn terminate_tenancy(
             }
             return response;
         }
-        tenancy::Outcome::Bytes {
-            status,
-            body,
-            content_type,
-        } => {
-            return buffered_response(
-                status,
-                Bytes::from(body),
-                Some(HeaderValue::from_static(content_type)),
-            )
-            .unwrap_or_else(|response| response);
-        }
         tenancy::Outcome::Commit { op, status, then } => (op, status, then),
     };
 
@@ -5865,34 +5058,7 @@ async fn terminate_tenancy(
         );
     }
 
-    // #438: the bytes reach a quorum before the op that references them is
-    // proposed, so a commit implies the blob is quorum-durable — the guarantee
-    // the log itself used to provide. Deliberately inside the parked window and
-    // deliberately *not* unparked on failure: the replay loop owns the intent
-    // from here and re-runs the fan-out.
-    // The pin lives inside `fan_out_then_submit`, which owns the submit — nothing
-    // references the blob until the op it carries commits, and no caller can drop
-    // a guard it was never handed (#439).
-    let submitted = match fan_out_then_submit(node, request, |r| {
-        tokio::time::timeout(WRITE_DEADLINE, node.submit(r))
-    })
-    .await
-    {
-        Ok(submitted) => submitted,
-        Err(reason) => {
-            node.request_replay();
-            let mut response = typed_error(
-                StatusCode::SERVICE_UNAVAILABLE,
-                ErrorKind::Unavailable,
-                &format!("blob not durable enough to commit (parked for replay): {reason}"),
-            );
-            response
-                .headers_mut()
-                .insert("retry-after", HeaderValue::from_static("1"));
-            set_header(&mut response, HEADER_OP_ID, &op_id.to_string());
-            return response;
-        }
-    };
+    let submitted = tokio::time::timeout(WRITE_DEADLINE, node.submit(request)).await;
 
     let committed = match submitted {
         Err(_) => {
@@ -5997,840 +5163,6 @@ async fn terminate_tenancy(
     response
 }
 
-/// The tenant's spec `id` from local applied state, or the client response that says why not:
-/// the §8.4-shaped `404` when there is no such record (a cross-tenant id is simply absent —
-/// `node.spec` is keyed `(tenant, id)`), `500` on a storage read failure. The one lookup every
-/// spec route that names an id starts with.
-#[allow(clippy::result_large_err)]
-fn spec_record_or_404(
-    node: &Arc<RaftNode>,
-    tenant: &TenantId,
-    id: &str,
-) -> Result<rift_cluster::SpecRecord, Response<FrontBody>> {
-    match node.spec(tenant.as_str(), id) {
-        Ok(Some(record)) => Ok(record),
-        Ok(None) => Err(typed_error(
-            StatusCode::NOT_FOUND,
-            ErrorKind::NoSuchResource,
-            &format!("no spec {id:?}"),
-        )),
-        Err(e) => Err(internal(&e.to_string())),
-    }
-}
-
-/// The document a spec record's digest names. The record and its blob are two tables
-/// (`raft::store`'s `sm_specs` / `sm_spec_blobs`); a record whose digest names no blob would mean
-/// apply upserted one without the other, which its `SpecPut` arm makes impossible — answered as a
-/// `500`, never silently, so a bug there is visible instead of serving a spec with no text.
-#[allow(clippy::result_large_err)]
-fn spec_document_or_500(
-    node: &Arc<RaftNode>,
-    record: &rift_cluster::SpecRecord,
-) -> Result<String, Response<FrontBody>> {
-    match node.spec_document(&record.digest) {
-        Ok(Some(document)) => Ok(document),
-        Ok(None) => Err(internal(&format!(
-            "spec {:?} has no stored document for digest {:?}",
-            record.id, record.digest
-        ))),
-        Err(e) => Err(internal(&e.to_string())),
-    }
-}
-
-/// A JSON success body. `buffered_response`'s `Err` is itself a client response (an oversize
-/// body), so either arm is the answer.
-fn json_ok(status: StatusCode, body: &serde_json::Value) -> Response<FrontBody> {
-    match buffered_response(status, Bytes::from(body.to_string()), json_content_type()) {
-        Ok(response) | Err(response) => response,
-    }
-}
-
-/// `GET /specs` (`id: None`) / `GET /specs/{id}` (`id: Some`) — RFC-004 §4.3, issue #278.
-///
-/// Both answer from local applied state, exactly like [`terminate_sources`]: a spec is a
-/// replicated projection, so every converged node answers identically and there is no leadership
-/// requirement. A single-spec read that finds no record — whether the id never existed or names
-/// another tenant's spec — renders the identical §8.4 404: `node.spec` is already keyed
-/// `(tenant, id)`, so a cross-tenant id is simply absent, with nothing extra to check.
-fn terminate_spec_read(
-    node: &Arc<RaftNode>,
-    tenant: &TenantId,
-    id: Option<&str>,
-) -> Response<FrontBody> {
-    let Some(id) = id else {
-        let specs = match node.specs(tenant.as_str()) {
-            Ok(specs) => specs,
-            Err(e) => return internal(&e.to_string()),
-        };
-        return json_ok(StatusCode::OK, &serde_json::json!({ "specs": specs }));
-    };
-    let record = match spec_record_or_404(node, tenant, id) {
-        Ok(record) => record,
-        Err(response) => return response,
-    };
-    let document = match spec_document_or_500(node, &record) {
-        Ok(document) => document,
-        Err(response) => return response,
-    };
-    let mut body = match serde_json::to_value(&record) {
-        Ok(body) => body,
-        Err(e) => return internal(&e.to_string()),
-    };
-    if let serde_json::Value::Object(map) = &mut body {
-        map.insert("document".to_owned(), serde_json::Value::String(document));
-    }
-    json_ok(StatusCode::OK, &body)
-}
-
-/// `POST /specs/{id}/compile` (RFC-004 §4.3, issue #278): a dry run. Compiles the stored document
-/// — for the port the body names, else the spec's one bound port, else no port at all — and
-/// answers with exactly what `deploySpec` would commit, plus a stub-id diff against whatever is
-/// currently deployed on the target port. Commits nothing: there is no `Mutation` here at all.
-async fn terminate_spec_compile(
-    node: &Arc<RaftNode>,
-    req: Request<Incoming>,
-    id: String,
-    tenant: &TenantId,
-) -> Response<FrontBody> {
-    let body = match Limited::new(req.into_body(), MAX_BODY_BYTES)
-        .collect()
-        .await
-    {
-        Ok(collected) => collected.to_bytes(),
-        Err(e) => {
-            return typed_error(
-                StatusCode::PAYLOAD_TOO_LARGE,
-                ErrorKind::RequestTooLarge,
-                &format!("admin request body refused: {e}"),
-            );
-        }
-    };
-    #[derive(Deserialize)]
-    struct CompileBody {
-        port: Option<u16>,
-    }
-    // Absent/empty body is fine (RFC-004 §4.3's `requestBody: required: false`) — it just means
-    // "no explicit target port".
-    let requested_port = if body.is_empty() {
-        None
-    } else {
-        match serde_json::from_slice::<CompileBody>(&body) {
-            Ok(parsed) => parsed.port,
-            Err(e) => {
-                return typed_error(
-                    StatusCode::BAD_REQUEST,
-                    ErrorKind::BadData,
-                    &format!("compile body: {e}"),
-                );
-            }
-        }
-    };
-    let record = match spec_record_or_404(node, tenant, &id) {
-        Ok(record) => record,
-        Err(response) => return response,
-    };
-    let document = match spec_document_or_500(node, &record) {
-        Ok(document) => document,
-        Err(response) => return response,
-    };
-    // Falls back to the spec's one bound port, precisely because that is the only port a diff
-    // could mean anything for without the caller having to say so twice; two-or-more bound ports
-    // have no single implied target, so the caller must name one.
-    let target_port = requested_port.or(match record.ports.as_slice() {
-        [port] => Some(*port),
-        _ => None,
-    });
-    let compiled = match compile(
-        document.as_bytes(),
-        &CompileOptions {
-            port: target_port,
-            name: Some(id.clone()),
-            max_bytes: MAX_SPEC_BYTES,
-        },
-    ) {
-        Ok(compiled) => compiled,
-        Err(e) => {
-            return typed_error(
-                StatusCode::BAD_REQUEST,
-                ErrorKind::BadData,
-                &format!("spec {id:?} does not compile: {e}"),
-            );
-        }
-    };
-    let operations: Vec<serde_json::Value> = compiled
-        .operations
-        .iter()
-        .map(|op| {
-            serde_json::json!({
-                "id": op.id.as_str(),
-                "method": op.method,
-                "pathTemplate": op.path_template,
-                "stubIds": op.stub_ids,
-            })
-        })
-        .collect();
-    let diff = match target_port {
-        None => serde_json::Value::Null,
-        Some(port) => {
-            let deployed = match node.get_imposter(tenant.as_str(), port) {
-                Ok(deployed) => deployed,
-                Err(e) => return internal(&e.to_string()),
-            };
-            // The deployed side was stored through `ImposterConfig`'s own (de)serialization — the
-            // same round trip `terminate_spec_deploy` sends every compiled imposter through before
-            // it is committed (see `normalize_for_diff`'s own doc for why that is not optional
-            // here). Comparing the compiler's raw canonical JSON against it directly would report
-            // spurious drift on a spec that has not changed at all.
-            spec_compile_diff(
-                port,
-                deployed.as_deref(),
-                &normalize_for_diff(&compiled.imposter),
-            )
-        }
-    };
-    json_ok(
-        StatusCode::OK,
-        &serde_json::json!({
-            "imposter": compiled.imposter,
-            "operations": operations,
-            "diff": diff,
-        }),
-    )
-}
-
-/// Round `imposter` through `ImposterConfig`'s own (de)serialization — deserialize, then
-/// re-serialize — the same transform every committed `PutImposter` goes through before it is
-/// stored (`terminate_spec_deploy` builds its op from exactly this). Without it, a diff comparing
-/// the compiler's raw canonical JSON against a *stored* config would see spurious drift on every
-/// single stub of an unchanged spec: the engine's own `IsResponseOut` renders `statusCode` as a
-/// **string** (`"200"`) for Mountebank wire compatibility, while `rift-cluster-spec` emits a JSON
-/// **number** — a real, pre-existing asymmetry in the vendored engine's own serialization, not a
-/// bug in either crate. Applying the same round trip to both sides of the comparison neutralizes
-/// it, leaving only genuine content differences visible. Falls back to `imposter` unchanged if it
-/// somehow does not parse as an `ImposterConfig` (it always should — it is the compiler's own
-/// output) — a diff that cannot normalize one side is more honest reporting some noise than none
-/// at all.
-fn normalize_for_diff(imposter: &serde_json::Value) -> serde_json::Value {
-    match serde_json::from_value::<ImposterConfig>(imposter.clone()) {
-        Ok(config) => match serde_json::to_value(&config) {
-            Ok(normalized) => normalized,
-            Err(e) => {
-                tracing::error!(error = %e, "compiled imposter did not re-serialize; diff is unnormalized");
-                imposter.clone()
-            }
-        },
-        Err(e) => {
-            // Loud, because the consequence is not "no diff" but a *wrong* one — every stub reads
-            // as `changed` — and nothing else would tell an operator why.
-            tracing::error!(error = %e, "compiled imposter is not an ImposterConfig; diff is unnormalized");
-            imposter.clone()
-        }
-    }
-}
-
-/// The stub-id-level half of `compileSpec`'s diff (RFC-004 §4.3): `added` — compiled ids the
-/// deployed config lacks; `removed` — deployed ids the compiler no longer emits, counting only
-/// generated (`spec:`-prefixed) ids, because a hand-added stub was never the compiler's to track;
-/// `changed` — ids on both sides whose stub JSON differs. `deployed` is `None` (nothing on the
-/// port) when there is nothing to diff against at all.
-fn spec_compile_diff(
-    port: u16,
-    deployed: Option<&str>,
-    compiled: &serde_json::Value,
-) -> serde_json::Value {
-    fn stubs_by_id(imposter: &serde_json::Value) -> HashMap<&str, &serde_json::Value> {
-        imposter
-            .get("stubs")
-            .and_then(serde_json::Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter_map(|stub| Some((stub.get("id")?.as_str()?, stub)))
-            .collect()
-    }
-
-    let compiled_stubs = stubs_by_id(compiled);
-    let Some(deployed) = deployed else {
-        let mut added: Vec<&str> = compiled_stubs.keys().copied().collect();
-        added.sort_unstable();
-        return serde_json::json!({
-            "port": port,
-            "deployed": false,
-            "added": added,
-            "removed": Vec::<&str>::new(),
-            "changed": Vec::<&str>::new(),
-        });
-    };
-    let deployed_value: serde_json::Value = match serde_json::from_str(deployed) {
-        Ok(value) => value,
-        Err(e) => {
-            // The stored config always round-trips (it was admitted as JSON in the first place);
-            // this is a defensive fallback for a state this crate cannot reach honestly, not an
-            // expected path — logged rather than silently treated as "nothing deployed".
-            tracing::error!(port, error = %e, "stored imposter config did not parse for a spec diff");
-            serde_json::Value::Null
-        }
-    };
-    let deployed_stubs = stubs_by_id(&deployed_value);
-
-    let prefix = format!("{STUB_ID_PREFIX}:");
-    let mut added = Vec::new();
-    let mut removed = Vec::new();
-    let mut changed = Vec::new();
-    for (id, stub) in &compiled_stubs {
-        match deployed_stubs.get(id) {
-            None => added.push(*id),
-            Some(deployed_stub) => {
-                if stub != deployed_stub {
-                    changed.push(*id);
-                }
-            }
-        }
-    }
-    for id in deployed_stubs.keys() {
-        if id.starts_with(&prefix) && !compiled_stubs.contains_key(id) {
-            removed.push(*id);
-        }
-    }
-    added.sort_unstable();
-    removed.sort_unstable();
-    changed.sort_unstable();
-    serde_json::json!({
-        "port": port,
-        "deployed": true,
-        "added": added,
-        "removed": removed,
-        "changed": changed,
-    })
-}
-
-/// `PUT /specs/{id}` (RFC-004 §4.3, issue #278): import or re-import an OpenAPI 3.0 document.
-///
-/// Compiled on this node **before** anything commits — `compile`'s own refusals (unsupported
-/// version, external `$ref`, a parse failure, a self-check failure) become this route's `400`
-/// verbatim, so a document that reaches the log has already been shown to compile. An unchanged
-/// re-import (same digest already stored under `id`) answers without minting a `Mutation` at all:
-/// zero log growth for a retry or a poll.
-#[allow(clippy::too_many_arguments)]
-async fn terminate_spec_put(
-    state: &Arc<FrontState>,
-    node: &Arc<RaftNode>,
-    tenant: &TenantId,
-    id: String,
-    body: &[u8],
-    auth: Option<&str>,
-    host: Option<&HeaderValue>,
-    idempotency: Option<&str>,
-    if_match: Option<&str>,
-    principal_id: Option<String>,
-) -> Response<FrontBody> {
-    let text = match String::from_utf8(body.to_vec()) {
-        Ok(text) => text,
-        Err(_) => {
-            return typed_error(
-                StatusCode::BAD_REQUEST,
-                ErrorKind::BadData,
-                "spec must be UTF-8 text (JSON or YAML)",
-            );
-        }
-    };
-    if text.len() > MAX_SPEC_BYTES {
-        return typed_error(
-            StatusCode::PAYLOAD_TOO_LARGE,
-            ErrorKind::RequestTooLarge,
-            &format!("spec exceeds {MAX_SPEC_BYTES} bytes"),
-        );
-    }
-    if let Err(e) = compile(text.as_bytes(), &CompileOptions::default()) {
-        return typed_error(
-            StatusCode::BAD_REQUEST,
-            ErrorKind::BadData,
-            &format!("spec does not compile: {e}"),
-        );
-    }
-    let digest = SpecDigest::of(text.as_bytes()).to_hex();
-    // YAML is a strict superset of JSON, so "parses as JSON" is the sniff: anything that does not
-    // is presumed YAML. `compile` above already proved the document parses as one of the two.
-    let format = if serde_json::from_str::<serde_json::Value>(&text).is_ok() {
-        control::SpecFormat::Json
-    } else {
-        control::SpecFormat::Yaml
-    };
-    let existing = match node.spec(tenant.as_str(), &id) {
-        Ok(existing) => existing,
-        Err(e) => return internal(&e.to_string()),
-    };
-    if let Some(existing) = &existing
-        && existing.digest == digest
-    {
-        return json_ok(
-            StatusCode::OK,
-            &serde_json::json!({
-                "id": id,
-                "digest": digest,
-                "format": format,
-                "revision": existing.revision,
-                "unchanged": true,
-            }),
-        );
-    }
-    let status = if existing.is_none() {
-        StatusCode::CREATED
-    } else {
-        StatusCode::OK
-    };
-    let response_body = serde_json::json!({
-        "id": id.clone(),
-        "digest": digest.clone(),
-        "format": format,
-        "unchanged": false,
-    });
-    let mutation = Mutation {
-        ops: vec![ControlOp::SpecPut {
-            tenant: tenant.clone(),
-            id,
-            meta: control::SpecMeta {
-                format,
-                digest: control::Digest::new(digest),
-                source: control::SpecSource::Inline,
-                size: text.len() as u64,
-            },
-            document: Some(text),
-            origin: 0,
-        }],
-        port: None,
-        render: Render::Captured {
-            body: Bytes::from(response_body.to_string()),
-            content_type: json_content_type(),
-            status,
-        },
-    };
-    match run_mutation(
-        state,
-        node,
-        tenant,
-        mutation,
-        false,
-        auth,
-        host,
-        idempotency,
-        if_match,
-        principal_id,
-    )
-    .await
-    {
-        Ok(response) | Err(response) => response,
-    }
-}
-
-/// `DELETE /specs/{id}` (RFC-004 §4.3, issue #278). Refuses with `409` while any port is still
-/// bound to the spec, unless `?force` — then every bound port is unbound first (`SpecUnbind`) and
-/// the record removed (`SpecDelete`) in the same mutation. Unbinding never tears an imposter down:
-/// it keeps serving, it just stops carrying provenance.
-#[allow(clippy::too_many_arguments)]
-async fn terminate_spec_delete(
-    state: &Arc<FrontState>,
-    node: &Arc<RaftNode>,
-    tenant: &TenantId,
-    id: String,
-    force: bool,
-    auth: Option<&str>,
-    host: Option<&HeaderValue>,
-    idempotency: Option<&str>,
-    if_match: Option<&str>,
-    principal_id: Option<String>,
-) -> Response<FrontBody> {
-    let record = match spec_record_or_404(node, tenant, &id) {
-        Ok(record) => record,
-        Err(response) => return response,
-    };
-    if !force && !record.ports.is_empty() {
-        let ports = record
-            .ports
-            .iter()
-            .map(u16::to_string)
-            .collect::<Vec<_>>()
-            .join(",");
-        return typed_error(
-            StatusCode::CONFLICT,
-            ErrorKind::ResourceConflict,
-            &format!("spec {id:?} is bound to port(s) {ports}; DELETE with ?force to unbind first"),
-        );
-    }
-    let unbound_ports: Vec<u16> = if force {
-        record.ports.clone()
-    } else {
-        Vec::new()
-    };
-    let mut ops: Vec<ControlOp> = unbound_ports
-        .iter()
-        .map(|&port| ControlOp::SpecUnbind {
-            tenant: tenant.clone(),
-            port,
-        })
-        .collect();
-    ops.push(ControlOp::SpecDelete {
-        tenant: tenant.clone(),
-        id: id.clone(),
-    });
-    let response_body = serde_json::json!({
-        "id": id,
-        "digest": record.digest,
-        "unboundPorts": unbound_ports,
-    });
-    let mutation = Mutation {
-        ops,
-        port: None,
-        render: Render::Captured {
-            body: Bytes::from(response_body.to_string()),
-            content_type: json_content_type(),
-            status: StatusCode::OK,
-        },
-    };
-    match run_mutation(
-        state,
-        node,
-        tenant,
-        mutation,
-        false,
-        auth,
-        host,
-        idempotency,
-        if_match,
-        principal_id,
-    )
-    .await
-    {
-        Ok(response) | Err(response) => response,
-    }
-}
-
-/// `POST /specs/{id}/deploy` (RFC-004 §4.3, issue #278): compile the stored document for `port`
-/// and commit it as that port's imposter, stamping the spec's provenance in the same barrier —
-/// `[PutImposter, SpecBind]`, so park/replay, `Idempotency-Key` dedup, `If-Match` against the
-/// imposter's own revision and the write barrier are all inherited from `run_mutation` rather than
-/// reimplemented.
-///
-/// `Action::SpecWrite` alone must not be a back door into imposter mutation (RFC-004 §4.3): a
-/// principal also needs `Action::ImposterWrite` on the target port, checked here rather than in
-/// `action_for` because the port lives in the body, not the route. Skipped entirely under the
-/// no-principal open-admin-plane bypass, for `authorize_action`'s own reason: with no principal at
-/// all there is no second role to check.
-#[allow(clippy::too_many_arguments)]
-async fn terminate_spec_deploy(
-    state: &Arc<FrontState>,
-    node: &Arc<RaftNode>,
-    tenant: &TenantId,
-    id: String,
-    body: &[u8],
-    auth: Option<&str>,
-    host: Option<&HeaderValue>,
-    idempotency: Option<&str>,
-    if_match: Option<&str>,
-    principal_id: Option<String>,
-    bindings: &[(TenantId, Role)],
-) -> Response<FrontBody> {
-    #[derive(Deserialize)]
-    struct DeployBody {
-        port: Option<u16>,
-        policy: Option<String>,
-    }
-    let parsed: DeployBody = if body.is_empty() {
-        DeployBody {
-            port: None,
-            policy: None,
-        }
-    } else {
-        match serde_json::from_slice(body) {
-            Ok(parsed) => parsed,
-            Err(e) => {
-                return typed_error(
-                    StatusCode::BAD_REQUEST,
-                    ErrorKind::BadData,
-                    &format!("deploy body: {e}"),
-                );
-            }
-        }
-    };
-    if parsed.policy.is_some() {
-        return typed_error(
-            StatusCode::BAD_REQUEST,
-            ErrorKind::BadData,
-            "drift policy (overwrite|skip|fail) arrives with S3 (#279); omit it",
-        );
-    }
-    let Some(port) = parsed.port else {
-        return typed_error(
-            StatusCode::BAD_REQUEST,
-            ErrorKind::BadData,
-            "deploy needs a port",
-        );
-    };
-    let record = match spec_record_or_404(node, tenant, &id) {
-        Ok(record) => record,
-        Err(response) => return response,
-    };
-    if principal_id.is_some() {
-        match authz::decide(bindings, Action::ImposterWrite, tenant) {
-            Decision::Allow { .. } => {}
-            Decision::Deny(Denial::InsufficientRole { role, .. }) => {
-                return typed_error(
-                    StatusCode::FORBIDDEN,
-                    ErrorKind::InsufficientAccess,
-                    &format!("role {role:?} does not grant imposter.write"),
-                );
-            }
-            Decision::Deny(Denial::NotBoundToTenant) => return tenant_boundary_not_found(),
-            Decision::Deny(Denial::Unauthenticated) => return unauthorized(),
-        }
-    }
-    let document = match spec_document_or_500(node, &record) {
-        Ok(document) => document,
-        Err(response) => return response,
-    };
-    let compiled = match compile(
-        document.as_bytes(),
-        &CompileOptions {
-            port: Some(port),
-            name: Some(id.clone()),
-            max_bytes: MAX_SPEC_BYTES,
-        },
-    ) {
-        Ok(compiled) => compiled,
-        Err(e) => {
-            return typed_error(
-                StatusCode::BAD_REQUEST,
-                ErrorKind::BadData,
-                &format!("spec {id:?} does not compile for port {port}: {e}"),
-            );
-        }
-    };
-    let config: ImposterConfig = match serde_json::from_value(compiled.imposter) {
-        Ok(config) => config,
-        Err(e) => {
-            // The compiler's own contract is that its output deserializes as an `ImposterConfig` —
-            // it is exactly what a client would `PUT /imposters`. Failing here names a bug in
-            // `rift-cluster-spec`, not a client mistake, so it is a `500`, not a `400`.
-            return internal(&format!(
-                "compiled spec is not a valid imposter config: {e}"
-            ));
-        }
-    };
-    // The compiled config is what a client would `PUT /imposters`, so it passes the same fleet
-    // admission gate (#288) — the compiler emits no `flowState` today, but the gate is about
-    // what reaches the log, not about who is expected to write it.
-    if let Err(response) =
-        refuse_fleet_scope_without_fleet_admin([&config], principal_id.as_deref(), bindings)
-    {
-        return response;
-    }
-    let existed = match node.get_imposter(tenant.as_str(), port) {
-        Ok(existed) => existed.is_some(),
-        Err(e) => return internal(&e.to_string()),
-    };
-    let mutation = Mutation {
-        ops: vec![
-            ControlOp::PutImposter {
-                tenant: tenant.clone(),
-                config: Box::new(config),
-            },
-            ControlOp::SpecBind {
-                tenant: tenant.clone(),
-                id,
-                port,
-            },
-        ],
-        port: Some(port),
-        render: Render::FetchAfter {
-            path: format!("/imposters/{port}"),
-            status: if existed {
-                StatusCode::OK
-            } else {
-                StatusCode::CREATED
-            },
-        },
-    };
-    match run_mutation(
-        state,
-        node,
-        tenant,
-        mutation,
-        false,
-        auth,
-        host,
-        idempotency,
-        if_match,
-        principal_id,
-    )
-    .await
-    {
-        Ok(response) | Err(response) => response,
-    }
-}
-
-/// The distinct ports a mutation's config-mutating ops (`PutImposter`/`PatchStubs`) touch, in
-/// order — what edit-time spec validation checks after the commit (RFC-004 §3.2, issue #278).
-///
-/// Empty when `ops` contains a `SpecBind`: that means this mutation IS a deploy, and a deploy's
-/// compiled config already self-checked at compile time (`rift-cluster-spec`'s own
-/// `CompileError::SelfCheck`) — re-validating it would be redundant.
-fn spec_warning_ports(ops: &[ControlOp]) -> Vec<u16> {
-    if ops
-        .iter()
-        .any(|op| matches!(op, ControlOp::SpecBind { .. }))
-    {
-        return Vec::new();
-    }
-    let mut ports = Vec::new();
-    for op in ops {
-        let port = match op {
-            ControlOp::PutImposter { config, .. } => config.port,
-            ControlOp::PatchStubs { port, .. } => Some(*port),
-            _ => None,
-        };
-        if let Some(port) = port
-            && !ports.contains(&port)
-        {
-            ports.push(port);
-        }
-    }
-    ports
-}
-
-/// Edit-time spec validation (RFC-004 §3.2, issue #278): after a config-mutating write commits,
-/// check every port it touched (from [`spec_warning_ports`]) against the spec that deployed it,
-/// when it is bound to one. **Warn, never refuse** — a deliberately divergent stub is a legitimate
-/// fixture; this is what tells an operator about it instead of leaving it silent. Read failures are
-/// logged and skipped, never surfaced as a failure of the write that already committed.
-fn spec_warnings(node: &Arc<RaftNode>, tenant: &TenantId, ports: &[u16]) -> Vec<String> {
-    let mut violations = Vec::new();
-    // An internal failure on a port that IS spec-bound is reported as an entry of its own rather
-    // than silently contributing nothing: "no header" must keep meaning "checked and clean", never
-    // "could not check" — the write already committed either way, so this is the only channel
-    // left to say the difference out loud to the client (the server log has the detail).
-    let unavailable =
-        |port: u16, why: &str| format!("port {port}: spec validation unavailable ({why})");
-    for &port in ports {
-        let binding = match node.spec_binding(tenant.as_str(), port) {
-            Ok(Some(binding)) => binding,
-            Ok(None) => continue,
-            Err(e) => {
-                tracing::error!(port, error = %e, "reading spec binding for edit-time warnings");
-                violations.push(unavailable(port, "binding unreadable"));
-                continue;
-            }
-        };
-        let document = match node.spec_document(&binding.digest) {
-            Ok(Some(document)) => document,
-            // Should be impossible (the blob and the binding that names its digest are written
-            // together) — never fail a write that already committed over it, but it is a bug, so
-            // it is loud rather than swallowed.
-            Ok(None) => {
-                tracing::error!(
-                    port,
-                    digest = %binding.digest,
-                    "a bound spec's document is missing its blob; the write already committed"
-                );
-                violations.push(unavailable(port, "spec document missing"));
-                continue;
-            }
-            Err(e) => {
-                tracing::error!(port, error = %e, "reading the bound spec's document");
-                violations.push(unavailable(port, "spec document unreadable"));
-                continue;
-            }
-        };
-        let compiled = match compile(
-            document.as_bytes(),
-            &CompileOptions {
-                port: Some(port),
-                name: None,
-                max_bytes: MAX_SPEC_BYTES,
-            },
-        ) {
-            Ok(compiled) => compiled,
-            Err(e) => {
-                tracing::warn!(port, error = %e, "bound spec no longer compiles; skipping edit-time warnings");
-                violations.push(unavailable(port, "bound spec does not compile"));
-                continue;
-            }
-        };
-        let mut by_stub = HashMap::new();
-        for op in &compiled.operations {
-            for response in &op.responses {
-                by_stub.insert(response.stub_id.as_str(), (op, &response.status));
-            }
-        }
-
-        let config = match node.get_imposter(tenant.as_str(), port) {
-            Ok(Some(config)) => config,
-            Ok(None) => continue,
-            Err(e) => {
-                tracing::error!(port, error = %e, "reading the deployed config for edit-time warnings");
-                violations.push(unavailable(port, "deployed config unreadable"));
-                continue;
-            }
-        };
-        let config: serde_json::Value = match serde_json::from_str(&config) {
-            Ok(config) => config,
-            Err(e) => {
-                tracing::error!(port, error = %e, "deployed config is not valid JSON");
-                violations.push(unavailable(port, "deployed config unreadable"));
-                continue;
-            }
-        };
-        for stub in config
-            .get("stubs")
-            .and_then(serde_json::Value::as_array)
-            .into_iter()
-            .flatten()
-        {
-            let Some(id) = stub.get("id").and_then(serde_json::Value::as_str) else {
-                continue;
-            };
-            let Some(&(op, status)) = by_stub.get(id) else {
-                continue;
-            };
-            for body in static_is_bodies(stub) {
-                for violation in validate_stub_response(op, status, &body) {
-                    violations.push(format!("{id} {violation}"));
-                }
-            }
-        }
-    }
-    violations
-}
-
-/// The static `is` bodies in `stub` worth schema-checking against the spec that generated it.
-///
-/// Skips a response carrying anything but a bare `is` — `_behaviors`, `proxy`, `inject`, `fault`
-/// and `_rift` are all runtime concerns (S4/S6's job, not this compile-time check) — and skips a
-/// templated string body (`{{…}}`), whose rendered value is not known until request time. Pure
-/// over `serde_json::Value` so it is unit-testable without a node.
-fn static_is_bodies(stub: &serde_json::Value) -> Vec<serde_json::Value> {
-    let Some(responses) = stub.get("responses").and_then(serde_json::Value::as_array) else {
-        return Vec::new();
-    };
-    responses
-        .iter()
-        .filter_map(|response| {
-            let object = response.as_object()?;
-            if object.len() != 1 {
-                return None;
-            }
-            let is = object.get("is")?;
-            match is.get("body") {
-                None => None,
-                Some(serde_json::Value::String(text)) if text.contains("{{") => None,
-                Some(serde_json::Value::String(text)) => Some(
-                    serde_json::from_str(text)
-                        .unwrap_or_else(|_| serde_json::Value::String(text.clone())),
-                ),
-                Some(other) => Some(other.clone()),
-            }
-        })
-        .collect()
-}
-
 /// Translate one terminated route into ops + a render plan. Reads that inform
 /// the mutation (current stubs for index-addressed edits, capture-before-delete
 /// bodies) come from the local applied state / loopback admin.
@@ -6852,7 +5184,7 @@ async fn build_mutation(
 ) -> Result<Mutation, Response<FrontBody>> {
     match kind {
         Terminated::Create => {
-            let config: ImposterConfig = parse_pinned(body, node, tenant)?;
+            let config: ImposterConfig = parse(body)?;
             refuse_fleet_scope_without_fleet_admin([&config], principal_id, bindings)?;
             let Some(port) = config.port else {
                 return Err(typed_error(
@@ -6882,7 +5214,7 @@ async fn build_mutation(
             })
         }
         Terminated::ReplaceAllImposters => {
-            let replace: ReplaceAllBody = parse_pinned(body, node, tenant)?;
+            let replace: ReplaceAllBody = parse(body)?;
             refuse_fleet_scope_without_fleet_admin(&replace.imposters, principal_id, bindings)?;
             // Upsert the new set first, then prune the leftovers — never a
             // DeleteAll up front. The ops commit as separate Raft entries, so a
@@ -6994,7 +5326,7 @@ async fn build_mutation(
             })
         }
         Terminated::AddStub(port) => {
-            let add: AddStubBody = parse_pinned(body, node, tenant)?;
+            let add: AddStubBody = parse(body)?;
             Ok(Mutation {
                 ops: vec![ControlOp::PatchStubs {
                     tenant: tenant.clone(),
@@ -7028,7 +5360,7 @@ async fn build_mutation(
                     &reason,
                 ));
             }
-            let mut stub: Stub = parse_pinned(body, node, tenant)?;
+            let mut stub: Stub = parse(body)?;
             // The path names the space, not the body — exactly as upstream's handler does it, so a
             // caller cannot file a stub into a space the URL never mentioned.
             stub.space = Some(flow.clone());
@@ -7048,13 +5380,13 @@ async fn build_mutation(
             })
         }
         Terminated::ReplaceStubs(port) => {
-            let replace: ReplaceStubsBody = parse_pinned(body, node, tenant)?;
+            let replace: ReplaceStubsBody = parse(body)?;
             let mut config = stored_config(node, tenant, port)?;
             config.stubs = replace.stubs;
             Ok(put_config_mutation(tenant, port, config))
         }
         Terminated::ReplaceStubAt(port, index) => {
-            let stub: Stub = parse_pinned(body, node, tenant)?;
+            let stub: Stub = parse(body)?;
             let mut config = stored_config(node, tenant, port)?;
             if index >= config.stubs.len() {
                 return Err(stub_index_missing(index));
@@ -7071,7 +5403,7 @@ async fn build_mutation(
             Ok(put_config_mutation(tenant, port, config))
         }
         Terminated::ReplaceStubById(port, id) => {
-            let stub: Stub = parse_pinned(body, node, tenant)?;
+            let stub: Stub = parse(body)?;
             Ok(Mutation {
                 ops: vec![ControlOp::PatchStubs {
                     tenant: tenant.clone(),
@@ -7194,18 +5526,6 @@ async fn build_mutation(
         Terminated::Tenancy(_) => Err(internal(
             "tenancy routes are served by terminate_tenancy, not build_mutation",
         )),
-        // Same shape, same reasoning: source reads divert to
-        // `terminate_sources` before this is reached.
-        Terminated::SourceList | Terminated::SourceRead(_) => Err(internal(
-            "source reads are served by terminate_sources, not build_mutation",
-        )),
-        // Same shape again: the three source writes divert to
-        // `terminate_source_write` before this is reached — none of them is a
-        // `ControlOp` sequence `build_mutation` knows how to build (a source
-        // write is not an imposter record at all).
-        Terminated::SourcePut | Terminated::SourceDelete(_) | Terminated::SourcePull(_) => Err(
-            internal("source writes are served by terminate_source_write, not build_mutation"),
-        ),
         // Not a `ControlOp` at all — the merged read has nothing to commit — and diverts to its
         // own `terminate_*` handler before this is ever reached.
         Terminated::ReadSavedRequests(_) => Err(internal(
@@ -7277,24 +5597,10 @@ async fn build_mutation(
         Terminated::TryImposter(_) => Err(internal(
             "a try is served by terminate_try_imposter, not build_mutation",
         )),
-        // The three spec reads divert to `terminate_spec_read`/`terminate_spec_compile` in
-        // `terminate` before this is ever reached — same shape as the source reads above.
-        Terminated::SpecList | Terminated::SpecRead(_) | Terminated::SpecCompile(_) => {
-            Err(internal(
-                "spec reads are served by terminate_spec_read/terminate_spec_compile, not build_mutation",
-            ))
-        }
-        // The three spec writes each build their own `Mutation` (a re-import short-circuits before
-        // minting anything at all) and call `run_mutation` directly — diverted in `terminate`
-        // before this is ever reached, same shape as the source writes above.
-        Terminated::SpecPut(_) => Err(internal(
-            "a spec import is served by terminate_spec_put, not build_mutation",
-        )),
-        Terminated::SpecDelete { .. } => Err(internal(
-            "a spec delete is served by terminate_spec_delete, not build_mutation",
-        )),
-        Terminated::SpecDeploy(_) => Err(internal(
-            "a spec deploy is served by terminate_spec_deploy, not build_mutation",
+        // Diverted to `terminate_spec_compile` in `terminate` before this is ever reached —
+        // and it is not a `ControlOp` at all: a compile commits nothing.
+        Terminated::SpecCompile => Err(internal(
+            "the OpenAPI compile is served by terminate_spec_compile, not build_mutation",
         )),
     }
 }
@@ -7781,74 +6087,6 @@ fn parse<T: serde::de::DeserializeOwned>(body: &[u8]) -> Result<T, Response<Fron
     })
 }
 
-/// [`parse`], with every `_rift.dataset` block resolved and pinned first (RFC-005 D2, #286).
-///
-/// Admission happens **here, on the leader, before the op is built**, so the committed entry names
-/// an exact digest rather than "latest" — which is time-dependent and would let two nodes applying
-/// the same entry reach different rows. Every body that can carry a stub response goes through
-/// this, not just a whole `ImposterConfig`.
-///
-/// The state machine is read only when the body actually binds something: this runs on every
-/// config write, and the overwhelming majority carry no dataset block at all.
-#[allow(clippy::result_large_err)]
-fn parse_pinned<T: serde::de::DeserializeOwned>(
-    body: &[u8],
-    node: &Arc<RaftNode>,
-    tenant: &TenantId,
-) -> Result<T, Response<FrontBody>> {
-    let mut document: serde_json::Value = parse(body)?;
-
-    // A failed *read* must not be reported as "no such dataset" — that would refuse a valid
-    // binding with a message naming the wrong cause. The closure can only answer `Option`, so the
-    // error is carried out here and takes precedence over whatever the refusal said.
-    let mut read_failure: Option<String> = None;
-    let mut live: Option<Vec<rift_cluster::DatasetSummary>> = None;
-
-    let pinned = rift_cluster::datasets::pin_bindings(&mut document, |name, version| {
-        if read_failure.is_some() {
-            return None;
-        }
-        let live = match live {
-            Some(ref cached) => cached,
-            None => match node.datasets(tenant.as_str()) {
-                Ok(rows) => live.insert(rows),
-                Err(e) => {
-                    read_failure = Some(e.to_string());
-                    return None;
-                }
-            },
-        };
-        // No version asked for means the latest *live* one — `datasets` already drops
-        // tombstoned rows, so a deleted version cannot be picked here.
-        let found = match version {
-            Some(want) => live.iter().find(|d| d.name == name && d.version == want),
-            None => live
-                .iter()
-                .filter(|d| d.name == name)
-                .max_by_key(|d| d.version),
-        }?;
-        Some(rift_cluster::datasets::ResolvedDataset {
-            version: found.version,
-            digest: found.digest.clone(),
-            delimiter: found.delimiter,
-            key_columns: found.key_columns.clone(),
-        })
-    });
-
-    if let Some(error) = read_failure {
-        return Err(internal(&format!("could not read datasets: {error}")));
-    }
-    pinned.map_err(|e| typed_error(StatusCode::BAD_REQUEST, ErrorKind::BadData, &e))?;
-
-    serde_json::from_value(document).map_err(|e| {
-        typed_error(
-            StatusCode::BAD_REQUEST,
-            ErrorKind::BadData,
-            &format!("invalid request JSON: {e}"),
-        )
-    })
-}
-
 /// Assemble a buffered-body response with an optional upstream content type.
 #[allow(clippy::result_large_err)]
 fn buffered_response(
@@ -7874,30 +6112,8 @@ fn refusal_response(reason: &str) -> Response<FrontBody> {
         // "no imposter on port" and must stay a 409, not fall into the 404
         // branch below.
         typed_error(StatusCode::CONFLICT, ErrorKind::ResourceConflict, reason)
-    } else if reason.contains("no imposter on port")
-        || reason.contains("no stub with id")
-        || reason.starts_with("no spec ")
-    {
+    } else if reason.contains("no imposter on port") || reason.contains("no stub with id") {
         typed_error(StatusCode::NOT_FOUND, ErrorKind::NoSuchResource, reason)
-    } else if reason.contains("cannot tell whether dataset") {
-        // `ports_binding_dataset` fails closed when a stored config will not parse (RFC-005 §5).
-        // That is this node's storage being corrupt, not the caller's request being wrong, and
-        // `400 bad data` would send an operator to inspect a payload that is fine.
-        typed_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            ErrorKind::InternalError,
-            reason,
-        )
-    } else if reason.contains("is bound to port(s)") {
-        // The state machine's own `SpecDelete` refusal (issue #278) — the front pre-checks the
-        // same condition and answers `409`, so a delete that loses the race against a deploy
-        // must render the same status, not a `400` that names the identical fact differently.
-        //
-        // `DatasetDelete` (RFC-005 §5, issue #287) refuses in the same words deliberately, so
-        // this one rule covers both. It has no front-side pre-check at all — the binding can be
-        // committed concurrently with the delete, so only the apply-time refusal is authoritative
-        // and this is the only place its status is decided.
-        typed_error(StatusCode::CONFLICT, ErrorKind::ResourceConflict, reason)
     } else {
         typed_error(StatusCode::BAD_REQUEST, ErrorKind::BadData, reason)
     }
@@ -8733,9 +6949,6 @@ mod tests {
                 barrier_timeout: Duration::from_secs(1),
                 admin_async: false,
                 readiness: Arc::new(crate::readiness::Readiness::awaiting([])),
-                puller: Arc::new(SourcePuller::new(
-                    rift_cluster_base::seams::SourceRegistry::default(),
-                )),
                 journal_net: JournalNet::new(rift_cluster::stores::ClusterJournal::new(1)),
                 flow_net: Arc::clone(&net),
                 fleet_journal_port_cap: rift_cluster::stores::DEFAULT_FLEET_JOURNAL_PORT_CAP,
@@ -9104,123 +7317,35 @@ mod tests {
         }
     }
 
-    /// The source inspection surface (issue #239): the two reads terminate,
-    /// everything else on the path falls through to the proxy and answers
-    /// upstream's own 404/405.
+    /// `POST /specs/compile` is the only route on `/specs` (D-72, #549). Every other verb and
+    /// every id-addressed shape the retired store served must fall through, not be force-fit.
     #[test]
-    fn classify_terminates_exactly_the_source_surface() {
+    fn classify_terminates_only_the_stateless_compile() {
         assert!(matches!(
-            classify(&Method::GET, "/admin/sources", None),
-            Some(Terminated::SourceList)
+            classify(&Method::POST, "/specs/compile", Some("port=4545")),
+            Some(Terminated::SpecCompile)
         ));
+        // The query is not part of the match: a missing `port` is the handler's `400`, not a
+        // route that does not exist — the difference matters, because 404 would send a caller
+        // looking for a route they typed correctly.
         assert!(matches!(
-            classify(&Method::GET, "/admin/sources/payments", None),
-            Some(Terminated::SourceRead(id)) if id == "payments"
-        ));
-        // `%2f` must not smuggle a segment: the id is matched literally,
-        // undecoded, exactly as the classifier's comment promises.
-        assert!(matches!(
-            classify(&Method::GET, "/admin/sources/pay%2Fments", None),
-            Some(Terminated::SourceRead(id)) if id == "pay%2Fments"
-        ));
-
-        // The write half, promoted from the cluster port in #253.
-        assert!(matches!(
-            classify(&Method::POST, "/admin/sources", None),
-            Some(Terminated::SourcePut)
-        ));
-        assert!(matches!(
-            classify(&Method::DELETE, "/admin/sources/payments", None),
-            Some(Terminated::SourceDelete(id)) if id == "payments"
-        ));
-        assert!(matches!(
-            classify(&Method::POST, "/admin/sources/payments/pull", None),
-            Some(Terminated::SourcePull(id)) if id == "payments"
-        ));
-        // The `/pull` verb is a suffix on the id path, not its own segment, so
-        // an id containing a slash still cannot smuggle one past the check.
-        assert!(matches!(
-            classify(&Method::DELETE, "/admin/sources/pay%2Fments", None),
-            Some(Terminated::SourceDelete(id)) if id == "pay%2Fments"
+            classify(&Method::POST, "/specs/compile", None),
+            Some(Terminated::SpecCompile)
         ));
 
         for (method, path) in [
-            // `PUT` is not the upsert verb here — `POST` is, mirroring the
-            // cluster port — so it must not terminate as one.
-            (Method::PUT, "/admin/sources/payments"),
-            (Method::GET, "/admin/sources/"),
-            (Method::GET, "/admin/sources/a/b"),
-            (Method::DELETE, "/admin/sources/"),
-            (Method::DELETE, "/admin/sources/a/b"),
-            // An empty id in front of the verb, and a nested one behind it.
-            (Method::POST, "/admin/sources//pull"),
-            (Method::POST, "/admin/sources/a/b/pull"),
-            // `POST` on an id with no verb is not a route.
-            (Method::POST, "/admin/sources/payments"),
-        ] {
-            assert!(
-                classify(&method, path, None).is_none(),
-                "{method} {path} must not terminate"
-            );
-        }
-    }
-
-    /// The `/specs` surface (RFC-004 §5, issue #278) terminates in full — every verb it
-    /// serves is EE-only with no upstream counterpart to proxy to.
-    #[test]
-    fn classify_terminates_exactly_the_spec_surface() {
-        assert!(matches!(
-            classify(&Method::GET, "/specs", None),
-            Some(Terminated::SpecList)
-        ));
-        assert!(matches!(
-            classify(&Method::GET, "/specs/petstore", None),
-            Some(Terminated::SpecRead(id)) if id == "petstore"
-        ));
-        assert!(matches!(
-            classify(&Method::PUT, "/specs/petstore", None),
-            Some(Terminated::SpecPut(id)) if id == "petstore"
-        ));
-        assert!(matches!(
-            classify(&Method::DELETE, "/specs/petstore", None),
-            Some(Terminated::SpecDelete { id, force: false }) if id == "petstore"
-        ));
-        assert!(matches!(
-            classify(&Method::DELETE, "/specs/petstore", Some("force")),
-            Some(Terminated::SpecDelete { id, force: true }) if id == "petstore"
-        ));
-        assert!(matches!(
-            classify(&Method::DELETE, "/specs/petstore", Some("force=true")),
-            Some(Terminated::SpecDelete { id, force: true }) if id == "petstore"
-        ));
-        assert!(matches!(
-            classify(&Method::POST, "/specs/petstore/compile", None),
-            Some(Terminated::SpecCompile(id)) if id == "petstore"
-        ));
-        assert!(matches!(
-            classify(&Method::POST, "/specs/petstore/deploy", None),
-            Some(Terminated::SpecDeploy(id)) if id == "petstore"
-        ));
-        // Undecoded, like every other id on this front: `%2f` cannot smuggle a segment.
-        assert!(matches!(
-            classify(&Method::GET, "/specs/pet%2Fstore", None),
-            Some(Terminated::SpecRead(id)) if id == "pet%2Fstore"
-        ));
-
-        for (method, path) in [
+            (Method::GET, "/specs"),
             (Method::POST, "/specs"),
             (Method::PUT, "/specs"),
             (Method::DELETE, "/specs"),
-            (Method::GET, "/specs/"),
-            (Method::PUT, "/specs/"),
-            (Method::GET, "/specs/a/b"),
-            (Method::PUT, "/specs/a/b"),
-            (Method::POST, "/specs/petstore"),
-            (Method::POST, "/specs//compile"),
-            (Method::POST, "/specs/a/b/deploy"),
-            (Method::GET, "/specs/petstore/compile"),
-            (Method::GET, "/specs/petstore/deploy"),
-            (Method::POST, "/specs/petstore/drift"),
+            (Method::GET, "/specs/compile"),
+            (Method::PUT, "/specs/compile"),
+            (Method::DELETE, "/specs/compile"),
+            (Method::GET, "/specs/petstore"),
+            (Method::PUT, "/specs/petstore"),
+            (Method::DELETE, "/specs/petstore"),
+            (Method::POST, "/specs/petstore/compile"),
+            (Method::POST, "/specs/petstore/deploy"),
         ] {
             assert!(
                 classify(&method, path, None).is_none(),
@@ -9229,283 +7354,22 @@ mod tests {
         }
     }
 
-    /// RFC-004 §4.3: reads and the dry-run compile at `spec.read`, import and deploy at
-    /// `spec.write`, delete at `spec.delete`. None of them is port-addressed — deploy names its
-    /// port in the body and checks `ImposterWrite` itself — and none names a tenant in its path.
+    /// D-72: compiling is authorized as the write it is the first half of, addresses no port
+    /// through the ownership gate (the `?port=` is a compile target, not a record it touches),
+    /// and names no tenant in its path.
     #[test]
-    fn spec_routes_map_to_the_spec_actions_and_address_no_port() {
-        let cases = [
-            (Terminated::SpecList, Action::SpecRead),
-            (
-                Terminated::SpecRead("petstore".to_owned()),
-                Action::SpecRead,
-            ),
-            (
-                Terminated::SpecCompile("petstore".to_owned()),
-                Action::SpecRead,
-            ),
-            (
-                Terminated::SpecPut("petstore".to_owned()),
-                Action::SpecWrite,
-            ),
-            (
-                Terminated::SpecDeploy("petstore".to_owned()),
-                Action::SpecWrite,
-            ),
-            (
-                Terminated::SpecDelete {
-                    id: "petstore".to_owned(),
-                    force: false,
-                },
-                Action::SpecDelete,
-            ),
-            (
-                Terminated::SpecDelete {
-                    id: "petstore".to_owned(),
-                    force: true,
-                },
-                Action::SpecDelete,
-            ),
-        ];
-        for (kind, action) in cases {
-            assert_eq!(action_for(&kind), action, "{kind:?}");
-            assert_eq!(addressed_port(&kind), None, "{kind:?}");
-            assert_eq!(scope_for(&kind), None, "{kind:?}");
-        }
+    fn the_compile_route_is_an_imposter_write_addressing_no_port() {
+        assert_eq!(action_for(&Terminated::SpecCompile), Action::ImposterWrite);
+        assert_eq!(addressed_port(&Terminated::SpecCompile), None);
+        assert_eq!(scope_for(&Terminated::SpecCompile), None);
     }
 
-    /// The front's cap and the compiler's cap are the same number, kept in two crates on
-    /// purpose (`rift-cluster` must not depend on the compiler — apply never runs spec code).
-    /// This is the tripwire that keeps them from drifting apart.
+    /// The front's cap is the compiler's own — the front bounds the body before parsing it, and
+    /// a body it accepted must not then be refused by `compile` for a different number.
     #[test]
-    fn the_spec_size_cap_matches_the_compiler() {
-        assert_eq!(
-            rift_cluster::control::MAX_SPEC_BYTES,
-            rift_cluster_spec::MAX_SPEC_BYTES
-        );
-    }
-
-    /// `static_is_bodies` skips exactly what edit-time validation must never flag: a stub
-    /// The header caps itself (issue #278): ten entries then `+N more`, visible ASCII only, and a
-    /// hard byte ceiling so a fat body echoed back can never push the response past a proxy's
-    /// header limit and turn a committed write into a `502`.
-    #[test]
-    fn spec_warnings_header_caps_entries_bytes_and_charset() {
-        assert_eq!(spec_warnings_header(&[]), None, "nothing to say, no header");
-
-        let few = vec!["a /x: one".to_owned(), "b /y: two".to_owned()];
-        assert_eq!(
-            spec_warnings_header(&few).as_deref(),
-            Some("a /x: one; b /y: two")
-        );
-
-        let many: Vec<String> = (0..13).map(|i| format!("s{i} /f: v")).collect();
-        let value = spec_warnings_header(&many).expect("header");
-        assert_eq!(
-            value.matches("; ").count(),
-            10,
-            "ten entries plus the tail: {value}"
-        );
-        assert!(value.ends_with("; +3 more"), "{value}");
-        assert!(
-            !value.contains("s10 "),
-            "the eleventh entry is folded into the count: {value}"
-        );
-
-        let curly = vec!["s /name: expected \u{201c}string\u{201d}, got number\n".to_owned()];
-        assert_eq!(
-            spec_warnings_header(&curly).as_deref(),
-            Some("s /name: expected ?string?, got number?"),
-            "non-visible-ASCII is replaced, never rejected"
-        );
-
-        let fat = vec!["x".repeat(SPEC_WARNINGS_MAX_BYTES * 2)];
-        let value = spec_warnings_header(&fat).expect("header");
-        assert_eq!(value.len(), SPEC_WARNINGS_MAX_BYTES);
-        assert!(value.ends_with("..."), "{}", &value[value.len() - 8..]);
-    }
-
-    /// `compileSpec`'s diff (issue #278): compiled ids the deployed config lacks are `added`,
-    /// deployed `spec:` ids the compiler no longer emits are `removed` (a hand-added stub is never
-    /// the compiler's loss), and ids on both sides whose JSON differs are `changed`.
-    #[test]
-    fn spec_compile_diff_classifies_added_removed_and_changed_by_stub_id() {
-        let compiled = serde_json::json!({ "stubs": [
-            { "id": "spec:listPets:200", "responses": [{ "is": { "statusCode": 200 } }] },
-            { "id": "spec:createPets:201", "responses": [{ "is": { "statusCode": 201 } }] },
-        ]});
-        let deployed = serde_json::json!({ "stubs": [
-            { "id": "spec:listPets:200", "responses": [{ "is": { "statusCode": 200, "body": "edited" } }] },
-            { "id": "spec:showPetById:200", "responses": [{ "is": { "statusCode": 200 } }] },
-            { "id": "hand-added", "responses": [{ "is": { "statusCode": 418 } }] },
-        ]})
-        .to_string();
-
-        assert_eq!(
-            spec_compile_diff(4545, Some(&deployed), &compiled),
-            serde_json::json!({
-                "port": 4545,
-                "deployed": true,
-                "added": ["spec:createPets:201"],
-                "removed": ["spec:showPetById:200"],
-                "changed": ["spec:listPets:200"],
-            })
-        );
-        assert_eq!(
-            spec_compile_diff(4545, None, &compiled),
-            serde_json::json!({
-                "port": 4545,
-                "deployed": false,
-                "added": ["spec:createPets:201", "spec:listPets:200"],
-                "removed": [],
-                "changed": [],
-            }),
-            "nothing on the port: everything is an addition, in id order"
-        );
-    }
-
-    /// `?force` is a boolean flag, not a presence check (issue #278): the contract declares it
-    /// `type: boolean`, so a client that spells "do not force" as `force=false` must not get the
-    /// destructive path it declined.
-    #[test]
-    fn query_flag_honours_an_explicit_false() {
-        for (query, want) in [
-            (None, false),
-            (Some("force"), true),
-            (Some("force="), true),
-            (Some("force=true"), true),
-            (Some("force=1"), true),
-            (Some("force=TRUE"), true),
-            (Some("force=false"), false),
-            (Some("force=0"), false),
-            (Some("other=1"), false),
-            (Some("a=b&force=false"), false),
-            (Some("a=b&force"), true),
-        ] {
-            assert_eq!(query_flag(query, "force"), want, "{query:?}");
-        }
-        assert!(matches!(
-            classify(&Method::DELETE, "/specs/petstore", Some("force=false")),
-            Some(Terminated::SpecDelete { force: false, .. })
-        ));
-    }
-
-    /// carrying `_behaviors` (or any key beside `is`) is a runtime concern, and a templated body
-    /// is not known until request time. A bare `is` with a static body is kept.
-    #[test]
-    fn static_is_bodies_skips_behaviors_and_templated_strings_but_keeps_a_static_is() {
-        let stub = serde_json::json!({
-            "id": "spec:listPets:200",
-            "responses": [
-                { "is": { "statusCode": 200, "body": { "id": 1 } } },
-                { "is": { "statusCode": 200, "body": "{{templated}}" } },
-                {
-                    "is": { "statusCode": 200, "body": { "id": 2 } },
-                    "_behaviors": { "wait": 10 }
-                },
-                { "proxy": { "to": "http://example.com" } },
-            ]
-        });
-        assert_eq!(
-            static_is_bodies(&stub),
-            vec![serde_json::json!({ "id": 1 })]
-        );
-    }
-
-    /// A string body that itself parses as JSON is checked as the value it encodes, not as a bare
-    /// string — otherwise a schema declaring `type: object` would flag every stub whose body
-    /// happened to arrive JSON-encoded-as-text rather than as a native JSON value.
-    #[test]
-    fn static_is_bodies_parses_a_json_encoded_string_body() {
-        let stub = serde_json::json!({
-            "id": "spec:listPets:200",
-            "responses": [{ "is": { "statusCode": 200, "body": "{\"id\":1}" } }]
-        });
-        assert_eq!(
-            static_is_bodies(&stub),
-            vec![serde_json::json!({ "id": 1 })]
-        );
-    }
-
-    /// A non-JSON string body is checked as the literal string it is — a plain-text response is a
-    /// legitimate declared shape, not a parse failure to be silently dropped.
-    #[test]
-    fn static_is_bodies_keeps_a_plain_string_body_as_a_string() {
-        let stub = serde_json::json!({
-            "id": "spec:listPets:200",
-            "responses": [{ "is": { "statusCode": 200, "body": "hello" } }]
-        });
-        assert_eq!(
-            static_is_bodies(&stub),
-            vec![serde_json::Value::String("hello".to_owned())]
-        );
-    }
-
-    /// A response with no `body` at all has nothing to check, and a stub with no `responses`
-    /// array is the same "nothing to check" answer, not a panic.
-    #[test]
-    fn static_is_bodies_skips_a_response_with_no_body_and_a_stub_with_no_responses() {
-        let stub = serde_json::json!({
-            "id": "spec:listPets:200",
-            "responses": [{ "is": { "statusCode": 204 } }]
-        });
-        assert_eq!(static_is_bodies(&stub), Vec::<serde_json::Value>::new());
-        assert_eq!(
-            static_is_bodies(&serde_json::json!({ "id": "spec:listPets:200" })),
-            Vec::<serde_json::Value>::new()
-        );
-    }
-
-    /// Issue #239's design decision, asserted at the render seam: a poll error
-    /// is this node's observation, so it travels under `nodeLocal` and never
-    /// lands on the replicated record — which stays byte-comparable across
-    /// nodes for convergence checks.
-    #[test]
-    fn render_sources_keeps_node_local_facts_off_the_replicated_record() {
-        let record = rift_cluster::SourceRecord {
-            id: "payments".to_owned(),
-            uri: "scripted://cfg/payments.json".to_owned(),
-            mode: rift_cluster::control::SourceMode::Tracking,
-            auth_ref: None,
-            on_drift: rift_cluster::control::OnDrift::Overwrite,
-            poll_secs: Some(60),
-            drifted: false,
-            last_version: Some("v1".to_owned()),
-            last_digest: None,
-            last_pulled_at_secs: None,
-            last_outcome: None,
-            ports: vec![9301],
-            revision: 12,
-        };
-
-        let body = render_sources(
-            3_342_140_982_834_931_156,
-            &SourcesView::One(record.clone()),
-            |id| (id == "payments").then(|| "connect timeout".to_owned()),
-        )
-        .expect("renders");
-        let body: serde_json::Value = serde_json::from_slice(&body).expect("valid JSON");
-        assert!(
-            body["source"].get("lastPollError").is_none(),
-            "the record must stay exactly the replicated projection: {body}"
-        );
-        // A realistic id, as a string. `7` passed happily while the endpoint rounded every id a
-        // real fleet actually issues — the third time in this codebase that a single-digit fixture
-        // hid a `u64` round-trip defect (see #332).
-        assert_eq!(body["nodeLocal"]["nodeId"], "3342140982834931156");
-        assert_eq!(
-            body["nodeLocal"]["pollErrors"]["payments"],
-            "connect timeout"
-        );
-
-        let body = render_sources(7, &SourcesView::List(vec![record]), |_| None).expect("renders");
-        let body: serde_json::Value = serde_json::from_slice(&body).expect("valid JSON");
-        assert_eq!(body["sources"][0]["id"], "payments");
-        assert_eq!(
-            body["nodeLocal"]["pollErrors"],
-            serde_json::json!({}),
-            "no error is an empty map, not an absent field"
-        );
+    fn the_compile_cap_is_the_compilers_own() {
+        assert_eq!(MAX_SPEC_BYTES, rift_cluster_spec::MAX_SPEC_BYTES);
+        assert_eq!(MAX_SPEC_BYTES, 4 * 1024 * 1024);
     }
 
     /// The front-door route surface (issue #131): `PUT`/`DELETE` terminate,
@@ -9581,12 +7445,6 @@ mod tests {
     /// (which "does not require leadership", per its own doc comment) without
     /// paying for `cluster_init`/election. The `TempDir` must outlive the node.
     async fn test_node() -> (Arc<RaftNode>, tempfile::TempDir) {
-        test_node_advertising(false).await
-    }
-
-    /// [`test_node`] with this node's own digest-only capability forced off (#481) — the solo
-    /// stand-in for a fleet member running a build that cannot apply a stripped op.
-    async fn test_node_advertising(incapable: bool) -> (Arc<RaftNode>, tempfile::TempDir) {
         let dir = tempfile::TempDir::new().expect("tempdir");
         let config = rift_cluster::NodeConfig {
             node_id: 1,
@@ -9597,7 +7455,6 @@ mod tests {
             routes: rift_cluster::Router::new(),
             engine: None,
             snapshot_log_entries: None,
-            advertise_as_digest_only_incapable: incapable,
         };
         let node = RaftNode::start(config).await.expect("node starts");
         (Arc::new(node), dir)
@@ -9639,9 +7496,6 @@ mod tests {
                 barrier_timeout: Duration::from_secs(1),
                 admin_async: false,
                 readiness: Arc::new(crate::readiness::Readiness::awaiting([])),
-                puller: Arc::new(SourcePuller::new(
-                    rift_cluster_base::seams::SourceRegistry::default(),
-                )),
                 journal_net: JournalNet::new(Arc::clone(&journal)),
                 // In-memory and never bound to `node`'s ring: nothing in this file's
                 // tests exercises `/admin/tenants`'s flow-entry fan-out, so this only
@@ -11217,134 +9071,5 @@ mod tests {
             assert_eq!(TRY_BUDGET, Duration::from_secs(10));
             assert_eq!(TRY_MAX_RESPONSE_BYTES, 1024 * 1024);
         }
-    }
-
-    // ---- #439: the bytes leave the op at submit, after the quorum (D-49) ----
-
-    fn carried_dataset_put(csv: &str) -> ControlOp {
-        ControlOp::DatasetPut {
-            tenant: TenantId::default(),
-            record: rift_cluster::control::DatasetRecord {
-                name: "customers".to_owned(),
-                digest: rift_cluster::control::Digest::new(
-                    rift_cluster::blobs::digest_of_bytes(csv.as_bytes())
-                        .as_str()
-                        .to_owned(),
-                ),
-                key_columns: vec!["id".to_owned()],
-                delimiter: ',',
-                columns: vec!["id".to_owned(), "name".to_owned()],
-                rows: 1,
-                bytes: csv.len() as u64,
-            },
-            csv: Some(csv.to_owned()),
-            origin: 0,
-        }
-    }
-
-    #[test]
-    fn strip_blob_drops_the_payload_and_stamps_the_origin() {
-        let mut op = carried_dataset_put("id,name\n1,ada\n");
-        assert!(
-            op_blob(&op).is_some(),
-            "carried: there is a blob to fan out"
-        );
-
-        strip_blob(&mut op, 42);
-
-        let ControlOp::DatasetPut { csv, origin, .. } = &op else {
-            panic!("expected DatasetPut")
-        };
-        assert_eq!(csv, &None);
-        assert_eq!(*origin, 42);
-        assert!(
-            op_blob(&op).is_none(),
-            "stripped: nothing left to fan out, so a second pass is a no-op"
-        );
-    }
-
-    /// Pins D-49: what `submit` receives is metadata-sized and names this node as origin, and
-    /// the blob is already in this node's own store — the fan-out ran before the strip, while
-    /// Pins D-53 (#481): the mirror of the test below, and the one that actually pins the gate. With a member
-    /// that is not known to apply digest-only ops, `fan_out_then_submit` must hand `submit` the
-    /// op **with its bytes** — the pre-D-49 shape every build can decode — rather than the
-    /// stripped one that would stop an un-upgraded member's Raft core at log read
-    /// (`RedbLogStore::try_get_log_entries`, not at apply as the operations chapter used to say).
-    ///
-    /// Solo, and that is enough *here* precisely because the capability under test is node-local:
-    /// this node's own `digest_only_capable` is off, so it is the member that is not capable. The
-    /// peer half of the question — that a real remote build is probed and classified — cannot be
-    /// asked solo and is pinned by `an_op_carries_its_bytes_while_a_member_cannot_apply_digest_only`
-    /// in `rift-cluster`'s cluster suite.
-    #[tokio::test]
-    async fn fan_out_then_submit_keeps_the_bytes_when_a_member_cannot_apply_digest_only() {
-        let (node, _dir) = test_node_advertising(true).await;
-        node.cluster_init().await.expect("solo cluster");
-        let csv = "id,name\n1,ada\n";
-        let request = ControlRequest {
-            op_id: uuid::Uuid::new_v4(),
-            principal: None,
-            issued_at_secs: 0,
-            expected_revision: None,
-            op: carried_dataset_put(csv),
-        };
-
-        let handed = fan_out_then_submit(&node, request, |r| async move { r })
-            .await
-            .expect("a solo cluster is its own joint quorum");
-
-        let ControlOp::DatasetPut { csv: carried, .. } = &handed.op else {
-            panic!("expected DatasetPut")
-        };
-        assert_eq!(
-            carried.as_deref(),
-            Some(csv),
-            "an un-upgraded member is in the membership, so the bytes must stay on the op"
-        );
-        let digest = rift_cluster::blobs::digest_of_bytes(csv.as_bytes());
-        assert!(
-            node.blobs().stat(&digest).expect("stat").have,
-            "the fan-out still happened; only the strip is withheld"
-        );
-    }
-
-    /// the op still carried its bytes.
-    #[tokio::test]
-    async fn fan_out_then_submit_hands_submit_a_stripped_op_with_this_node_as_origin() {
-        let (node, _dir) = test_node().await;
-        // A quorum needs a membership: an empty one is refused by design (D-19).
-        node.cluster_init().await.expect("solo cluster");
-        let csv = "id,name\n1,ada\n";
-        let request = ControlRequest {
-            op_id: uuid::Uuid::new_v4(),
-            principal: None,
-            issued_at_secs: 0,
-            expected_revision: None,
-            op: carried_dataset_put(csv),
-        };
-
-        let handed = fan_out_then_submit(&node, request, |r| async move { r })
-            .await
-            .expect("a solo cluster is its own joint quorum");
-
-        let ControlOp::DatasetPut {
-            csv: carried,
-            origin,
-            ..
-        } = &handed.op
-        else {
-            panic!("expected DatasetPut")
-        };
-        assert_eq!(carried, &None, "the bytes must not reach the log");
-        assert_eq!(*origin, node.id());
-        assert!(
-            serde_json::to_vec(&handed.op).expect("serialise").len() < 4096,
-            "what is proposed is metadata-sized"
-        );
-        let digest = rift_cluster::blobs::digest_of_bytes(csv.as_bytes());
-        assert!(
-            node.blobs().stat(&digest).expect("stat").have,
-            "fanned out to this node's own store before the strip"
-        );
     }
 }

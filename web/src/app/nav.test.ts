@@ -6,20 +6,16 @@ import { toHash } from "./routing.ts";
 describe("nav model", () => {
   it("ships the screens C4, C6 and C7 actually built as live entries", () => {
     // C6 (#189) turns `requests` live and adds the front-door route editor beside it. C7 (#190)
-    // turns `administration` live. #233 turns `sources` live.
+    // turns `administration` live.
     //
     // The order is the nav bar's section grouping, not authoring order — and it is the design's:
-    // the four mock screens, then the two fleet-scoped ones, then administration. `sources` sits in
-    // the fleet group rather than with the mocks because a source is a fleet-wide declaration
-    // (leader-only poller, replicated to every node), which is also the only arrangement that puts
-    // it where the design draws it without breaking the group-sorted invariant asserted below.
+    // the four mock screens, then the fleet-scoped one, then administration.
     expect(liveEntries().map((e) => e.id)).toEqual([
       "imposters",
       "routes",
       "scenarios",
       "requests",
       "cluster",
-      "sources",
       "administration",
     ]);
   });
@@ -61,27 +57,16 @@ describe("nav model", () => {
     }
   });
 
-  it("puts every unbuilt screen last, together", () => {
-    // "A visible roadmap" reads after the things that work, never interleaved with them.
-    const firstPlanned = NAV.findIndex((entry) => entry.kind === "planned");
-    expect(NAV.slice(firstPlanned).every((entry) => entry.kind === "planned")).toBe(true);
-  });
-
-  it("renders every unshipped screen as a planned entry rather than omitting it", () => {
+  it("names the screens that are promised but unbuilt, and nothing else", () => {
     /*
-     * RFC-006 §4: "a visible roadmap, not a 404" — so each chip must name work that is actually
-     * outstanding, which is not the same as naming the epic the feature belongs to. `specs` names
-     * #148 because there genuinely is nothing to render until RFC-004 lands.
+     * RFC-006 §4: "a visible roadmap, not a 404". The roadmap is empty right now — `specs` was the
+     * last chip and #549 removed the stored-spec surface it was promising, rather than the chip
+     * graduating to a live entry the way `sources` (#233) and `scenarios` (#232) did.
      *
-     * `sources` is no longer here: #233 built it, so the chip became a live entry. `scenarios` left
-     * the same way for #232. That is the whole lifecycle this list is meant to have — a planned
-     * entry is a promise, and the promise is discharged by the entry graduating rather than by the
-     * number being edited again.
+     * Asserted rather than deleted, because "no planned entries" is the claim: a chip that reappears
+     * here without a live screen behind it is exactly what the ordering and shape rules below guard.
      */
-    const planned = Object.fromEntries(plannedEntries().map((e) => [e.id, e.issue]));
-    expect(planned).toEqual({
-      specs: 148,
-    });
+    expect(plannedEntries()).toEqual([]);
   });
 
   it("gives every planned entry an issue number and no route", () => {

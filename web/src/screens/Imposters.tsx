@@ -14,7 +14,6 @@ import {
   useImposters,
   useLifecycleToggle,
   useReplaceImposters,
-  useSources,
 } from "../app/queries.ts";
 import { useSession } from "../app/session.tsx";
 import { toHash, useHashQuery } from "../app/routing.ts";
@@ -36,8 +35,6 @@ import {
   decodeQuery,
   encodeQuery,
   bindUnclassifiedCount,
-  driftedPorts,
-  sourceOwnedPorts,
   unclassifiedCount,
   visibleImposters,
 } from "../features/imposters/list.ts";
@@ -65,18 +62,11 @@ import { type Finding, lintStub } from "../features/stubs/lint.ts";
 import type { CommitOutcome } from "../features/writes/commit.ts";
 
 type Imposter = components["schemas"]["Imposter"];
-type SourceRecord = components["schemas"]["SourceRecord"];
 
 /**
- * The screen's four tiles.
- *
- * Three of them are real and one is a marker, and the split is the whole point of building it this
- * way rather than filling all four with plausible numbers:
+ * The screen's three tiles.
  *
  * - **Imposters / stubs** — counted from the list this screen already holds.
- * - **Sources / drifted** — counted from `/admin/sources`, the same read the provenance filter uses.
- *   Absent entirely for a principal without `source.read`, rather than shown as zero: "you may not
- *   ask" and "the answer is none" are different facts.
  * - **Requests · fleet sum** — real since #363 declared `numberOfRequests` on the contract. It had
  *   reached the imposter body only through a non-exhaustive index signature, which is exactly the
  *   client-side guess `contract.ts` refuses, so summing it here would have laundered a value the
@@ -89,14 +79,10 @@ type SourceRecord = components["schemas"]["SourceRecord"];
  */
 function ImposterTiles({
   imposters,
-  sources,
-  maySeeSources,
   countsArePartial,
   fleet,
 }: {
   imposters: readonly Imposter[];
-  sources: readonly SourceRecord[] | undefined;
-  maySeeSources: boolean;
   /** The fleet sum could not reach every node, so it is a floor rather than a total (#363). */
   countsArePartial: boolean;
   /** `undefined` for a principal without `fleet.read` — refused, which is not the same as zero. */
@@ -123,7 +109,6 @@ function ImposterTiles({
   const requestTotal = requestCounts.every((n) => n !== undefined)
     ? requestCounts.reduce((sum: number, n) => sum + (n ?? 0), 0)
     : null;
-  const drifted = sources?.filter((source) => source.drifted === true).length ?? 0;
 
   return (
     <dl className="tiles">
@@ -158,20 +143,9 @@ function ImposterTiles({
         </dd>
       </div>
 
-      {maySeeSources ? (
-        <div className={`tile${drifted > 0 ? " is-warn" : ""}`}>
-          <dt className="eyebrow">Sources</dt>
-          <dd className="v">{sources?.length ?? 0}</dd>
-          <dd className="note">
-            {drifted === 0 ? "none drifted" : `${String(drifted)} drifted`}
-          </dd>
-        </div>
-      ) : null}
-
       {/*
-        Absent entirely for a principal without `fleet.read`, on the same reasoning as the sources
-        tile above: "you may not ask" and "the answer is none" are different facts, and a zero here
-        is the reassuring one.
+        Absent entirely for a principal without `fleet.read`, rather than rendered as zero: "you may
+        not ask" and "the answer is none" are different facts, and a zero here is the reassuring one.
       */}
       {fleet === undefined ? null : (
         <div className={`tile${(fleet.parkedIntents ?? 0) > 0 ? " is-warn" : ""}`}>
@@ -277,32 +251,21 @@ export function Imposters(): ReactNode {
   const query = decodeQuery(search);
   const setQuery = (next: typeof query): void => setSearch(encodeQuery(next));
 
-  /*
-   * Provenance, joined rather than assumed: every `SourceRecord` carries the `ports` it owns, so the
-   * union of those IS the source-owned set. It needs `source.read`, which the imposter list itself
-   * does not, so a principal without it never issues the call and is never offered the filter — the
-   * same shape as the fleet-health read above.
-   */
-  const maySeeSources = can("source.read");
-  const sources = useSources({ enabled: maySeeSources });
-  const sourceOwned = sourceOwnedPorts(sources.data?.sources);
-  const drifted = driftedPorts(sources.data?.sources);
-
   const all = listed;
   // `null`, not `fleet.data ?? undefined`, when the fleet reading is unread or refused: `list.ts`
-  // treats that the same way it treats `sourceOwned === null` — "cannot check" matches nothing.
+  // reads that as "cannot check", which matches nothing.
   const fleetForBind = fleet.data ?? null;
-  const rows = visibleImposters(all, query, sourceOwned, drifted, fleetForBind);
-  const unclassified = unclassifiedCount(all, query, sourceOwned, fleetForBind);
-  const bindUnclassified = bindUnclassifiedCount(all, query, sourceOwned, fleetForBind);
+  const rows = visibleImposters(all, query, fleetForBind);
+  const unclassified = unclassifiedCount(all, query, fleetForBind);
+  const bindUnclassified = bindUnclassifiedCount(all, query, fleetForBind);
 
   const [selected, setSelected] = useState<ReadonlySet<number>>(new Set());
 
   /*
    * A tick is dropped as soon as its imposter leaves the fleet.
    *
-   * Selection is a set of bare port numbers, and ports are reused constantly — a source pull, an
-   * import, or another operator can recreate one. Without this, ticking 4545, watching it be
+   * Selection is a set of bare port numbers, and ports are reused constantly — an import, or
+   * another operator, can recreate one. Without this, ticking 4545, watching it be
    * deleted, and seeing a *different* imposter appear at 4545 leaves the new one silently ticked and
    * one click from a bulk delete the operator never asked for. `effective` intersecting with the
    * visible rows keeps the count honest and is exactly what hides that.
@@ -445,8 +408,6 @@ export function Imposters(): ReactNode {
 
         <ImposterTiles
           imposters={all}
-          sources={sources.data?.sources}
-          maySeeSources={maySeeSources}
           countsArePartial={countsArePartial}
           fleet={fleet.data}
         />
@@ -542,7 +503,6 @@ export function Imposters(): ReactNode {
               shown={rows.length}
               total={all.length}
               unclassified={unclassified}
-              showOwner={sourceOwned !== null}
               bindFilterAvailable={fleetForBind !== null}
               bindUnclassified={bindUnclassified}
             />
@@ -628,9 +588,7 @@ export function Imposters(): ReactNode {
                           every node, so every node serves them — only a *flow* is owned, and a
                           port has as many owners as it has flows (#359, D-20). The column is gone
                           rather than pending, because a column that can never be filled is a
-                          promise, not a roadmap. `Provenance` is a real join this screen already
-                          computes for its filter, so it renders. */}
-                      <th style={{ width: "16ch" }}>Provenance</th>
+                          promise, not a roadmap. */}
                       {mayToggle || mayDelete ? <th aria-label="Actions" /> : null}
                     </tr>
                   </thead>
@@ -639,8 +597,6 @@ export function Imposters(): ReactNode {
                       <Row
                         key={imposter.port ?? `unnamed-${index}`}
                         imposter={imposter}
-                        sourceOwned={sourceOwned}
-                        drifted={drifted}
                         mayToggle={mayToggle}
                         mayDelete={mayDelete}
                         busy={toggle.isPending}
@@ -785,8 +741,6 @@ function Row({
   onSelect,
   onToggle,
   onDelete,
-  sourceOwned,
-  drifted,
 }: {
   imposter: Imposter;
   mayToggle: boolean;
@@ -798,9 +752,6 @@ function Row({
   onSelect: (port: number, checked: boolean) => void;
   onToggle: (port: number, enable: boolean) => void;
   onDelete: () => void;
-  /** `null` when `source.read` was refused or the read has not landed — not "hand-created". */
-  sourceOwned: ReadonlySet<number> | null;
-  drifted: ReadonlySet<number> | null;
 }): ReactNode {
   const port = imposter.port;
   const label = imposter.name ?? (port === undefined ? UNKNOWN : String(port));
@@ -835,28 +786,6 @@ function Row({
           <ImposterField imposter={imposter} field={column.key} renderName={nameLink(imposter)} />
         </td>
       ))}
-      {/*
-        Provenance is real, and the three states are genuinely different facts: a source owns this
-        port and has drifted from it, a source owns it cleanly, or nothing declared it. `null` — the
-        source read was refused or has not happened — is a fourth, and says so rather than claiming
-        the imposter was hand-created.
-      */}
-      <td className="ident">
-        {sourceOwned === null ? (
-          <span className="muted">not read</span>
-        ) : port !== undefined && drifted?.has(port) === true ? (
-          <span className="status status-warn">
-            <span className="g" aria-hidden="true">
-              &#9650;
-            </span>
-            drifted
-          </span>
-        ) : port !== undefined && sourceOwned.has(port) ? (
-          "source"
-        ) : (
-          "hand-created"
-        )}
-      </td>
       {mayToggle || mayDelete ? (
         <td>
           {/* Rendered only for a role that holds the matching action. RFC-006 §3 rule 3: this is
@@ -897,9 +826,8 @@ function Row({
  * The name cell is the one field the list renders differently: it links through to the detail.
  *
  * It is also the **only** route to that screen — no other cell is clickable — so the absent-name
- * case has to stay linked. `name` is optional on `POST /imposters`, and imported configs and
- * imposter sources routinely omit it, so a nameless imposter is an ordinary thing to have rather
- * than a malformed one. Falling back to a bare `—` here (which is what the shared field renderer
+ * case has to stay linked. `name` is optional on `POST /imposters`, and imported configs routinely
+ * omit it, so a nameless imposter is an ordinary thing to have rather than a malformed one. Falling back to a bare `—` here (which is what the shared field renderer
  * does when no render prop is passed) left those rows with nothing to click and no way to reach
  * their stubs, recording panel or export.
  *

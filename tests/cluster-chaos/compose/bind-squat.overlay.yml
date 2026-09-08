@@ -56,8 +56,8 @@
 # hand_out` guard test for a port nothing outside the fleet needs to reach --
 # every assertion in the scenario goes through the front door or the metrics
 # port, never this one directly. 6520 continues the imposter-port numbering
-# this file's other scenarios use (C17/C18 sit at 6500-6512, C20-C23 at
-# 6610-6640); nothing else in this tier binds it.
+# this file's other scenarios use (C17/C18 sit at 6500-6512); nothing else in
+# this tier binds it.
 
 services:
   bind-squat:

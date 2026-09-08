@@ -5,7 +5,6 @@ import { Pending } from "./pending.tsx";
 import { summaryLine } from "../features/imposters/bulk.ts";
 import type {
   ImposterQuery,
-  OwnerFilter,
   RecordingFilter,
   SortDirection,
   SortKey,
@@ -33,12 +32,6 @@ const RECORDING_OPTIONS: readonly { value: RecordingFilter; label: string }[] = 
   { value: "none", label: "Not recording" },
 ];
 
-const OWNER_OPTIONS: readonly { value: OwnerFilter; label: string }[] = [
-  { value: "all", label: "Any origin" },
-  { value: "source", label: "Source-owned" },
-  { value: "hand", label: "Hand-created" },
-];
-
 export function ImposterFilters({
   query,
   onChange,
@@ -46,7 +39,6 @@ export function ImposterFilters({
   shown,
   total,
   unclassified,
-  showOwner,
   bindFilterAvailable,
   bindUnclassified,
 }: {
@@ -57,15 +49,9 @@ export function ImposterFilters({
   total: number;
   unclassified: number;
   /**
-   * Offered only when this session actually has a reading of `GET /admin/sources` to join against.
-   * Without one the filter could only answer "hand-created" for everything, which is a wrong answer
-   * wearing the clothes of a real one.
-   */
-  showOwner: boolean;
-  /**
    * Whether this session holds `fleet.read` (#369). Without it there is no bind reading to filter
-   * on, so the pill stays in its pending form rather than silently filtering nothing — the same
-   * reasoning `showOwner` above follows for the provenance filter.
+   * on, so the pill stays in its pending form rather than silently filtering nothing — offering a
+   * filter that can only answer wrongly is worse than not offering it.
    */
   bindFilterAvailable: boolean;
   /** Rows the bind filter excluded because their verdict is `"unknown"`, not because it is clean. */
@@ -118,30 +104,13 @@ export function ImposterFilters({
         </select>
       </label>
 
-      {showOwner ? (
-        <label className="field">
-          <span className="visually-hidden">Filter by origin</span>
-          <select
-            data-testid="imposter-filter-owner"
-            value={query.owner}
-            onChange={(event) => onChange({ ...query, owner: event.target.value as OwnerFilter })}
-          >
-            {OWNER_OPTIONS.map((option) => (
-              <option key={option.value} value={option.value}>
-                {option.label}
-              </option>
-            ))}
-          </select>
-        </label>
-      ) : null}
-
       <div className="spacer" />
 
       {/*
         The design's quick filters, over the same query the controls above write.
         
         Not a replacement for them: the selects can express combinations these cannot, and the text
-        box is what makes 200 imposters navigable. These are the three questions asked often enough
+        box is what makes 200 imposters navigable. These are the questions asked often enough
         to deserve one click — and `aria-pressed` carries the state, so the fill is not the only
         signal.
       */}
@@ -150,21 +119,10 @@ export function ImposterFilters({
           type="button"
           className="pill-filter"
           data-testid="quick-all"
-          aria-pressed={query.state === "all" && query.drifted === "all"}
-          onClick={() => onChange({ ...query, state: "all", drifted: "all" })}
+          aria-pressed={query.state === "all" && query.bind === "all"}
+          onClick={() => onChange({ ...query, state: "all", bind: "all" })}
         >
           All
-        </button>
-        <button
-          type="button"
-          className="pill-filter"
-          data-testid="quick-drifted"
-          aria-pressed={query.drifted === "drifted"}
-          onClick={() =>
-            onChange({ ...query, drifted: query.drifted === "drifted" ? "all" : "drifted" })
-          }
-        >
-          Drifted
         </button>
         <button
           type="button"
@@ -177,9 +135,9 @@ export function ImposterFilters({
         >
           Paused
         </button>
-        {/* The design's fourth pill (#369). Real once this session holds `fleet.read` — without it
+        {/* The design's bind pill (#369). Real once this session holds `fleet.read` — without it
             there is no bind reading to filter on, and the pill says so rather than filtering
-            nothing, the same rule `showOwner` follows for provenance above. */}
+            nothing. */}
         {bindFilterAvailable ? (
           <button
             type="button"

@@ -893,19 +893,25 @@ async fn a_departed_founder_rejoins_through_the_peers_its_log_remembers() {
 }
 
 // ---------------------------------------------------------------------------
-// Issue #134: `--imposters` becomes source declarations under `--cluster`
+// D-72 (#549): `--imposters` is a one-shot bootstrap through the replicated log
 // ---------------------------------------------------------------------------
 
-/// Under `--cluster`, `--imposters` is sugar for declaring pinned sources and
-/// pulling them — so the imposters land through the replicated log rather than
-/// in this node's manager alone (where the reconciler would then delete them,
-/// the failure `--configfile` is refused for).
+/// Under `--cluster`, `--imposters` reads each URI **once** at startup and submits what it
+/// declares as ordinary `PutImposter` ops — so the imposters land through the replicated log
+/// rather than in this node's manager alone, where the reconciler would then delete them (the
+/// failure `--configfile` is refused for).
 ///
-/// Drives `compose::start` because that is where the desugaring lives: the flag
-/// has to be taken off the CLI *before* `ServerBuilder` sees it, or upstream
-/// creates the imposters itself and the log never hears about them.
+/// Drives `compose::start` because that is where the bootstrap lives: the flag has to be taken
+/// off the CLI *before* `ServerBuilder` sees it, or upstream creates the imposters itself and the
+/// log never hears about them.
+///
+/// Pins D-72's idempotence, which is the half that replaced the source record: the second boot
+/// re-derives the same `op_id` from `(uri, port, document digest)` and collapses in the dedup
+/// table, so the imposter is not duplicated and the log does not grow. Asserted in this test
+/// rather than its own so the suite does not hold a second composed server open concurrently —
+/// seventeen of them exhaust the process's file descriptors on a developer machine.
 #[tokio::test]
-async fn imposters_flag_becomes_a_replicated_source_under_cluster() {
+async fn the_imposters_flag_bootstraps_through_the_log_and_a_restart_does_not_duplicate() {
     let state = TempDir::new().expect("tempdir");
     let doc = state.path().join("mocks.json");
     let port = common::ports::reserve_port();
@@ -918,7 +924,7 @@ async fn imposters_flag_becomes_a_replicated_source_under_cluster() {
         })
         .to_string(),
     )
-    .expect("write the source document");
+    .expect("write the bootstrap document");
 
     let uri = format!("file:{}", doc.to_string_lossy());
     let server = compose::start(cluster_cli(
@@ -929,63 +935,53 @@ async fn imposters_flag_becomes_a_replicated_source_under_cluster() {
     .expect("a node with --imposters must start");
 
     let node = server.node().expect("clustered");
-    let sources = node.sources(DEFAULT_TENANT).expect("read sources");
-    assert_eq!(
-        sources.len(),
-        1,
-        "--imposters must declare exactly one source per uri: {sources:?}"
-    );
-    let source = &sources[0];
-    assert_eq!(source.uri, uri);
-    assert_eq!(source.ports, vec![port], "the source owns what it declared");
-    assert!(!source.drifted);
     assert_eq!(
         node.configured_ports().expect("ports"),
         vec![(TenantId::new(DEFAULT_TENANT), port)],
         "the imposter must be in the replicated log, not just this node's manager"
     );
-    assert_eq!(
-        node.config_provenance().expect("provenance")[0].2.id,
-        source.id,
-        "the config carries the provenance of the source that produced it"
-    );
-    let id = source.id.clone();
+    let revision_after_first_boot = node
+        .imposter_revision(DEFAULT_TENANT, port)
+        .expect("read the imposter's revision")
+        .expect("the imposter exists");
     server.shutdown().await;
 
-    // Idempotent by id: a restart on the same state directory with the same
-    // flag upserts the same source rather than accumulating one per boot, and
-    // the digest short circuit makes the repeat pull a no-op. Asserted in this
-    // test rather than its own so the suite does not hold a second composed
-    // server open concurrently — seventeen of them exhaust the process's file
-    // descriptors on a developer machine.
     let restarted = compose::start(cluster_cli(
         &state,
         &["--cluster-allow-solo", "--imposters", &uri],
     ))
     .await
     .expect("a restart with the same flag must start");
-    let sources = restarted
-        .node()
-        .expect("clustered")
-        .sources(DEFAULT_TENANT)
-        .expect("read sources");
+    let node = restarted.node().expect("clustered");
     assert_eq!(
-        sources.len(),
-        1,
-        "a restart must not add a source: {sources:?}"
+        node.configured_ports().expect("ports"),
+        vec![(TenantId::new(DEFAULT_TENANT), port)],
+        "the same document must still describe exactly one imposter after a restart"
     );
+    // The dedup collapse is the mechanism, and it is only observable on the *record*: the op is
+    // proposed again and recognised at apply, so the entry exists but changes nothing and the
+    // config keeps the revision the first boot gave it. A bootstrap that genuinely re-applied
+    // would look identical from `configured_ports` alone, which is why this is asserted on the
+    // stored revision rather than on the port list.
+    //
+    // Deliberately not asserted on `last_applied`: dedup happens at apply, not at propose, so
+    // the deduped entry does advance the applied index by one. That is the honest cost of an
+    // `op_id`-keyed dedup and not something this test should pretend away.
     assert_eq!(
-        sources[0].id, id,
-        "the id is derived from the uri, so it is stable across boots"
+        node.imposter_revision(DEFAULT_TENANT, port)
+            .expect("read the imposter's revision")
+            .expect("the imposter still exists"),
+        revision_after_first_boot,
+        "a restart on an unchanged document must not rewrite the config"
     );
     restarted.shutdown().await;
 }
 
-/// A source that cannot be fetched fails the start. An operator who passed
-/// `--imposters` asked for those imposters to be serving; coming up healthy
-/// without them is the silently half-configured node this path exists to avoid.
+/// A URI that cannot be read fails the start. An operator who passed `--imposters` asked for
+/// those imposters to be serving; coming up healthy without them is the silently
+/// half-configured node this path exists to avoid.
 #[tokio::test]
-async fn an_unfetchable_imposters_source_fails_the_start() {
+async fn an_unreadable_imposters_uri_fails_the_start() {
     let state = TempDir::new().expect("tempdir");
     let missing = state.path().join("does-not-exist.json");
     let err = match compose::start(cluster_cli(
@@ -998,11 +994,43 @@ async fn an_unfetchable_imposters_source_fails_the_start() {
     ))
     .await
     {
-        Ok(_) => panic!("an unfetchable source must not start silently"),
+        Ok(_) => panic!("an unreadable --imposters uri must not start silently"),
         Err(e) => format!("{e:#}"),
     };
     assert!(
         err.contains("does-not-exist.json"),
-        "the failure must name the source that could not be loaded: {err}"
+        "the failure must name the uri that could not be read: {err}"
     );
+}
+
+/// Pins D-72: a `git+`/`s3:`/`registry:` URI is refused **at startup, by name**, not left to
+/// fail as an unrecognised scheme or — worse — to be read as a relative file path.
+///
+/// The refusal names the issue because an operator meeting it typed a URI that worked on the
+/// previous release; "unsupported scheme" would send them to check their spelling. The rule is
+/// the one D-34 stated and D-72 kept after superseding it — fail loudly at declaration, not at
+/// first use — applied to the schemes that left with it.
+#[tokio::test]
+async fn a_retired_source_scheme_is_refused_at_startup_naming_the_issue() {
+    for uri in [
+        "git+https://example.invalid/repo#main:mocks.json",
+        "s3://bucket/mocks.json",
+        "registry:my-mocks",
+    ] {
+        let state = TempDir::new().expect("tempdir");
+        let err = match compose::start(cluster_cli(
+            &state,
+            &["--cluster-allow-solo", "--imposters", uri],
+        ))
+        .await
+        {
+            Ok(_) => panic!("{uri} must not start"),
+            Err(e) => format!("{e:#}"),
+        };
+        assert!(err.contains(uri), "the refusal must name the uri: {err}");
+        assert!(
+            err.contains("#549"),
+            "the refusal must name the removal, not just the scheme: {err}"
+        );
+    }
 }

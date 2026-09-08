@@ -34,10 +34,6 @@ const EXPECTED: Record<Capability, Role[]> = {
   // read. It is not — a try mutates scenario state, the request log and proxy recordings — and a
   // Viewer who widened this row would get a button whose every call answers 403.
   "imposter.try": ["operator", "editor", "tenant-admin", "fleet-admin"],
-  // `Action::SourceRead`. Viewer, alongside `ImposterRead` — its own action server-side rather
-  // than a wire-folding onto it, transcribed as its own row for the same reason `imposter.delete`
-  // above gets one: the day the grant moves is what this row exists to catch.
-  "source.read": ["viewer", "operator", "editor", "tenant-admin", "fleet-admin"],
   // `Action::SavedRequestsClear`. Operator-tier: clearing a log disturbs state without redefining
   // configuration, which is the line `authz.rs` draws between the Operator and Editor arms.
   "requests.clear": ["operator", "editor", "tenant-admin", "fleet-admin"],

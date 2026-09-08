@@ -114,49 +114,23 @@ jobs:
           # headroom for a CI runner slower than the one this was measured on.
           - scenario: c18_routes_survive_a_full_cluster_restart
             iterations: 80
-          # Imposter sources (#137). Every one of these brings up a fourth
-          # container (the counting origin) alongside the fleet. Sized from
-          # per-iteration wall clock measured against a pre-built image, the
-          # same way this job runs them.
-          #
-          # C20 is a stack-up, one declare, two pulls and a convergence check —
-          # measured at ~18s/iteration, the same shape and cost as C17, so it
-          # gets the same 100 and lands near 30 min against the 100 min budget.
-          - scenario: c20_source_pull_converges_and_fetches_once
-            iterations: 100
-          # C21 carries two irreducible 40s measurement windows on top of an
-          # election and a poll-driven convergence — measured at ~108s, the most
-          # expensive per iteration in the suite. 50 lands near 90 min. Do not
-          # raise it without re-measuring, and never buy headroom by shortening
-          # the windows: the rate bound is derived from their length.
-          - scenario: c21_tracking_poll_is_leader_only_and_survives_failover
-            iterations: 50
-          # One full-fleet stop/start on top of two sources and a hand edit,
-          # measured at ~40s/iteration — the same cost as C18's restart, so the
-          # same 80, landing near 53 min.
-          - scenario: c22_sources_survive_a_full_cluster_restart
-            iterations: 80
-          # Stack up, one declare, one hand edit, two pulls, no restart —
-          # measured at ~18s/iteration, so 100 lands near 30 min.
-          - scenario: c23_drift_flags_and_pull_overwrites
-            iterations: 100
           # Stack up, two tenancy writes, one imposter, then 18 probes (6 actions
           # x 3 nodes) — measured at ~18s/iteration on a warm image, the same
-          # shape and cost as C17/C20/C23, so the same 100, landing near 30 min.
+          # shape and cost as C17, so the same 100, landing near 30 min.
           # Measure with the image already built: a run that rebuilds the
           # container absorbs ~90s and is not the per-iteration cost.
           - scenario: c24_rbac_enforcement_is_identical_through_any_node
             iterations: 100
           # A partition, a revocation on the majority, a heal, and a polled
           # convergence window — measured at ~40s/iteration, the same cost as
-          # C18's and C22's restarts, so the same 80, landing near 53 min. Rides
+          # C18's restart, so the same 80, landing near 53 min. Rides
           # the chaos overlay as well as the tenancy one, which is what makes the
           # partition possible at all.
           - scenario: c25_key_revocation_survives_a_partition
             iterations: 80
           # A lagged follower caught up by a real snapshot install, then one
           # full-fleet stop/start, on top of eighteen imposter writes — measured
-          # at ~40s/iteration, identical to C18/C22, so the same 80 (~53 min).
+          # at ~40s/iteration, identical to C18, so the same 80 (~53 min).
           - scenario: c26_replicated_imposters_survive_a_full_cluster_restart_by_snapshot_install
             iterations: 80
           # Stack up, two tenants, two principals, two imposters, a handful of

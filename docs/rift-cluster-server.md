@@ -414,9 +414,6 @@ replicated apply path:
 | `maxImposters` | Yes. Counts the tenant's existing ports *excluding* the one being written, so replacing an imposter you already own never trips the ceiling |
 | `maxStubsPerImposter` | Yes — on the payload for a create/replace, and on the *result* for a stub edit |
 | `maxFlowEntries` | Stored; enforced by the flow owner |
-| `maxDatasets` (50) | Yes (issue #285). Distinct live dataset *names*; a new version of a name the tenant already holds is not a new dataset |
-| `maxDatasetBytes` (8 MiB) | Yes — on the upload's bytes, at apply |
-| `maxDatasetTotalBytes` (64 MiB) | Yes — the sum of every live dataset version's bytes plus the upload; a delete frees its share |
 | `journalRetentionSecs` | Moved **off** `quotas` onto the tenant record itself (it is a duration policy, not a count). Stored; applied by the request shards in M3 |
 
 > **If you set `quotas.journalRetentionSecs` on an earlier M2 build, re-set it.**
@@ -425,11 +422,6 @@ replicated apply path:
 > (unlimited), silently. Nothing enforces the value yet — M3 (#147) is what will
 > read it — so the practical window to fix this is before that lands, but the
 > value is lost now rather than then.
-
-The three dataset ceilings **default when absent** on the tenant body and in
-stored records — the one exception to the "present-but-partial fails" rule
-above, because tenant records committed before they existed have to keep
-decoding.
 
 A ceiling of `0` is refused at validation rather than stored: it makes the tenant
 permanently unusable, and "unlimited" has its own spelling (a large number). A
@@ -1111,656 +1103,94 @@ control-plane object**, exactly like the imposter config set.
 With `--cluster` off, none of this exists: `--front-door` behaves exactly as
 it does in the open-source binary, which is what the `parity` CI job checks.
 
-## Imposter sources (#134)
+## `--imposters` under `--cluster` — a one-shot bootstrap (D-72, #549)
 
-An **imposter source** is a URI the fleet agrees backs some of its imposters —
-a config document in S3, in a git repo, on a config server. Under `--cluster`
-a source is a replicated control-plane object, like the imposter set and the
-route table: declared once, visible on every node, and pulled on demand.
+Upstream's `--imposters <uri,...>` loads imposters from URIs at startup. With
+`--cluster` **off** it behaves exactly as it does in the open-source binary.
+With `--cluster` **on** it is a **one-shot bootstrap** and nothing more:
 
-The rule that makes this cluster-correct: **fetching never happens in the apply
-path.** A fetch is I/O against a system this cluster does not control, and two
-nodes fetching the same URI a second apart can legitimately get different
-bytes — so the node that received the request fetches *once*, hashes what it
-got, and submits the result as an ordinary control op. The fetched bytes enter
-the log exactly once and every node applies those same bytes. Followers never
-fetch.
+1. At startup each URI is resolved through **upstream's own `SourceRegistry`**
+   (U-12) — `file:` and `http(s):` only.
+2. The fetched documents are parsed by upstream's config loader.
+3. Each imposter is submitted as an ordinary `ControlOp::PutImposter`, so it
+   lands through the replicated log and reaches every node.
 
-### The endpoints
+That is the whole mechanism. The cluster keeps **no source record**, runs **no
+poll scheduler**, reports **no poll status**, tracks **no drift**, and offers no
+`/admin/sources*` surface — all of that was removed by D-71/D-72 (#549). After
+startup an imposter that came in this way is indistinguishable from one written
+by `PUT /imposters`, and it is edited the same way.
 
-These ride the **cluster port**, beside `/_cluster/*` — they are an operator
-surface authenticated with the cluster credential (`--cluster-secret`), not
-with the admin API key:
-
-| Endpoint | What it does |
-|---|---|
-| `POST /admin/sources` | Declare a source: `{ id, uri, mode?, authRef?, onDrift? }` |
-| `GET /admin/sources` | Every source, with its drift flag and last pull outcome |
-| `GET /admin/sources/:id` | One source |
-| `DELETE /admin/sources/:id` | Stop tracking the URI |
-| `POST /admin/sources/:id/pull` | Fetch it now and apply what it produced |
-
-A pull answers `{ revision, version, digest, unchanged, skipped, changed: [ports] }`.
-The two negative flags mean different things: `unchanged` is "nothing to do, no
-log entry written", while `skipped` is "the log recorded a decision *not* to
-apply" (a drifted source under `onDrift: skip`) — in which case the fleet does
-not hold this content and `changed` is empty.
-
-Refusals carry the usual split: `400` for something the operator can fix (a
-malformed body, an unservable scheme, a drifted source under `onDrift: fail`),
-`404` for an unknown source, and `503` + `Rift-Cluster-Op-Id` when the write
-could not be committed — the same Chapter 4 write-path contract the admin
-front uses, so a client polls `GET /_cluster/ops/:id` rather than blind-
-retrying.
-
-**What a pull's 2xx does and does not promise.** It means the op was committed
-and *the node you asked* has applied it — the puller awaits its own local apply
-before answering, no more (#99). `--cluster-write-barrier` is a property of the
-**admin front**, and these endpoints are not on it, so a 2xx here is not the
-fleet-wide read-after-write a `POST /imposters` 201 is. The rest of the fleet
-follows within a replication round; compare `GET /_cluster/config` across nodes
-if a script needs to know it has. Container scenario
-`c20_source_pull_converges_and_fetches_once` is where that convergence is
-asserted, alongside the exactly-one-fetch equality.
-
-These endpoints are on the cluster port, so reach them with `cluster-curl` (see
-"The `/_cluster/*` operator surface" above), and see `deploy/README.md`'s
-"Imposter sources demo" for a three-node walkthrough that rolls the whole fleet
-with one pull.
-
-### Reading sources from the admin front (#239)
-
-The **public admin address** also serves the read half, RBAC-gated instead of
-cluster-credentialed, which is the surface the console uses:
-
-| Endpoint | Action | Floor |
-|---|---|---|
-| `GET /admin/sources` | `source.read` | Viewer |
-| `GET /admin/sources/:id` | `source.read` | Viewer |
-
-Both are tenant-scoped by `X-Rift-Tenant`, and a source in another tenant
-answers `404`, indistinguishable from one that never existed (RFC-002 §8.4).
-The response keeps two kinds of fact structurally apart: `sources` / `source`
-is the fleet-replicated record, byte-identical on every converged node — so
-diffing two nodes' answers remains a convergence check — while `nodeLocal
-{ nodeId, pollErrors }` is the answering node's own view. A poll failure is
-deliberately node-local (see "Tracking sources" below), so it rides the
-scope-named field rather than being flattened into the record, unlike the
-cluster-port `GET /admin/sources/:id`, where you addressed one node explicitly
-and the flat `lastPollError` is the question you asked. Declaring, deleting
-and pulling stay cluster-port-only for now — a write touches `authRef` and
-deserves its own authorization tier before it moves here.
-
-| Field | Values | Meaning |
-|---|---|---|
-| `mode` | `"pinned"` (default) \| `"tracking"` | `pinned`: explicit pulls only. `tracking`: the fleet re-fetches on `pollSecs` — see below |
-| `pollSecs` | ≥ 5 | How often a `tracking` source is re-fetched. Required for `tracking`, refused for `pinned` |
-| `onDrift` | `"overwrite"` (default) \| `"skip"` \| `"fail"` | What a pull does when the source's imposters have been hand-edited since it last applied |
-| `authRef` | a credential *name* | Stored and validated as a name. Resolving it into a request header ships with the providers that need it (#136) — upstream's `HttpSource` has no header-injection seam, so a credentialed fetch needs a new provider, not a hook here |
-
-**Secret hygiene.** A URI carrying credentials in its authority
-(`https://user:pass@host/x.json`) is refused before anything is written, so the
-secret never reaches the log — not even as a committed refusal, which would
-keep it on every replica's disk and in every snapshot. `authRef` is the only
-credential path.
-
-### No-change pulls cost nothing
-
-A pull whose content matches what the source last applied produces **no log
-entry at all** — it answers `unchanged: true` and the applied index does not
-move. Without that, a fleet re-pulling a stable document would grow its log
-forever and re-churn imposter state every round. The comparison is a SHA-256
-over a canonical (recursively key-sorted) encoding of the fetched configs, so
-a document that only reordered itself still counts as unchanged.
-
-Two things deliberately do **not** count as unchanged, because in both the
-fleet does not hold the content:
-
-- a **drifted** source — an operator who hand-edited an imposter and then pulls
-  to restore declared truth is the ordinary repair path, and answering
-  "unchanged" there would make drift unfixable except by editing the document
-  upstream;
-- content a previous pull **skipped** — a skip records the digest it *saw*, not
-  one that was applied.
-
-### Tracking sources: one poller, fleet-wide (#135)
-
-A `tracking` source is re-fetched on an interval without anyone asking. The
-whole difficulty is the word *fleet*: N nodes each running a timer would fetch N
-times per interval, undoing the fetch-once property above with the very thing
-meant to drive it. So the scheduler is **leader-only**.
-
-- The poller is grounded on the same Raft leadership signal the forward-to-leader
-  write path reads — deliberately not a second notion of leadership, because two
-  independent answers to "am I the leader" is exactly how a fleet grows a second
-  poller during an election.
-- On losing leadership a node stops every poll task; on gaining it, it starts
-  them. `SourcePut` and `SourceDelete` reconcile the running set without a
-  restart.
-- **Polls cover every tenant's tracking sources**, not just the default
-  tenant's (#241). The running set is keyed `(tenant, id)` — a source id is
-  unique only within its tenant — and a pull commits under the tenant that owns
-  the source. Deleting a tenant removes its source rows in the same committed
-  op, so the next reconcile stops their pollers with no tombstone check.
-- **A source record that will not decode costs only its own source** (#243).
-  It is *held*: neither started, stopped, nor re-intervalled, while every other
-  tenant's sources reconcile normally. Before #243 that one row parked
-  reconciliation for the entire fleet.
-
-  **A held source is not being fetched.** Holding keeps the failure attributable
-  and lets a repair recover without a restart; it does not keep the source
-  up to date. A poll of a held source re-reads the record through the strict
-  path and fails, so its content is frozen at whatever the last successful pull
-  applied, and it stays frozen until someone rewrites the record. Treat a
-  nonzero `rift_cluster_source_scheduler_corrupt_rows` as **mocks going stale**,
-  not as a degraded-but-working source.
-
-  To act on it: the gauge tells you how many rows, and the scheduler logs the
-  tenant, the source id and the decode error at `ERROR` on the leader when the
-  condition starts (and at `INFO` when it clears). The owning tenant's own
-  `GET /admin/sources` also fails hard, which is the tenant-facing half of the
-  same fact. Rewriting the record with `SourcePut` — or deleting it — releases
-  the hold through the ordinary reconcile paths, with no restart.
-
-  Separately, `rift_cluster_source_scheduler_read_failures_total` counts
-  reconciles that could not read the table *at all*. That is a transient storage
-  fault rather than a bad row, and it does still park the whole reconcile until
-  the next tick.
-- Intervals are jittered ±10%, so sources declared together do not arrive at the
-  upstream host as a burst every interval.
-- **`pollSecs` has a 5-second floor**, enforced at admission with a typed `400`.
-  A mistyped `1` would turn the fleet into a request flood against someone
-  else's host, and the operator would see only that their mocks update promptly.
-
-**A poll costs no log growth when nothing changed.** Polling runs the same pull
-flow as an explicit `POST .../pull`, so the digest short circuit applies: an
-unchanged document writes no log entry, forever. That is what makes tracking
-mode affordable at a 30-second cadence.
-
-**A failing poll is visible without being written down.** Errors are recorded
-*leader-locally* — surfaced as `lastPollError` on `GET /admin/sources/:id`, and
-counted by `rift_cluster_source_polls_total{outcome="error"}`. They are
-deliberately never committed: a log entry per failure would reintroduce the log
-growth the short circuit exists to prevent, at the worst possible moment (an
-upstream outage is exactly when you do not want fleet-wide write traffic). The
-durable `last…` fields still move only when a pull actually applies or is
-skipped, so a stale `lastVersion` next to a `lastPollError` reads correctly:
-the fleet is holding the last good content and the source is currently
-unreachable.
-
-Observability: `rift_cluster_source_polls_total{outcome}` (`applied` /
-`unchanged` / `skipped` / `error`) and `rift_cluster_source_poll_seconds`. Only
-the leader increments them, so summing across the fleet counts each poll once —
-which is also how you would catch a fleet that has somehow grown a second
-poller.
-
-### Provenance and drift
-
-A pull stamps each config it applies with its source id and version. That
-provenance is replicated state, which is what makes drift detection
-deterministic: when an operator edits a source-owned imposter by hand — a
-`PUT`/`POST` on its stubs, an enable/disable, a delete — every replica flips
-that source's `drifted` flag at the same log index, for the same reason.
-
-`GET /_cluster/config` reports the provenance alongside the ports, so the
-question an operator actually asks of a source-driven fleet — "has every node
-converged on the same configs, from the same source version?" — is answered by
-comparing two nodes' responses.
-
-The next pull then follows the source's declared `onDrift`:
-
-- `overwrite` (the default, and Solo's behaviour) applies the document and
-  clears the flag — but *declared*, and visible in `GET /admin/sources/:id`
-  beforehand, rather than a silent clobber;
-- `skip` leaves the operator's edit alone and records the attempt, so a source
-  being held back is visible rather than looking idle;
-- `fail` refuses the pull.
-
-Two deliberate non-destructive choices:
-
-- **A pull only touches what its own source owns.** Ports the document dropped
-  are removed; a config it declares unchanged is not rewritten at all (the
-  rewrite is what would reset that imposter's runtime state); an imposter no
-  source owns is never in the blast radius. If two sources declare the same
-  port — nothing forbids it, since they are fetched independently — the one
-  that loses the port is marked `drifted` rather than left believing it still
-  owns it.
-- **Deleting a source does not delete its imposters.** "Stop tracking this URI"
-  is not "tear down live traffic". The imposters keep serving and simply lose
-  their provenance, so nothing is left pointing at a source that no longer
-  exists.
-
-### `--imposters` under `--cluster`
-
-Upstream's `--imposters <uri,...>` loads imposters from source URIs at startup.
-With `--cluster` **off** it behaves exactly as it does in the open-source
-binary. With `--cluster` **on** it becomes sugar for declaring pinned sources:
-this binary takes the flag before handing the CLI to `ServerBuilder` and
-declares one source per URI, then pulls each once — so the imposters land
-through the replicated log and reach every node.
+`git+`, `s3:` and `registry:` URIs are **refused at startup** with the scheme
+named. They are not supported schemes; a fleet that needs mocks out of Git or a
+registry fetches them in CI and writes them with `PUT /imposters`.
 
 Left in place, upstream's own startup would create those imposters in *this
 node's* manager, outside the log, and the reconciler — which treats the
-replicated set as authoritative — would then delete them again. That is the
-same failure `--configfile` is refused for (see the startup guards);
-`--imposters` can be desugared instead of refused because a URI is fetchable
-from every node, while a local path is not.
+replicated set as authoritative — would then delete them again. That is the same
+failure `--configfile` is refused for (see the startup guards); `--imposters` can
+be desugared instead of refused because a URI is fetchable from every node, while
+a local path is not.
 
-Source ids are derived from the URI (a readable slug plus a short hash), so
-they are stable: a restart, or a second node booting with the same flags,
-upserts the same source rather than accumulating one per boot — and the digest
-short circuit then makes the repeat pull a no-op.
+**Restarts are idempotent by construction.** Each submitted op carries a
+deterministic `op_id` derived from `(uri, port, digest of the fetched document)`,
+so a restart — or a second node booting with the same flags — re-submits the same
+op ids, which the state machine's dedup map absorbs. Unchanged documents cost the
+log nothing; a changed document produces a different digest, hence a different
+`op_id`, hence a real write.
 
-A source that cannot be declared or pulled **fails the start**. An operator who
-passed `--imposters` asked for those imposters to be serving; a node that comes
-up healthy without them is the silently half-configured fleet this path exists
-to avoid.
+A URI that cannot be fetched or parsed, or an imposter that cannot be submitted,
+**fails the start**. An operator who passed `--imposters` asked for those
+imposters to be serving; a node that comes up healthy without them is the silently
+half-configured fleet this path exists to avoid.
 
-### What a pull does not apply
+A bootstrap document may declare blocks that belong to other subsystems. An
+`intercept` block **fails the start** — the cluster refuses the TLS-MITM intercept
+listener fleet-wide, because its state is per-node and is not replicated. A
+`routes` block is **ignored, with a warning**: the front door's table is its own
+replicated object with its own op (`PUT /front-door/routes`, above).
 
-A source document may declare blocks that belong to other subsystems:
+## Compiling OpenAPI: `POST /specs/compile` (D-72, #549)
 
-- an `intercept` block **refuses the pull** — the cluster refuses the TLS-MITM
-  intercept listener fleet-wide, because its state is per-node and is not
-  replicated;
-- a `routes` block is **ignored, with a warning in the pull response** — the
-  front door's table is its own replicated object with its own op (`PUT
-  /front-door/routes`, above).
-
-### The pull log line
-
-Every applied pull writes a structured `rift_cluster::sources`-target log event
-naming the principal, the source id, the version and the applying revision — so
-"who moved the payment mocks to which commit, and when" is a log query.
-
-Container-tier chaos coverage for sources is #137.
-
-## Source providers (#136)
-
-Which schemes a node can fetch is **per-node** configuration — deliberately not
-part of the replicated op validation, so two nodes can never disagree about a
-committed source. `POST /admin/sources` refuses a scheme *this* node cannot
-serve, listing the ones it can.
-
-| Scheme | URI shape | `version` is | Credential (`authRef`) |
-|---|---|---|---|
-| `file:` | `file:/srv/mocks.json` | *(none — always re-applied)* | n/a |
-| `http:` / `https:` | `https://host/imposters.json` | the `ETag` | n/a — use `registry:` for a token-authenticated endpoint |
-| `git+https:` | `git+https://host/org/repo#<ref>:<path>` | the **commit sha** | a token, sent as an `Authorization: Basic` git `http.extraHeader` |
-| `git+file:` | `git+file:///srv/repo.git#<ref>:<path>` | the **commit sha** | as above (rarely needed for a local mirror) |
-| `s3:` | `s3://bucket/key` | the `ETag`, unquoted | `<access-key-id>:<secret-access-key>`, signed with SigV4 |
-| `registry:` | `registry://<service-id>[,…]` | a SHA-256 of the responses | a token, sent as `Authorization: Bearer` |
-
-Notes that matter in practice:
-
-- **`git+…` needs a `git` binary, and it is a detected capability.** These
-  providers shell out rather than linking libgit2 or `gitoxide`, and the binary
-  is probed once at **startup**. What happens next depends on *how* the probe
-  fails:
-  - **No `git` at all** — the node boots and serves normally, logs
-    `git not found; git+ imposter sources disabled in this image` at WARN, and
-    registers `git+https:`/`git+file:` as **unavailable**. Declaring one then
-    fails at declaration time with ``​`git+https:` sources are unavailable: no
-    git in this image — use the default (non-static) image``, and the schemes
-    stay listed as unavailable rather than silently vanishing. This is what
-    lets the `-static` image flavor exist at all (see `deploy/README.md`).
-  - **A `git` that is present but does not work** — the node still **refuses to
-    boot**, as before. That is a broken host rather than an image built without
-    git, and it is owed a loud failure.
-
-  The default `deploy/Dockerfile` runtime installs `git`, so the default flavor
-  behaves exactly as it always has. A fleet that uses `git+` sources should run
-  the default flavor on **every** node: followers apply git-sourced bytes from
-  the log without fetching, but boot-time declarations, refresh-now on the
-  receiving node, and leader-only tracking polls all fetch locally.
-- **`<path>` may be a file or a directory.** A directory parses every file under
-  it and merges them; a port declared by two documents is an error naming both,
-  never a silent last-one-wins.
-- **`s3:` is path-style** (`{endpoint}/{bucket}/{key}`), which is what makes a
-  MinIO or in-VPC endpoint reachable. Ambient credentials (IRSA, an EC2/ECS task
-  role) are **not** implemented: `authRef` static keys are the credentialed
-  path, and a source with no `authRef` fetches anonymously.
-- **`registry:` is only registered when its endpoint is configured** — a scheme
-  with nothing to reach is a pull failure waiting to happen.
-- **Interop caveat:** the SigV4 signer is covered by structural and regression
-  tests against a local stub, not by a test against a real S3 or MinIO — the
-  chaos tier has no S3-compatible container plumbing. Treat first use against a
-  new S3-compatible endpoint as worth verifying by hand.
-
-### What a source URI is not allowed to be
-
-A source URI is operator-supplied data that reaches every node through the
-replicated log, so the `git+` schemes are constrained tightly — at **admission**,
-so a URI no node should ever fetch never reaches the log at all, and again in the
-provider:
-
-- A `git+` URI must be written with `//` after the scheme — `git+file://…`, not
-  `git+file:…`. The single-colon spelling is **refused at admission**, so that
-  each scheme has exactly one admissible spelling.
-
-  This refusal originally existed because the two parsers *disagreed* about that
-  spelling: the control plane called `git+file:/srv/x` a git remote while the
-  fetch path's scheme parser split on `://` and routed it to the `file:`
-  provider, which opened the whole string as a path — a source the control plane
-  had just called a well-formed git remote failing with a not-found naming a path
-  nobody wrote. Since [rift#926](https://github.com/achird-labs/rift/pull/926)
-  the fetch path reads a bare `scheme:` through an RFC 3986 scheme grammar, so it
-  now agrees: both spellings resolve to `git+file`. The admission refusal is kept
-  regardless — one spelling per scheme is worth having on its own, and it now
-  guards against the parsers drifting apart again rather than papering over a
-  live disagreement.
-- A remote or ref beginning with `-` is **refused**. `git`'s option parser
-  permutes, so a remote like `--upload-pack=/tmp/x.sh` would otherwise be parsed
-  as an *option* and run `/tmp/x.sh` as the rift process on every node that pulls
-  it. This is the reason the two checks exist at all. For **refs** this is an
-  admission check; for **remotes** it now bites in the provider, since the `//`
-  spelling above leaves every admissible `git+file:` remote starting with `/`.
-- A remote containing `::` is **refused** — that is the `<helper>::<target>`
-  transport syntax, whose purpose is running a command as the transport.
-  `protocol.ext.allow=never` is also set on every invocation, so it is two
-  independent gates rather than one. This one still bites at admission.
-- A `git+file:` remote must be an **absolute path**; a `git+https:` remote must
-  parse as an `https` URL with a host. The `git+file:` half is enforced in the
-  provider rather than at admission, for the same reason as the `-` rule.
-- A ref must look like a ref: `[A-Za-z0-9._/+-]`, no `..`, no leading `/`.
-
-Three more properties of the git subprocess worth knowing operationally:
-
-- **Every invocation has a 30s budget** and is killed — as a process *group*, so
-  the `git-remote-https` helper goes with it — when the budget passes. Without
-  the group kill the helper survives holding the pipes open, and a stalled
-  remote would leak one blocking-pool thread per poll until nothing on the node
-  could do blocking work at all.
-- **Redirects are refused** (`http.followRedirects=false`). `git` does not strip
-  `http.extraHeader` when it follows one, so a remote that 302s elsewhere would
-  otherwise hand that host your token.
-- **Host git config is ignored** (`GIT_CONFIG_GLOBAL`/`GIT_CONFIG_SYSTEM` are
-  `/dev/null`), so an `insteadOf` rewrite, a `credential.helper` or an
-  `http.proxy` outside this process cannot redirect or re-credential a fetch the
-  replicated URI is supposed to define completely.
-
-### Credentials
-
-A source **names** a credential and never carries one: a URI with credentials in
-its authority is refused at admission, before it can reach a log that every
-replica keeps and every snapshot copies. Resolution happens on the fetching
-node, at fetch time, in this order — first hit wins:
-
-1. environment variable `RIFT_SOURCE_AUTH_<REF>`, where `<REF>` is `authRef`
-   upper-cased with every non-alphanumeric character replaced by `_` (so
-   `gh-mocks` reads `RIFT_SOURCE_AUTH_GH_MOCKS`);
-2. a file named exactly `<authRef>` under `RIFT_SOURCE_SECRETS_DIR` — the shape
-   a Kubernetes secret mounts as (a trailing newline is stripped);
-3. a cloud secret manager, when one is configured. None is wired in this build.
-
-**Resolution fails closed.** An `authRef` that cannot be resolved is a *pull
-error* surfaced in `last.outcome` — never a retry without the credential, never
-a silent skip. A source configured for a private repo does not quietly start
-serving whatever a public one holds because a secret mount went missing.
-
-**An `authRef` a provider would ignore is refused, not accepted.** Only
-`git+https:`, `git+file:`, `s3:` and `registry:` consume a credential; `file:`
-and `http(s):` do not. Setting `authRef` on one of those is a `400` at
-`POST /admin/sources`, naming the schemes that do take one. Accepting it would
-mean fetching anonymously forever while the operator believed the request was
-authenticated — and against an endpoint that serves public content to anonymous
-callers, that is not an error the operator ever sees, it is the fleet quietly
-serving the wrong corpus. (This is a node-local check, like the unknown-scheme
-refusal: which schemes take a credential is per-node configuration, so it
-cannot live in the replicated op validation.)
-
-Secret material never reaches a log line or an error string: the
-credential type has no `Display` and renders as `<redacted>` under `Debug`, the
-git token travels in the subprocess environment rather than in the remote URL
-(`git` echoes URLs on failure), the S3 secret key never leaves the signing
-function, and no provider folds a response body into an error — an echoing
-server must not be able to reflect an `Authorization` header back into a
-message an operator reads.
-
-### Provider configuration
-
-Environment variables, not flags — this is deliberately the minimum plumbing,
-not a config subsystem:
-
-| Variable | Effect |
-|---|---|
-| `RIFT_SOURCE_SECRETS_DIR` | Directory of `<authRef>`-named secret files |
-| `RIFT_S3_ENDPOINT` | Override the S3 endpoint (MinIO, in-VPC gateway) |
-| `RIFT_S3_REGION` | SigV4 region; defaults to `us-east-1` |
-| `RIFT_SOURCE_REGISTRY_ENDPOINT` | Registry base URL; **registers the `registry:` scheme** |
-| `RIFT_SOURCE_REGISTRY_POINTER` | RFC 6901 pointer to the imposters array in a registry response; defaults to `/imposters` |
-
-A `registry:` fetch issues one `GET {endpoint}/{service-id}` per id in the URI,
-in order, and pulls the imposters array out of each response through the
-pointer. A pointer that matches nothing is an **error**, not an empty list —
-an empty list would silently delete every imposter the source owns.
-
-## Spec-driven mocking: the `/specs` surface (#278)
-
-RFC-004 makes an OpenAPI 3.0 document a first-class **control-plane object**.
-[`rift-cluster-spec`](../crates/rift-cluster-spec) (#277) is the pure compiler —
-`(spec bytes, options) → imposter JSON` — and this surface is its home: where a
-spec is stored, replicated, deployed, and later validated against. Everything
-here is EE-only and terminates in the clustered front; the upstream admin has no
-notion of a spec.
-
-The rule that makes it cluster-correct mirrors sources: **the compiler never
-runs in the apply path.** `PUT /specs/{id}` compiles on the node that accepted
-the request, *before* anything is committed, and refuses a document that does
-not compile with the compiler's own reason. Only bytes every node can compile
-identically ever enter the log; a `deploy` compiles again on the accepting node
-and commits the *result* as an ordinary `PutImposter`. Apply stores and stamps;
-it never parses OpenAPI.
-
-### The endpoints
-
-All under the tenant in view (`X-Rift-Tenant`), all answering the typed error
-envelope, and every write carrying `Rift-Cluster-Revision` / `Rift-Cluster-Op-Id`
-because it *is* an ordinary terminated write — park/replay, `Idempotency-Key`
-dedup and the write barrier are inherited, not rebuilt.
+[`rift-cluster-spec`](../crates/rift-cluster-spec) (#277) is a pure compiler —
+`(document bytes, options) → imposter JSON`. This endpoint is the only thing the
+server exposes on top of it, and it is **stateless**: it compiles what you send
+and answers the result. It stores nothing.
 
 | Route | Action | What it does |
 |---|---|---|
-| `PUT /specs/{id}` | `spec.write` (Editor+) | Import or re-import. Body is the document (JSON or YAML, UTF-8, ≤ 4 MiB). `201` on first import, `200` on re-import; an unchanged re-import answers `200` with `unchanged: true` and **writes no log entry**. |
-| `GET /specs` | `spec.read` (Viewer+) | `{specs: [{id, format, digest, source, ports, drifted, revision}]}` — never the documents. |
-| `GET /specs/{id}` | `spec.read` | The record plus `document`, verbatim as imported. |
-| `DELETE /specs/{id}[?force]` | `spec.delete` (Editor+) | `409` while any port is deployed from it; `?force` (or `?force=true`) unbinds those ports first (they keep serving) and then removes the record; `?force=false` is a declined force. |
-| `POST /specs/{id}/compile` | `spec.read` | Dry run: `{imposter, operations, diff}` for `{port?}` — commits nothing. |
-| `POST /specs/{id}/deploy` | `spec.write` **+ `imposter.write`** | `{port}` → compile → `PutImposter` + `SpecBind` under one barrier. `201` created / `200` replaced; the body is the stored imposter; `If-Match` conditions on the imposter's revision. |
+| `POST /specs/compile?port=<n>[&name=<s>]` | `imposter.write` (Editor+) | Body is an OpenAPI 3.0 document (JSON or YAML, UTF-8, **≤ 4 MiB**). Answers `{imposter, operations}` — the compiled imposter JSON and the compiled operation index. Commits nothing, writes no log entry, and leaves no record. |
 
-The RBAC actions `spec.read` / `spec.write` / `spec.delete` are RFC-004 §4.3's,
-landed here rather than in S6 because a terminated route cannot ship without its
-action — `action_for` is matched wildcard-free. `deploy` additionally checks
-`imposter.write` on the caller's bindings: holding `spec.write` alone must not
-be a back door into imposter mutation. Cross-tenant probes (`GET /specs/{id}`
-for another tenant's id) answer the same `404` as an id that never existed.
+- `port` is **required** — the compiled imposter needs one, and the endpoint will
+  not guess.
+- `name` is optional and becomes the imposter's name.
+- A document that does not compile is refused with the compiler's own reason in
+  the typed error envelope. There is no partial result.
+- It is authorized as **`ImposterWrite`** rather than a read action or an action
+  of its own: compiling is a step in writing an imposter, and the caller who may
+  not write one has no use for the output.
 
-### Content-addressed, capped, replicated
+The intended flow is two calls, and the second is an ordinary write:
 
-Specs live in two replicated tables: `sm_specs` `(tenant, id) → {format,
-digest, source, revision}` and `sm_spec_blobs` `digest → bytes`. The blob is
-**content-addressed and shared** — two specs with identical bytes, in one tenant
-or across tenants, hold one blob, and it goes when the last record referencing
-it does. `control::validate` refuses a document over **4 MiB** before commit
-(the store has no per-record size guard of its own; the front's 16 MiB body
-cap is the only other bound), and refuses a `SpecPut` whose digest is not the
-sha256 of its document, so a bad client can never corrupt the blob table.
-Snapshots carry both tables; a node that joins by snapshot holds the same bytes.
-The 4 MiB cap is a validation bound, not a replication guarantee: see the
-known limitation under *Datasets on the control plane* (#411) — today an entry
-above roughly 512 KiB does not commit.
+```sh
+curl -sX POST "$ADMIN/specs/compile?port=9090&name=petstore" \
+  -H "Authorization: Bearer $KEY" -H 'Content-Type: application/yaml' \
+  --data-binary @petstore.yaml | jq .imposter > imposter.json
 
-### Provenance, drift, and edit-time warnings
-
-Deploying stamps the imposter's control-plane record with `{specId, digest}`
-— the same idea sources use, invisible to the core config schema — and sets
-`drifted: false`. Any later config-mutating write to that port (`PUT`/`POST
-/imposters/{port}`, a stub add/replace/delete, a source pull that overwrites
-it) flips `drifted: true`; `GET /specs` reports the flag per spec and the bound
-ports per record. A redeploy resets the baseline. Toggling `enable`/`disable`
-is not drift.
-
-A config-mutating write to a **spec-bound** imposter also gets its static `is`
-bodies checked against the operation's declared response schema (`spec:<op>:
-<status>` stub ids are how the compiler ties a stub to an operation). Violations
-come back in a `Rift-Spec-Warnings` header — `spec:showPetById:200 /id: expected
-integer, got string`, `; `-separated, capped at ten entries and 2 KiB — and the
-write is **never refused**: a deliberately divergent stub is a legitimate
-fixture. Templated bodies, `_behaviors`, and non-`is` responses are skipped;
-runtime validation is S4/S6's job. The check runs after the commit, off the
-request thread; if it cannot run for a bound port (a storage read failed, the
-bound document no longer compiles) the header carries `port <n>: spec validation
-unavailable (<why>)` rather than staying silent, so "no header" always means
-"checked and clean".
-
-### What is not here yet
-
-Drift classification and the re-import report with `overwrite | skip | fail`
-(S3, #279 — `deploy` refuses a `policy` field rather than ignoring it), any
-traffic-validation mode (S4/S6), and `openapi+https:` / `openapi+git:` source
-kinds (S8).
-
-## Datasets on the control plane (#285)
-
-RFC-005 D1. A **dataset** is a tenant-owned, named, versioned CSV table the
-engine's `lookup` behavior can read rows from. Under `--cluster` a dataset is a
-replicated control-plane object like an imposter or a spec: uploaded once,
-identical bytes on every node, governed by the tenant's quotas.
-
-The load-bearing decision (RFC-005 §3.2): **the bytes ride the log.**
-`ControlOp::DatasetPut { tenant, record, csv }` commits metadata and content
-together; apply on every node writes `<state-dir>/datasets/<digest>.csv`
-(temp file, `0600`, rename) *before* it inserts the record. Log order alone
-therefore guarantees every node holds the bytes on disk before any config that
-references them applies — the sources' one-fetch-then-replicate rule with the
-upload as the one fetch. No blob sidecar, no fetch protocol, no readiness
-handshake; a node never fetches a dataset from a peer.
-
-This slice ships the ops, validation, tables and spool lifecycle, driven through
-the control layer; the admin routes and RBAC actions arrive with D3, the
-`_rift.dataset` stub binding with D2.
-
-### Validation, deterministic and pre-commit
-
-`control::validate` refuses — never accepts-but-breaks — an upload whose record
-does not describe its document (`digest` = sha256 of the exact bytes, `bytes`,
-`columns`, `rows`), a name that is not a slug, a missing or duplicated header
-column, a delimiter that cannot split, a declared key column that is not in the
-header, and — the one that matters most — a **duplicate key**: every declared
-`keyColumns` entry, and column 0 whether declared or not, must be unique across
-rows. The engine keys its row map on column 0 and silently keeps the last
-duplicate, and picks among duplicate key matches in hash order; validation makes
-both unreachable rather than documenting them. The tokenizer is the engine's own
-(`lines()`, split on the delimiter, trim), so "unique" means what the engine will
-actually see. The refusal names the column, both rows and the value:
-`key column "email" is not unique: rows 1 and 3 share value "a@x"`.
-
-### Tables, blobs, versions
-
-`sm_datasets` `(tenant, name, version) → {record, createdAtSecs, revision,
-deleted}` and `sm_dataset_blobs` `digest → csv`. Every upload of a name is a new
-**version** (monotonic per name; a delete tombstones every live version and a
-later upload continues the numbering). Blobs are content-addressed and shared:
-identical bytes under two names or two tenants hold one blob and one spool file,
-and no API reports the dedup. The blob and its file go when the last *live*
-record referencing the digest goes — the file is removed only after the
-transaction that dropped the reference commits. Snapshots carry both tables and
-a node that installs one materialises the files; a node that has lost its
-`datasets/` directory gets every file back from its own state machine at
-startup (`reconcile_engine`), which never deletes anything it finds there.
-
-`DatasetDelete` refuses while any of the tenant's stubs carries a
-`_rift.dataset` block naming the dataset — the binding itself is D2's, the
-refusal is wired now so a dataset can never be pulled out from under a stub.
-
-> **Known limitation (#411).** The quota's 8 MiB default is the RFC's, but the
-> fleet cannot yet commit an entry that large: openraft bounds every
-> AppendEntries round trip by the 50 ms heartbeat, so a single entry that does
-> not replicate and fsync within that window is retried indefinitely and never
-> commits — measured at ≥1 MiB on loopback (~512 KiB takes minutes). Until #411
-> lands, keep datasets (and imported specs) in the low hundreds of KiB. A refused
-> upload of that shape shows up as a `503` with a parked op id, not as a quota
-> refusal.
-
-### Binding a stub to a dataset (#286)
-
-RFC-005 D2. A stub response binds a dataset with a `_rift.dataset` block — a `lookup` named by
-*dataset* rather than by file path:
-
-```jsonc
-"_rift": { "dataset": {
-  "name": "customers",
-  "version": 3,                 // optional; default = latest at bind time, then PINNED
-  "key": { "from": { "query": "id" }, "using": { "method": "regex", "selector": ".*" } },
-  "keyColumn": "customer_id",
-  "into": "${row}"
-} }
+curl -sX PUT "$ADMIN/imposters" -H "Authorization: Bearer $KEY" \
+  -H 'Content-Type: application/json' --data-binary @imposter.json
 ```
 
-The engine's `lookup` behavior needs a **filesystem path**, and a path is node-local, so it can
-never travel in a config that replicates. The work is therefore split, and the split is the whole
-determinism argument:
+Because the second call is a plain `PUT /imposters`, everything the write path
+already provides applies unchanged: `Rift-Cluster-Revision` / `Rift-Cluster-Op-Id`,
+the write barrier, `Idempotency-Key` dedup, park-and-replay, quotas and RBAC. The
+compiler never runs in the apply path, and apply never parses OpenAPI.
 
-**Admission, on the leader.** The version resolves to a concrete `(version, digest)` and both are
-written back into the block, so what commits names an exact set of bytes rather than a moving
-target. A later upload does **not** move a serving stub — rebinding is an explicit config write.
-Refused here, naming what is wrong: an absent or deleted dataset, and a `keyColumn` the dataset
-does not *declare*. That second refusal matters more than it looks — #285 proves every declared key
-column is unique across rows, so a binding restricted to them matches at most one row; an
-undeclared column carries no such proof and the engine picks among duplicates in hash order.
-
-**Apply, on every node.** The pinned block is rewritten into the engine's own
-`behaviors.lookup` pointing at that node's `<state-dir>/datasets/<digest>.csv`. It keys **only** on
-the committed digest and never re-resolves "latest", which is what makes two nodes applying the
-same entry reach the same rows. The hot path is unmodified upstream code, so the request-time cost
-is zero.
-
-**What `GET` returns.** The block you wrote, carrying the resolved pin — never the compiled
-`lookup`. The compiled form names a node-local path, so rendering it would make the same imposter
-read differently depending on which node answered, and editing that rendered document and `PUT`ing
-it back would store one node's filesystem path as a hand-written lookup. A `lookup` you wrote
-yourself, with an explicit path, is left exactly as written.
-
-**Template tokens in dataset values are inert.** A CSV cell containing `{{ uuid }}` is served
-literally: templating is opt-in per response (`_rift.templated`) and a bound response does not set
-it. This is deliberate — if dataset values were rendered, any uploaded CSV would become a
-template-injection surface.
-
-**Not available through a source pull.** A `_rift.dataset` block is resolved and pinned when it is
-written to the admin API, and a source pull is not an admission — a pulled document carrying one is
-refused, naming the port and dataset.
-
-
-### The dataset admin surface (#287)
-
-RFC-005 D3. Five routes, all EE-terminated — there is no upstream endpoint to proxy to:
-
-```text
-POST   /admin/tenants/:id/datasets                    upload a new version
-GET    /admin/tenants/:id/datasets                    list, with a bindings count per dataset
-GET    /admin/tenants/:id/datasets/:name              version history + bindings
-GET    /admin/tenants/:id/datasets/:name/:ver/content the bytes
-DELETE /admin/tenants/:id/datasets/:name              409 while bound
-```
-
-An upload sends the CSV as the body (`text/csv`); its name, key columns and delimiter travel as
-`X-Rift-Dataset-*` headers or query parameters, headers winning. Every field of the stored record
-is derived from the bytes — digest, row count, columns — never taken from the caller, because the
-state machine re-proves the record against the document on every replica anyway.
-
-The response deliberately omits the assigned version. It is allocated at apply, and reporting one
-would mean guessing `latest + 1`, which two concurrent uploads of the same name would both get
-wrong. A number that is right except under concurrency is worse than an absent one, because it is
-exactly the pin a caller would then bind against. The history route has it.
-
-**Roles.** `dataset.read` is a Viewer's; `dataset.write` and `dataset.delete` are an Editor's — a
-new table of rows redefines what every bound stub answers, which is the same line `spec.write` sits
-on. A dataset in another tenant answers **404**, never 403, and the body is byte-identical to a
-dataset that does not exist: a distinguishable refusal would confirm the dataset is there.
-
-A dataset whose record is live but whose bytes are missing on the answering node is a `500`, not a
-`404`: the row proves the dataset exists, so absence of the blob is this node's integrity failure,
-not the operator's mistake.
+**What deliberately does not exist.** There is no stored spec, no `/specs/{id}`,
+no re-import, no drift classification, no diff-vs-deployed report, and no traffic
+validation mode. An imposter compiled from a document and then hand-edited is
+simply an edited imposter; the cluster holds no baseline to call that drift
+against. Re-import is: compile again, `PUT` again.
 
 ## Clustered flow state (#120)
 
@@ -1827,14 +1257,13 @@ the gate keep serving unchanged; the next config write that *carries the knob*
 is what needs the role — a stub edit on a fleet-scoped imposter carries no
 `flowState` and is not gated, whoever makes it. Under the open admin plane (no
 principal configured) nothing gates, exactly as no other authorization does
-there. A **source** is not a way around the gate: a pull carries no principal
-to hold the role (the scheduler has none, and `POST /admin/sources/{id}/pull` is
-an ordinary `ImposterWrite`), so once the admin plane is enforced — an
+there. The `--imposters` bootstrap is not a way around the gate either: it runs
+before any principal is in view, so once the admin plane is enforced — an
 `--api-key` is configured or any principal exists, the same predicate the
-front's bypass reads — a pull whose document sets `contextScope: "fleet"` is
-refused before the write with a `400`
-naming the port and the way in (`PUT /imposters` as a `FleetAdmin`, or `tenant`
-scope in the document); configs a source admitted before that keep serving.
+front's bypass reads — a bootstrap document that sets `contextScope: "fleet"`
+fails the start with the same `400`, naming the port and the way in
+(`PUT /imposters` as a `FleetAdmin`, or `tenant` scope in the document).
+Configs admitted before the gate keep serving.
 
 **One residual difference from single-node.** The namespace is keyed by the
 imposter's *port*, not by the store instance, so deleting an imposter and
@@ -2010,10 +1439,9 @@ labelled with a tenant it never asked for; for a principal not bound to
 opens on the remembered tenant, else `default` when the principal is bound
 there, else the first it holds.
 
-Screens whose backend or slice has not shipped — request log (#189), scenarios
-(#149), sources (#20), specs (#148), administration (#190) — appear as greyed
-nav entries carrying their issue number. A visible roadmap, not a 404 and not an
-omission.
+Screens whose backend or slice has not shipped — request log (#189),
+administration (#190) — appear as greyed nav entries carrying their issue
+number. A visible roadmap, not a 404 and not an omission.
 
 Reads poll every 5 seconds while the tab is visible and **stop while it is
 hidden** (RFC-006 §6). SSE is deferred to v2 and will carry cache invalidation

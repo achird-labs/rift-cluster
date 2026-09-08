@@ -43,15 +43,15 @@ code = ["crates/rift-cluster-server/src/authz.rs", "crates/rift-cluster-server/s
 status = "amended"
 verified_sha = ""
 verified_on = ""
-code = ["crates/rift-cluster-spec/**", "crates/rift-cluster/src/blobs/**"]
-note = "§4.1 'on consensus' reversed for blob bytes by D-23; prose revision tracked by #441."
+code = ["crates/rift-cluster-spec/**"]
+note = "§3.1-§3.3 (the compiler) are live. §3.4-§3.6, §4 and §5 are retired by D-71 (#549) and carry callouts; §3.4 is amended by D-72."
 
 ["docs/rfc/RFC-005-data-sources-and-state-ergonomics.md"]
-status = "amended"
+status = "superseded"
 verified_sha = ""
 verified_on = ""
-code = ["crates/rift-cluster/src/blobs/**", "crates/rift-cluster/src/stores/flow_config.rs"]
-note = "§3.2 'the bytes ride the log' reversed by D-18/D-23; prose revision tracked by #441."
+code = []
+note = "Superseded in full by D-71 (RFC-007 §3.2, #549): data sources, datasets and the blob store no longer exist. Retained as history; describes no code."
 
 ["docs/rfc/RFC-006-web-console-and-mcp.md"]
 status = "current"
@@ -82,7 +82,7 @@ code = ["crates/rift-cluster-server/src/compose.rs"]
 status = "current"
 verified_sha = "1a7b52b78"
 verified_on = "2026-08-26"
-code = ["crates/rift-cluster/src/raft/**", "crates/rift-cluster/src/blobs/**"]
+code = ["crates/rift-cluster/src/raft/**"]
 
 ["docs/architecture/04-write-path.md"]
 status = "current"
@@ -142,7 +142,8 @@ code = ["tests/cluster-chaos/**", "crates/rift-cluster/tests/**"]
 status = "current"
 verified_sha = "9e0433dd0"
 verified_on = "2026-08-25"
-code = ["crates/rift-cluster/src/sources/**"]
+code = []
+note = "The front-door chapter. Its sources half was retired by D-71 (#549); the file keeps its name until #554 renames it."
 
 ["docs/architecture/14-cloud-deployment.md"]
 status = "current"

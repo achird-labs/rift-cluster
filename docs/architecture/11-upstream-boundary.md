@@ -39,9 +39,9 @@ table is where a `U-n` is defined (`scripts/design-check.py` resolves citations 
 | U-9 | rift#854 (+ `authz::classify`, rift#889) | `AdminAuthorizer` / `AuthzRequest` / `AuthzDecision` | RFC-002 enforcement point (Chapter 8) | merged |
 | U-10 | rift#855 | `EventContext` on `ImposterEventListener` (principal-on-events) | event attribution (RFC-002, Chapter 8) | merged |
 | U-11 | — | `front_door::{RouteTable, bind_front_door, RouteObserver}` (route table + listener) | single-port content routing (#19, Chapter 13); the admin CRUD is a replicated control-plane object here (#131) | merged |
-| U-12 | — | `ImposterSource` provider trait, `SourceRegistry`, `parse_remote_document`; `FileSource`/`HttpSource` built-ins | imposter sources (#20, Chapter 13) | merged |
+| U-12 | — | `ImposterSource` provider trait, `SourceRegistry`, `parse_remote_document`; `FileSource`/`HttpSource` built-ins | the one-shot `--imposters <uri>` bootstrap resolves each URI through this registry at startup and submits the parsed documents as ordinary `PutImposter` ops (D-71, #549); the cluster registers no provider of its own | merged |
 | U-13 | rift#966/#967 | `ExchangeInspector` / `ExchangeInspectorProvider` (`extensions::exchange_inspector`) | request-side hook after journaling and before matching; response-side hook in the shared funnel — spec traffic validation (RFC-004 §6); re-exported by #281 | merged |
-| U-14 | — | `extensions::template_fn` — template-function registration | template read parity for datasets (RFC-005 §3.8, §6.2) | **queued** (#291) |
+| U-14 | — | `extensions::template_fn` — template-function registration | never consumed; RFC-005 was retired in full (D-71, #549) and #291 closed as out of scope | **withdrawn** |
 | U-15 | — | `extensions::state_ops` — declarative state operations | `_rift.stateOps` (RFC-005 §3.7, §6.1); landed by #418 | merged |
 | U-16 | rift#910/#911 | `ProxyRecordingStore` claim semantics revised for fleet-wide exactly-once (`StubPublication`, `publishes_stubs()`) | clustered `proxyOnce` (#226, Chapter 7) | merged |
 | U-17 | rift#990 | `ProxyStoreError::Refused(BackendUnavailable)` (+ `#[non_exhaustive]`) and the proxy-leg 503 door — a store that *arbitrates* exactly-once can refuse a claim instead of being degraded around | clustered `proxyOnce` fails closed at the client (#529, D-66) | merged |
@@ -101,12 +101,13 @@ function. Instead it emits the same JSON a client would `PUT`, and `rift-cluster
 admits it through the gate every other write already passes. Type safety stays where it is
 load-bearing — at admission — and the compiler stays a pure function of `(spec bytes,
 options)` that golden files can pin. The arrow is a real dependency as of issue #278:
-`rift-cluster-server` calls the compiler on the accepting node — at `PUT /specs/{id}`,
-`deploy`, and for edit-time warnings — and parses its output through the same
-`ImposterConfig` gate. **`rift-cluster` does not depend on it, and must not**: the state
-machine stores spec bytes and stamps provenance, but never parses OpenAPI, so apply stays
-free of fallible spec code (RFC-004 §8). The one number both crates need — the 4 MiB
-pre-commit cap — is declared in each and held equal by a tripwire test in the server crate.
+`rift-cluster-server` calls the compiler on the node that accepted `POST /specs/compile`,
+and answers the compiled imposter JSON to the caller — who then writes it with an ordinary
+`PUT /imposters`, through the same `ImposterConfig` gate. Since D-72 (#549) that endpoint is
+**stateless**: it retains no document. **`rift-cluster` does not depend on the compiler, and
+must not**: the state machine never parses OpenAPI, so apply stays free of fallible spec
+code (RFC-004 §8). The one number both crates need — the 4 MiB request cap — is declared in
+each and held equal by a tripwire test in the server crate.
 
 **One seam cannot be guarded that way, and gets its own tripwire.**
 `ServerBuilder::manager()` is all-or-nothing: injecting a manager replaces

@@ -13,21 +13,18 @@
 //! an opaque string body); they are wiped, not migrated — the format changed
 //! before any release shipped.
 
-pub(crate) mod blob_source;
 pub mod identity;
 pub(crate) mod network;
 pub mod node;
 pub mod ring;
 pub(crate) mod store;
 
-pub use blob_source::BlobFetchStall;
 pub use identity::NodeIdentity;
 pub use network::ADMIT_CURRENCY_WAIT;
 pub use node::{
     JoinOutcome, JoinedAs, LeaveOutcome, NodeConfig, NodeError, RaftNode, StatusReport,
 };
 pub use ring::{KeyClass, OwnStatus, OwnedKey, Ring};
-pub use store::{PullOutcome, SourceRecord, SourceRow};
 
 use openraft::BasicNode;
 

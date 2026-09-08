@@ -75,7 +75,6 @@ async fn spawn_member(
         routes: proxy_routes(Arc::clone(&net)),
         engine: None,
         snapshot_log_entries,
-        advertise_as_digest_only_incapable: false,
     })
     .await
     .unwrap_or_else(|e| panic!("start node {id}: {e}"));

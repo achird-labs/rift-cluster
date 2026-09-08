@@ -53,19 +53,13 @@ AWS-specific decisions and why:
   is within the design's LAN envelope — it widens write-barrier and owner-RPC
   latencies slightly and that is all. Cross-region violates every timeout
   assumption (Chapter 1's non-goal); run one cluster per region instead, each
-  pulling the same sources (#20) — same mocks everywhere without stretching
-  consensus.
-- **Secrets**: Secrets Manager → External Secrets Operator → mounted file, but
-  by two different routes. The **cluster HMAC secret** is a single file named by
-  `--cluster-secret-file`. **Source `auth_ref`s** (Git tokens, registry creds,
-  S3 static keys) are a *directory* of `<auth_ref>`-named files pointed at by
-  `RIFT_SOURCE_SECRETS_DIR`, or individual `RIFT_SOURCE_AUTH_<REF>` environment
-  variables, which take precedence (#136).
-  IRSA grants the pod role read access to those secrets. It does **not** yet
-  reach `s3://` sources: the S3 provider signs with static keys resolved from an
-  `auth_ref`, and ambient role credentials are not implemented — a bucket
-  policy that only admits the pod role will not be readable by this build. An
-  `s3://` source with no `auth_ref` fetches anonymously.
+  bootstrapped from the same imposter documents — same mocks everywhere without
+  stretching consensus.
+- **Secrets**: Secrets Manager → External Secrets Operator → mounted file. The
+  **cluster HMAC secret** is a single file named by `--cluster-secret-file`, and
+  since D-71 (#549) it is the only third-party-credential-shaped thing the fleet
+  consumes: the cloud imposter-source providers, and the credential-reference
+  machinery that fed them, are gone.
 - **Cluster port stays ClusterIP-internal** — never on the NLB. Security
   group: cluster port open node-to-node only; front-door/admin from the NLB;
   metrics from the scrape infrastructure.
@@ -82,10 +76,11 @@ preference:
    configuration): a real disk per task — full R3 durability, the recommended
    ECS shape.
 2. **Fargate ephemeral + external re-seeding**: accept that a *simultaneous*
-   full-fleet replacement loses control-plane disk, and lean on sources (#20)
-   as the recovery story — on cold start, one task runs with
-   `--cluster-allow-solo` and no seeds, and re-pulls every `pinned` source. Configs survive (they live in Git/S3/the
-   registry — provenance makes this legitimate, not a hack); **flow state does
+   full-fleet replacement loses control-plane disk, and lean on the one-shot
+   `--imposters <uri>` bootstrap as the recovery story — on cold start, one task
+   runs with `--cluster-allow-solo`, no seeds, and the same `--imposters` URIs
+   it first started with. Configs survive because they live wherever those URIs
+   point (a file mount, an HTTP endpoint under your control); **flow state does
    not**. Acceptable for perf-test fleets; state so in the runbook.
 3. **EC2 launch type** with instance EBS when neither fits.
 
@@ -111,7 +106,7 @@ leave).
 | 3× compute | c7g.large-class (2 vCPU/4 GiB) | Rift is CPU-light per request; scale for target RPS, learners for read fan-out |
 | 3× EBS gp3 | 20 GiB each | State dir: Raft log (snapshot-bounded) + flow shard; IOPS matter more than size — gp3 baseline is fine, provision IOPS only if `sync` durability at high transition rates |
 | 1× internal NLB | 2 listeners | front door + admin |
-| Secrets Manager | 2–5 secrets | cluster key + source creds |
+| Secrets Manager | 1 secret | cluster key |
 
 No ElastiCache, no RDS, no MSK, no external coordinator — the zero-dependency
 premise is precisely what makes the bill this short. (The optional Redis-strict
@@ -148,5 +143,5 @@ answers these same six against Azure rather than repeating them:
 4. **SIGTERM with ≥ 2× leave-timeout** on every replacement path (deploys,
    scale-in, spot interruption handlers).
 5. Secrets from the platform's secret store as files, never env-inlined URIs.
-6. One cluster per region; share mocks across regions via sources, not
-   consensus.
+6. One cluster per region; share mocks across regions by bootstrapping each
+   from the same imposter documents, not by stretching consensus.

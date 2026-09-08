@@ -404,10 +404,11 @@ jobs:
           esac
 
       # The static flavor's own smoke, against the real published artifact (#270). Same shape as
-      # the default-flavor smoke above — `--version`, boot, `/console` — plus the two assertions
-      # that are the whole point of publishing a second flavor: the git-capability WARN actually
-      # fires, and the image really has no git in it (checked in the next two steps, since neither
-      # needs a running container).
+      # the default-flavor smoke above — `--version`, boot, `/console` — plus the assertion that
+      # is the whole point of publishing a second flavor: the image really has no git in it, and
+      # no OS packages at all (checked in the next two steps, since neither needs a running
+      # container). Until #549 this flavor also differed in what it could *fetch*; it no longer
+      # does — the cluster's git-backed source providers are gone from both images.
       #
       # Distinct container name (`smoke-static`, not `smoke`) and distinct host ports (`22525`/
       # `22526`, not `12525`/`12526`): the step above already tore its own container down via its
@@ -452,21 +453,6 @@ jobs:
             *) echo "FAIL: published static image served no console SPA shell" >&2; exit 1 ;;
           esac
 
-          echo "--- git capability degraded loudly, not silently ---"
-          # The direct proof that #270's capability detection did its job on the REAL published
-          # artifact, not just in a unit test: this image has no git (confirmed in the next step),
-          # yet it just booted and served `/console` above — which only happens because the
-          # missing-git case now logs and continues instead of refusing to start.
-          logs="$(docker logs smoke-static 2>&1)"
-          case "$logs" in
-            *"git not found; git+ imposter sources disabled in this image"*)
-              echo "PASS: static image logs the git-capability warning" ;;
-            *)
-              echo "FAIL: static image did not log the git-capability warning" >&2
-              echo "$logs" >&2
-              exit 1 ;;
-          esac
-
           echo "--- docker healthcheck reaches healthy (AC1) ---"
           # A distinct code path from the `/console/` curl above: the HEALTHCHECK
           # execs the binary's own `healthcheck` subcommand against /healthz.
@@ -488,14 +474,15 @@ jobs:
           fi
           echo "PASS: static image reports docker health 'healthy'"
 
-          echo "--- a git+ declaration is refused with the documented text (AC2) ---"
-          # The refusal string is quoted verbatim by `deploy/README.md`, by
-          # `docs/rift-cluster-server.md` and by this Dockerfile's own comment.
-          # Unit tests assert it on a hand-built provider set; nothing until here
-          # asserts that the shipped binary in the shipped image actually emits
-          # it. `RIFT_IMPOSTERS` takes the boot declaration path, so the failure
-          # is the container refusing to start — which is the documented
-          # behaviour, hence `|| true` on the run and the assertion on the log.
+          echo "--- a retired source scheme is refused at startup, by name (AC2) ---"
+          # D-72 (#549) removed the cluster's own `git+`/`s3:`/`registry:` providers with the
+          # tracking sources they served. `--imposters` is now a one-shot bootstrap over
+          # upstream's `file:`/`http(s):` sources, and a URI naming a retired scheme is refused
+          # at startup naming the issue — so an operator upgrading across the change learns what
+          # happened instead of reading "unsupported scheme" about a URI that worked yesterday.
+          # Unit tests assert this on a composed server; nothing until here asserts that the
+          # shipped binary in the shipped image does it. The container is expected NOT to start,
+          # hence `set +e` around the run and the assertion on its output.
           set +e
           decl="$(docker run --rm \
             -e RIFT_CLUSTER=true \
@@ -510,10 +497,10 @@ jobs:
           set -e
           echo "$decl"
           case "$decl" in
-            *"\`git+https:\` sources are unavailable"*)
-              echo "PASS: the shipped static image refuses git+ with the documented refusal" ;;
+            *"#549"*)
+              echo "PASS: the shipped static image refuses a retired scheme and names the removal" ;;
             *)
-              echo "FAIL: the static image did not emit the documented git+ refusal" >&2
+              echo "FAIL: the static image did not emit the documented refusal" >&2
               exit 1 ;;
           esac
 
@@ -654,8 +641,7 @@ jobs:
       #
       # Both flavors are promoted here, together and last. `latest-static` is held to exactly the
       # same rule as `latest` (#270): it aliases a version tag whose own smokes — console, docker
-      # health, the git-absent WARN, the documented `git+` refusal, no git binary, zero OS
-      # packages — have all passed. Promoting it at manifest-creation time instead would leave a
+      # health, the retired-scheme refusal, no git binary, zero OS packages — have all passed. Promoting it at manifest-creation time instead would leave a
       # discoverable `latest-static` pointing at a build this job went on to reject, which is the
       # exact failure #296 removed for the default flavor.
       - name: Promote latest

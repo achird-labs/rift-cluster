@@ -54,9 +54,9 @@ struct Member {
     id: NodeId,
     addr: SocketAddr,
     dir: TempDir,
-    /// `Arc` because the node-bound subsystems (`SourcePuller`, and the flow
-    /// and pull-on-miss bridges in the composed server) take a `&Arc<RaftNode>`
-    /// so they can hold a `Weak` back to it without keeping it alive.
+    /// `Arc` because the node-bound subsystems (the flow and pull-on-miss bridges in the
+    /// composed server) take a `&Arc<RaftNode>` so they can hold a `Weak` back to it without
+    /// keeping it alive.
     node: Option<Arc<RaftNode>>,
 }
 
@@ -73,20 +73,6 @@ async fn spawn_with_snapshot_policy(
     dir: &Path,
     snapshot_log_entries: Option<u64>,
 ) -> Arc<RaftNode> {
-    spawn_full(id, addr, dir, snapshot_log_entries, false).await
-}
-
-/// [`spawn_with_snapshot_policy`] plus the #481 capability knob: `advertise_as_digest_only_incapable`
-/// makes this one node's blob route claim it cannot apply a digest-only `ControlOp`, pretending
-/// to be a pre-#481 build — the only way this in-process harness can put a version-skewed member
-/// in a cluster without two binary versions.
-async fn spawn_full(
-    id: NodeId,
-    addr: SocketAddr,
-    dir: &Path,
-    snapshot_log_entries: Option<u64>,
-    advertise_as_digest_only_incapable: bool,
-) -> Arc<RaftNode> {
     let config = NodeConfig {
         node_id: id,
         bind: addr,
@@ -96,7 +82,6 @@ async fn spawn_full(
         routes: Router::new(),
         engine: None,
         snapshot_log_entries,
-        advertise_as_digest_only_incapable,
     };
     // No retry-on-lock-contention: `RaftNode::shutdown` now waits for the Raft
     // core to release its storage handles before returning (#41), so a restart on
@@ -119,28 +104,16 @@ impl TestCluster {
     /// Start `n` nodes, bootstrap node 1, and seed-join the rest through it, so
     /// the returned cluster is one converged group of `n` voters.
     async fn start(n: usize) -> Self {
-        Self::start_full(n, None, None).await
+        Self::start_full(n, None).await
     }
 
     /// [`Self::start`] with every node snapshotting every `entries` log entries and purging to
     /// the tip, so a member that falls behind must be caught up by `install_snapshot`.
     async fn start_with_snapshots(n: usize, entries: u64) -> Self {
-        Self::start_full(n, Some(entries), None).await
+        Self::start_full(n, Some(entries)).await
     }
 
-    /// [`Self::start`] with `incapable`'s blob route advertising `applies_digest_only: false`
-    /// (#481) — that one member's build pretends to predate D-49, the digest-only `ControlOp`
-    /// shape. The only way this in-process harness puts a version-skewed member in a cluster
-    /// without standing up two binary versions.
-    async fn start_with_one_member_digest_only_incapable(n: usize, incapable: NodeId) -> Self {
-        Self::start_full(n, None, Some(incapable)).await
-    }
-
-    async fn start_full(
-        n: usize,
-        snapshot_log_entries: Option<u64>,
-        digest_only_incapable: Option<NodeId>,
-    ) -> Self {
+    async fn start_full(n: usize, snapshot_log_entries: Option<u64>) -> Self {
         assert!(n >= 1, "a cluster needs at least one node");
         let mut members: Vec<Member> = reserve_ports(n)
             .into_iter()
@@ -153,12 +126,11 @@ impl TestCluster {
             })
             .collect();
 
-        let n1 = spawn_full(
+        let n1 = spawn_with_snapshot_policy(
             members[0].id,
             members[0].addr,
             members[0].dir.path(),
             snapshot_log_entries,
-            digest_only_incapable == Some(members[0].id),
         )
         .await;
         n1.cluster_init().await.expect("bootstrap node 1");
@@ -166,12 +138,11 @@ impl TestCluster {
 
         let seed = Authority::from(members[0].addr);
         for member in members.iter_mut().skip(1) {
-            let node = spawn_full(
+            let node = spawn_with_snapshot_policy(
                 member.id,
                 member.addr,
                 member.dir.path(),
                 snapshot_log_entries,
-                digest_only_incapable == Some(member.id),
             )
             .await;
             node.join_via(&seed)
@@ -1084,593 +1055,47 @@ async fn test_rejoin_after_leave_with_retained_state_dir() {
     cluster.shutdown_all().await;
 }
 
-// ---------------------------------------------------------------------------
-// Issue #134: sources as control-plane objects
-// ---------------------------------------------------------------------------
-
-/// A source that counts how many times it was fetched, so the fetch-once
-/// criterion is an assertion rather than an argument.
-struct CountingSource {
-    fetches: Arc<std::sync::atomic::AtomicUsize>,
-    body: std::sync::Mutex<Vec<rift_cluster_base::seams::ImposterConfig>>,
-    version: std::sync::Mutex<String>,
-}
-
-impl rift_cluster_base::seams::ImposterSource for CountingSource {
-    fn schemes(&self) -> &'static [&'static str] {
-        &["counting"]
-    }
-
-    fn fetch<'a>(
-        &'a self,
-        _r: &'a rift_cluster_base::seams::SourceRef,
-    ) -> std::pin::Pin<
-        Box<
-            dyn std::future::Future<
-                    Output = anyhow::Result<rift_cluster_base::seams::FetchedImposters>,
-                > + Send
-                + 'a,
-        >,
-    > {
-        Box::pin(async move {
-            self.fetches
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            Ok(rift_cluster_base::seams::FetchedImposters {
-                configs: self.body.lock().expect("body lock").clone(),
-                intercept: None,
-                routes: None,
-                meta: rift_cluster_base::seams::SourceMeta {
-                    version: Some(self.version.lock().expect("version lock").clone()),
-                    fetched_at: std::time::SystemTime::now(),
-                },
-                unchanged: false,
-            })
-        })
-    }
-}
-
-fn source_config(port: u16, name: &str) -> rift_cluster_base::seams::ImposterConfig {
-    serde_json::from_value(serde_json::json!({
-        "port": port,
-        "protocol": "http",
-        "name": name,
-    }))
-    .expect("test config parses")
-}
-
-/// C-#134: one pull fetches exactly once no matter how many nodes are in the
-/// fleet, and every node converges on what that single fetch produced.
+/// A `PutImposter` whose serialized entry is at least `target_bytes` — the bulk payload the
+/// large-entry tests (#411, #430, #431, #428) need in order to exercise openraft and redb at
+/// size.
 ///
-/// This is the property that justifies fetch-then-submit over "each node
-/// fetches for itself": the fetched bytes enter the log once, so replicas
-/// cannot disagree about what the source said.
-#[tokio::test]
-async fn source_pull_fetches_exactly_once_and_converges_the_fleet() {
-    let _guard = TEST_LOCK.lock().await;
-    let mut cluster = TestCluster::start(3).await;
-    assert!(cluster.wait_for_leader(LEADER_DEADLINE).await.is_some());
-
-    let fetches = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let source = Arc::new(CountingSource {
-        fetches: Arc::clone(&fetches),
-        body: std::sync::Mutex::new(vec![source_config(9401, "from-source-v1")]),
-        version: std::sync::Mutex::new("v1".to_owned()),
-    });
-    let mut registry = rift_cluster_base::seams::SourceRegistry::new();
-    registry
-        .register(Arc::clone(&source) as Arc<dyn rift_cluster_base::seams::ImposterSource>)
-        .expect("register the counting source");
-    let puller = rift_cluster::SourcePuller::new(registry);
-    // Bound to the leader here; the write path forwards from any node, so which
-    // node holds the puller is not what makes the fetch single.
-    puller
-        .bind(cluster.leader_handle().expect("a leader"))
-        .expect("bind the puller");
-
-    let report = puller
-        .declare_and_pull(
-            "mocks",
-            "counting://host/i.json",
-            rift_cluster::OnDrift::Overwrite,
-        )
-        .await
-        .expect("declare and pull");
-    assert!(!report.unchanged);
-    assert_eq!(report.changed, vec![9401]);
-    assert_eq!(
-        fetches.load(std::sync::atomic::Ordering::SeqCst),
-        1,
-        "a 3-node fleet must fetch the source exactly once: followers apply, they do not fetch"
-    );
-
-    assert!(
-        cluster
-            .wait_converged(9401, "from-source-v1", CONVERGE_DEADLINE)
-            .await,
-        "every node must converge on the config the single fetch produced"
-    );
-    // And every node can answer for the source itself, not just its imposters.
-    for node in cluster.live() {
-        let record = node
-            .source(DEFAULT_TENANT, "mocks")
-            .expect("read source")
-            .expect("the source is replicated, not node-local");
-        assert_eq!(record.last_version.as_deref(), Some("v1"));
-        assert_eq!(record.ports, vec![9401]);
-        assert!(!record.drifted);
+/// Bulk used to come from a dataset CSV or a spec document; #549 removed both ops, and the
+/// ceiling those tests pin is a property of **a log entry**, not of what happened to be in it.
+/// An imposter config is the largest thing that still rides the log, so it is the honest carrier
+/// now — and it goes through the same `PutImposter` admission every other config does, which the
+/// dataset path did not.
+///
+/// `tag` makes two calls at the same size produce *different* bytes, so a test that writes N of
+/// these writes N distinct entries rather than N copies of one.
+fn bulky_request(port: u16, tag: &str, target_bytes: usize) -> ControlRequest {
+    let mut body = String::with_capacity(target_bytes);
+    body.push_str(tag);
+    while body.len() < target_bytes {
+        body.push('x');
     }
-
-    // Re-pulling unchanged content fetches again (the provider is the only one
-    // who can tell) but writes nothing: the applied index must not move.
-    let before = cluster
-        .leader()
-        .expect("a leader")
-        .status()
-        .last_applied
-        .expect("an applied index");
-    let report = puller
-        .pull(DEFAULT_TENANT, "mocks", None)
-        .await
-        .expect("re-pull");
-    assert!(report.unchanged, "identical content is not a change");
-    assert!(report.changed.is_empty());
-    assert_eq!(
-        fetches.load(std::sync::atomic::Ordering::SeqCst),
-        2,
-        "the re-pull did fetch"
-    );
-    assert_eq!(
-        cluster
-            .leader()
-            .expect("a leader")
-            .status()
-            .last_applied
-            .expect("an applied index"),
-        before,
-        "unchanged content must produce no log entry at all"
-    );
-
-    // A real change does move the fleet.
-    *source.body.lock().expect("body lock") = vec![source_config(9401, "from-source-v2")];
-    *source.version.lock().expect("version lock") = "v2".to_owned();
-    let report = puller
-        .pull(DEFAULT_TENANT, "mocks", None)
-        .await
-        .expect("pull v2");
-    assert!(!report.unchanged);
-    assert!(
-        cluster
-            .wait_converged(9401, "from-source-v2", CONVERGE_DEADLINE)
-            .await,
-        "a changed document must reach every node"
-    );
-
-    cluster.shutdown_all().await;
-}
-
-/// The secret-hygiene criterion, asserted where it matters: a credential-bearing
-/// URI is refused *before* anything is written, so it never reaches the log —
-/// not even as a committed refusal, which would keep the secret on every
-/// replica's disk and in every snapshot.
-#[tokio::test]
-async fn a_credential_bearing_source_uri_never_reaches_the_log() {
-    let _guard = TEST_LOCK.lock().await;
-    let mut cluster = TestCluster::start(1).await;
-    assert!(cluster.wait_for_leader(LEADER_DEADLINE).await.is_some());
-
-    let fetches = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let mut registry = rift_cluster_base::seams::SourceRegistry::new();
-    registry
-        .register(Arc::new(CountingSource {
-            fetches: Arc::clone(&fetches),
-            body: std::sync::Mutex::new(vec![]),
-            version: std::sync::Mutex::new("v1".to_owned()),
+    body.truncate(target_bytes);
+    let config: rift_cluster_base::seams::ImposterConfig =
+        serde_json::from_value(serde_json::json!({
+            "port": port,
+            "protocol": "http",
+            "host": "127.0.0.1",
+            "stubs": [{
+                "id": format!("bulk-{tag}"),
+                "responses": [{ "is": { "statusCode": 200, "body": body } }],
+            }],
         }))
-        .expect("register");
-    let puller = rift_cluster::SourcePuller::new(registry);
-    puller
-        .bind(cluster.leader_handle().expect("a leader"))
-        .expect("bind");
-
-    let before = cluster
-        .leader()
-        .expect("a leader")
-        .status()
-        .last_applied
-        .expect("an applied index");
-    let err = puller
-        .declare_and_pull(
-            "leaky",
-            "counting://user:hunter2@host/i.json",
-            rift_cluster::OnDrift::Overwrite,
-        )
-        .await
-        .expect_err("a credential-bearing uri must be refused");
-    assert!(
-        matches!(&err, rift_cluster::PullError::BadRequest(detail) if detail.contains("auth_ref")),
-        "{err}"
-    );
-    assert_eq!(
-        cluster
-            .leader()
-            .expect("a leader")
-            .status()
-            .last_applied
-            .expect("an applied index"),
-        before,
-        "the refused uri must not have produced a log entry"
-    );
-    assert!(
-        cluster
-            .leader()
-            .expect("a leader")
-            .sources(DEFAULT_TENANT)
-            .expect("read sources")
-            .is_empty()
-    );
-    assert_eq!(
-        fetches.load(std::sync::atomic::Ordering::SeqCst),
-        0,
-        "a refused source is never fetched"
-    );
-
-    cluster.shutdown_all().await;
-}
-
-// ---------------------------------------------------------------------------
-// Issue #135: the leader-only tracking poll scheduler
-// ---------------------------------------------------------------------------
-
-/// Declare a tracking source and start a scheduler bound to `node`.
-async fn start_scheduler(
-    node: &Arc<RaftNode>,
-    source: &Arc<CountingSource>,
-) -> (
-    Arc<rift_cluster::SourcePuller>,
-    Arc<rift_cluster::PollStatus>,
-    tokio::task::JoinHandle<()>,
-) {
-    let mut registry = rift_cluster_base::seams::SourceRegistry::new();
-    registry
-        .register(Arc::clone(source) as Arc<dyn rift_cluster_base::seams::ImposterSource>)
-        .expect("register the counting source");
-    let puller = Arc::new(rift_cluster::SourcePuller::new(registry));
-    puller.bind(node).expect("bind the puller");
-    // The task handle is returned, not dropped: the supervisor holds an
-    // `Arc<RaftNode>` while waiting on the leadership watch, so a test that
-    // forgot to abort it would keep the node alive past `shutdown_all` and the
-    // next test's bind would fail.
-    let (status, task) =
-        rift_cluster::SourceScheduler::spawn(&tokio::runtime::Handle::current(), node, &puller);
-    (puller, status, task)
-}
-
-fn tracking_put(id: &str, uri: &str, poll_secs: u64) -> rift_cluster::ControlRequest {
-    rift_cluster::ControlRequest {
+        .expect("the bulky config parses");
+    ControlRequest {
         op_id: uuid::Uuid::new_v4(),
         principal: None,
         issued_at_secs: 0,
         expected_revision: None,
-        op: rift_cluster::ControlOp::SourcePut {
+        op: rift_cluster::ControlOp::PutImposter {
             tenant: rift_cluster::TenantId::default(),
-            id: id.to_owned(),
-            uri: uri.to_owned(),
-            mode: rift_cluster::SourceMode::Tracking,
-            auth_ref: None,
-            on_drift: rift_cluster::OnDrift::Overwrite,
-            poll_secs: Some(poll_secs),
+            config: Box::new(config),
         },
     }
 }
-
-/// The property the whole design rests on: **one poller fleet-wide**, not one
-/// per node.
-///
-/// Every node runs a scheduler — the real deployment shape — but each is given
-/// its **own** counting source with its **own** counter. That turns the claim
-/// into an exact assertion (`followers fetched 0 times`) rather than a timing
-/// bound, which matters: an earlier version of this test asserted a ceiling on
-/// the *total* fetch count and a mutant that ignored leadership slipped under
-/// it, because two pollers at a 5s cadence over 12s land right at the bound.
-/// Per-node counters cannot be fudged by cadence, jitter, or a slow runner.
-#[tokio::test]
-async fn tracking_polls_run_on_the_leader_only() {
-    let _guard = TEST_LOCK.lock().await;
-    let mut cluster = TestCluster::start(2).await;
-    let leader_id = cluster
-        .wait_for_leader(LEADER_DEADLINE)
-        .await
-        .expect("a leader");
-
-    // One scheduler per node, each with its own counter.
-    let mut counters: Vec<(NodeId, Arc<std::sync::atomic::AtomicUsize>)> = Vec::new();
-    let mut schedulers = Vec::new();
-    for member in &cluster.members {
-        let node = member.node.as_ref().expect("running");
-        let fetches = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let source = Arc::new(CountingSource {
-            fetches: Arc::clone(&fetches),
-            body: std::sync::Mutex::new(vec![source_config(9501, "tracked-v1")]),
-            version: std::sync::Mutex::new("v1".to_owned()),
-        });
-        schedulers.push(start_scheduler(node, &source).await);
-        counters.push((member.id, fetches));
-    }
-
-    let leader = cluster.leader_handle().expect("a leader").clone();
-    leader
-        .submit(tracking_put("tracked", "counting://cfg/i.json", 5))
-        .await
-        .expect("declaring a tracking source commits");
-
-    // Long enough that a follower running its own timer would certainly have
-    // fired at a 5s cadence.
-    tokio::time::sleep(Duration::from_secs(14)).await;
-
-    for (id, fetches) in &counters {
-        let observed = fetches.load(std::sync::atomic::Ordering::SeqCst);
-        if *id == leader_id {
-            assert!(
-                observed >= 1,
-                "node {id} is the leader and must poll; saw {observed} fetches"
-            );
-        } else {
-            assert_eq!(
-                observed, 0,
-                "node {id} is a follower and must never fetch — a follower that polls is the \
-                 duplicate-fetch bug the whole fetch-then-submit design exists to prevent"
-            );
-        }
-    }
-
-    // And the polled content really did converge through the log.
-    assert!(
-        cluster
-            .wait_converged(9501, "tracked-v1", CONVERGE_DEADLINE)
-            .await,
-        "a scheduled poll must apply through the log like any other pull"
-    );
-
-    // Abort before shutdown: dropping a `JoinHandle` does not cancel the task,
-    // and a live supervisor holds the node alive past `shutdown_all`.
-    for (_, _, task) in &schedulers {
-        task.abort();
-    }
-    cluster.shutdown_all().await;
-}
-
-/// Unchanged content costs **zero log growth**, however long the fleet polls.
-/// This is what makes tracking mode affordable, and it is the first thing a
-/// careless refactor of the digest short circuit would break.
-#[tokio::test]
-async fn polling_unchanged_content_never_grows_the_log() {
-    let _guard = TEST_LOCK.lock().await;
-    let mut cluster = TestCluster::start(1).await;
-    assert!(cluster.wait_for_leader(LEADER_DEADLINE).await.is_some());
-
-    let fetches = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let source = Arc::new(CountingSource {
-        fetches: Arc::clone(&fetches),
-        body: std::sync::Mutex::new(vec![source_config(9502, "static")]),
-        version: std::sync::Mutex::new("v1".to_owned()),
-    });
-    let node = cluster.leader_handle().expect("a leader").clone();
-    let (_puller, _status, task) = start_scheduler(&node, &source).await;
-
-    node.submit(tracking_put("static", "counting://cfg/i.json", 5))
-        .await
-        .expect("declaring commits");
-    // Let the first poll apply the content, then pin the index.
-    assert!(
-        cluster
-            .wait_converged(9502, "static", CONVERGE_DEADLINE)
-            .await
-    );
-    let settled = node.status().last_applied.expect("an applied index");
-    let fetches_at_settle = fetches.load(std::sync::atomic::Ordering::SeqCst);
-
-    tokio::time::sleep(Duration::from_secs(12)).await;
-
-    assert!(
-        fetches.load(std::sync::atomic::Ordering::SeqCst) > fetches_at_settle,
-        "the scheduler must still be polling — otherwise this proves nothing"
-    );
-    assert_eq!(
-        node.status().last_applied.expect("an applied index"),
-        settled,
-        "polling unchanged content must not write a single log entry"
-    );
-
-    task.abort();
-    cluster.shutdown_all().await;
-}
-
-/// A credentialed provider that counts fetches — the same shape as
-/// `CountingSource` above, but registered through
-/// `SourceProviders::register_credentialed` / `CredentialedSource`, the
-/// cluster seam issue #136 adds. `ImposterSource::fetch` has no `auth_ref`
-/// to give it, so exercising the digest short circuit through *this* trait is
-/// what proves it fires on the path the real `git+https:`/`s3:`/`registry:`
-/// providers actually use, not merely on the upstream-only path
-/// `source_pull_fetches_exactly_once_and_converges_the_fleet` above already
-/// covers.
-struct CountingCredentialedSource {
-    fetches: Arc<std::sync::atomic::AtomicUsize>,
-    body: std::sync::Mutex<Vec<rift_cluster_base::seams::ImposterConfig>>,
-    version: std::sync::Mutex<String>,
-}
-
-impl rift_cluster::sources::CredentialedSource for CountingCredentialedSource {
-    fn schemes(&self) -> &'static [&'static str] {
-        &["counting-cred"]
-    }
-
-    fn fetch_with_auth<'a>(
-        &'a self,
-        _r: &'a rift_cluster_base::seams::SourceRef,
-        _auth_ref: Option<&'a str>,
-    ) -> std::pin::Pin<
-        Box<
-            dyn std::future::Future<
-                    Output = anyhow::Result<rift_cluster_base::seams::FetchedImposters>,
-                > + Send
-                + 'a,
-        >,
-    > {
-        Box::pin(async move {
-            self.fetches
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            Ok(rift_cluster_base::seams::FetchedImposters {
-                configs: self.body.lock().expect("body lock").clone(),
-                intercept: None,
-                routes: None,
-                meta: rift_cluster_base::seams::SourceMeta {
-                    version: Some(self.version.lock().expect("version lock").clone()),
-                    fetched_at: std::time::SystemTime::now(),
-                },
-                unchanged: false,
-            })
-        })
-    }
-}
-
-/// Issue #136 review, B6.1: the digest short circuit (#134) exercised through
-/// the *actual shipped path* — a credentialed provider, pulled twice through
-/// a real `SourcePuller` bound to a real `RaftNode` — rather than the
-/// tautological version this replaces (two `digest_of(...)` calls compared
-/// directly, in `sources/provider_tests.rs`, which would still pass even if
-/// the short circuit in `SourcePuller::pull` were deleted outright, since it
-/// never drove a pull through that code at all).
-#[tokio::test]
-async fn a_credentialed_source_short_circuits_on_unchanged_content() {
-    let _guard = TEST_LOCK.lock().await;
-    let mut cluster = TestCluster::start(1).await;
-    assert!(cluster.wait_for_leader(LEADER_DEADLINE).await.is_some());
-
-    let fetches = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let source = Arc::new(CountingCredentialedSource {
-        fetches: Arc::clone(&fetches),
-        body: std::sync::Mutex::new(vec![source_config(9504, "cred-static")]),
-        version: std::sync::Mutex::new("v1".to_owned()),
-    });
-    let mut providers = rift_cluster::sources::SourceProviders::new(
-        rift_cluster_base::seams::SourceRegistry::new(),
-    );
-    providers
-        .register_credentialed(source as Arc<dyn rift_cluster::sources::CredentialedSource>)
-        .expect("register the credentialed counting source");
-    let puller = rift_cluster::SourcePuller::new(providers);
-    puller
-        .bind(cluster.leader_handle().expect("a leader"))
-        .expect("bind the puller");
-
-    let first = puller
-        .declare_and_pull(
-            "cred-mocks",
-            "counting-cred://host/i.json",
-            rift_cluster::OnDrift::Overwrite,
-        )
-        .await
-        .expect("first pull");
-    assert!(!first.unchanged, "the first pull is a real change");
-    assert_eq!(fetches.load(std::sync::atomic::Ordering::SeqCst), 1);
-
-    let before = cluster
-        .leader()
-        .expect("a leader")
-        .status()
-        .last_applied
-        .expect("an applied index");
-
-    let second = puller
-        .pull(DEFAULT_TENANT, "cred-mocks", None)
-        .await
-        .expect("second pull");
-    assert!(
-        second.unchanged,
-        "identical content through a credentialed provider must short circuit"
-    );
-    assert_eq!(
-        fetches.load(std::sync::atomic::Ordering::SeqCst),
-        2,
-        "the re-pull did fetch — the provider is the only one who can tell content is unchanged"
-    );
-    assert_eq!(
-        cluster
-            .leader()
-            .expect("a leader")
-            .status()
-            .last_applied
-            .expect("an applied index"),
-        before,
-        "unchanged content through a credentialed provider must produce no log entry at all"
-    );
-
-    cluster.shutdown_all().await;
-}
-
-/// The task set follows the source table without a restart: deleting a tracking
-/// source stops its poller.
-#[tokio::test]
-async fn deleting_a_tracking_source_stops_its_poller() {
-    let _guard = TEST_LOCK.lock().await;
-    let mut cluster = TestCluster::start(1).await;
-    assert!(cluster.wait_for_leader(LEADER_DEADLINE).await.is_some());
-
-    let fetches = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let source = Arc::new(CountingSource {
-        fetches: Arc::clone(&fetches),
-        body: std::sync::Mutex::new(vec![source_config(9503, "temp")]),
-        version: std::sync::Mutex::new("v1".to_owned()),
-    });
-    let node = cluster.leader_handle().expect("a leader").clone();
-    let (_puller, _status, task) = start_scheduler(&node, &source).await;
-
-    node.submit(tracking_put("temp", "counting://cfg/i.json", 5))
-        .await
-        .expect("declaring commits");
-    tokio::time::sleep(Duration::from_secs(8)).await;
-    let polled = fetches.load(std::sync::atomic::Ordering::SeqCst);
-    assert!(
-        polled >= 1,
-        "the source must have been polled at least once"
-    );
-
-    node.submit(rift_cluster::ControlRequest {
-        op_id: uuid::Uuid::new_v4(),
-        principal: None,
-        issued_at_secs: 0,
-        expected_revision: None,
-        op: rift_cluster::ControlOp::SourceDelete {
-            tenant: rift_cluster::TenantId::default(),
-            id: "temp".to_owned(),
-        },
-    })
-    .await
-    .expect("delete commits");
-
-    // Give the supervisor a reconcile window, then confirm the rate stopped.
-    tokio::time::sleep(Duration::from_secs(3)).await;
-    let after_delete = fetches.load(std::sync::atomic::Ordering::SeqCst);
-    tokio::time::sleep(Duration::from_secs(10)).await;
-    assert_eq!(
-        fetches.load(std::sync::atomic::Ordering::SeqCst),
-        after_delete,
-        "a deleted source must stop being polled without restarting the node"
-    );
-
-    task.abort();
-    cluster.shutdown_all().await;
-}
-
-// ---------------------------------------------------------------------------
-// Issue #163 — leader-side quotas across a real cluster.
-//
-// The state-machine unit tests in `raft/store.rs` already pin the refusal's
-// shape. What can only be asserted here is that the refusal is the *same*
-// committed decision on every replica: the write lands nowhere, and every node
-// applies the revision that refused it.
-// ---------------------------------------------------------------------------
 
 fn submit_request(op_id: u128, issued_at_secs: u64, op: rift_cluster::ControlOp) -> ControlRequest {
     ControlRequest {
@@ -1782,7 +1207,7 @@ async fn a_quota_refusal_is_the_same_committed_decision_on_every_node() {
 /// The fleet's name survives a process death (issue #373).
 ///
 /// **Restart, not snapshot install** — the same correction the chaos README records for C18 and
-/// C22. `snapshot_round_trips_the_fleet_name`
+/// `snapshot_round_trips_the_fleet_name`
 /// in `raft/store.rs` drives `build_snapshot`/`install_snapshot` directly against a *fresh* state
 /// machine; it never closes and reopens the same redb file. A restart is the far more common
 /// event of the two — the default `LogEntries(5000)` policy means most nodes come back by
@@ -1891,220 +1316,7 @@ async fn voter_count_sizes_the_journal_shard() {
     cluster.shutdown_all().await;
 }
 
-// -- datasets on the control plane (RFC-005 D1, issue #285) --------------------------------------
-
-fn dataset_digest_hex(csv: &str) -> String {
-    use sha2::{Digest as _, Sha256};
-    let mut hasher = Sha256::new();
-    hasher.update(csv.as_bytes());
-    format!("{:x}", hasher.finalize())
-}
-
-/// A truthful `DatasetPut` for `csv`, keyed on its first column, under the default tenant.
-fn dataset_put(name: &str, csv: &str) -> ControlRequest {
-    let mut lines = csv.lines();
-    let columns: Vec<String> = lines
-        .next()
-        .unwrap_or_default()
-        .split(',')
-        .map(|c| c.trim().to_owned())
-        .collect();
-    let rows = lines.count() as u64;
-    ControlRequest {
-        op_id: uuid::Uuid::new_v4(),
-        principal: None,
-        issued_at_secs: 0,
-        expected_revision: None,
-        op: rift_cluster::ControlOp::DatasetPut {
-            tenant: rift_cluster::TenantId::default(),
-            record: rift_cluster::control::DatasetRecord {
-                name: name.to_owned(),
-                digest: rift_cluster::control::Digest::new(dataset_digest_hex(csv)),
-                key_columns: vec![columns[0].clone()],
-                delimiter: ',',
-                columns,
-                rows,
-                bytes: csv.len() as u64,
-            },
-            csv: Some(csv.to_owned()),
-            origin: 0,
-        },
-    }
-}
-
-fn spool_file(dir: &Path, csv: &str) -> std::path::PathBuf {
-    dir.join("datasets")
-        .join(format!("{}.csv", dataset_digest_hex(csv)))
-}
-
-/// A CSV of at least `bytes` bytes with a unique first column — the quota-ceiling payload the
-/// RFC §11 check wants openraft/redb exercised at.
-fn big_csv(bytes: usize) -> String {
-    tagged_csv(bytes, "")
-}
-
-/// Put `csv`'s bytes into `node`'s blob transport store, mirroring the fan-out the production
-/// admin-front write path (`fan_out_then_submit`, D-49) performs before proposing — which the
-/// low-level `submit` these harness tests use deliberately bypasses.
-///
-/// Manifest-snapshot catch-up (#440, D-50) fetches each referenced blob from a holder's transport
-/// store rather than carrying the bytes in the snapshot, so a holder must exist for the joiner to
-/// fetch from. Production guarantees one on a quorum via fan-out (D-18); a `submit`-driven test
-/// never fans out, so it establishes the same precondition directly on the accepting node.
-fn seed_blob_store(node: &RaftNode, csv: &str) {
-    let digest = rift_cluster::blobs::digest_of_bytes(csv.as_bytes());
-    node.blobs()
-        .store_whole(&digest, csv.as_bytes())
-        .expect("seed the accepting node's blob transport store");
-}
-
-/// Issue #285: the bytes ride the log, so once the leader's write barrier has answered, every
-/// member holds the spool file — byte-identical to the upload — with no fetch and no readiness
-/// handshake. This is the fleet-level "on disk before the 2xx" the front's barrier will surface.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_dataset_upload_is_byte_identical_on_every_node_before_the_write_returns() {
-    let _serial = TEST_LOCK.lock().await;
-    let cluster = TestCluster::start(3).await;
-    cluster
-        .wait_for_leader(LEADER_DEADLINE)
-        .await
-        .expect("leader");
-    let csv = "id,name,tier\n1,ada,gold\n2,bob,silver\n";
-
-    let leader = cluster.leader().expect("leader");
-    let response = leader
-        .submit(dataset_put("customers", csv))
-        .await
-        .expect("the put commits");
-    assert_eq!(response.outcome, rift_cluster::ControlOutcome::Applied);
-    let unapplied = leader
-        .await_applied(response.revision, CONVERGE_DEADLINE)
-        .await;
-    assert!(
-        unapplied.is_empty(),
-        "the barrier must reach every member: {unapplied:?}"
-    );
-
-    for member in &cluster.members {
-        let path = spool_file(member.dir.path(), csv);
-        let on_disk = std::fs::read(&path)
-            .unwrap_or_else(|e| panic!("node {} has no spool file at {path:?}: {e}", member.id));
-        assert_eq!(
-            on_disk,
-            csv.as_bytes(),
-            "node {} holds different bytes",
-            member.id
-        );
-        let node = member.node.as_ref().expect("live");
-        let record = node
-            .dataset(DEFAULT_TENANT, "customers")
-            .expect("read")
-            .expect("every node lists the dataset");
-        assert_eq!(record.version, 1);
-        assert_eq!(record.digest, dataset_digest_hex(csv));
-        assert_eq!(
-            node.spool_path(&record.digest),
-            Some(path),
-            "the node names the file it holds"
-        );
-        let listed = node.datasets(DEFAULT_TENANT).expect("list");
-        assert_eq!(
-            listed
-                .iter()
-                .map(|d| (d.name.as_str(), d.version))
-                .collect::<Vec<_>>(),
-            [("customers", 1)],
-            "node {} lists exactly the one dataset",
-            member.id
-        );
-    }
-
-    let mut cluster = cluster;
-    cluster.shutdown_all().await;
-}
-
-/// Issue #285: an upload commits, converges, and survives every node going down and coming
-/// back. One member also loses its spool directory while down, and gets the file back from its
-/// own state machine on restart — never from a peer. Parameterised on the payload size because of
-/// #411 (see the two callers below).
-async fn dataset_survives_a_full_cluster_restart_and_a_lost_spool(bytes: usize) {
-    let mut cluster = TestCluster::start(3).await;
-    cluster
-        .wait_for_leader(LEADER_DEADLINE)
-        .await
-        .expect("leader");
-    let csv = big_csv(bytes);
-
-    let leader = cluster.leader().expect("leader");
-    let response = leader
-        .submit(dataset_put("big", &csv))
-        .await
-        .expect("the entry commits");
-    assert_eq!(response.outcome, rift_cluster::ControlOutcome::Applied);
-    let unapplied = leader
-        .await_applied(response.revision, Duration::from_secs(30))
-        .await;
-    assert!(unapplied.is_empty(), "{unapplied:?}");
-    for member in &cluster.members {
-        assert_eq!(
-            std::fs::read(spool_file(member.dir.path(), &csv))
-                .expect("spool file")
-                .len(),
-            csv.len(),
-            "node {} spool",
-            member.id
-        );
-    }
-
-    let ids: Vec<NodeId> = cluster.members.iter().map(|m| m.id).collect();
-    let victim = ids[ids.len() - 1];
-    cluster.shutdown_all().await;
-    // A node that lost its derived state: only the spool directory, never the state machine.
-    std::fs::remove_dir_all(cluster.member(victim).dir.path().join("datasets"))
-        .expect("wipe the victim's spool dir");
-    for id in &ids {
-        cluster.restart(*id).await;
-    }
-    assert!(
-        cluster.wait_for_leader(LEADER_DEADLINE).await.is_some(),
-        "no leader after the cold restart"
-    );
-    // Startup repair runs from `reconcile_engine`, which the composed server calls on start; the
-    // in-process harness has no composition, so call it the way `compose` does.
-    for member in &cluster.members {
-        member
-            .node
-            .as_ref()
-            .expect("live")
-            .reconcile_engine()
-            .await
-            .expect("reconcile");
-    }
-    for member in &cluster.members {
-        let on_disk = std::fs::read(spool_file(member.dir.path(), &csv)).unwrap_or_else(|e| {
-            panic!(
-                "node {} lost its spool file across the restart: {e}",
-                member.id
-            )
-        });
-        assert_eq!(on_disk.len(), csv.len(), "node {}", member.id);
-        assert_eq!(
-            on_disk[..64],
-            csv.as_bytes()[..64],
-            "node {} bytes differ",
-            member.id
-        );
-        let record = member
-            .node
-            .as_ref()
-            .expect("live")
-            .dataset(DEFAULT_TENANT, "big")
-            .expect("read")
-            .expect("the record survived");
-        assert_eq!(record.bytes, csv.len() as u64);
-    }
-    cluster.shutdown_all().await;
-}
+// -- large log entries and snapshot catch-up (#411, #428, #430, #431) ----------------------------
 
 /// #430: a leader that loses its term while an 8 MiB entry is in flight keeps its replication
 /// cores alive for a moment; the new leader's conflict truncates the old leader's uncommitted
@@ -2153,15 +1365,15 @@ async fn a_leadership_change_under_load_never_panics_a_replication_worker() {
         .wait_for_leader(LEADER_DEADLINE)
         .await
         .expect("leader");
-    let csv = big_csv(8 * 1024 * 1024 - 1_100);
     // The outcome of the write is deliberately not asserted: under this load it may park or
     // fail with "not the leader" until #431 lands. The panic count is the claim.
     let _ = tokio::time::timeout(
         Duration::from_secs(30),
-        cluster
-            .leader()
-            .expect("leader")
-            .submit(dataset_put("big", &csv)),
+        cluster.leader().expect("leader").submit(bulky_request(
+            19501,
+            "big",
+            8 * 1024 * 1024 - 1_100,
+        )),
     )
     .await;
     // Let any stale core that is mid-read finish its read and (on 0.9.24) panic.
@@ -2204,25 +1416,20 @@ async fn a_restarted_voter_behind_a_purged_log_catches_up_by_snapshot() {
         .expect("leader");
     let victim: NodeId = if leader_id == 3 { 2 } else { 3 };
 
-    let csv = big_csv(512 * 1024);
     let r = cluster
         .leader()
         .expect("leader")
-        .submit(dataset_put("d0", &csv))
+        .submit(bulky_request(19510, "d0", 512 * 1024))
         .await
         .expect("d0");
     assert_eq!(r.outcome, rift_cluster::ControlOutcome::Applied);
-    // d0..d8 are all the same bytes (one digest), so one seed on the leader covers the whole
-    // manifest the restarted voter will fetch on install (D-50); production's fan-out would have
-    // left this holder behind.
-    seed_blob_store(cluster.leader().expect("leader"), &csv);
     cluster.kill(victim).await;
 
     for i in 1..=8 {
         let r = cluster
             .leader()
             .expect("leader")
-            .submit(dataset_put(&format!("d{i}"), &csv))
+            .submit(bulky_request(19510 + i, &format!("d{i}"), 512 * 1024))
             .await
             .expect("commit while the victim is down");
         assert_eq!(r.outcome, rift_cluster::ControlOutcome::Applied);
@@ -2299,503 +1506,11 @@ async fn a_restarting_member_holds_elections_until_it_hears_a_leader_or_the_grac
     );
 }
 
-/// #411's other shipped ceiling: a spec document at the RFC-004 S2 maximum (4 MiB, #278) is one
-/// log entry and must commit on a real 3-node cluster.
-///
-/// The dataset case below proves the 8 MiB path; this proves the other quota the front already
-/// accepts. Both were validated, accepted, and then unable to commit — openraft dropped every
-/// AppendEntries attempt at the 50 ms `heartbeat_interval` and restarted the body, so the fleet's
-/// true ceiling was "whatever replicates in one heartbeat" (a few hundred KiB on loopback)
-/// rather than either documented quota.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_four_mebibyte_spec_document_commits_on_a_three_node_cluster() {
-    let _serial = TEST_LOCK.lock().await;
-    let mut cluster = TestCluster::start(3).await;
-    cluster
-        .wait_for_leader(LEADER_DEADLINE)
-        .await
-        .expect("leader");
-
-    // At the ceiling, not merely near it: `MAX_SPEC_BYTES` is inclusive, and the point is that
-    // the largest document the front accepts is the largest the log can carry.
-    let document = big_spec_document(rift_cluster::control::MAX_SPEC_BYTES);
-    assert_eq!(
-        document.len(),
-        rift_cluster::control::MAX_SPEC_BYTES,
-        "the document must sit exactly on the documented ceiling"
-    );
-
-    let leader = cluster.leader().expect("leader");
-    let response = leader
-        .submit(spec_put("big-spec", &document))
-        .await
-        .expect("a 4 MiB spec entry commits");
-    assert_eq!(response.outcome, rift_cluster::ControlOutcome::Applied);
-    let unapplied = leader
-        .await_applied(response.revision, Duration::from_secs(30))
-        .await;
-    assert!(unapplied.is_empty(), "{unapplied:?}");
-
-    // Every member, not just the leader: the whole claim is that the bytes rode the log.
-    for member in &cluster.members {
-        let record = member
-            .node
-            .as_ref()
-            .expect("live")
-            .spec(DEFAULT_TENANT, "big-spec")
-            .expect("read")
-            .expect("the spec record replicated");
-        assert_eq!(
-            record.digest,
-            dataset_digest_hex(&document),
-            "node {} must hold the document's own digest",
-            member.id
-        );
-    }
-    cluster.shutdown_all().await;
-}
-
-/// A spec document of exactly `bytes` bytes. Content is irrelevant to this crate — it stores
-/// bytes and a digest and never parses the document — so this pads to an exact length rather
-/// than pretending to be a valid OpenAPI file.
-fn big_spec_document(bytes: usize) -> String {
-    let head = "openapi: 3.0.0\ninfo:\n  title: big\n  version: 1.0.0\npaths: {}\n# ";
-    let mut doc = String::with_capacity(bytes);
-    doc.push_str(head);
-    while doc.len() < bytes {
-        doc.push('x');
-    }
-    doc.truncate(bytes);
-    doc
-}
-
-/// A truthful `SpecPut` for `document` under the default tenant.
-fn spec_put(id: &str, document: &str) -> ControlRequest {
-    ControlRequest {
-        op_id: uuid::Uuid::new_v4(),
-        principal: None,
-        issued_at_secs: 0,
-        expected_revision: None,
-        op: rift_cluster::ControlOp::SpecPut {
-            tenant: rift_cluster::TenantId::default(),
-            id: id.to_owned(),
-            meta: rift_cluster::control::SpecMeta {
-                format: rift_cluster::control::SpecFormat::Yaml,
-                digest: rift_cluster::control::Digest::new(dataset_digest_hex(document)),
-                source: rift_cluster::control::SpecSource::Inline,
-                size: document.len() as u64,
-            },
-            document: Some(document.to_owned()),
-            origin: 0,
-        },
-    }
-}
-
-/// The restart + lost-spool proof at a small size (128 KiB), kept as the fast sibling of the
-/// 8 MiB case below — the two differ only in payload, so a failure in one and not the other
-/// points straight at size.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_dataset_survives_a_full_cluster_restart_and_a_lost_spool() {
-    let _serial = TEST_LOCK.lock().await;
-    dataset_survives_a_full_cluster_restart_and_a_lost_spool(128 * 1024).await;
-}
-
-/// RFC-005 §11's check: an upload at the per-dataset ceiling (8 MiB) is one log entry, and the
-/// fleet must be comfortable with it.
-///
-/// #411's half of this is done: openraft 0.9 bounds every AppendEntries RPC by
-/// `heartbeat_interval` (50 ms here) and drops the future when that fires, so an entry that could
-/// not transfer and fsync inside one round trip restarted from byte 0 forever — ≥1 MiB never
-/// committed and ~512 KiB took 23-548 s. The transfer is now single-flighted in the network
-/// adapter, so it outlives the RPC deadline and a re-send attaches to it rather than restarting
-/// it, with the timers untouched. Unloaded, this test passes in ~9.4 s.
-///
-/// It was `#[ignore]`d for a *different* and pre-existing reason (#430), now closed:
-/// `try_get_log_entries` could be asked for a range whose entries openraft had counted but
-/// `append` had not yet made readable; it answered with an empty vec, and openraft 0.9.24 did
-/// `logs.first().….unwrap()` on that (`replication/mod.rs:399`), panicking the replication
-/// workers and costing the leader its leadership. The window scales with entry size, so #411 is
-/// what made it reachable. #446 fixed that; #449 then fixed the restarted-voter livelock (#431)
-/// that kept the write failing afterwards. Both issues are closed, so the attribute is gone and
-/// this runs.
-///
-/// It is the end-to-end gate for the #411 → #430 → #431 ladder, and the only test that asserts
-/// the whole claim: an 8 MiB dataset commits, survives a full-cluster restart, and is rebuilt
-/// after its spool is lost. What #446 shipped alongside it is deliberately narrower — it counts
-/// panics located in openraft's replication module and does not assert the write's own result.
-/// The 4 MiB `SpecPut` case below is #411's own CI-green proof.
-///
-/// Read its verdict off CI, not off a developer machine. The failure this guards against was
-/// load-dependent: it reproduced on GitHub's 2-vCPU runners and never once locally, unloaded or
-/// loaded, on either openraft version. A local pass says the blocker is cleared; it is not
-/// evidence the test is CI-stable.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn an_eight_mebibyte_dataset_survives_a_full_cluster_restart_and_a_lost_spool() {
-    let _serial = TEST_LOCK.lock().await;
-    let bytes = 8 * 1024 * 1024 - 1_100;
-    let csv = big_csv(bytes);
-    assert!(
-        csv.len() <= 8 * 1024 * 1024,
-        "at or under the default ceiling: {}",
-        csv.len()
-    );
-    assert!(
-        csv.len() > 8 * 1024 * 1024 - 2_200,
-        "close to the ceiling: {}",
-        csv.len()
-    );
-    dataset_survives_a_full_cluster_restart_and_a_lost_spool(bytes).await;
-}
-
-// ---- #438: quorum blob fan-out before propose ---------------------------
-
-/// Pins D-18: completeness is established by the write path — the fan-out puts
-/// the blob on every member *before* the referencing op is proposed, so a commit
-/// implies quorum-durability and the origin dying after it leaves holders behind.
-///
-/// Acceptance 1. The accepting node stores the blob and every other member ends
-/// up holding it, so a commit implies the blob is quorum-durable and the origin
-/// dying afterwards does not matter.
-///
-/// Asserted on `bytes_sent` rather than on the return being `Ok`: a fan-out that
-/// silently sent nothing and one that moved the whole payload are
-/// indistinguishable from a status, and only the byte count separates them.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_blob_fanned_out_before_propose_reaches_every_member() {
-    let _serial = TEST_LOCK.lock().await;
-    let mut cluster = TestCluster::start(3).await;
-    cluster
-        .wait_for_leader(LEADER_DEADLINE)
-        .await
-        .expect("leader");
-
-    let csv = "id,name\n1,ada\n2,bob\n";
-    let digest = rift_cluster::blobs::digest_of_bytes(csv.as_bytes());
-    let leader = cluster.leader().expect("leader");
-
-    let (outcome, _pin) = leader
-        .fan_out_blob(&digest, csv.as_bytes())
-        .await
-        .expect("fan-out");
-
-    assert!(
-        outcome.quorum,
-        "3 live voters must be a joint-consensus quorum"
-    );
-    assert!(!outcome.joint, "no membership change is in flight");
-    assert_eq!(
-        outcome.acks.len(),
-        3,
-        "every member acked: {:?}",
-        outcome.acks
-    );
-    assert!(outcome.skewed.is_empty());
-    assert!(
-        outcome.bytes_sent > 0,
-        "the fan-out must actually put bytes on the wire, not merely return Ok"
-    );
-
-    for node in cluster.live() {
-        assert!(
-            node.blobs().stat(&digest).expect("stat").have,
-            "node {} does not hold the fanned-out blob",
-            node.id()
-        );
-    }
-
-    // Released here as the real write path releases it: once the op that
-    // references the blob has committed.
-    drop(_pin);
-    cluster.shutdown_all().await;
-}
-
-/// Pins D-19: with 1 of 3 voters holding the blob there is no majority of either
-/// configuration, so the fan-out reports no quorum and the write parks.
-///
-/// Acceptance 2. With only one reachable peer there is no majority of either
-/// configuration, so the fan-out reports no quorum and the write path parks
-/// rather than committing an op whose blob is on one node.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_fan_out_without_a_reachable_quorum_reports_no_quorum() {
-    let _serial = TEST_LOCK.lock().await;
-    let mut cluster = TestCluster::start(3).await;
-    let leader_id = cluster
-        .wait_for_leader(LEADER_DEADLINE)
-        .await
-        .expect("leader");
-
-    // Kill both peers, leaving the accepting node alone in a 3-voter config.
-    for id in [1, 2, 3] {
-        if id != leader_id {
-            cluster.kill(id).await;
-        }
-    }
-
-    let csv = "id,name\n1,ada\n";
-    let digest = rift_cluster::blobs::digest_of_bytes(csv.as_bytes());
-    let leader = cluster
-        .member(leader_id)
-        .node
-        .as_ref()
-        .expect("leader node");
-
-    let (outcome, _pin) = leader
-        .fan_out_blob(&digest, csv.as_bytes())
-        .await
-        .expect("fan-out completes even when peers are unreachable");
-
-    assert!(
-        !outcome.quorum,
-        "1 of 3 voters is not a majority; acks were {:?}",
-        outcome.acks
-    );
-    assert_eq!(
-        outcome.acks,
-        BTreeSet::from([leader_id]),
-        "only the accepting node holds it"
-    );
-    // The blob is still stored locally — the shortfall is about durability, not
-    // about the write having been lost. That is what makes the parked intent
-    // replayable rather than a dead end.
-    assert!(leader.blobs().stat(&digest).expect("stat").have);
-
-    drop(_pin);
-    cluster.shutdown_all().await;
-}
-
-/// The replay path's precondition: re-running a fan-out after a shortfall must
-/// be idempotent, or the 503-and-replay contract would re-send the whole payload
-/// on every attempt. `BlobTransfer::put` probes `stat` first, so a peer that
-/// already holds the digest costs one round trip and no bytes.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn re_running_a_fan_out_sends_no_bytes_to_a_peer_that_already_has_it() {
-    let _serial = TEST_LOCK.lock().await;
-    let mut cluster = TestCluster::start(3).await;
-    cluster
-        .wait_for_leader(LEADER_DEADLINE)
-        .await
-        .expect("leader");
-
-    let csv = "id,name\n1,ada\n2,bob\n3,cleo\n";
-    let digest = rift_cluster::blobs::digest_of_bytes(csv.as_bytes());
-    let leader = cluster.leader().expect("leader");
-
-    let (first, first_pin) = leader
-        .fan_out_blob(&digest, csv.as_bytes())
-        .await
-        .expect("first fan-out");
-    assert!(first.bytes_sent > 0);
-    // Release it, so the second call exercises a fresh pin rather than
-    // inheriting this one's protection.
-    drop(first_pin);
-
-    let (second, _pin) = leader
-        .fan_out_blob(&digest, csv.as_bytes())
-        .await
-        .expect("second fan-out");
-
-    assert!(second.quorum, "the peers still hold it");
-    assert_eq!(
-        second.bytes_sent, 0,
-        "a replayed fan-out must re-send nothing"
-    );
-
-    drop(_pin);
-    cluster.shutdown_all().await;
-}
-
-/// The pin a fan-out returns must outlive the fan-out itself, because the window
-/// it guards runs from "a quorum holds it" to "the op that references it
-/// commits" — and the submit happens after the fan-out returns. A pin released
-/// on return would leave the blob unpinned *and* unreferenced for exactly that
-/// stretch.
-///
-/// Regression test for a real defect in this change's first draft, which dropped
-/// the guard inside `fan_out_blob`. It survived the other tests because the
-/// grace window is measured from the blob's mtime and a freshly-written blob is
-/// young — so the bug was invisible until the blob was older than the grace,
-/// which is precisely the replayed-intent case this issue's 503 contract
-/// creates. Asserting on GC directly is what makes it visible now.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn the_pin_a_fan_out_returns_protects_the_blob_until_it_is_dropped() {
-    let _serial = TEST_LOCK.lock().await;
-    let mut cluster = TestCluster::start(3).await;
-    cluster
-        .wait_for_leader(LEADER_DEADLINE)
-        .await
-        .expect("leader");
-
-    let csv = "id,name\n1,ada\n2,bob\n3,cleo\n4,dai\n";
-    let digest = rift_cluster::blobs::digest_of_bytes(csv.as_bytes());
-    let leader = cluster.leader().expect("leader");
-
-    let (outcome, pin) = leader
-        .fan_out_blob(&digest, csv.as_bytes())
-        .await
-        .expect("fan-out");
-    assert!(outcome.quorum);
-
-    // Nothing references the digest yet — no op has been proposed — and `now` is
-    // far past any grace, so the pin is the only thing that can save it.
-    let unreferenced = std::collections::HashSet::new();
-    let far_future = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("clock after epoch")
-        .as_secs()
-        + 10_000_000;
-
-    let outcome = leader
-        .blobs()
-        .gc(
-            &unreferenced,
-            &std::collections::HashMap::new(),
-            0,
-            0,
-            far_future,
-            3600,
-        )
-        .expect("gc");
-    assert_eq!(
-        outcome.removed, 0,
-        "the returned pin must still be protecting it"
-    );
-    assert!(leader.blobs().stat(&digest).expect("stat").have);
-
-    drop(pin);
-    let outcome = leader
-        .blobs()
-        .gc(
-            &unreferenced,
-            &std::collections::HashMap::new(),
-            0,
-            0,
-            far_future,
-            3600,
-        )
-        .expect("gc");
-    assert_eq!(
-        outcome.removed, 1,
-        "released, it is collectable like any other blob"
-    );
-
-    cluster.shutdown_all().await;
-}
-
-/// Acceptance 3. An 8 MiB dataset — the documented per-dataset ceiling — fans
-/// out to a 3-node cluster on loopback, and the elapsed time is recorded.
-///
-/// Read the number off CI, not off a developer machine: the transfer is 4 MiB-
-/// chunked, so this is round-trip-bound rather than bandwidth-bound, and a
-/// 2-vCPU runner is the honest measurement.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn an_eight_mebibyte_blob_fans_out_to_three_nodes() {
-    let _serial = TEST_LOCK.lock().await;
-    let mut cluster = TestCluster::start(3).await;
-    cluster
-        .wait_for_leader(LEADER_DEADLINE)
-        .await
-        .expect("leader");
-
-    let csv = big_csv(8 * 1024 * 1024 - 1_100);
-    let digest = rift_cluster::blobs::digest_of_bytes(csv.as_bytes());
-    let leader = cluster.leader().expect("leader");
-
-    let started = Instant::now();
-    let (outcome, _pin) = leader
-        .fan_out_blob(&digest, csv.as_bytes())
-        .await
-        .expect("fan-out");
-    let elapsed = started.elapsed();
-
-    assert!(outcome.quorum);
-    assert_eq!(outcome.acks.len(), 3);
-    // Two peers, each receiving the whole payload.
-    assert_eq!(outcome.bytes_sent, 2 * csv.len() as u64);
-    for node in cluster.live() {
-        assert!(node.blobs().stat(&digest).expect("stat").have);
-    }
-
-    println!(
-        "#438 acceptance 3: {} bytes fanned out to 3 nodes in {elapsed:?} ({} bytes on the wire)",
-        csv.len(),
-        outcome.bytes_sent
-    );
-
-    drop(_pin);
-    cluster.shutdown_all().await;
-}
-
-/// Issue #285: a node that joins after the upload materialises the spool file from what it
-/// receives through the log/snapshot — nothing is fetched from a peer.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_node_joining_after_the_upload_materialises_the_spool_file() {
-    let _serial = TEST_LOCK.lock().await;
-    let mut cluster = TestCluster::start(2).await;
-    cluster
-        .wait_for_leader(LEADER_DEADLINE)
-        .await
-        .expect("leader");
-    let csv = "id,name\n1,ada\n2,bob\n";
-    let leader = cluster.leader().expect("leader");
-    let response = leader
-        .submit(dataset_put("customers", csv))
-        .await
-        .expect("commits");
-    assert!(
-        leader
-            .await_applied(response.revision, CONVERGE_DEADLINE)
-            .await
-            .is_empty()
-    );
-
-    // A brand-new third member on a fresh directory.
-    let port = reserve_ports(1)[0];
-    let addr: SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
-    let dir = TempDir::new().expect("tempdir");
-    let seed = cluster.leader().expect("leader").advertise();
-    let joiner = spawn(3, addr, dir.path()).await;
-    joiner.join_via(seed).await.expect("join");
-
-    let deadline = Instant::now() + CONVERGE_DEADLINE;
-    let path = spool_file(dir.path(), csv);
-    loop {
-        if std::fs::read(&path).ok().as_deref() == Some(csv.as_bytes()) {
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "the joiner never materialised the spool file at {path:?}"
-        );
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    assert!(
-        joiner
-            .dataset(DEFAULT_TENANT, "customers")
-            .expect("read")
-            .is_some()
-    );
-    joiner.shutdown().await.ok();
-    cluster.shutdown_all().await;
-}
-
-/// A CSV of at least `bytes` bytes whose content is unique to `tag`.
-///
-/// Distinct content per dataset is the point: a dataset's blob is addressed by digest, so
-/// uploading the same bytes under N names stores one blob and the snapshot stays small.
-fn tagged_csv(bytes: usize, tag: &str) -> String {
-    let mut csv = String::from("id,payload\n");
-    let mut i = 0u64;
-    while csv.len() < bytes {
-        csv.push_str(&format!("{i},{tag}{}\n", "x".repeat(1_000)));
-        i += 1;
-    }
-    csv
-}
-
 /// Issue #428: a fleet that has snapshotted and purged catches a fresh node up **over the wire**.
 ///
-/// Every byte of a dataset rides the state machine, so a fleet at RFC-005's quotas has a snapshot
-/// measured in MiB. openraft bounds each snapshot *chunk* by `install_snapshot_timeout` and
+/// Every byte of committed config rides the state machine, so a fleet holding a few large
+/// imposters has a snapshot measured in MiB. openraft bounds each snapshot *chunk* by
+/// `install_snapshot_timeout` and
 /// abandons the whole transfer — back to offset 0 — when one misses, so at its defaults (3 MiB
 /// chunks, 200 ms) the transfer could never finish: chunks ride the JSON cluster port at ~4× their
 /// raw size, which is ~900 ms for a default chunk on loopback alone. Measured before the fix on
@@ -2813,8 +1528,9 @@ fn tagged_csv(bytes: usize, tag: &str) -> String {
 ///
 /// **The fixture size is load-bearing, and is measured here rather than asserted in prose (#492).**
 /// The install must outlast the 500 ms window, and it had stopped doing so: #436 (binary,
-/// file-backed snapshots) and #440 (a KiB manifest plus a blob fetch) each cut the install time
-/// while this fixture stayed at 8 × 512 KiB, until it landed at 577–592 ms locally and 502–1219 ms
+/// file-backed snapshots) and #440 (a KiB manifest plus an out-of-band fetch, both since removed
+/// by D-72) each cut the install time while this fixture stayed at 8 × 512 KiB, until it landed at
+/// 577–592 ms locally and 502–1219 ms
 /// on CI. Against a 500 ms window that is a coin flip — ~55% failure in CI, 0% locally across four
 /// attempts, which is why it read as an infrastructure flake for a day. `MIN_INSTALL_MARGIN` now
 /// checks the margin on every run, so the next time something makes installs faster this fails
@@ -2825,24 +1541,22 @@ fn tagged_csv(bytes: usize, tag: &str) -> String {
 /// log it would need has been purged, so `install_snapshot` is openraft's only route.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_joiner_is_caught_up_by_a_multi_mebibyte_snapshot() {
-    /// 32 MiB of state — under RFC-005's 8 MiB per-dataset and 64 MiB per-tenant ceilings, and
-    /// sized so the install outlasts `ADMIT_CURRENCY_WAIT` by a wide margin on the *fastest*
-    /// environment measured, not the average one. See `MIN_INSTALL_MARGIN` below and #492.
-    const DATASETS: usize = 8;
-    const PER_DATASET_BYTES: usize = 4 * 1024 * 1024;
+    /// 32 MiB of state, sized so the install outlasts `ADMIT_CURRENCY_WAIT` by a wide margin on
+    /// the *fastest* environment measured, not the average one. See `MIN_INSTALL_MARGIN` below
+    /// and #492.
+    const ENTRIES: usize = 8;
+    const PER_ENTRY_BYTES: usize = 4 * 1024 * 1024;
     const CONVERGE_BY: Duration = Duration::from_secs(60);
 
     /// The install must outlast the admission window by this factor for the learner assertion
     /// below to be measuring two-phase admission rather than a coin flip. Checked, not assumed:
     /// #492 was exactly this margin silently going to zero.
     ///
-    /// **Enlarging the fixture has roughly 2x left, and then it stops working.** RFC-005 caps a
-    /// dataset at `DEFAULT_MAX_DATASET_BYTES` (8 MiB) and a tenant at
-    /// `DEFAULT_MAX_DATASET_TOTAL_BYTES` (64 MiB), so 8 x 8 MiB is the ceiling and the write is
-    /// already ~0.35 s/MiB of test time. If another change makes installs 3x faster again, the
-    /// answer is a different mechanism — spreading across tenants, or the deterministic variant
-    /// #492 defers to #486 (seed the blob store after the join so the install parks) — not a
-    /// bigger `PER_DATASET_BYTES`.
+    /// **Enlarging the fixture has limited headroom.** The write is already ~0.35 s/MiB of test
+    /// time, and a single log entry has its own ceiling (#411, and the measurement recorded in
+    /// D-23 — superseded by D-72, but the numbers behind it are why this bound exists).
+    /// If another change makes installs 3x faster again, the answer is a different mechanism —
+    /// more entries rather than bigger ones — not a bigger `PER_ENTRY_BYTES`.
     const MIN_INSTALL_MARGIN: u32 = 3;
 
     let _serial = TEST_LOCK.lock().await;
@@ -2861,18 +1575,16 @@ async fn a_joiner_is_caught_up_by_a_multi_mebibyte_snapshot() {
     }
 
     let mut last_revision = 0;
-    let mut last_csv = String::new();
-    for i in 0..DATASETS {
-        let csv = tagged_csv(PER_DATASET_BYTES, &format!("d{i}-"));
+    for i in 0..ENTRIES {
         let response = leader
-            .submit(dataset_put(&format!("d{i}"), &csv))
+            .submit(bulky_request(
+                19520 + i as u16,
+                &format!("d{i}"),
+                PER_ENTRY_BYTES,
+            ))
             .await
-            .unwrap_or_else(|e| panic!("dataset d{i} commits: {e}"));
+            .unwrap_or_else(|e| panic!("entry d{i} commits: {e}"));
         last_revision = response.revision;
-        // The joiner will fetch this blob over the transport on install (D-50); seed the holder
-        // the fan-out would have created in production.
-        seed_blob_store(&leader, &csv);
-        last_csv = csv;
     }
     assert!(
         leader
@@ -2983,17 +1695,17 @@ async fn a_joiner_is_caught_up_by_a_multi_mebibyte_snapshot() {
         install_took >= MIN_INSTALL_MARGIN * ADMIT_CURRENCY_WAIT,
         "the install took {install_took:?} against a {ADMIT_CURRENCY_WAIT:?} admission window — \
          the fixture no longer produces a slow install, so the learner assertion above is a coin \
-         flip rather than a check on two-phase admission. Enlarge `PER_DATASET_BYTES` (see #492 \
-         and `MIN_INSTALL_MARGIN`'s note on the quota ceiling); do not loosen the assertion. {}",
+         flip rather than a check on two-phase admission. Enlarge `PER_ENTRY_BYTES` (see #492 \
+         and `MIN_INSTALL_MARGIN`'s note on the headroom); do not loosen the assertion. {}",
         state("margin")
     );
 
-    let last_name = format!("d{}", DATASETS - 1);
+    let last_port = 19520 + (ENTRIES - 1) as u16;
     let deadline = Instant::now() + CONVERGE_BY;
     let mut converged = false;
     while Instant::now() < deadline {
         if joiner
-            .dataset(DEFAULT_TENANT, &last_name)
+            .imposter_config(DEFAULT_TENANT, last_port)
             .expect("read")
             .is_some()
         {
@@ -3011,7 +1723,14 @@ async fn a_joiner_is_caught_up_by_a_multi_mebibyte_snapshot() {
 
     // The other half of the new shape: once current, the leader's promotion sweep makes the
     // joiner a voter with no further part played by the joiner itself.
-    let deadline = Instant::now() + CONVERGE_DEADLINE;
+    //
+    // Bounded by `CONVERGE_BY`, not the generic `CONVERGE_DEADLINE`: since #549 the fixture's
+    // 4 MiB configs ride the log inline (the blob sideload is gone), so "current" means the
+    // joiner has applied eight 4 MiB entries — binding eight imposters — after a 32 MiB install.
+    // The claim here is that the sweep promotes a caught-up learner with no help from the joiner,
+    // not how fast a CI runner can apply 32 MiB; a 10 s bound failed on GitHub's runners while
+    // passing 3/3 locally in ~25 s per whole test.
+    let deadline = Instant::now() + CONVERGE_BY;
     while !leader.status().voters.contains(&2) {
         assert!(
             Instant::now() < deadline,
@@ -3021,12 +1740,16 @@ async fn a_joiner_is_caught_up_by_a_multi_mebibyte_snapshot() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 
-    // Installing a snapshot must also materialise the blobs' spool files, or the joiner holds a
-    // dataset record it cannot serve a lookup from.
-    let spool = spool_file(dir2.path(), &last_csv);
-    let on_disk = std::fs::read(&spool)
-        .unwrap_or_else(|e| panic!("the joiner never materialised {spool:?}: {e}"));
-    assert_eq!(on_disk.len(), last_csv.len());
+    // The install carried the configs themselves, not a reference to them: the joiner must hold
+    // every port the leader does, from its own applied state.
+    let ports = joiner
+        .configured_ports()
+        .expect("read the joiner's configs");
+    assert_eq!(
+        ports.len(),
+        ENTRIES,
+        "the joiner must hold every imposter the snapshot carried: {ports:?}"
+    );
 
     joiner.shutdown().await.ok();
     leader.shutdown().await.ok();
@@ -3077,16 +1800,12 @@ async fn a_snapshot_catch_up_does_not_disturb_a_fleet_that_already_has_quorum() 
         .expect("node 2 joins an empty fleet");
 
     let mut last_revision = 0;
-    for i in 0..8 {
-        let csv = tagged_csv(512 * 1024, &format!("m{i}-"));
+    for i in 0..8u16 {
         last_revision = n1
-            .submit(dataset_put(&format!("m{i}"), &csv))
+            .submit(bulky_request(19540 + i, &format!("m{i}"), 512 * 1024))
             .await
-            .unwrap_or_else(|e| panic!("dataset m{i} commits: {e}"))
+            .unwrap_or_else(|e| panic!("entry m{i} commits: {e}"))
             .revision;
-        // n3 fetches each blob from a joint voter on install (D-50); seed the accepting node the
-        // fan-out would have populated in production.
-        seed_blob_store(&n1, &csv);
     }
     assert!(
         n1.await_applied(last_revision, CONVERGE_DEADLINE)
@@ -3106,7 +1825,11 @@ async fn a_snapshot_catch_up_does_not_disturb_a_fleet_that_already_has_quorum() 
         if let Some(leader) = n1.status().current_leader {
             leaders_seen.insert(leader);
         }
-        if n3.dataset(DEFAULT_TENANT, "m7").expect("read").is_some() {
+        if n3
+            .imposter_config(DEFAULT_TENANT, 19547)
+            .expect("read")
+            .is_some()
+        {
             converged = true;
             break;
         }
@@ -3221,19 +1944,15 @@ async fn a_joiner_behind_a_purged_log_starts_as_learner_and_the_leader_promotes_
     // Put enough on the log — snapshotting every 2 entries, purging to the
     // tip — that a fresh joiner can only be caught up by a multi-MiB
     // snapshot, never by log replay.
-    let csv = big_csv(512 * 1024);
-    for i in 0..8 {
+    for i in 0..8u16 {
         let r = cluster
             .leader()
             .expect("leader")
-            .submit(dataset_put(&format!("j{i}"), &csv))
+            .submit(bulky_request(19560 + i, &format!("j{i}"), 512 * 1024))
             .await
-            .expect("dataset commits");
+            .expect("the bulky entry commits");
         assert_eq!(r.outcome, rift_cluster::ControlOutcome::Applied);
     }
-    // j0..j7 are all the same bytes (one digest); the snapshot-joining fourth node fetches that
-    // one blob on install (D-50), so seed the holder production's fan-out would have created.
-    seed_blob_store(cluster.leader().expect("leader"), &csv);
 
     // A fourth node, exactly as `start_full` would build it.
     let port = reserve_ports(1)[0];
@@ -3299,1177 +2018,6 @@ async fn a_joiner_behind_a_purged_log_starts_as_learner_and_the_leader_promotes_
             panic!("the promoted joiner never converged (at {mine:?}, leader at {target})");
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    cluster.shutdown_all().await;
-}
-
-// ---------------------------------------------------------------------------
-// Blob transfer (#437, epic #432 child 2)
-//
-// The store's own rules are unit-tested in `src/blobs/mod.rs`; what can only be
-// proven here is that the bytes cross a real signed connection between two real
-// nodes, at the size the epic's quotas actually permit.
-// ---------------------------------------------------------------------------
-
-/// sha256 of `b"hello"` — a digest no node in these tests ever receives.
-const ABSENT_DIGEST: &str = "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824";
-
-fn blob_transfer() -> rift_cluster::blobs::BlobTransfer {
-    let client = Arc::new(rift_cluster::rpc::RpcClient::new(
-        Some(rift_cluster::rpc::Signer::new(SECRET)),
-        Arc::new(rift_cluster::rpc::AlwaysHealthy),
-        rift_cluster::rpc::RpcClientConfig::default(),
-    ));
-    rift_cluster::blobs::BlobTransfer::new(client)
-}
-
-#[tokio::test]
-async fn blob_of_the_per_tenant_ceiling_crosses_between_nodes() {
-    // Acceptance criterion 1. 64 MiB is RFC-005 §4's per-tenant total — the size
-    // the epic measured as un-replicable *through the log*, which is the whole
-    // reason this transport exists. A smaller payload would not test the claim.
-    let _guard = TEST_LOCK.lock().await;
-    let mut cluster = TestCluster::start(3).await;
-
-    let bytes = vec![b'Z'; 64 * 1024 * 1024];
-    let digest = rift_cluster::blobs::digest_of_bytes(&bytes);
-    let target = cluster.members[1].addr;
-    let transfer = blob_transfer();
-
-    let outcome = transfer
-        .put(target, &digest, &bytes)
-        .await
-        .expect("put 64 MiB to a peer");
-    assert_eq!(outcome.resumed_from, 0, "nothing was staged beforehand");
-    assert_eq!(outcome.bytes_sent, bytes.len() as u64);
-
-    // The have/lack probe criterion 1 names. It is `?stat=1` rather than the
-    // `HEAD` the issue asks for: a HEAD response carries no body, so it can
-    // report neither a size nor a distinguishable 404 (see `blobs::routes`).
-    assert!(
-        transfer.have(target, &digest).await.expect("have"),
-        "the receiver must report the blob it just accepted"
-    );
-    let stat = transfer.stat(target, &digest).await.expect("stat");
-    assert!(stat.have);
-    assert_eq!(stat.size, bytes.len() as u64);
-
-    // And the bytes that come back are the bytes that went out.
-    let fetched = transfer
-        .get(target, &digest)
-        .await
-        .expect("get 64 MiB back");
-    assert_eq!(fetched.len(), bytes.len());
-    assert_eq!(rift_cluster::blobs::digest_of_bytes(&fetched), digest);
-
-    cluster.shutdown_all().await;
-}
-
-#[tokio::test]
-async fn an_interrupted_transfer_resumes_from_its_offset() {
-    // Acceptance criterion 1, second half. The observable is `bytes_sent`: a
-    // resumed transfer that quietly restarted from zero would still leave a
-    // correct blob behind, so "the blob arrived" cannot distinguish the two.
-    let _guard = TEST_LOCK.lock().await;
-    let mut cluster = TestCluster::start(3).await;
-
-    let bytes = vec![b'Q'; 9 * 1024 * 1024];
-    let digest = rift_cluster::blobs::digest_of_bytes(&bytes);
-    let target = cluster.members[1].addr;
-    let transfer = blob_transfer();
-
-    // Deliver a prefix and stop, exactly as a killed origin would.
-    let partial = transfer
-        .put_prefix(target, &digest, &bytes, 4 * 1024 * 1024)
-        .await
-        .expect("partial put");
-    assert_eq!(partial, 4 * 1024 * 1024);
-    assert!(
-        !transfer.have(target, &digest).await.expect("have"),
-        "a partial transfer must not be visible as a blob"
-    );
-
-    let outcome = transfer.put(target, &digest, &bytes).await.expect("resume");
-    assert_eq!(
-        outcome.resumed_from,
-        4 * 1024 * 1024,
-        "the sender must pick up from what the receiver already held"
-    );
-    assert_eq!(
-        outcome.bytes_sent,
-        bytes.len() as u64 - 4 * 1024 * 1024,
-        "the resumed transfer must not re-send the bytes already staged"
-    );
-    assert!(transfer.have(target, &digest).await.expect("have"));
-
-    cluster.shutdown_all().await;
-}
-
-#[tokio::test]
-async fn a_zero_byte_blob_crosses_the_wire_like_any_other() {
-    // `BlobTransfer::put` special-cases `total == 0` (there is no chunk for the
-    // loop to send, so the commit has to be driven explicitly). Nothing else
-    // exercises that branch over a real connection.
-    let _guard = TEST_LOCK.lock().await;
-    let mut cluster = TestCluster::start(3).await;
-
-    let target = cluster.members[1].addr;
-    let transfer = blob_transfer();
-    let digest = rift_cluster::blobs::digest_of_bytes(&[]);
-
-    let outcome = transfer
-        .put(target, &digest, &[])
-        .await
-        .expect("put empty blob");
-    assert_eq!(outcome.bytes_sent, 0);
-
-    assert!(
-        transfer.have(target, &digest).await.expect("have"),
-        "an empty blob is still a blob the receiver holds"
-    );
-    assert_eq!(transfer.stat(target, &digest).await.expect("stat").size, 0);
-    assert_eq!(
-        transfer.get(target, &digest).await.expect("get"),
-        Vec::<u8>::new()
-    );
-
-    cluster.shutdown_all().await;
-}
-
-#[tokio::test]
-async fn a_partially_staged_blob_is_not_served_and_still_completes_on_resume() {
-    // Two things at once, both about the staging/committed boundary as seen
-    // over the wire: a `.part` must never be readable, and a resume onto one
-    // must still commit.
-    let _guard = TEST_LOCK.lock().await;
-    let mut cluster = TestCluster::start(3).await;
-
-    let bytes = vec![b'P'; 6 * 1024 * 1024];
-    let digest = rift_cluster::blobs::digest_of_bytes(&bytes);
-    let target = cluster.members[1].addr;
-    let transfer = blob_transfer();
-
-    transfer
-        .put_prefix(target, &digest, &bytes, 4 * 1024 * 1024)
-        .await
-        .expect("partial put");
-
-    let err = transfer.get(target, &digest).await;
-    assert!(
-        matches!(err, Err(rift_cluster::rpc::RpcError::NotFound { .. })),
-        "a staged-but-unverified blob must not be readable, got {err:?}"
-    );
-
-    transfer.put(target, &digest, &bytes).await.expect("resume");
-    assert_eq!(
-        transfer
-            .get(target, &digest)
-            .await
-            .expect("get after resume"),
-        bytes
-    );
-
-    cluster.shutdown_all().await;
-}
-
-#[tokio::test]
-async fn fetching_a_blob_the_node_lacks_is_a_typed_not_found() {
-    // Acceptance criterion 3: a 404 the caller can act on, never a 500. #439's
-    // fetch-on-apply has to tell "this peer does not have it, ask another" from
-    // "this peer is broken", and a 500 collapses that distinction.
-    let _guard = TEST_LOCK.lock().await;
-    let mut cluster = TestCluster::start(3).await;
-
-    let target = cluster.members[1].addr;
-    let transfer = blob_transfer();
-    let digest = rift_cluster::blobs::BlobDigest::parse(ABSENT_DIGEST).expect("digest");
-
-    let err = transfer.get(target, &digest).await;
-    assert!(
-        matches!(err, Err(rift_cluster::rpc::RpcError::NotFound { .. })),
-        "expected RpcError::NotFound, got {err:?}"
-    );
-    assert!(!transfer.have(target, &digest).await.expect("have"));
-    let stat = transfer
-        .stat(target, &digest)
-        .await
-        .expect("stat is not an error");
-    assert!(!stat.have);
-    assert_eq!(stat.staged, 0);
-
-    cluster.shutdown_all().await;
-}
-
-#[tokio::test]
-async fn a_chunk_that_does_not_match_the_digest_leaves_no_blob_on_the_receiver() {
-    // Acceptance criterion 2, over the wire rather than in the store: the
-    // receiver, not the sender, is what must refuse.
-    let _guard = TEST_LOCK.lock().await;
-    let mut cluster = TestCluster::start(3).await;
-
-    let bytes = vec![b'M'; 1024];
-    let honest = rift_cluster::blobs::digest_of_bytes(&bytes);
-    let target = cluster.members[1].addr;
-    let transfer = blob_transfer();
-
-    // Claim one digest, send the bytes of another.
-    let lie = rift_cluster::blobs::BlobDigest::parse(ABSENT_DIGEST).expect("digest");
-    let err = transfer.put(target, &lie, &bytes).await;
-    // The concrete class, not merely `is_err()`: "you sent bytes that are not
-    // what you named them" is a 400 the sender must not retry identically. An
-    // implementation that answered 500 would pass an `is_err()` check while
-    // telling every caller the fault was the receiver's, and retryable.
-    assert!(
-        matches!(err, Err(rift_cluster::rpc::RpcError::BadRequest(_))),
-        "expected BadRequest for a digest mismatch, got {err:?}"
-    );
-
-    assert!(!transfer.have(target, &lie).await.expect("have"));
-    assert!(!transfer.have(target, &honest).await.expect("have"));
-
-    cluster.shutdown_all().await;
-}
-
-// ---- #439: fetch-on-apply — the bytes leave the log (D-23, D-48, D-49) --------------------
-
-/// `dataset_put`, with the bytes taken off the op and `origin` stamped — the shape the admin
-/// front submits once a quorum holds the blob (D-49). The harness submits directly, so the
-/// fan-out is the test's own job: call `fan_out_blob` first.
-fn digest_only_dataset_put(name: &str, csv: &str, origin: NodeId) -> ControlRequest {
-    let mut request = dataset_put(name, csv);
-    if let rift_cluster::ControlOp::DatasetPut {
-        csv,
-        origin: accepted_by,
-        ..
-    } = &mut request.op
-    {
-        *csv = None;
-        *accepted_by = origin;
-    }
-    request
-}
-
-fn dataset_delete(name: &str) -> ControlRequest {
-    ControlRequest {
-        op_id: uuid::Uuid::new_v4(),
-        principal: None,
-        issued_at_secs: 0,
-        expected_revision: None,
-        op: rift_cluster::ControlOp::DatasetDelete {
-            tenant: rift_cluster::TenantId::default(),
-            name: name.to_owned(),
-        },
-    }
-}
-
-/// Poll `node` until it no longer lists `name`, or `deadline` passes.
-///
-/// Only `Ok(None)` counts as gone. `wait_for_dataset`'s `.ok().flatten()` is safe for the
-/// *presence* question — a read error there degrades to "not yet", and the loop keeps polling —
-/// but the polarity is flipped here, so the same idiom would let a transient read failure report
-/// a deletion that never happened. Restart and recovery windows, which is exactly when this
-/// helper is used, are also when such a transient is likeliest.
-async fn wait_for_dataset_gone(node: &RaftNode, name: &str, deadline: Duration) -> bool {
-    let started = Instant::now();
-    loop {
-        if matches!(node.dataset(DEFAULT_TENANT, name), Ok(None)) {
-            return true;
-        }
-        if started.elapsed() >= deadline {
-            return false;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-}
-
-/// Poll `node` until its blob transport store holds `digest`, or `deadline` passes.
-async fn wait_for_blob(
-    node: &RaftNode,
-    digest: &rift_cluster::blobs::BlobDigest,
-    deadline: Duration,
-) -> bool {
-    let started = Instant::now();
-    loop {
-        if node.blobs().stat(digest).is_ok_and(|stat| stat.have) {
-            return true;
-        }
-        if started.elapsed() >= deadline {
-            return false;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-}
-
-/// Poll `node` until it lists `name`, or `deadline` passes.
-async fn wait_for_dataset(node: &RaftNode, name: &str, deadline: Duration) -> bool {
-    let started = Instant::now();
-    loop {
-        if node.dataset(DEFAULT_TENANT, name).ok().flatten().is_some() {
-            return true;
-        }
-        if started.elapsed() >= deadline {
-            return false;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-}
-
-/// Fan `csv` out from the leader with `absent` down, then commit the digest-only op. Returns
-/// the leader's id (the op's origin) and the digest.
-async fn commit_digest_only_with_a_member_down(
-    cluster: &TestCluster,
-    absent: NodeId,
-    csv: &str,
-) -> (NodeId, rift_cluster::blobs::BlobDigest) {
-    let digest = rift_cluster::blobs::digest_of_bytes(csv.as_bytes());
-    let leader = cluster.leader().expect("two of three still lead");
-    let (outcome, pin) = leader
-        .fan_out_blob(&digest, csv.as_bytes())
-        .await
-        .expect("fan-out");
-    assert!(outcome.quorum, "two of three hold it");
-    assert!(
-        !outcome.acks.contains(&absent),
-        "the killed node cannot have acked"
-    );
-    let response = leader
-        .submit(digest_only_dataset_put("customers", csv, leader.id()))
-        .await
-        .expect("commits");
-    assert_eq!(response.outcome, rift_cluster::ControlOutcome::Applied);
-    drop(pin);
-    for node in cluster.live() {
-        assert!(
-            wait_for_dataset(node, "customers", Duration::from_secs(30)).await,
-            "live node {} applies from its own store",
-            node.id()
-        );
-    }
-    (leader.id(), digest)
-}
-
-/// Pins D-23 and D-49: a follower that was down for the fan-out never received the bytes, and
-/// the entry it later replicates carries only the digest — so it must fetch on apply from a
-/// member that holds the blob, and end up with the same spool file every other node has.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_follower_down_during_fan_out_fetches_the_blob_on_apply() {
-    let _serial = TEST_LOCK.lock().await;
-    let mut cluster = TestCluster::start(3).await;
-    cluster
-        .wait_for_leader(LEADER_DEADLINE)
-        .await
-        .expect("leader");
-    let leader_id = cluster.leader().expect("leader").id();
-    let absent = cluster
-        .members
-        .iter()
-        .map(|m| m.id)
-        .find(|&id| id != leader_id)
-        .expect("a follower");
-    cluster.kill(absent).await;
-
-    let csv = "id,name\n1,ada\n2,bob\n";
-    let (_origin, digest) = commit_digest_only_with_a_member_down(&cluster, absent, csv).await;
-
-    cluster.restart(absent).await;
-    {
-        let member = cluster.member(absent);
-        let node = member.node.as_ref().expect("restarted");
-        assert!(
-            wait_for_dataset(node, "customers", Duration::from_secs(30)).await,
-            "the restarted follower applies the digest-only entry"
-        );
-        assert!(
-            node.blobs().stat(&digest).expect("stat").have,
-            "fetched into its own store"
-        );
-        assert_eq!(
-            std::fs::read(spool_file(member.dir.path(), csv)).expect("spool file"),
-            csv.as_bytes(),
-            "the spool file is materialised from the fetched bytes"
-        );
-        assert_eq!(
-            node.blob_fetch_stall(),
-            None,
-            "a fetch that succeeded is not a stall"
-        );
-    }
-    cluster.shutdown_all().await;
-}
-
-/// Pins D-48 (origin first, *then any member*) and epic #432's acceptance 5: killing the node
-/// that accepted the write does not stop a member that missed the fan-out from applying it.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_dead_origin_is_not_needed_to_apply_a_digest_only_entry() {
-    let _serial = TEST_LOCK.lock().await;
-    let mut cluster = TestCluster::start(3).await;
-    cluster
-        .wait_for_leader(LEADER_DEADLINE)
-        .await
-        .expect("leader");
-    let leader_id = cluster.leader().expect("leader").id();
-    let absent = cluster
-        .members
-        .iter()
-        .map(|m| m.id)
-        .find(|&id| id != leader_id)
-        .expect("a follower");
-    cluster.kill(absent).await;
-
-    let csv = "id,name\n1,ada\n2,bob\n3,cleo\n";
-    let (origin, digest) = commit_digest_only_with_a_member_down(&cluster, absent, csv).await;
-    assert_eq!(origin, leader_id);
-
-    // The origin dies before the absent member comes back: only the third node holds the blob.
-    cluster.kill(origin).await;
-    cluster.restart(absent).await;
-    assert!(
-        cluster.wait_for_leader(LEADER_DEADLINE).await.is_some(),
-        "two of three elect"
-    );
-    {
-        let node = cluster.member(absent).node.as_ref().expect("restarted");
-        assert!(
-            wait_for_dataset(node, "customers", Duration::from_secs(60)).await,
-            "applies by fetching from the surviving holder"
-        );
-        assert!(node.blobs().stat(&digest).expect("stat").have);
-        assert_eq!(node.blob_fetch_stall(), None);
-    }
-    cluster.shutdown_all().await;
-}
-
-/// Pins D-51 (#486): a member serves a **referenced** blob out of applied state when its own
-/// transport store does not have the bytes.
-///
-/// The setup is the pre-fan-out shape the issue names, reproduced exactly: every live member has
-/// the `sm_dataset_blobs` row (it applied the entry) and none has the bytes in a blob transport
-/// store — which is the state a node reaches by applying an op that carried its bytes on the log,
-/// since that arm writes redb and never `store_whole`s. Before this fix the joiner's fetch found
-/// no holder and parked forever (D-48), applying nothing thereafter; now applied state answers.
-///
-/// This is the same setup as `a_blob_no_member_holds_parks_apply_and_recovers_when_a_holder_returns`
-/// below, with the opposite outcome — which is the fix, stated as a diff between two tests.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_blob_only_applied_state_holds_is_served_to_a_member_that_must_fetch_it() {
-    let _serial = TEST_LOCK.lock().await;
-    let mut cluster = TestCluster::start(3).await;
-    cluster
-        .wait_for_leader(LEADER_DEADLINE)
-        .await
-        .expect("leader");
-    let leader_id = cluster.leader().expect("leader").id();
-    let absent = cluster
-        .members
-        .iter()
-        .map(|m| m.id)
-        .find(|&id| id != leader_id)
-        .expect("a follower");
-    cluster.kill(absent).await;
-
-    let csv = "id,name\n1,ada\n2,bob\n";
-    let (_origin, digest) = commit_digest_only_with_a_member_down(&cluster, absent, csv).await;
-
-    // Erase every transport-store copy. The dataset is still live, so every live member still
-    // holds the referenced `sm_dataset_blobs` row — bytes in applied state, held by nobody in a
-    // transport store.
-    for node in cluster.live() {
-        std::fs::remove_file(node.blobs().path_of(&digest)).expect("erase the transport copy");
-        assert!(
-            !node.blobs().stat(&digest).expect("stat").have,
-            "node {} must not hold the bytes in its transport store",
-            node.id()
-        );
-    }
-
-    cluster.restart(absent).await;
-    {
-        let member = cluster.member(absent);
-        let node = member.node.as_ref().expect("restarted");
-        assert!(
-            wait_for_dataset(node, "customers", Duration::from_secs(60)).await,
-            "applies by fetching from a member that holds it only in applied state"
-        );
-        assert_eq!(
-            node.blob_fetch_stall(),
-            None,
-            "a fetch that succeeded is not a stall"
-        );
-        assert!(
-            node.blobs().stat(&digest).expect("stat").have,
-            "the fetched bytes land in the joiner's own transport store, so it is now an \
-             ordinary holder"
-        );
-        assert_eq!(
-            std::fs::read(spool_file(member.dir.path(), csv)).expect("spool file"),
-            csv.as_bytes(),
-            "the spool file is materialised from the bytes applied state served"
-        );
-    }
-    cluster.shutdown_all().await;
-}
-
-/// Pins D-52 (#480): blob GC retains an unreferenced digest until this node's log is purged past
-/// the index that unreferenced it. End to end: a blob whose last reference is deleted while a voter is
-/// down stays on the holders' stores until the log is purged past the index that unreferenced it,
-/// so the returning voter can still fetch it and apply the entry that references it.
-///
-/// This is the failure #480 describes: the delete makes the digest unreferenced fleet-wide, the
-/// 60 s GC tick would reap it on every member (the grace is measured from the blob's *mtime*, not
-/// from when it became unreferenced), and the returning replica then replays the original
-/// digest-only `PUT` and finds no holder anywhere. It cannot be rescued by compaction either —
-/// openraft's state-machine worker runs `apply` and `install_snapshot` on one sequential loop, so
-/// the snapshot that would skip the blob queues behind the parked apply and never runs.
-///
-/// Since D-55 (#504) the sweep below retains for a second reason as well: the lagging voter is
-/// *down* when it runs, so the fleet applied floor is unknown and rule C holds every tombstoned
-/// blob regardless of the purge point. Rule A still holds it on its own — the purge point here
-/// is far below the tombstone — so this test's claim is unchanged.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_blob_deleted_while_a_voter_lags_is_retained_until_the_log_is_purged_past_it() {
-    let _serial = TEST_LOCK.lock().await;
-    let mut cluster = TestCluster::start(3).await;
-    cluster
-        .wait_for_leader(LEADER_DEADLINE)
-        .await
-        .expect("leader");
-    let leader_id = cluster.leader().expect("leader").id();
-    let absent = cluster
-        .members
-        .iter()
-        .map(|m| m.id)
-        .find(|&id| id != leader_id)
-        .expect("a follower");
-    cluster.kill(absent).await;
-
-    let csv = "id,name\n1,ada\n2,bob\n";
-    let (_origin, digest) = commit_digest_only_with_a_member_down(&cluster, absent, csv).await;
-
-    // The delete unreferences the digest on every live member.
-    cluster
-        .leader()
-        .expect("two of three still lead")
-        .submit(dataset_delete("customers"))
-        .await
-        .expect("commits");
-    for node in cluster.live() {
-        assert!(
-            wait_for_dataset_gone(node, "customers", Duration::from_secs(30)).await,
-            "live node {} applies the delete",
-            node.id()
-        );
-    }
-
-    // Sweep as the 60 s tick would, but **at a `now` past the mtime grace**. Sweeping at the real
-    // clock would prove nothing: the blob was written seconds ago, so `BLOB_GC_GRACE_SECS` alone
-    // keeps it whether or not retention works, and the test would pass against an implementation
-    // that had no tombstone rule at all. Past the grace, the tombstone is the only thing left that
-    // can keep it — its index is far above these nodes' purge point, so it must.
-    let past_the_grace = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("clock after epoch")
-        .as_secs()
-        + 10_000;
-    for node in cluster.live() {
-        node.run_blob_gc_now(past_the_grace).await.expect("sweep");
-        assert!(
-            node.blobs().stat(&digest).expect("stat").have,
-            "node {} must retain a blob its log has not been purged past",
-            node.id()
-        );
-    }
-
-    // So the returning voter still finds a holder and applies the entry it was missing.
-    cluster.restart(absent).await;
-    {
-        let node = cluster.member(absent).node.as_ref().expect("restarted");
-        assert!(
-            wait_for_blob(node, &digest, Duration::from_secs(60)).await,
-            "the returning voter fetches the retained blob"
-        );
-        assert_eq!(
-            node.blob_fetch_stall(),
-            None,
-            "retention means it never had to stall"
-        );
-        assert!(
-            wait_for_dataset_gone(node, "customers", Duration::from_secs(30)).await,
-            "and it applies the delete behind the entry it was parked on"
-        );
-    }
-    cluster.shutdown_all().await;
-}
-
-/// Pins D-55 (#504): blob GC retains a tombstoned digest until **every member has applied past
-/// it** — rule C — because the purge point alone (D-52 rule A) does not protect a replica whose
-/// log is ahead of its applied index. The issue's exact sequence, end to end:
-///
-/// 1. A voter is down for a digest-only `PUT` at `p` and the `DatasetDelete` at `t` behind it.
-/// 2. The bytes are reaped from every live member; the voter returns, replays `p` from the log,
-///    finds no holder and **parks** (D-48) while replication keeps filling its log. This is the
-///    state rule A cannot see: its log runs past `t` — and past the leader's purge point, once
-///    the log compacts — so it will never be offered a snapshot; its applied index is below `p`.
-/// 3. The request grace lapses (rule B no longer holds anything), one holder is restored, and
-///    that holder sweeps with its log purged past `t`. **Under D-52 alone this reaps the blob**
-///    — `t <= purged`, nobody asked within the grace — and the parked voter, still replaying `p`
-///    from its own log against a fleet that holds nothing, wedges forever. Under rule C the
-///    floor is the parked voter's own applied index, below `p`, so the blob stays.
-/// 4. The parked voter's next probe finds the retained holder: it fetches, applies `p` and then
-///    the delete at `t`. Now every member has applied past `t`, and the same sweep reaps it.
-///
-/// Both halves are asserted; the first is the discriminator. The request grace is expired by
-/// hand for the same reason the sweep runs at a synthetic `now`: the loop's real clocks would
-/// keep the blob for an hour whether or not retention works, and the test would prove nothing.
-/// The issue's step 4 — the voter *restarts* between the delete and the sweep — is the same
-/// state seen from the holders (no request inside the grace), and is deliberately not staged
-/// here: keeping the voter alive lets this test sweep while the fleet floor is **known and below
-/// `p`**, which is a stronger pin of rule C than the fail-closed "a member is unreachable" arm a
-/// kill would exercise. Restarting a parked node in-process is itself possible since D-56
-/// (#513); `a_parked_node_shuts_down_cleanly_and_its_data_directory_reopens` below covers it.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_blob_deleted_while_a_replica_is_parked_is_retained_until_every_member_has_applied_past_it()
- {
-    let _serial = TEST_LOCK.lock().await;
-    // Snapshot (and purge to the tip) every 24 entries: late enough that nothing is purged before
-    // the returning voter has caught its log up past `t`, early enough that a few dozen fill
-    // writes push every live member's purge point past `t` inside the test.
-    let mut cluster = TestCluster::start_with_snapshots(3, 24).await;
-    cluster
-        .wait_for_leader(LEADER_DEADLINE)
-        .await
-        .expect("leader");
-    let leader_id = cluster.leader().expect("leader").id();
-    let parked = cluster
-        .members
-        .iter()
-        .map(|m| m.id)
-        .find(|&id| id != leader_id)
-        .expect("a follower");
-    cluster.kill(parked).await;
-
-    // (1) `PUT` at `p`, delete at `t`, with the voter down for both.
-    let csv = "id,name\n1,ada\n2,bob\n";
-    let (_origin, digest) = commit_digest_only_with_a_member_down(&cluster, parked, csv).await;
-    let p = cluster
-        .leader()
-        .expect("leader")
-        .status()
-        .last_applied
-        .expect("applied the put");
-    let t = cluster
-        .leader()
-        .expect("two of three still lead")
-        .submit(dataset_delete("customers"))
-        .await
-        .expect("commits")
-        .revision;
-    assert!(t > p);
-    for node in cluster.live() {
-        assert!(
-            wait_for_dataset_gone(node, "customers", Duration::from_secs(30)).await,
-            "live node {} applies the delete, dropping its blob row",
-            node.id()
-        );
-        // Reap the bytes so the returning voter has nothing to fetch (D-51's applied-state
-        // holder is gone with the delete) and parks — the D-48 setup.
-        std::fs::remove_file(node.blobs().path_of(&digest)).expect("reap the blob from a holder");
-    }
-
-    // (2) The voter returns, replays `p` from its log and parks; replication keeps filling its
-    // log. Fill until every live member's log is purged past `t`, one write at a time, waiting
-    // for the parked voter's log to reach each entry before the next: the leader purges the
-    // moment it snapshots, and the parked voter must be at the tip when that happens or openraft
-    // switches it to a snapshot — the *other* case, which D-52 already covers.
-    cluster.restart(parked).await;
-    let fill_deadline = Instant::now() + Duration::from_secs(120);
-    let mut fill = 0_u32;
-    loop {
-        let purged_past_t = cluster
-            .live()
-            .filter(|node| node.id() != parked)
-            .all(|node| node.purged_index().is_some_and(|purged| purged >= t));
-        if purged_past_t {
-            break;
-        }
-        assert!(
-            Instant::now() < fill_deadline,
-            "the live members never purged past t={t} (fills: {fill})"
-        );
-        let revision = cluster
-            .leader()
-            .expect("leader")
-            .submit(dataset_put(
-                &format!("fill{fill}"),
-                &format!("id,v\n{fill},x\n"),
-            ))
-            .await
-            .expect("fill commits")
-            .revision;
-        fill += 1;
-        let parked_node = cluster.member(parked).node.as_ref().expect("restarted");
-        assert!(
-            wait_for_log_index(parked_node, revision, Duration::from_secs(30)).await,
-            "the parked voter's log must keep up with the tip (wanted {revision}, at {:?})",
-            parked_node.last_log_index()
-        );
-    }
-    let purge_floor = cluster
-        .live()
-        .filter(|node| node.id() != parked)
-        .map(|node| node.purged_index().expect("purged past t"))
-        .max()
-        .expect("two live members");
-    {
-        let node = cluster.member(parked).node.as_ref().expect("restarted");
-        assert!(
-            wait_for_log_index(node, purge_floor, Duration::from_secs(30)).await,
-            "log ahead of the purge point: the voter is caught up by entries, never a snapshot"
-        );
-        let applied = node.status().last_applied.unwrap_or(0);
-        assert!(
-            applied < p,
-            "parked below p={p}: applied {applied} — the bytes must be unobtainable"
-        );
-        assert!(
-            node.dataset(DEFAULT_TENANT, "customers")
-                .expect("the node still answers")
-                .is_none(),
-            "parked, not applied"
-        );
-    }
-
-    // (3) Restore ONE holder, let the request grace lapse, and sweep past the mtime grace — all
-    // three within the same few milliseconds. Restoring the holder is also what lets the parked
-    // voter's next fetch round succeed, so the window between the restore and the sweep's own
-    // floor probe must be small against the voter's round interval: one holder keeps the window
-    // to this node's probe (a restore on a second holder would let the voter fetch, apply past
-    // `t`, and lift the floor before the second sweep). The voter's backoff doubles from
-    // `FETCH_BACKOFF_MIN` to its 5 s cap in about 6 s of parking; waiting that out first puts the
-    // window at a few ms in 5 s. A lost race reads as a voided premise below, not as retention
-    // failing.
-    tokio::time::sleep(Duration::from_secs(7)).await;
-    let past_the_grace = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("clock after epoch")
-        .as_secs()
-        + 10_000;
-    let holder = cluster
-        .live()
-        .find(|node| node.id() != parked)
-        .expect("a live member other than the parked voter");
-    let purged = holder.purged_index().expect("purged");
-    assert!(
-        purged >= t,
-        "precondition: rule A alone would reap at {purged}"
-    );
-    holder
-        .blobs()
-        .store_whole(&digest, csv.as_bytes())
-        .expect("restore the blob on a holder");
-    holder.blobs().expire_requests();
-    holder.run_blob_gc_now(past_the_grace).await.expect("sweep");
-    let still_parked = cluster
-        .member(parked)
-        .node
-        .as_ref()
-        .expect("live")
-        .status()
-        .last_applied
-        .is_none_or(|applied| applied < p);
-    assert!(
-        still_parked,
-        "premise void, not a retention failure: the voter fetched and applied past p={p} inside \
-         the restore→sweep window"
-    );
-    assert!(
-        holder.blobs().stat(&digest).expect("stat").have,
-        "node {} must retain a blob a member parked below p={p} still needs — \
-         under D-52 alone (purged {purged} >= t {t}, nobody asked within the grace) this is reaped",
-        holder.id()
-    );
-
-    // (4) The parked voter's next probe finds a holder: it fetches, applies `p` and the delete.
-    {
-        let node = cluster.member(parked).node.as_ref().expect("live");
-        assert!(
-            wait_for_blob(node, &digest, Duration::from_secs(60)).await,
-            "the parked voter fetches the retained blob"
-        );
-        assert!(
-            wait_for_dataset_gone(node, "customers", Duration::from_secs(30)).await,
-            "and applies the delete behind the entry it was parked on"
-        );
-        assert!(
-            wait_for_applied_index(node, t, Duration::from_secs(30)).await,
-            "applied past t={t}: at {:?}",
-            node.status().last_applied
-        );
-        assert_eq!(
-            node.blob_fetch_stall(),
-            None,
-            "the stall clears on recovery"
-        );
-    }
-    // Every member has now applied past `t`: the floor lifts and the same sweep reaps.
-    for node in cluster.live().filter(|node| node.id() != parked) {
-        node.blobs().expire_requests();
-        node.run_blob_gc_now(past_the_grace).await.expect("sweep");
-        assert!(
-            !node.blobs().stat(&digest).expect("stat").have,
-            "node {} reaps once every member has applied past the tombstone",
-            node.id()
-        );
-    }
-    cluster.shutdown_all().await;
-}
-
-/// Poll `node` until its log reaches `index`, or `deadline` passes.
-async fn wait_for_log_index(node: &RaftNode, index: u64, deadline: Duration) -> bool {
-    let started = Instant::now();
-    loop {
-        if node.last_log_index().is_some_and(|last| last >= index) {
-            return true;
-        }
-        if started.elapsed() >= deadline {
-            return false;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-}
-
-/// Poll `node` until its applied index reaches `index`, or `deadline` passes.
-async fn wait_for_applied_index(node: &RaftNode, index: u64, deadline: Duration) -> bool {
-    let started = Instant::now();
-    loop {
-        if node.status().last_applied.is_some_and(|last| last >= index) {
-            return true;
-        }
-        if started.elapsed() >= deadline {
-            return false;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-}
-
-/// Pins D-48: a blob no reachable member holds parks the follower's apply — it does not halt
-/// the node, does not apply an empty document, and past `BLOB_FETCH_ESCALATE_AFTER` reports
-/// the stall on the health surface; it applies the moment a holder returns, and the stall
-/// clears. The setup is the failure D-48 exists for: the blob reaped from every holder before
-/// a member that missed the fan-out could fetch it.
-///
-/// **Reaching that state now takes a delete.** Since D-51 (#486) applied state is itself a
-/// holder, so erasing the transport files leaves every live member still able to serve the
-/// referenced `sm_dataset_blobs` row — see
-/// `a_blob_only_applied_state_holds_is_served_to_a_member_that_must_fetch_it` above, which is
-/// this same setup with the opposite outcome. Deleting the dataset first drops that row on
-/// every live member (`gc_dataset_blob_if_unreferenced`, in the delete's own transaction), so
-/// nothing in the fleet holds the bytes and D-48's park is reachable again. That the parked
-/// entry's own `DatasetDelete` sits *behind* it in the log — making the park permanent until a
-/// holder returns or compaction intervenes — is the residual #480 tracks.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_blob_no_member_holds_parks_apply_and_recovers_when_a_holder_returns() {
-    let _serial = TEST_LOCK.lock().await;
-    let mut cluster = TestCluster::start(3).await;
-    cluster
-        .wait_for_leader(LEADER_DEADLINE)
-        .await
-        .expect("leader");
-    let leader_id = cluster.leader().expect("leader").id();
-    let absent = cluster
-        .members
-        .iter()
-        .map(|m| m.id)
-        .find(|&id| id != leader_id)
-        .expect("a follower");
-    cluster.kill(absent).await;
-
-    let csv = "id,name\n1,ada\n";
-    let (origin, digest) = commit_digest_only_with_a_member_down(&cluster, absent, csv).await;
-
-    // Unreference it, so applied state stops being a holder (D-51), then reap the bytes.
-    cluster
-        .leader()
-        .expect("two of three still lead")
-        .submit(dataset_delete("customers"))
-        .await
-        .expect("commits");
-    for node in cluster.live() {
-        assert!(
-            wait_for_dataset_gone(node, "customers", Duration::from_secs(30)).await,
-            "live node {} applies the delete, dropping its blob row",
-            node.id()
-        );
-        std::fs::remove_file(node.blobs().path_of(&digest)).expect("reap the blob from a holder");
-    }
-
-    cluster.restart(absent).await;
-    {
-        let node = cluster.member(absent).node.as_ref().expect("restarted");
-        assert!(
-            !wait_for_dataset(node, "customers", Duration::from_secs(3)).await,
-            "must not apply without the bytes"
-        );
-        assert_eq!(
-            node.blob_fetch_stall(),
-            None,
-            "not yet a stall: the escalation window has not passed"
-        );
-
-        // Polled, not slept: the escalation window starts when the *fetch* starts, and the
-        // fetch starts only once the restarted node has caught its log up — which on a 2-vCPU
-        // runner can be seconds after `restart` returns. A fixed sleep of window + 3 s passed
-        // locally and failed on CI for exactly that reason.
-        let escalation_deadline = Instant::now()
-            + rift_cluster::blobs::BLOB_FETCH_ESCALATE_AFTER
-            + Duration::from_secs(45);
-        let stall = loop {
-            if let Some(stall) = node.blob_fetch_stall() {
-                break stall;
-            }
-            assert!(
-                Instant::now() < escalation_deadline,
-                "never escalated to a stall"
-            );
-            tokio::time::sleep(Duration::from_millis(250)).await;
-        };
-        assert_eq!(stall.digest, digest.as_str());
-        assert!(stall.stalled_for() >= rift_cluster::blobs::BLOB_FETCH_ESCALATE_AFTER);
-        assert_eq!(stall.origin, origin);
-        assert!(
-            stall.tried.contains(&origin),
-            "the origin was asked: {:?}",
-            stall.tried
-        );
-        assert!(stall.skewed.is_empty(), "no member is version-skewed");
-        assert_eq!(
-            stall.last_error, None,
-            "every member merely lacks the blob; nobody refused"
-        );
-        assert!(
-            node.dataset(DEFAULT_TENANT, "customers")
-                .expect("the node still answers")
-                .is_none(),
-            "parked, not applied"
-        );
-    }
-
-    // A holder returns.
-    cluster
-        .member(origin)
-        .node
-        .as_ref()
-        .expect("live")
-        .blobs()
-        .store_whole(&digest, csv.as_bytes())
-        .expect("restore the blob on the origin");
-    {
-        let member = cluster.member(absent);
-        let node = member.node.as_ref().expect("live");
-        // The fetch landing in this node's own store is what proves the parked apply drained:
-        // it is reachable only through the apply that was parked. Asserting on the dataset
-        // instead would prove nothing here, because the `DatasetDelete` queued behind the
-        // parked entry removes it again moments later.
-        assert!(
-            wait_for_blob(node, &digest, Duration::from_secs(30)).await,
-            "the parked apply drains and fetches once a holder returns"
-        );
-        assert_eq!(
-            node.blob_fetch_stall(),
-            None,
-            "the stall clears on recovery"
-        );
-        assert!(
-            wait_for_dataset_gone(node, "customers", Duration::from_secs(30)).await,
-            "and it keeps going past the parked entry, applying the delete behind it"
-        );
-    }
-    cluster.shutdown_all().await;
-}
-
-/// Pins D-56 (#513): a node parked on a blob nobody holds still shuts down **cleanly**, and its
-/// data directory can be reopened in the same process.
-///
-/// Before D-56 this was impossible, and the failure was silent in the worst way. A parked apply
-/// occupies openraft's state-machine worker, which awaits `apply` inline; the worker therefore
-/// never returns to its command channel, never drops its `RedbStateMachine` clone, and
-/// `RaftNode::shutdown`'s storage-release wait times out and returns `Err` — while the redb file
-/// lock stays held by the stuck task. `TestCluster::kill` discards that `Err`, so the next
-/// `RaftNode::start` on the same directory failed with `redb: Database already open`, several
-/// steps away from the cause. D-56's shutdown signal ends the parked fetch, the apply fails, the
-/// worker exits, and the handle drops.
-///
-/// The park is D-48's, built exactly as
-/// `a_blob_no_member_holds_parks_apply_and_recovers_when_a_holder_returns` builds it: a member
-/// that missed the fan-out, a delete that drops applied state as a holder (D-51), and the bytes
-/// removed from every live member's transport store.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_parked_node_shuts_down_cleanly_and_its_data_directory_reopens() {
-    let _serial = TEST_LOCK.lock().await;
-    let mut cluster = TestCluster::start(3).await;
-    cluster
-        .wait_for_leader(LEADER_DEADLINE)
-        .await
-        .expect("leader");
-    let leader_id = cluster.leader().expect("leader").id();
-    let parked = cluster
-        .members
-        .iter()
-        .map(|m| m.id)
-        .find(|&id| id != leader_id)
-        .expect("a follower");
-    cluster.kill(parked).await;
-
-    let csv = "id,name\n1,ada\n";
-    let (_origin, digest) = commit_digest_only_with_a_member_down(&cluster, parked, csv).await;
-    cluster
-        .leader()
-        .expect("two of three still lead")
-        .submit(dataset_delete("customers"))
-        .await
-        .expect("commits");
-    for node in cluster.live() {
-        assert!(
-            wait_for_dataset_gone(node, "customers", Duration::from_secs(30)).await,
-            "live node {} applies the delete, dropping its blob row",
-            node.id()
-        );
-        std::fs::remove_file(node.blobs().path_of(&digest)).expect("reap the blob from a holder");
-    }
-
-    // The member returns and parks: it replays the `PUT` from its own log and no member can
-    // supply the bytes.
-    cluster.restart(parked).await;
-    let node = cluster
-        .member_mut(parked)
-        .node
-        .take()
-        .expect("restarted, and taken so this test owns the shutdown rather than `kill`");
-    let escalation_deadline =
-        Instant::now() + rift_cluster::blobs::BLOB_FETCH_ESCALATE_AFTER + Duration::from_secs(45);
-    while node.blob_fetch_stall().is_none() {
-        assert!(
-            Instant::now() < escalation_deadline,
-            "precondition: the node never parked, so this proves nothing about a parked shutdown"
-        );
-        tokio::time::sleep(Duration::from_millis(250)).await;
-    }
-    assert!(
-        node.dataset(DEFAULT_TENANT, "customers")
-            .expect("the node still answers")
-            .is_none(),
-        "parked, not applied"
-    );
-
-    // The claim. Under the old behaviour this is `Err(Runtime("raft core did not release
-    // storage within 2s"))` after the full timeout.
-    let stopped = tokio::time::timeout(Duration::from_secs(30), node.shutdown())
-        .await
-        .expect("shutdown must not hang");
-    assert!(
-        stopped.is_ok(),
-        "a parked node must shut down cleanly, got {stopped:?}"
-    );
-    drop(node);
-
-    // And the consequence that made this worth fixing: the directory is usable again. `restart`
-    // panics inside `spawn_full` on `Database already open`, so reaching this line is most of the
-    // claim; the status read is what proves the reopened node is actually serving.
-    cluster.restart(parked).await;
-    let restarted = cluster.member(parked).node.as_ref().expect("reopened");
-    assert_eq!(
-        restarted.status().node_id,
-        parked,
-        "the reopened node answers as itself"
-    );
-
-    cluster.shutdown_all().await;
-}
-
-// ---- #481: a byte quorum is not a decode quorum -----------------------------------------
-
-/// Pins the half of D-53 (#481) that only a real fleet can ask: that a **peer** running a build which
-/// cannot apply digest-only ops is probed over the wire and classified, rather than merely acked.
-///
-/// One member advertises `applies_digest_only: false` (the hidden knob). As a full voter it still
-/// receives the blob during fan-out, so a byte quorum forms exactly as before (`outcome.quorum`) —
-/// D-19 is untouched. What must differ is the fan-out's *verdict*: not every member is confirmed
-/// capable, so it is not safe to strip, and the incapable member is named rather than merged into
-/// a bare boolean an operator could not act on.
-///
-/// Deliberately stops at the verdict. The strip itself lives in
-/// `rift_cluster_server::admin_front::fan_out_then_submit`, which this crate cannot depend on, and
-/// a test that re-implemented the gate here would be asserting against its own copy of the logic —
-/// green no matter what production did. That gate is pinned where it lives, by
-/// `fan_out_then_submit_keeps_the_bytes_when_a_member_cannot_apply_digest_only`.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_peer_that_cannot_apply_digest_only_is_probed_and_named() {
-    let _serial = TEST_LOCK.lock().await;
-    let incapable: NodeId = 3;
-    let mut cluster = TestCluster::start_with_one_member_digest_only_incapable(3, incapable).await;
-    cluster
-        .wait_for_leader(LEADER_DEADLINE)
-        .await
-        .expect("leader");
-
-    let csv = "id,name\n1,ada\n2,bob\n";
-    let digest = rift_cluster::blobs::digest_of_bytes(csv.as_bytes());
-    {
-        let leader = cluster.leader().expect("leader");
-        let (outcome, pin) = leader
-            .fan_out_blob(&digest, csv.as_bytes())
-            .await
-            .expect("fan-out");
-        assert!(
-            outcome.quorum,
-            "the byte quorum is unaffected: an incapable member still stores the blob (D-19)"
-        );
-        assert!(
-            !outcome.sideload_safe,
-            "one member is not confirmed capable, so stripping is not safe: {:?} / {:?}",
-            outcome.sideload_incapable, outcome.sideload_unobserved
-        );
-        assert!(
-            outcome.sideload_incapable.contains(&incapable),
-            "the incapable member is named so the warning can say who: {:?}",
-            outcome.sideload_incapable
-        );
-        assert!(
-            outcome.skewed.is_empty(),
-            "it has blob routes — it is not the pre-#437 skew case"
-        );
-        drop(pin);
-    }
-    cluster.shutdown_all().await;
-}
-
-/// The mirror: with every member on this build, the same fan-out reports it *is* safe to strip.
-/// Without this, `sideload_safe` could be hard-wired to `false` — closing #481's wedge by
-/// disabling sideloading altogether, which is the epic's whole point undone — and the test above
-/// would still pass.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_fleet_of_capable_members_is_safe_to_strip() {
-    let _serial = TEST_LOCK.lock().await;
-    let mut cluster = TestCluster::start(3).await;
-    cluster
-        .wait_for_leader(LEADER_DEADLINE)
-        .await
-        .expect("leader");
-
-    let csv = "id,name\n1,carol\n2,dan\n";
-    let digest = rift_cluster::blobs::digest_of_bytes(csv.as_bytes());
-    {
-        let leader = cluster.leader().expect("leader");
-        let (outcome, pin) = leader
-            .fan_out_blob(&digest, csv.as_bytes())
-            .await
-            .expect("fan-out");
-        assert!(outcome.quorum);
-        assert!(
-            outcome.sideload_safe,
-            "every member is this build, so nothing should be held back: {:?} / {:?}",
-            outcome.sideload_incapable, outcome.sideload_unobserved
-        );
-        drop(pin);
     }
     cluster.shutdown_all().await;
 }

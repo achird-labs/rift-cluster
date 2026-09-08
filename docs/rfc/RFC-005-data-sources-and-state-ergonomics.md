@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | v1 — design draft for review |
+| **Status** | v1 — **superseded by D-71** (RFC-007 §3.2, #549) |
 | **Tracking issue** | [achird-labs/rift-cluster#149](https://github.com/achird-labs/rift-cluster/issues/149) (milestone M5); isolation defect filed as [#152](https://github.com/achird-labs/rift-cluster/issues/152) |
 | **Canonical location** | `rift-cluster:docs/rfc/RFC-005-data-sources-and-state-ergonomics.md` |
 | **Depends on** | **ADR-001** (Raft control plane), **RFC-002** (tenancy, actions, 404-vs-403 rule), **#20** (ImposterSource SPI — the one-fetch-then-replicate rule this RFC mirrors) |
@@ -11,6 +11,16 @@
 | **Date** | 2026-07-26 |
 
 ---
+
+> **Retired by D-71** (RFC-007 §3.2, #549): this RFC is superseded **in full**. Data sources,
+> datasets and the content-addressed blob store that carried their bytes no longer exist — no
+> source records, no providers, no poll scheduler, no drift policy, no `DatasetPut`, no quota
+> governance for any of it. Nothing below is served or built. The document stays as the record
+> of what was designed and shipped, and of why it was withdrawn (RFC-007 §2.4, §3.2).
+>
+> What survives from this RFC's scope lives elsewhere and is unaffected: the flow-state store
+> (RFC-007 §3.1, `docs/architecture/06-flow-state.md`) and upstream's own `_rift.stateOps`
+> (U-15).
 
 ## 1. Summary
 
@@ -189,7 +199,8 @@ refused with a 400 naming the row and value — never accepted-but-broken.
 
 ### 3.2 Distribution — the bytes ride the log
 
-> **Amended by D-18 and D-23** (2026-08-24, epic #432): they do not, any more. The decision below
+> **Amended by D-18 and D-23** (2026-08-24, epic #432; both since superseded by **D-72**, #549 —
+> neither shape is live, because datasets are gone): they do not, any more. The decision below
 > — "dataset bytes are committed through the Raft log … no blob sidecar, no fetch protocol" — is
 > reversed: bytes are sideloaded through the content-addressed blob store (#437), fanned out to a
 > joint-consensus quorum *before* the referencing op is proposed (#438, D-19), and fetched on

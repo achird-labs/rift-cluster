@@ -342,12 +342,12 @@ mod tests {
     /// silently drop the query on the floor.
     #[test]
     fn a_prefix_route_matches_past_a_query_but_keeps_it_in_the_suffix() {
-        let router = Router::new().route_prefix("POST", "/admin/sources/", echo_suffix());
+        let router = Router::new().route_prefix("POST", "/_cluster/things/", echo_suffix());
         let (_, suffix) = router
-            .lookup_prefix("POST", "/admin/sources/mocks/pull?force=1")
+            .lookup_prefix("POST", "/_cluster/things/one/act?force=1")
             .expect("the query must not prevent the prefix from matching");
         assert_eq!(
-            suffix, "mocks/pull?force=1",
+            suffix, "one/act?force=1",
             "the handler owns its own query semantics, so the suffix carries it"
         );
     }
@@ -365,16 +365,18 @@ mod tests {
     }
 
     /// Exact-wins-over-prefix is documented on `route_prefix`; a query string
-    /// must not flip that ordering. `/admin/sources?x=1` is the collection, not
-    /// a member of `/admin/sources/`.
+    /// must not flip that ordering. `/_cluster/things?x=1` is the collection, not
+    /// a member of `/_cluster/things/`.
     #[test]
     fn a_query_does_not_let_a_prefix_steal_an_exact_route() {
         let router = Router::new()
-            .route("GET", "/admin/sources", echo())
-            .route_prefix("GET", "/admin/sources/", echo_suffix());
-        assert!(router.lookup("GET", "/admin/sources?x=1").is_some());
+            .route("GET", "/_cluster/things", echo())
+            .route_prefix("GET", "/_cluster/things/", echo_suffix());
+        assert!(router.lookup("GET", "/_cluster/things?x=1").is_some());
         assert!(
-            router.lookup_prefix("GET", "/admin/sources?x=1").is_none(),
+            router
+                .lookup_prefix("GET", "/_cluster/things?x=1")
+                .is_none(),
             "the collection route must not fall through to the member prefix"
         );
     }
