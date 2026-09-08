@@ -11,17 +11,20 @@ export const API_PATHS = {
   fleetHealth: "/_fleet/health",
   session: "/session",
   frontDoorRoutes: "/front-door/routes",
-  /**
-   * Every imposter's recorded requests, merged server-side (#362) — replaces the console's own
-   * N-way fan-out over `requestsPath(port)`. One read, one cursor, one stated coverage.
-   */
-  fleetRequests: "/admin/requests",
 } as const satisfies Record<string, ApiPath>;
 
 /** Path builders for the templated routes, so a port is interpolated in exactly one place. */
 export const imposterPath = (port: number): string => `/imposters/${port}`;
 export const lifecyclePath = (port: number, enabled: boolean): string =>
   `/imposters/${port}/${enabled ? "enable" : "disable"}`;
+/**
+ * One imposter's recorded requests, **on the node the browser reached** (D-74, #552).
+ *
+ * Upstream's own route, proxied verbatim to the embedded engine — there is no fleet-wide spelling
+ * of this any more, and deliberately so: the request journal belongs to the engine, once, for every
+ * deployment shape (RFC-007 §3.3). `?since=` here is upstream's **scalar** index, echoed back on
+ * `x-rift-next-index`; nothing on this side parses either.
+ */
 export const requestsPath = (port: number): string => `/imposters/${port}/requests`;
 
 /** The stub collection. `POST` here appends a stub; it takes `If-Match` like the by-id writes do. */

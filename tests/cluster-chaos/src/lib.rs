@@ -118,18 +118,20 @@ fn stack_lock() -> &'static Mutex<()> {
 
 /// Every image this tier builds for itself, as the compose files tag them.
 ///
-/// There are two, and the difference between them is not cosmetic: the faketime
-/// flavor carries an `LD_PRELOAD` that lies about the clock. Before they were
-/// tagged apart they shared whatever name compose derived from the project and
-/// service (`rift-cluster-rift-1`), and the ONLY thing keeping C12 from running
-/// on a truthful clock — or a later scenario from inheriting a lying one — was
-/// that every scenario passed `--build` and so re-tagged on the way up. That is
-/// a real invariant resting on an argument nobody would think to keep.
+/// One, as of #552. There were two: the second was a `faketime` flavor carrying
+/// an `LD_PRELOAD` that lies about the clock, built for the clock-skew scenario
+/// that proved journal clears consulted no timestamp. That scenario left with
+/// the clear generations it exercised (D-74), and nothing else ever wanted a
+/// lying clock, so the flavor went with it.
 ///
-/// `compose_images_are_tagged_by_flavor` pins this list against the compose
-/// files, so an overlay that introduces a third flavor fails a test rather than
-/// silently sharing a tag with one of these.
-pub const BUILT_IMAGES: [&str; 2] = ["rift-cluster-server:local", "rift-cluster-server:faketime"];
+/// The list stays a list, and `compose_images_are_tagged_by_flavor` stays,
+/// because the invariant it encodes outlived the flavor: before D-58 the two
+/// flavors shared whatever name compose derived from the project and service
+/// (`rift-cluster-rift-1`), and the ONLY thing keeping a scenario from
+/// inheriting the wrong one was that every `up` passed `--build` and so
+/// re-tagged on the way. A second flavor arriving again must declare its tag
+/// here, not rediscover that.
+pub const BUILT_IMAGES: [&str; 1] = ["rift-cluster-server:local"];
 
 /// Whether `cluster-smoke` has already built and loaded [`BUILT_IMAGES`].
 ///
@@ -1542,11 +1544,12 @@ mod tests {
     /// the compose graph — it compares two flat sets — but the two failures it
     /// catches are the two that matter, and both have precedent here:
     ///
-    /// 1. A new `build.target` with no tag of its own. Until D-58 the faketime
-    ///    flavor was exactly this: it shared the production tag, and what kept
-    ///    the bytes matching the overlay was `--build` running before every
-    ///    `up`. `cluster-smoke` no longer passes `--build`, so a repeat would
-    ///    mean a scenario silently running the wrong flavor.
+    /// 1. A new `build.target` with no tag of its own. Until D-58 the (since
+    ///    removed, #552) faketime flavor was exactly this: it shared the
+    ///    production tag, and what kept the bytes matching the overlay was
+    ///    `--build` running before every `up`. `cluster-smoke` no longer passes
+    ///    `--build`, so a repeat would mean a scenario silently running the
+    ///    wrong flavor.
     /// 2. A tag the prebuild does not produce. `ensure_prebuilt_images` asserts
     ///    `BUILT_IMAGES` is loaded; a compose file naming some other
     ///    `rift-cluster-server:` tag would pass that check and then fail at

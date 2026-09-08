@@ -27,7 +27,7 @@ flowchart TB
     MULTI -- no --> RESP["build response<br/>(behaviors, templates, scripts)"]
     RESP --> TRANS{"stub declares<br/>willSetStateTo?"}
     TRANS -- "yes → owner CAS<br/>(same round-trip class)" --> REC
-    TRANS -- no --> REC["journal: note_request / record<br/>(always local — CRDT shard, Ch.7)"]
+    TRANS -- no --> REC["journal: note_request / record<br/>(always local — upstream's own<br/>per-node RequestJournal)"]
     REC --> OUT([respond])
 ```
 
@@ -45,7 +45,9 @@ Three zones, three cost profiles:
    operation is **one LAN RPC to the key's owner** unless this node *is* the
    owner. Chapter 6 is entirely about this zone.
 3. **The local-append zone** — request journaling and counters. Always local,
-   never blocking on any other node; merged at *read* time instead (Chapter 7).
+   never blocking on any other node — and never merged either: recording is
+   upstream Rift's own `RequestJournal`, so what a node records is what that
+   node answers with (D-74).
 
 ## Why the scenario gate must read through the owner
 
@@ -136,11 +138,24 @@ table in Chapter 9):
 
 ## Admin reads
 
+> **Amended by D-74** (2026-09-08): verification reads are no longer cluster-merged. `GET
+> /imposters/:port/requests`, its `savedRequests` spelling and `numberOfRequests` answer for the
+> node the read reached, and the request-anatomy diagram and the local-append zone above are
+> amended with them.
+
 `GET /imposters`, `GET .../stubs` read the local applied state machine — every
 node serves them, consistent at its applied revision, comparable fleet-wide via
-the revision header and `/_cluster/config`. Verification reads
-(`savedRequests`, counts) are the cluster-merged reads of Chapter 7. Cluster
-introspection (`/_cluster/members`, `/_cluster/config`, and
-`GET /imposters/{port}/spaces/{flowId}`, which names the flow's owning node)
-exists precisely so that "why did this request match that stub on that node" is
-always answerable from the outside.
+the revision header and `/_cluster/config`. Verification reads are ordinary
+proxied reads to that node's own engine: `GET /imposters/:port/requests` (and
+`savedRequests`) is upstream's per-imposter journal, `?since=` is upstream's own
+scalar cursor with upstream's `x-rift-next-index` / `x-rift-truncated` headers,
+and `numberOfRequests` on `GET /imposters` and `GET /imposters/:port` is **this
+node's own count** — not a fleet sum. Nothing decorates or terminates them, so
+a client reading through the cluster front sees exactly what it would reading
+the node's engine directly. A test that needs the fleet's answer pins a node or
+reads all of them (RFC-007 §3.3).
+
+That makes the node the read reached the unit of every verification answer, which is why cluster
+introspection matters more here, not less: `/_cluster/members`, `/_cluster/config`, and
+`GET /imposters/{port}/spaces/{flowId}` (which names the flow's owning node) exist precisely so
+that "why did this request match that stub on that node" is always answerable from the outside.

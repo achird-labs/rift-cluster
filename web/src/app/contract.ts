@@ -43,9 +43,10 @@ export type ImposterColumn = {
  *
  * `numberOfRequests` was deliberately absent until #363: it reached the body only through the
  * non-exhaustive index signature, so rendering it would have been exactly the client-side guess
- * §11 forbids. It is a declared field now, and therefore a column. What it is *not* is this node's
- * tally — the front rewrites it to the fleet sum (#223), which is why the tile above the table can
- * call itself one.
+ * §11 forbids. It is a declared field now, and therefore a column. What it counts is **the
+ * answering node's own recorded requests** (D-74, #552): the admin front used to rewrite it to the
+ * sum across every node's journal slot for that port, and does not any more, so neither this column
+ * nor the tile above the table may call it a fleet figure.
  */
 export const IMPOSTER_COLUMNS = [
   { key: "port", label: "Port", numeric: true },

@@ -758,8 +758,10 @@ becomes the §7.6 503, never a silent wrong match. OSS behavior is unchanged in 
 > go to the **Raft leader** as a `ControlOp` (§7.6, #9), not to a per-port config owner
 > assigning `(g, revision)`, and ADR-001 deletes the content-addressed
 > `GET /internal/v1/config/{port}/{digest}` fetch along with the digest-gossip mechanism it
-> served. Retained for context, like §7.1/§7.2/§7.4. The KV, sequence, proxy and journal
-> rows are unaffected — they are data-plane, which stays off consensus.
+> served. Retained for context, like §7.1/§7.2/§7.4. The KV, sequence and proxy rows are
+> unaffected — they are data-plane, which stays off consensus. The journal row is **gone**: it
+> was never built as written, and D-71 (#552) retired the sharded journal that would have needed
+> it, so no journal RPC crosses the cluster port at all (D-74).
 >
 > **Content-addressed fetch returned as `/internal/v1/blob/{digest}` (#437, epic #432), and is
 > gone again.** It was the sideloading transport for the payloads that should never have been *on*
@@ -782,7 +784,6 @@ version (§11.4).
 | `POST /internal/v1/proxy/complete` / `release` `{port, signature, token, ...}` | owner: Pending→Recorded (after config-write ack, §7.5.3) / Pending→Unclaimed; stale token rejected | Idempotent |
 | `POST /internal/v1/config/write` `{port, body \| stub_patch \| delete}` | **port-config owner**: validate, assign `(g, revision)`, publish | Idempotent via client op-id |
 | `GET /internal/v1/config/{port}/{digest}` | content-addressed config body fetch | Idempotent, cacheable |
-| `GET /internal/v1/journal/{port}?since=<seq-vector>&gen=<g>` | pull journal shard deltas ≥ watermark | Idempotent |
 
 Timeouts: connect 500 ms, request 2 s. **Fast-fail:** if the local view already marks the
 owner Suspect/Dead, skip the RPC and resolve immediately per the §7.6 owner-unreachable
@@ -993,6 +994,13 @@ binds can fail on some nodes (port taken by an unrelated process). Built (#143):
 
 #### 7.5.1 Recorded-request journal
 
+> **Retired by D-71** (RFC-007 §3.2, #552). Nothing in this section is built any more: the
+> per-writer shards, the merge-on-read and its anti-entropy pull, the caps and watermarks, and the
+> vector cursor and merged SSE tail were all removed. The journal is upstream Rift's own,
+> per node — `GET /imposters/:port/requests` answers for the node you reached. **D-74** records the
+> replacement and supersedes D-32, D-37 and D-39. The callout below is kept because those
+> decisions' amendments to this section are part of the record.
+
 > **Amended by D-37 and D-39** (as built, #223/#225/#348): per-writer shards merged on read stand; the cursor shipped as base64url-JSON `{v1, gen, pos: node_id → seq}` (not CBOR), lapses surface as `x-rift-truncated: true` (not `Cursor-Lapsed`), `Cursor-Reset` is carried but not acted on, the age cap defaults to 600 s, and `read_since` is not a seam — U-13 is the exchange inspector. The register entries are normative for the built shape.
 
 - Per port, a **grow-only log sharded by writer**: each node appends locally to its own
@@ -1089,6 +1097,12 @@ generation; a node going unreachable mid-sequence yields `Rift-Cluster-Partial` 
 entries on a later poll rather than never.
 
 #### 7.5.2 Clears are generation bumps (clock-free)
+
+> **Retired by D-71** (RFC-007 §3.2, #552). There is no fleet-wide clear to make clock-free:
+> `DELETE .../savedRequests` clears the journal of the node it reached, upstream's own way, and
+> `ControlOp::JournalClearGen` and the `sm_journal_gens` table are gone with the merge that read
+> them. **D-74** records the replacement and supersedes D-38. The callout below is kept because
+> D-38's amendment to this section is part of the record.
 
 > **Amended by D-38** (as built, #223): the generation rides the Raft log as `ControlOp::JournalClearGen`, not gossip; the per-`(port, flow)` TTL and the `teardown_space` `(g, v, deleted)` markers were never built.
 
@@ -1268,7 +1282,7 @@ for gate B). Summary:
 | `FlowStore` + `compare_and_set` (`extensions::flow_state`) | itself | `ClusteredFlowStore` (owner-serialized, successor-replicated) |
 | `FlowStoreProvider` (`extensions::flow_state`) | private `create_flow_store` match (`imposter/core.rs:152`) | provider returning clustered stores |
 | `ResponseSequencer` (`behaviors::sequencer`) | `RuleCycler`/`StubState` cursor call sites | `ClusteredSequencer` (owner INCR); `RedisSequencer` |
-| `RequestJournal` (`imposter::journal`) | `RwLock<Vec<RecordedRequest>>` + count `AtomicU64` | `ClusteredJournal` (sharded G-log) |
+| `RequestJournal` (`imposter::journal`) | `RwLock<Vec<RecordedRequest>>` + count `AtomicU64` | none — the seam (U-4) is **withdrawn**: since D-74 (#552) the cluster registers no journal, and upstream's own per-node one serves the reads unwrapped |
 | `ProxyRecordingStore` (`recording::store`) | concrete `RecordingStore` | `ClusteredProxyStore` (owner state machine); `RedisProxyStore` |
 | `ImposterEventListener` + `apply_config` + `move_stub` + `stub_key` (`imposter::manager`, `imposter`) | `reload()` for sync purposes | config publisher + reconciler |
 | Embeddable server pieces (`rift-http-proxy`): bootstrap builder, metrics server, gateway dispatch | bin-private `main.rs` | `rift-cluster-server` composition |

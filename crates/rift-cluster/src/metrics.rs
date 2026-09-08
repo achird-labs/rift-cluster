@@ -28,8 +28,8 @@
 //! | `rift_cluster_sequence_fallbacks_total` | C33 — owner identified by killing it ("the assertion, not the index") |
 //! | `rift_cluster_sequence_decisions_total{op,path}` | `sequencer.rs` — the D-63 RPC budget: one `next` per decision, never a `peek` |
 //!
-//! Families owned by surfaces that leave with other children of #544 (`no_principals`, the
-//! journal's partial-read count) stay here until those children land and go with them.
+//! Families owned by surfaces that leave with other children of #544 (`no_principals`) stay
+//! here until those children land and go with them.
 //!
 //! They ride upstream's `/metrics` because that is where the tests already read them: the
 //! families are registered into the `prometheus` crate's *global default* registry, which the
@@ -220,21 +220,6 @@ lazy_static! {
         &["port"]
     )
     .expect("rift_cluster_config_revision registers once");
-
-    /// `rift_cluster_journal_partial_reads_total` — merge-on-read answers
-    /// (issue #223) the caller had to stamp `Rift-Cluster-Partial: true`
-    /// because a roster peer's shard could not be pulled into the replica
-    /// cache in time. Touched by the merge's caller, not by `merge_shards`
-    /// itself — the merge only carries the bit its caller already decided.
-    static ref JOURNAL_PARTIAL_READS: IntCounter = register_int_counter!(
-        "rift_cluster_journal_partial_reads_total",
-        "Fleet journal merge-on-read answers stamped partial"
-    )
-    .expect("rift_cluster_journal_partial_reads_total registers once");
-}
-
-pub(crate) fn journal_partial_read() {
-    JOURNAL_PARTIAL_READS.inc();
 }
 
 /// A write was durably parked on this node; the pending depth rises until the

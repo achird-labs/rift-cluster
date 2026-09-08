@@ -113,21 +113,26 @@ test.describe("component baselines", () => {
   });
 
   /*
-   * The request log's scope strip had a baseline here until #147 H. It is deliberately gone rather
-   * than re-pointed: the strip is now a **partial-merge-only** element — it renders when the
-   * server stamps `Rift-Cluster-Partial`, and not otherwise — and this fixture is a live
-   * single-node server whose merges always reach every node. There is no state it can drive that
-   * shows the strip, so any baseline taken here would be a screenshot of an element that no longer
-   * exists. The strip's presence, absence and copy are asserted instead in
-   * `src/__tests__/requestLog.test.tsx`, which can drive the header directly.
+   * No baseline for the request log's scope line, and deliberately so.
+   *
+   * It carries the answering node's raft id (D-74, #552), which the fixture server mints fresh on
+   * every start — so a committed screenshot of it would diff on the id alone, every run, which is
+   * exactly the "a value moves and the whole capture diffs" flakiness this file's header says it
+   * exists to avoid. Masking the id would leave a picture of a label with its content hidden. The
+   * line's copy, its port and the node it names are asserted instead in
+   * `src/__tests__/requestLog.test.tsx`, which can drive `/_fleet/members` directly.
+   *
+   * (Until #552 there was a different element here and a different reason: a partial-merge strip
+   * that rendered only when the fleet journal read was stamped `Rift-Cluster-Partial`, which a
+   * single-node fixture could never provoke. That merge is gone, and so is the strip.)
    */
 
   test("the scenarios scope strip", async ({ page }) => {
     /*
-     * The same reasoning as the request log's strip above: this screen's every number and control
-     * acts on **one space**, and the strip is what keeps that in front of the reader. A baseline
-     * fails if it stops being the most prominent thing under the title — which is the failure mode
-     * that turns a per-space reset into one an operator thinks is global.
+     * This screen's every number and control acts on **one space**, and the strip is what keeps
+     * that in front of the reader. A baseline fails if it stops being the most prominent thing
+     * under the title — which is the failure mode that turns a per-space reset into one an operator
+     * thinks is global.
      */
     const { imposters } = fixture();
     await signIn(page);

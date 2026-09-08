@@ -201,8 +201,7 @@ fencing):
 |---|---|---|
 | Scenario FSM / flow KV | **Adopt** highest `(m_idx, v, origin)` from replicas/disk | ≤ 1 replication round staleness; adopt-found-nothing ⇒ FSM restarts, and a takeover that could not verify against any replica is named in a `warn` line — no response header, because the store is reached through `spawn_blocking`, which the annotation scope does not cross; bounded and visible, never silent |
 | Sequence cursors | **Reset** | Deliberate (D-8): replicating every advance puts a network write on the hottest stateful path for test-run-scoped data. A mid-test membership change may restart sequences; documented. *Not yet built:* no clustered sequencer exists — cursors are node-local (`LocalSequencer`) today, so there is nothing to hand off |
-| proxyOnce | `Recorded` adopts (replicated); `Pending` dies with the owner → re-claim | Duplicate-upstream bound: 1 + ownership changes in flight (Chapter 7). That is now the bound on *upstream calls* too, not just recordings: a claim the cluster cannot serialize is refused `503` rather than forwarded (D-66), so an outage no longer adds a call per request |
-| Journal / counters | No owner — nothing to hand off | CRDT merge-on-read (Chapter 7) |
+| proxyOnce | `Recorded` adopts (replicated); `Pending` dies with the owner → re-claim | Duplicate-upstream bound: 1 + ownership changes in flight (the proxyOnce section at the end of this chapter). That is now the bound on *upstream calls* too, not just recordings: a claim the cluster cannot serialize is refused `503` rather than forwarded (D-66), so an outage no longer adds a call per request |
 
 Graceful leave adds no separate flush: every accepted write was already pushed
 to the successors when it was applied, so a planned restart hands off with at
@@ -278,6 +277,90 @@ sequencing, zero adoption staleness — the same seams accept **Redis-backed
 implementations** (cluster, Phases 4–5; D-12, none built yet): the external
 store becomes the single writer and the windows above collapse to Redis's own
 guarantees. Exactly-once proxy recording no longer needs this hatch: it shipped
-cluster-native on consensus (Chapter 7, #226). Zero-dependency by default,
+cluster-native on consensus (the last section of this chapter, #226). Zero-dependency by default,
 external store by choice; the trait boundary makes the swap invisible to
 imposter configs.
+
+## proxyOnce: exactly-once recording via an owner claim
+
+*Moved here from Chapter 7 by D-74 (#552), which retired that chapter's journal body. It belongs
+in this chapter because a proxy claim is **owned exactly the way a flow is**: `KeyClass::Proxy`,
+HRW over `(port, signature)` on the same applied-membership ring (D-20), fenced and handed off by
+the machinery above. The journal it used to sit beside is gone; the claim is not.*
+
+> **Amended by D-66** (2026-08-29, #529): the duplicate-upstream bound below holds only while
+> something is serializing claims. When nothing is — an isolated, unreachable or not-ready owner —
+> the request is now **refused** (`503`) rather than forwarded; see the paragraph after the state
+> diagram.
+
+`proxyOnce` must call the real upstream **once** per request signature, record the response, and
+replay it forever after. "Once" under concurrent first-hits on three nodes needs an arbiter —
+which is this chapter's ring, keyed by `(port, signature)` rather than by flow id, running a small
+state machine at the owner:
+
+```mermaid
+stateDiagram-v2
+    [*] --> Unclaimed
+    Unclaimed --> Pending : try_claim → token<br/>(winner calls upstream)
+    Pending --> Recorded : complete(token) —<br/>only AFTER the recorded stub's<br/>config write is acknowledged
+    Pending --> Unclaimed : release(token) on upstream failure<br/>· or deadline expiry (fixed TTL, default 60 s)
+    Recorded --> [*] : replicated fact —<br/>all future hits replay locally
+
+    note right of Pending
+        Pending is owner-local and dies with
+        the owner: a crash makes the signature
+        re-claimable, bounding duplicate upstream
+        calls at 1 + ownership changes in flight.
+        Stale tokens are rejected — a late
+        complete() after re-claim cannot
+        misattribute a recording.
+    end note
+```
+
+Two ordering subtleties carry the correctness:
+
+- **Claim owner ≠ config owner.** The recorded stub is published through the
+  Chapter 4 write path, while the claim lives at the `(port, signature)`
+  owner. `Pending → Recorded` transitions only after the config write is
+  acknowledged; if that write fails, the claim releases and the signature
+  stays retryable. "Recorded but stub-less" is unrepresentable — and by
+  construction, not by discipline: the recorded stub and the Recorded marker
+  ride **one** committed op (`ProxyRecorded`), applied in one state-machine
+  transaction, because the front door's multi-op mutations commit one log
+  entry at a time and a two-op shape would open a crash window between them.
+  The stub's insertion position is resolved at apply against the then-current
+  stub list, mirroring the engine's own re-locate-under-the-write-lock rule.
+- **Why not a simple replicated set?** A pure grow-only claim set cannot
+  express *release*: a failed upstream call would either resurrect its claim on
+  every merge or wedge the signature forever. The Pending/Recorded split — with
+  only `Recorded` ever replicated — is the minimal shape that supports both
+  exactly-once success and retryable failure.
+
+Recordings themselves (multi-response proxy modes) append through the config
+write path like any stub mutation, so they inherit R1/R3/R4 wholesale —
+`proxyAlways` merges into the existing recorded stub at apply (the upstream
+#611 structural-equality rule, reproduced deterministically in the state
+machine). A `proxyOnce` recording with **no** predicate generators produces no
+stub at all; its replayable response is stored in the same committed op, so
+`lookup()` answers from any node's applied state forever — that row, not a
+config stub, is the replay source for the stub-less case. The claim deadline
+is a fixed TTL rather than a per-imposter derivation because the recording
+seam (U-16) deliberately carries no timeout context; it only needs to sit
+comfortably above any upstream call the engine would wait for.
+
+**When the arbiter cannot answer, the request fails — it is not forwarded.** The bound above
+("1 + ownership changes in flight") holds only while *something* is serializing claims. If the
+owner is isolated, unreachable, or not yet ready, nothing is: every request for the duration of
+the outage would reach the real upstream, and the duplicate would be bounded by the outage rather
+than by the contract. So a claim the cluster cannot serialize is **refused** — `503`
+`backendUnavailable`, `feature: "proxyOnce"`, the reason in `detail` — and the upstream is never
+called (D-66, through the U-17 seam; Chapter 9's degradation table has promised this status since
+the design was written, and RFC-001 §7.6 with it). Refusals are counted
+`rift_cluster_proxy_claims_total{outcome="refused"}`.
+
+Two things this deliberately does **not** cover. `ClaimOutcome::InFlight` — a concurrent
+first-hit that lost the race — still proxies without recording: a claim *was* serialized there, so
+that duplicate is the bounded, by-design one (Chapter 12's C11 row). And `complete`/`release`
+failures still release the claim and serve the response, because by then the upstream call has
+already succeeded; answering `503` would provoke a retry, and the retry is the duplicate.
+`proxyAlways` and `proxyTransparent` gate nothing and so refuse nothing.

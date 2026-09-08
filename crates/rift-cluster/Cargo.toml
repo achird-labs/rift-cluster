@@ -48,15 +48,11 @@ lazy_static.workspace = true
 [dev-dependencies]
 # Scratch directories for the redb-backed store tests.
 tempfile = "3"
-# Round-trip and rejection invariants for the vector cursor token (#225): the codec is
-# pure logic over inputs no fixture enumerates, which is exactly what this is for.
-proptest.workspace = true
 # Streaming request bodies, to prove the body cap holds without a declared length.
 futures-lite = "2"
-# Captures `tracing` output so the journal's warn-once-per-fill-up guard is testable.
-# Upstream measured a 29-55% RPS loss when that mechanism regressed (rift #718), so the
-# guard is load-bearing rather than cosmetic.
-tracing-test = "0.2"
+# `proptest` and `tracing-test` were here for the fleet journal alone — the vector
+# cursor's round-trip invariants and the shard's warn-once-per-fill-up guard — and
+# left with it (D-74, #552). Nothing else in this crate had a use for either.
 # The 3-node integration harness (tests/cluster.rs) drives real nodes directly,
 # so it needs tokio in its own right — integration tests do not inherit the
 # library's normal dependencies.

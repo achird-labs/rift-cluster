@@ -94,22 +94,25 @@ verified_on = "2026-08-25"
 code = ["crates/rift-cluster/src/control.rs", "crates/rift-cluster/src/raft/node.rs", "crates/rift-cluster-server/src/admin_front.rs"]
 
 ["docs/architecture/05-read-path.md"]
-status = "current"
+status = "amended"
 verified_sha = "98bcbfc09"
 verified_on = "2026-08-28"
 code = ["crates/rift-cluster/src/stores/flow.rs", "crates/rift-cluster/src/stores/shard.rs"]
+note = "The Admin reads section is amended by D-74 (#552) and carries the callout: verification reads are per node, numberOfRequests is the answering node's count."
 
 ["docs/architecture/06-flow-state.md"]
 status = "amended"
 verified_sha = "0135ae018"
 verified_on = "2026-09-07"
-code = ["crates/rift-cluster/src/stores/flow.rs", "crates/rift-cluster/src/stores/flow_config.rs", "crates/rift-cluster/src/stores/shard.rs", "crates/rift-cluster/src/raft/ring.rs"]
+code = ["crates/rift-cluster/src/stores/flow.rs", "crates/rift-cluster/src/stores/flow_config.rs", "crates/rift-cluster/src/stores/shard.rs", "crates/rift-cluster/src/raft/ring.rs", "crates/rift-cluster/src/stores/proxy.rs"]
+note = "Gained chapter 7's proxyOnce owner-claim section in #552 (D-74), hence the added proxy.rs anchor: a proxy claim is owned on this chapter's ring (KeyClass::Proxy), and the journal it used to sit beside is gone."
 
 ["docs/architecture/07-verification-plane.md"]
-status = "current"
-verified_sha = "e0df0c376"
-verified_on = "2026-08-29"
-code = ["crates/rift-cluster/src/stores/journal.rs", "crates/rift-cluster/src/stores/journal_net.rs", "crates/rift-cluster/src/stores/journal_seq.rs", "crates/rift-cluster/src/stores/proxy.rs"]
+status = "superseded"
+verified_sha = ""
+verified_on = ""
+code = []
+note = "Retired by D-71/D-74 (#552): the fleet journal merge — shards, merge-on-read, clear generations, vector cursors, the fleet tail and the numberOfRequests fleet sum — is gone, and the journal is upstream's own, per node. Its proxyOnce owner-claim section was moved to 06-flow-state.md rather than deleted. The file is a stub kept for inbound links; it describes no code."
 
 ["docs/architecture/08-tenancy-security.md"]
 status = "superseded"

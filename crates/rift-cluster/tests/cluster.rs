@@ -16,7 +16,6 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use rift_cluster::stores::ClusterJournal;
 use rift_cluster::{
     ADMIT_CURRENCY_WAIT, Authority, ControlRequest, NodeConfig, NodeId, RaftNode, Router,
 };
@@ -179,15 +178,6 @@ impl TestCluster {
 
     fn live(&self) -> impl Iterator<Item = &RaftNode> {
         self.members.iter().filter_map(|m| m.node.as_deref())
-    }
-
-    /// The current leader as a shared handle, for the subsystems that bind to
-    /// one.
-    fn leader_handle(&self) -> Option<&Arc<RaftNode>> {
-        self.members
-            .iter()
-            .filter_map(|m| m.node.as_ref())
-            .find(|n| n.status().is_leader)
     }
 
     /// The node currently reporting itself leader, if any.
@@ -1160,47 +1150,6 @@ async fn the_fleet_name_survives_a_node_restart() {
         Some("rift-prod-eu".to_owned()),
         "a node that came back without the fleet's name would answer `Unnamed` to every console \
          reading the fleet through it, with nothing logged to say why"
-    );
-
-    cluster.shutdown_all().await;
-}
-
-/// `voter_count_sizes_the_journal_shard`: the journal's shard cap divides fleet capacity
-/// by the applied membership, so this pins the two halves that only exist together — that
-/// `RaftNode::voter_count` reports the committed voter set, and that binding a journal to
-/// a node actually re-sizes its shards.
-///
-/// The unit tests inject a fixed voter count; nothing there proves the real accessor
-/// agrees with real membership, which is the half that would silently drift.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn voter_count_sizes_the_journal_shard() {
-    let _serial = TEST_LOCK.lock().await;
-    let mut cluster = TestCluster::start(3).await;
-
-    for node in cluster.live() {
-        assert_eq!(
-            node.voter_count(),
-            3,
-            "node {} does not see the full voter set",
-            node.id()
-        );
-    }
-
-    let leader = cluster
-        .leader_handle()
-        .expect("a converged cluster has a leader");
-    let journal = ClusterJournal::new(leader.id());
-    assert_eq!(
-        journal.shard_cap(),
-        10_000,
-        "an unbound journal sizes as a single writer, preserving single-node behaviour"
-    );
-
-    journal.bind(leader);
-    assert_eq!(
-        journal.shard_cap(),
-        3_333,
-        "binding re-sizes the shard to its share of fleet capacity"
     );
 
     cluster.shutdown_all().await;

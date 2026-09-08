@@ -3531,6 +3531,10 @@ fn flow_keyed_imposter(port: u16) -> serde_json::Value {
     json!({
         "port": port,
         "protocol": "http",
+        // On, so a space teardown has recorded requests to clear — the half of D-69's teardown
+        // that is upstream's own (`RequestJournal::clear_flow`) and would otherwise be untested
+        // because nothing was ever recorded to begin with.
+        "recordRequests": true,
         "_rift": { "flowState": { "flowIdSource": "header:X-Flow-Id" } },
         "stubs": [{
             "id": "global",
@@ -3544,6 +3548,28 @@ fn space_stub(body: &str) -> serde_json::Value {
         "predicates": [{ "equals": { "path": "/cart" } }],
         "responses": [{ "is": { "statusCode": 200, "body": body } }],
     })
+}
+
+/// The `?space=` value of every request this node recorded, in recorded order, read from its
+/// **own** journal (D-74).
+///
+/// Identifies an entry by a query parameter the caller set rather than by its flow id, because a
+/// recorded entry does not carry the flow on the wire — the flow is the journal's key, not a
+/// field of `RecordedRequest`. The driver sends the two in lockstep, so the query names the space.
+async fn recorded_spaces_on(admin: &str, port: u16) -> Vec<String> {
+    let read: serde_json::Value =
+        reqwest::get(format!("http://{admin}/imposters/{port}/savedRequests"))
+            .await
+            .expect("read the recorded requests")
+            .json()
+            .await
+            .expect("json");
+    read.as_array()
+        .expect("savedRequests answers a bare array")
+        .iter()
+        .filter_map(|entry| entry["query"]["space"].as_str())
+        .map(str::to_owned)
+        .collect()
 }
 
 /// The ids of the stubs an imposter holds, read from `node`'s own engine.
@@ -3650,12 +3676,18 @@ async fn a_space_stub_replicates_and_survives_an_unrelated_reconcile() {
 
 /// Pins D-69 (the inverse half): once space stubs are in the replicated config, a
 /// space `DELETE` that only tears down the local engine would be undone by the next `Sync`, which
-/// would resurrect the stubs fleet-wide. The teardown therefore commits a space-scoped stub delete
-/// alongside its journal clear.
+/// would resurrect the stubs fleet-wide. The teardown therefore commits a space-scoped stub delete.
 ///
 /// Also pins that the delete is *scoped*: another space's stubs and the imposter's global stubs
 /// are untouched, which is what makes a space-addressed delete correct rather than approximately
 /// right.
+///
+/// And pins **D-74's** half of the same teardown: the space's *recorded requests* still go, on the
+/// node that took the teardown. That used to be a Raft-committed `JournalClearGen` the fleet-wide
+/// merge consulted; it is now upstream's own `RequestJournal::clear_flow`, called by
+/// `teardown_space` on the way through the proxy. The distinction that matters is per node — the
+/// node the teardown reached loses that space's entries, and the sibling space's entries on the
+/// same node do not — because a per-node journal is the whole of what D-74 leaves.
 #[tokio::test]
 async fn a_space_teardown_removes_only_that_spaces_stubs_fleet_wide_and_they_stay_gone() {
     let leader_state = TempDir::new().expect("tempdir");
@@ -3695,6 +3727,33 @@ async fn a_space_teardown_removes_only_that_spaces_stubs_fleet_wide_and_they_sta
         assert_eq!(added.status().as_u16(), 201, "seeding {flow}");
     }
 
+    // Drive one request into each space **through the leader's own gateway**, so both are
+    // recorded in the leader's journal under their resolved flow id. The gateway leg rather than
+    // the imposter's data port: two nodes bind the same port and only one of them wins it, so a
+    // direct dial names whichever node happened to get there first — which is precisely the
+    // ambiguity a per-node assertion cannot afford.
+    for flow in ["blue", "green"] {
+        let driven = client
+            .get(format!(
+                "http://{lead_admin}/__rift/{port}/cart?space={flow}"
+            ))
+            .header("X-Flow-Id", flow)
+            .send()
+            .await
+            .expect("drive a request into the space");
+        assert!(
+            driven.status().is_success(),
+            "{flow}: the space stub must answer: {}",
+            driven.status()
+        );
+    }
+    assert_eq!(
+        recorded_spaces_on(&lead_admin, port).await,
+        vec!["blue".to_string(), "green".to_string()],
+        "both spaces' requests must be recorded before the teardown, or the assertion below \
+         would pass against a journal that was empty all along"
+    );
+
     let torn = client
         .delete(format!("http://{lead_admin}/imposters/{port}/spaces/blue"))
         .send()
@@ -3704,6 +3763,13 @@ async fn a_space_teardown_removes_only_that_spaces_stubs_fleet_wide_and_they_sta
         torn.status().is_success(),
         "the teardown itself must succeed: {}",
         torn.status()
+    );
+
+    assert_eq!(
+        recorded_spaces_on(&lead_admin, port).await,
+        vec!["green".to_string()],
+        "the torn-down space's recorded requests must be gone on the node that took the \
+         teardown, and only that space's"
     );
 
     // Force the reconcile that would resurrect them if the delete had stayed node-local.

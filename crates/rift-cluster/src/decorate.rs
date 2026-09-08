@@ -47,28 +47,20 @@ pub const HEADER_WARNINGS: &str = "rift-cluster-warnings";
 /// affected reads are *proxied*, and the core admin phase decorates with `req_port: None`, so no
 /// annotation scope downstream can know which imposter the response is about.
 pub const HEADER_BIND_FAILURES: &str = "rift-cluster-bind-failures";
-/// A fleet merge-on-read (the journal entries read, its `numberOfRequests` decoration, or the
-/// transitional clear fan-out — issue #223) could not confirm every roster peer within its budget.
+/// A read that genuinely fans out across the fleet could not confirm every roster peer within
+/// its budget (D-74). Exactly two routes stamp it — `/_fleet/members` and `/_fleet/health` — and
+/// the OpenAPI contract declares it on those two operations and nowhere else.
+///
 /// Set directly by the front for the same reason as the three above — there is no per-request
-/// annotation scope for a read this journal-net-specific — and additively: a Ch.12 strict-mode gate
+/// annotation scope for a fan-out this fleet-specific — and additively: a Ch.12 strict-mode gate
 /// asserts the header's *absence* on a fully healthy answer, so this must never be stamped `false`.
+///
+/// Since D-74 it marks *only* those fan-outs. The request journal is upstream's own, per node,
+/// so a requests read has no peer to be partial about: it either answers for the node the caller
+/// reached or it fails. The spaces listing fans out too but reports its incompleteness in the
+/// body (`partial`, beside `unavailable`) rather than here — an enumeration refused by policy and
+/// one shortened by a slow peer are different facts, and this header cannot tell them apart.
 pub const HEADER_PARTIAL: &str = "rift-cluster-partial";
-
-/// The cursor to present for the next page of a requests read (issue #225).
-///
-/// **Upstream's name, not a `Rift-Cluster-*` one**, and deliberately so: this is the same header
-/// the engine sets for a single-node cursor read, carrying the same meaning in the same place, so
-/// a client pages a clustered read with exactly the code that pages a single-node one. Renaming it
-/// under the cluster prefix would fork the contract for no gain — the *value* is what changed
-/// (an opaque vector token rather than a bare index), and the value was always opaque by contract.
-pub const HEADER_NEXT_INDEX: &str = "x-rift-next-index";
-/// Retention evicted entries the reader had not yet seen (issue #225) — upstream's name and
-/// upstream's meaning, for the same reason as [`HEADER_NEXT_INDEX`].
-///
-/// Additive-only, like [`HEADER_PARTIAL`]: set to `true` or not set at all, never `false`. A
-/// reader that has missed nothing must see no header, because that is the shape upstream's own
-/// clients already test against.
-pub const HEADER_TRUNCATED: &str = "x-rift-truncated";
 
 /// Translates `cluster.*` annotations into `Rift-Cluster-*` response headers.
 #[derive(Debug, Clone, Default)]
@@ -184,7 +176,7 @@ mod tests {
     fn non_cluster_notes_are_left_alone() {
         let headers = decorate(&[
             ("flow.cas_retries", "2".to_owned()),
-            ("journal.truncated", "true".to_owned()),
+            ("proxy.claims", "2".to_owned()),
         ]);
         assert!(headers.is_empty(), "{headers:?}");
     }

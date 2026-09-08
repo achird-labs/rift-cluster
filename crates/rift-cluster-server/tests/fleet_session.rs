@@ -785,8 +785,8 @@ async fn a_keyed_fleet_refuses_an_unauthenticated_request_on_every_surface() {
         "/openapi.json",
         "/front-door/routes",
         "/_fleet/health",
-        // Terminated.
-        "/admin/requests",
+        // Terminated (a GET the front answers itself, rather than proxying).
+        "/imposters/4545/spaces",
         // Proxied to the loopback.
         "/imposters",
         // Not classified by anything — the route-existence oracle.

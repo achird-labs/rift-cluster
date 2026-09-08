@@ -50,7 +50,6 @@ use crate::rpc::{
     RpcServerConfig, Signer, TrackedPeerHealth, Verifier,
 };
 use crate::stores::flow::FlowNet;
-use crate::stores::journal::ClusterJournal;
 
 /// Log-file name for the Raft storage inside the node's data directory.
 const RAFT_DB_FILE: &str = "raft.redb";
@@ -605,28 +604,24 @@ impl RaftNode {
     /// does not form or join a cluster; call [`RaftNode::cluster_init`] to
     /// bootstrap a new one or [`RaftNode::join_via`] to attach to an existing one.
     pub async fn start(config: NodeConfig) -> Result<Self, NodeError> {
-        Self::start_inner(config, None, None, None, None).await
+        Self::start_inner(config, None, None, None).await
     }
 
-    /// Like [`Self::start`], with the front door's compiled-route handle and this node's local
-    /// request journal both attached to the state machine before `Raft::new` (issue #131 for the
-    /// routes handle, #224 for the journal) — a separate constructor rather than two more
+    /// Like [`Self::start`], with the front door's compiled-route handle attached to the state
+    /// machine before `Raft::new` (issue #131) — a separate constructor rather than two more
     /// `NodeConfig` fields so every existing caller (most of which touch neither) keeps
     /// compiling untouched. Same before-construction contract as `NodeConfig::engine`: attaching
     /// here, rather than after this call returns, means catch-up replay during a join drives the
-    /// `ArcSwap` and pushes clear generations into the journal too, not just live commits
-    /// afterward.
+    /// `ArcSwap` too, not just live commits afterward.
     pub async fn start_with_front_door_routes(
         config: NodeConfig,
         front_door_routes: Arc<ArcSwap<CompiledRoutes>>,
-        journal: Arc<ClusterJournal>,
         sequencing: Arc<crate::stores::SequencingRegistry>,
         flow_net: Arc<FlowNet>,
     ) -> Result<Self, NodeError> {
         Self::start_inner(
             config,
             Some(front_door_routes),
-            Some(journal),
             Some(sequencing),
             Some(flow_net),
         )
@@ -636,7 +631,6 @@ impl RaftNode {
     async fn start_inner(
         config: NodeConfig,
         front_door_routes: Option<Arc<ArcSwap<CompiledRoutes>>>,
-        journal: Option<Arc<ClusterJournal>>,
         sequencing: Option<Arc<crate::stores::SequencingRegistry>>,
         flow_net: Option<Arc<FlowNet>>,
     ) -> Result<Self, NodeError> {
@@ -660,10 +654,6 @@ impl RaftNode {
         // and a replayed or snapshot-installed delete clears exactly like a live one.
         let state_machine = match flow_net {
             Some(flow_net) => state_machine.with_flow_net(flow_net),
-            None => state_machine,
-        };
-        let state_machine = match &journal {
-            Some(journal) => state_machine.with_journal(journal),
             None => state_machine,
         };
         // The handlers need the Raft, which needs the bound server address, which
@@ -1826,17 +1816,6 @@ impl RaftNode {
     pub fn fleet_name(&self) -> Result<Option<String>, NodeError> {
         self.sm_reader
             .fleet_name()
-            .map_err(|e| NodeError::Storage(e.to_string()))
-    }
-
-    /// The applied clear generation for `port` (or `port`'s `space`, when given); `0` if
-    /// `ControlOp::JournalClearGen` has never committed for that key (issue #224).
-    ///
-    /// # Errors
-    /// Storage I/O.
-    pub fn journal_gen(&self, port: u16, space: Option<&str>) -> Result<u64, NodeError> {
-        self.sm_reader
-            .journal_gen(port, space)
             .map_err(|e| NodeError::Storage(e.to_string()))
     }
 

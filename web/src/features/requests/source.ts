@@ -1,54 +1,29 @@
 import type { components } from "../../api/schema.ts";
 
 /**
- * The request log's data source — **the landing point for #147 H**.
+ * The request log's data source.
  *
- * The screen renders only through this module. It now reads the fleet's merged journal
- * (`GET /imposters/:port/requests`, admin-front-side fan-out per #147 B/D) rather than one node's
- * own, so `Coverage` names what the *response* says about that merge rather than what this node's
- * view of fleet topology implies — `coverageFor` takes the `Rift-Cluster-Partial` bit straight off
- * the read, and `useRequestLog` (`app/queries.ts`) is the only caller.
- */
-
-/**
- * How much of the fleet's traffic the rows on screen actually represent.
+ * The screen renders only through this module. It reads `GET /imposters/:port/requests` — upstream's
+ * own journal route, proxied verbatim to the engine embedded in whichever node the browser reached
+ * (**D-74**, #552). There is no coverage to describe any more: the fleet merge that used to sit
+ * behind this route is gone, so a read either answers for that one node or it fails, and the only
+ * two states left are `LogState`'s `rows` and `unknown`.
  *
- * A two-valued type on purpose: a merge either reached every node in its budget or it did not, and
- * the server says which via one additive-only header. There is no third "could not be determined"
- * case here the way there was for the old topology-derived coverage — a read that fails outright is
- * `LogState`'s `unknown`, not a `Coverage` at all, so the ambiguity that used to live in this type
- * cannot arise.
+ * `Coverage`/`coverageFor`/`describeCoverage` lived here to carry the merge's `Rift-Cluster-Partial`
+ * bit onto the screen. That header no longer rides a requests read at all — it survives only on the
+ * reads that genuinely fan out (`/_fleet/*` and the spaces listing) — so keeping the type would mean
+ * a screen branching on a fact nothing can ever report.
  */
-export type Coverage = { kind: "fleet" } | { kind: "partial" };
 
 export type Cursor = { offset: number; size: number };
 
 export type Page<T> = { rows: T[]; total: number; hasMore: boolean };
 
-/** What the merge's `Rift-Cluster-Partial` bit says about this read's coverage. */
-export function coverageFor(partial: boolean): Coverage {
-  return partial ? { kind: "partial" } : { kind: "fleet" };
-}
-
-/**
- * The sentence the scope label shows. Only ever called for `{ kind: "partial" }` — `RequestLog.tsx`
- * renders the label at all only in that case, so there is no complete-merge sentence to branch to:
- * a complete merge says nothing here, on the theory that a permanent label with nothing wrong to
- * report trains operators to stop reading it before the day it matters.
- */
-export function describeCoverage(): string {
-  return (
-    "This merge could not reach every node in its budget, so it may be missing entries a slower " +
-    "node was still holding. If a call looks missing, check again — the next poll re-merges and " +
-    "often catches up."
-  );
-}
-
 /**
  * One page of rows, for the table's own pager.
  *
  * This is a *display* page, over whatever the screen has already accumulated in memory — a separate
- * concern from the network-level `?since=` cursor `useRequestLog` sends the merge (the one that
+ * concern from the network-level `?since=` cursor `useRequestLog` sends the engine (the one that
  * keeps a single poll from re-fetching the whole journal). That one bounds the request; this one
  * bounds the DOM on a busy imposter by slicing client-side, which is unaffected by where the array
  * it slices came from.
@@ -116,10 +91,10 @@ function asText(value: unknown): string {
 }
 
 /**
- * The merge's answer, as a value.
+ * The node's answer, as a value.
  *
  * `unknown` is not `empty`, and this type is where that distinction is made unrepresentable-as-one:
- * a merge that could not answer has an unknown journal, and rendering it as an empty table tells an
+ * a node that could not answer has an unknown journal, and rendering it as an empty table tells an
  * operator their system under test never called the mock.
  */
 export type LogState =
@@ -131,6 +106,6 @@ export function readLog(body: unknown): LogState {
   if (Array.isArray(body)) return { kind: "rows", rows: body as RecordedRequest[] };
   return {
     kind: "unknown",
-    reason: "the merge answered with a body that is not a request list",
+    reason: "this node answered with a body that is not a request list",
   };
 }

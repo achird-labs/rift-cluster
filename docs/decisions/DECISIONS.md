@@ -578,10 +578,10 @@ it and what it saw is not. A response that flattens the two into one shape would
 node-local observation as fleet state — the past-state-as-present error. They stay separate
 fields with separate provenance.
 
-### D-32 — Fleet request tail over a capped, declared coverage set
-- **Status:** active
+### ~~D-32 — Fleet request tail over a capped, declared coverage set~~
+- **Status:** superseded
 - **Decided:** 2026-08 · #362
-- **Code:** crates/rift-cluster-server/src/admin_front.rs, crates/rift-cluster-server/src/cli.rs
+- **Superseded by:** D-74
 
 The fleet-wide request tail carries a `port → JournalCursor` map over a coverage set capped by
 `fleet_journal_port_cap` (default 100) and reports `coverage: {covered, total, omitted}` on every
@@ -642,10 +642,10 @@ LRU eviction keyed on a millisecond timestamp alone evicts the wrong flow when s
 within the same millisecond; a process-wide monotone sequence (`static TOUCH_SEQ`) stamped on
 every touch breaks the tie so LRU holds at any rate.
 
-### D-37 — The journal is per-writer shards, merged on read
-- **Status:** active
+### ~~D-37 — The journal is per-writer shards, merged on read~~
+- **Status:** superseded
 - **Decided:** 2026-08 · #223, #224 (RFC-001 §7.5.1 as built)
-- **Code:** crates/rift-cluster/src/stores/journal.rs, crates/rift-cluster/src/stores/journal_net.rs
+- **Superseded by:** D-74
 
 Every node appends only to its own `(port, node_id)` shard; a read k-way-merges the shards by
 recorded timestamp with `(node_id, seq)` breaking ties. Caps are writer-local with an
@@ -654,11 +654,11 @@ recorded timestamp with `(node_id, seq)` breaking ties. Caps are writer-local wi
 *Rejected:* owner-routed or consensus-carried journaling — a mock request must never wait on
 another node to be recorded.
 
-### D-38 — Clears are generation bumps, never timestamps
-- **Status:** active
+### ~~D-38 — Clears are generation bumps, never timestamps~~
+- **Status:** superseded
 - **Decided:** 2026-08 · #223 (RFC-001 §7.5.2 as built)
 - **Amends:** RFC-001 §7.5.2
-- **Code:** crates/rift-cluster/src/control.rs, crates/rift-cluster/src/stores/journal.rs
+- **Superseded by:** D-74
 
 A monotone per-port (and per-`(port, space)`) clear generation rides the Raft log as
 `ControlOp::JournalClearGen`; entries and counter slots carry their writer's generation, and the
@@ -668,11 +668,11 @@ its `teardown_space` markers were never built — the generation is a committed 
 *Rejected:* timestamped deletion (clocks are not ordered across nodes); `retain` predicates stay
 best-effort per shard.
 
-### D-39 — The journal cursor is a vector, opaque by contract
-- **Status:** active
+### ~~D-39 — The journal cursor is a vector, opaque by contract~~
+- **Status:** superseded
 - **Decided:** 2026-08 · #225, #348 (RFC-001 §7.5.1 as built)
 - **Amends:** RFC-001 §7.5.1
-- **Code:** crates/rift-cluster/src/stores/journal.rs, crates/rift-cluster/src/stores/journal_net.rs
+- **Superseded by:** D-74
 
 `since` is `v1 {gen, pos: node_id → seq}`, base64url-JSON; per-shard filtering, monotone advance,
 dead shards frozen rather than rewound; a bare `u64` is read as `{this_node: seq}` for the upgrade
@@ -1567,7 +1567,7 @@ assumed away.
 - **Decided:** 2026-08-28
 - **Refines:** D-41
 - **Implemented by:** #516
-- **Code:** .github/workflows/ci.yml, scripts/chaos-shard.sh, scripts/cluster-smoke-gate.sh, tests/cluster-chaos/src/lib.rs, deploy/compose/docker-compose.yml, tests/cluster-chaos/compose/faketime.overlay.yml
+- **Code:** .github/workflows/ci.yml, scripts/chaos-shard.sh, scripts/cluster-smoke-gate.sh, tests/cluster-chaos/src/lib.rs, deploy/compose/docker-compose.yml, deploy/Dockerfile
 
 `cluster-smoke` took 35–37 min. Measured, by regressing the tier's own reported wall clock against
 its scenario count over ten runs (2026-07-23 → 2026-08-28, N from 17 to 36):
@@ -1683,6 +1683,16 @@ makes `test_cold_start` pass for the wrong reason); it trades a latency problem 
 one. Cutting scenarios or widening the path filter's skip set — D-41 already settled the
 coverage-for-latency trade at one iteration per scenario, and this entry buys the latency back
 without reopening it.
+
+**Amendment (D-74, 2026-09-08, #552):** the tier builds **one** image, not two. The second was the
+`faketime` flavor, whose `LD_PRELOAD` lied about the clock for the one scenario (C12) that proved
+journal clears consulted no timestamp; that scenario left with the clear generations it was
+proving clock-free, so the flavor, its overlay and the `runtime-faketime` Dockerfile stage went
+with it. Nothing about the decision changes — `BUILT_IMAGES` is still the declared list, and
+`compose_images_are_tagged_by_flavor` still fails a build target that arrives without a tag of its
+own, which is the invariant this entry exists to keep. `runtime` is the Dockerfile's last stage
+again, and every build site still pins `target:` anyway: the ordering is not a thing a compose
+file should have to know.
 
 ### D-59 — A voter departs by one `RemoveVoters(retain = false)`; a leaving node is never a learner
 - **Status:** active
@@ -2154,7 +2164,7 @@ literally "owner-unreachable".
 
 - **Status:** active
 - **Decided:** 2026-08-29
-- **Amends:** RFC-001 §7.6, docs/architecture/07-verification-plane.md, docs/architecture/09-durability-failure.md, docs/architecture/12-testing.md
+- **Amends:** RFC-001 §7.6, docs/architecture/06-flow-state.md, docs/architecture/09-durability-failure.md, docs/architecture/12-testing.md
 - **Refines:** D-17, D-40, D-65
 - **Implemented by:** #529 (EE), rift#990 (the U-17 seam)
 - **Code:** crates/rift-cluster/src/stores/proxy.rs, vendor/rift/crates/rift-mock-core/src/recording/proxy_store.rs
@@ -2694,3 +2704,85 @@ one fewer route and one fewer replicated record, but it puts a long-lived creden
 for the whole session, and rotation would then have no kill switch short of changing the flag on
 every node and restarting. The cookie is the only revocation this design has; removing it would
 leave none.
+
+### D-74 — Verification is per node: the request journal is upstream's own, `numberOfRequests` is the answering node's count, and `Rift-Cluster-Partial` is stamped only on reads that genuinely fan out
+
+- **Status:** active
+- **Decided:** 2026-09-08 · RFC-007 §3.2 · #552
+- **Supersedes:** D-32, D-37, D-38, D-39
+- **Amends:** docs/architecture/05-read-path.md
+- **Implemented by:** #552
+- **Code:** crates/rift-cluster-server/src/admin_front.rs, crates/rift-cluster-server/src/openapi.rs, crates/rift-cluster/src/decorate.rs, crates/rift-cluster/src/control.rs, crates/rift-cluster/src/raft/store.rs, crates/rift-cluster/src/stores/mod.rs
+
+A RiftCluster node's recorded requests are **upstream Rift's own**, per node.
+`GET /imposters/:port/requests` — and its `savedRequests` spelling, its `?since=` cursor form and
+its `DELETE` — are ordinary proxied routes to the local engine, answering for the node the caller
+reached, with upstream's own scalar `x-rift-next-index` and `x-rift-truncated` and upstream's
+Mountebank semantics unchanged. A test that needs fleet-wide verification pins a node or reads all
+of them and adds up (RFC-007 §3.3).
+
+**What leaves.** The whole fleet journal: `stores/{journal,journal_net,journal_seq}.rs`, the
+per-writer `(node_id, seq, clear_gen)` shards and their `evicted_below_seq` watermarks, the k-way
+merge-on-read, the anti-entropy pull and its replica cache, the `/_cluster/journal/{since,counts}`
+RPCs, `ControlOp::JournalClearGen` with the `sm_journal_gens` table and the `journal_gens`
+snapshot field, the vector cursor and its `JournalCursor`/`FleetCursor` codecs, the merged SSE
+tail on `.../savedRequests/stream`, the fleet-wide `GET /admin/requests` and its stream with the
+declared coverage set, `--cluster-fleet-journal-port-cap`, and
+`rift_cluster_journal_partial_reads_total`. The console's Requests screen loses the merge and
+names the node it read from instead.
+
+**`numberOfRequests` is a contract change, stated as one.** On `GET /imposters` and
+`GET /imposters/{port}` it is now **the answering node's own count**. It was a fleet sum: upstream
+answered its local counter and the front rewrote it by fanning out to every peer. A client that
+wants a fleet total reads every node and sums — and then knows which nodes it counted, which the
+old answer could not tell it whenever a peer missed the budget and the sum silently became a
+floor.
+
+**`Rift-Cluster-Partial` narrows rather than leaving.** It stays on the two reads that stamp it —
+`/_fleet/members` and `/_fleet/health` — and goes from every journal site. A requests read has no
+peer to be partial about: it either answers for the node the caller reached, or it fails. The
+contract now *declares* the header on those two operations, which it never did: every `$ref` to it
+was on a journal route, so removing them would have left the component defined and referenced by
+nothing. The spaces listing fans out too and keeps reporting its own incompleteness in the body
+(`partial`, beside `unavailable`) — an enumeration refused by policy and one shortened by a slow
+peer are different facts, and a boolean header cannot tell them apart.
+`HEADER_NEXT_INDEX`/`HEADER_TRUNCATED` leave `decorate.rs` entirely; the cursor headers on the
+wire are upstream's, emitted by upstream.
+
+**A space teardown still clears that space's requests.** `DELETE /imposters/:port/spaces/:flow`
+proxies to the local engine, and upstream's own `teardown_space` calls
+`RequestJournal::clear_flow(port, space)` on the way through — so the entries go on the node that
+took the teardown, which is the node whose journal held them. The `JournalClearGen { space }` half
+this front used to commit alongside existed only to raise a *replicated* generation the merge
+consulted; with no merge there is nothing for it to be replicated for. The replicated **stub**
+half (D-69) is untouched and still required.
+
+**This is a fleet-wide log-format break**, the same one #549 (D-72) and #550 (D-73) declared and
+for the same reason: removing a `ControlOp` variant makes an old log entry undecodable, so a fleet
+upgrading across this commit starts from a fresh `--cluster-state-dir`. Snapshot *decoding* is
+deliberately tolerant of the removed `journal_gens` field — `SnapshotPayload` sets no
+`deny_unknown_fields`, so a snapshot built before this still installs and its extra key is
+dropped.
+
+**Why.** The journal was a second distributed system riding inside the first: per-writer shards, a
+k-way merge by recorded timestamp, an anti-entropy loop, generation clears committed through Raft,
+a vector cursor and a declared coverage set — about 4,000 source lines and 5,700 test lines, built
+so a test assertion could be made against any node. That is a real problem. It is Rift's to solve,
+in the engine, once, for every deployment shape — and while the cluster carried it, it doubled the
+surface of every read: two code paths for `GET /imposters/{port}/requests`, two cursor vocabularies,
+a `numberOfRequests` that meant something different depending on which node answered and how many
+peers replied in time.
+
+*Rejected:* keeping a replicated clear generation without the merged read. It is the cheapest half
+to keep — one `ControlOp`, one small redb table — and it converges a `DELETE savedRequests` across
+the fleet without any fan-out on the read path. But a clear generation is only observable through
+a reader that consults it, and the only reader was the merge. Kept alone it is a counter that
+commits, replicates, snapshots and is compared against nothing: a fleet-wide write whose effect no
+API can show, which is a worse thing to own than either the whole subsystem or none of it.
+
+*Rejected:* keeping the fleet-sum `numberOfRequests` decoration. It is the single most useful thing
+the merge produced and the cheapest to keep — one fan-out over `/_cluster/journal/counts`, no
+shards, no cursor. It stays rejected because a sum is only honest if every addend arrived: under a
+slow peer it silently becomes a floor, and the `Rift-Cluster-Partial` bit that says so is a header
+most clients never read. A per-node count is smaller and always exactly true, and a caller that
+wants the total can compute it from `/_fleet/members` and know what it counted.

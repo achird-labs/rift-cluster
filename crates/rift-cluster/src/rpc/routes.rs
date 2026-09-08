@@ -198,7 +198,7 @@ impl Router {
 
     /// Fold `other`'s routes into `self`.
     ///
-    /// Exists because a handful of route builders (`journal_routes`, `flow_routes`) build their
+    /// Exists because a handful of route builders (`flow_routes`, `proxy_routes`) build their
     /// own table from `Router::new()` rather than accepting a `base: Router` to extend — each is a
     /// self-contained subsystem's whole surface, and taking a base would let one subsystem's
     /// builder observe another's routes for no reason. `merge` is how the composition root brings

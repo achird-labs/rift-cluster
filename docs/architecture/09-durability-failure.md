@@ -26,23 +26,19 @@ What state lives where, and what it survives:
 | Flow state @ `async` (default) | FlowShard, group fsync per 50 ms | ✅ (replicas live) | ✅ minus ≤ 1 interval | Loss only if **all 3** holders die inside one interval |
 | Flow state @ `none` | memory | via replicas | ❌ (opted) | Throwaway CI imposters |
 | Sequence cursors | memory | ❌ reset (D-8) | ❌ | Deliberate: hottest stateful path, test-run-scoped |
-| Request journal + counters | memory (CRDT shards) | ❌ that shard | ❌ | In-run assertion data, bounded buffers |
-| Journal per-port **seq floor** | `journal-seq-floors` in the state dir | ✅ | ✅ | Not the entries — just the counter, so a restarted writer cannot reuse `(node_id, seq)` (#351) |
-| proxyOnce `Pending` claims | owner memory | ❌ re-claimable | ❌ | By design — Chapter 7 |
+| Request journal + counters | memory (upstream's own per-node journal) | ❌ that node's | ❌ | In-run assertion data, bounded buffers |
+| proxyOnce `Pending` claims | owner memory | ❌ re-claimable | ❌ | By design — Chapter 6 |
 | proxyOnce `Recorded` + recorded stubs | via config (Raft SM) | ✅ | ✅ | Recordings are config |
 
 The volatile rows are decisions, not gaps: each would cost hot-path writes to
 preserve state whose value ends with the test run.
 
-The seq-floor row is the one place that reasoning was applied too widely, and
-#351 corrects it. The journal's *entries* are indeed test-run-scoped and stay
-volatile. Its *counter* is not the same kind of thing: `node_id` is durable, so
-`(node_id, seq)` is an identity the rest of the fleet keeps referring to — in
-replica caches and in live cursors — after the writer that issued it is gone.
-A counter that restarted at 0 would hand those identities out a second time,
-which is not lost data but wrong data. Persisting it also does not cost a
-hot-path write, because the floor is reserved a block at a time: one fsync per
-2^20 appends per port, and nothing at all in between.
+The journal row is the plainest of them since D-74 (#552): a node's recorded requests are that
+node's, held in upstream's own in-memory journal, and a restart loses them exactly as a restart of
+the single-node binary does. There is no fleet identity attached to an entry any more — no
+`(node_id, seq)` a peer's cache or a live cursor keeps referring to — so nothing about the
+recording path needs to be durable to stay *correct*, only to stay *present*, and presence is what
+the row above declines to buy.
 
 ## The degradation table
 
@@ -125,9 +121,8 @@ read it are asserting.
 | Script flow-KV read (`local`, opt-in) | — | local replica, flagged when owner down | Imposter chose speed |
 | Sequence advance | cursor owner (opt-in, D-47) | **falls back to the node-local cursor, annotated and counted** (`rift_cluster_sequence_fallbacks_total`) | Blocking all cyclic responses during a blip is worse than a possible duplicate index — the one place availability wins (D-10). Never a `503`; the counter, not the returned index, is what distinguishes a degraded answer from a healthy one |
 | proxyOnce claim | signature owner | `503`, **never forwarded**; counted `rift_cluster_proxy_claims_total{outcome="refused"}` (D-66) | Duplicate upstream side-effects are worse than a failed mock call — and with the owner unreachable the duplicate is bounded by the *outage*, not by "1 + ownership changes" |
-| Journal append / count | — (always local) | unaffected | Mergeable by design |
-| Journal / count read | all peers | merge of reachable shards + `Rift-Cluster-Partial: true` | Partial-and-says-so beats blocked |
-| Journal read **from a crash-restarted writer** | all peers | merge, still `Rift-Cluster-Partial: true` while peers cache entries of its own lost shard (#349) | The entries are gone for good, not late — a knowingly short answer must say so |
+| Journal append / count | — (always local) | unaffected | Recording never leaves the node |
+| Journal / count read | — (this node's own journal) | unaffected, and scoped to this node by contract | A per-node answer cannot be partial: there is nothing it failed to reach (D-74) |
 | Admin config read | — (local applied state) | served, possibly behind; revision comparable | Staleness is measurable, not hidden |
 
 ## The replication ceiling
@@ -217,7 +212,7 @@ class remaining is the flagged, opt-in `local` modes.
 
 **Full-cluster restart (deploy, power event).** Chapter 3's cold start: redb →
 group re-forms → replay. Configs, tenancy, intents: intact (R3). Flow state:
-per its durability level. Journal: empty (matrix above). A CI run interrupted
+per its durability level. Recorded requests: gone on every node (matrix above). A CI run interrupted
 mid-flight resumes against identical mocks with identical scenario states (at
 `sync`/`async`), which is precisely the "always-on shared environment" promise.
 
@@ -310,3 +305,9 @@ Everything above surfaces through five headers — `Rift-Cluster-Revision`,
 `Rift-Cluster-Partial` — plus `rift_cluster_degraded_ops_total{feature}` and
 friends in metrics. A strict test harness asserts the absence of the last
 three; a lenient one ignores them. Both get the truth.
+
+`Rift-Cluster-Partial` is the narrowest of the five, and deliberately so since D-74 (#552): it is
+stamped only on reads that genuinely fan out across the fleet — `/_fleet/members`,
+`/_fleet/health`, the fleet spaces listing — where "I could not reach every node" is a fact about
+the answer. A read that was never a fan-out cannot be partial, so requests reads no longer carry
+it at all rather than carrying it as a permanent disclaimer.

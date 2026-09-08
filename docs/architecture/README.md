@@ -18,10 +18,11 @@ machine-checkable acceptance criteria.
 ## How to read this guide
 
 Chapters 1–2 give the mental model: what the system is, what it refuses to be,
-and the two-plane architecture everything else hangs from. Chapters 3–7 walk the
-machinery: the control plane, the write path, the read path, flow state, and the
-verification plane. Chapters 8–9 cover the cross-cutting guarantees: tenancy and
-security, durability and failure. Chapters 10–12 are for operators and
+and the two-plane architecture everything else hangs from. Chapters 3–6 walk the
+machinery: the control plane, the write path, the read path, and flow state —
+which since #552 also carries proxyOnce, chapter 7 being retired. Chapters 8–9
+cover the cross-cutting guarantees: tenancy and security (retired), durability
+and failure. Chapters 10–12 are for operators and
 implementers: running it, the upstream boundary, and how correctness is
 verified.
 
@@ -35,8 +36,8 @@ If you read only three chapters, read **1 (Overview)**, **4 (Write Path)**, and
 | 3 | [The Control Plane](03-control-plane.md) | Raft membership, the replicated state machine, storage, cold start |
 | 4 | [The Write Path](04-write-path.md) | Life of an admin request: barrier, intents, exactly-once effect |
 | 5 | [The Read Path](05-read-path.md) | Life of a mock request: matching, stateful gates, where RPCs happen |
-| 6 | [Flow State](06-flow-state.md) | Ownership, replication, durability, recovery, fencing |
-| 7 | [The Verification Plane](07-verification-plane.md) | Recorded requests, counters, clears, cursors/SSE, proxyOnce |
+| 6 | [Flow State](06-flow-state.md) | Ownership, replication, durability, recovery, fencing — and proxyOnce owner claims, moved here from Ch. 7 |
+| 7 | ~~[The Verification Plane](07-verification-plane.md)~~ | **Retired** by D-71/D-74 (#552). The journal is upstream's own, per node; proxyOnce moved to Ch. 6 |
 | 8 | ~~[Multi-Tenancy & Security](08-tenancy-security.md)~~ | **Retired** by D-71/D-73 (#550). The peer secret moved to Ch. 3; sessions and `/_fleet/*` to Ch. 10 |
 | 9 | [Durability & Failure](09-durability-failure.md) | What survives what: the restart matrix and partition behavior |
 | 10 | [Operations](10-operations.md) | Deployment, probes, metrics, runbooks, rolling upgrades, sizing |

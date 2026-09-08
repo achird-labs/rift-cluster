@@ -7,7 +7,7 @@ import {
   type RevisionedRead,
   type SendResult,
   apiGet,
-  apiGetMerged,
+  apiGetDecorated,
   apiGetWithRevision,
   apiSend,
 } from "../api/client.ts";
@@ -34,12 +34,7 @@ import {
   tryImposterPath,
 } from "../api/paths.ts";
 import type { components } from "../api/schema.ts";
-import {
-  type Coverage,
-  type RecordedRequest,
-  coverageFor,
-  readLog,
-} from "../features/requests/source.ts";
+import { type RecordedRequest, readLog } from "../features/requests/source.ts";
 import {
   type FlowStateRead,
   type ScenarioState,
@@ -62,32 +57,26 @@ export type TryResult = components["schemas"]["TryResponse"];
 type FleetMembers = components["schemas"]["FleetMembers"];
 type FleetHealth = components["schemas"]["FleetHealth"];
 type RouteTable = components["schemas"]["RouteTable"];
-type FleetRequestPage = components["schemas"]["FleetRequestPage"];
-export type FleetJournalCoverage = components["schemas"]["FleetJournalCoverage"];
 
 /**
- * Every imposter the fleet serves, and whether the fleet sum on them is complete.
+ * Every imposter **the node the browser reached** serves.
  *
- * `partial` is carried rather than dropped because `numberOfRequests` is a **fleet** figure
- * (issue #363): the front rewrites each entry's count to the sum across every node's slot for that
- * port, and stamps `Rift-Cluster-Partial` when a peer could not be reached inside the fan-out
- * budget. The sum is then a floor, not a total — and a floor presented as a total is the reading an
- * operator would act on.
- *
- * Carried beside the array rather than merged into it: the two facts have different scopes, and a
- * caller that does not care about coverage should have to ignore it explicitly rather than never
- * learn it exists.
+ * A bare array again since **D-74** (#552). It used to be `{ imposters, partial }`: each entry's
+ * `numberOfRequests` was rewritten by the admin front to the sum across every node's journal slot
+ * for that port, and `Rift-Cluster-Partial` said when that fan-out missed a peer and the sum was
+ * therefore a floor. The journal is upstream's own and per node now, so `numberOfRequests` is the
+ * answering node's own count, this read fans out to nobody, and the header can never be stamped on
+ * it — a `partial` carried here would be a field that is structurally always `false`, which is a
+ * worse lie than not offering it at all.
  */
-export type ImposterList = { imposters: Imposter[]; partial: boolean };
-
-export function useImposters(): UseQueryResult<ImposterList> {
+export function useImposters(): UseQueryResult<Imposter[]> {
   return useQuery({
     queryKey: ["imposters"],
-    queryFn: async (): Promise<ImposterList> => {
-      const read = await apiGetMerged<{ imposters?: Imposter[] }>(API_PATHS.imposters);
+    queryFn: async (): Promise<Imposter[]> => {
+      const body = await apiGet<{ imposters?: Imposter[] }>(API_PATHS.imposters);
       // `imposters` is optional in the contract, so an absent array is a shape the schema permits —
       // a domain-optional read, not a swallowed failure. A non-2xx has already thrown in `client`.
-      return { imposters: read.data.imposters ?? [], partial: read.partial };
+      return body.imposters ?? [];
     },
     ...POLLED,
   });
@@ -133,11 +122,11 @@ export function useFleetView(options: { polled?: boolean } = {}): UseQueryResult
     queryFn: async () => {
       const [members, health] = await Promise.all([
         apiGet<FleetMembers>(API_PATHS.fleetMembers),
-        // `apiGetMerged` for health alone: its `parked_intents_fleet` is summed across voters
+        // `apiGetDecorated` for health alone: its `parked_intents_fleet` is summed across voters
         // (#360), and `Rift-Cluster-Partial` is the only signal that a node did not answer and the
         // sum is therefore a floor. The members read carries its coverage per row instead, so it
         // needs no header.
-        apiGetMerged<FleetHealth>(API_PATHS.fleetHealth),
+        apiGetDecorated<FleetHealth>(API_PATHS.fleetHealth),
       ]);
       return fleetView(members, health.data, health.partial);
     },
@@ -145,8 +134,9 @@ export function useFleetView(options: { polled?: boolean } = {}): UseQueryResult
      * `polled: false` reads the fleet once per mount instead of every 5s. `RecordingPanel`'s single
      * caller wants this reading only to name a caveat about fleet size, which changes on membership
      * events, not on every 5s tick — polling it there would be five-second noise for a sentence that
-     * would not change. (The request log used to be a second caller of this option, before #147 H
-     * moved its coverage off fleet topology entirely and onto the merge's own response headers.)
+     * would not change. The request log is a caller too, and it takes the polled default: it names
+     * the node it is reading from (D-74), and the browser is reconnected to whichever node the load
+     * balancer picks, so that name really can change under a screen left open.
      */
     ...(options.polled === false ? {} : POLLED),
   });
@@ -187,26 +177,30 @@ export function useLifecycleToggle(): UseMutationResult<
 }
 
 /**
- * One imposter's recorded requests, read from the fleet's merged journal (#147 H) — one already
- * combined answer rather than one node's own, with coverage and paging carried on the response
- * headers `apiGetMerged` reads (`Rift-Cluster-Partial`, `x-rift-next-index`, `x-rift-truncated`).
+ * One imposter's recorded requests, read from the engine embedded in **the node the browser
+ * reached** (D-74, #552).
+ *
+ * `coverage` is gone with the fleet merge: this read fans out to nobody, so `Rift-Cluster-Partial`
+ * is never stamped on it and there is nothing left to be partial about. `truncated` and `cursor`
+ * stay, because they were never the cluster's — `x-rift-truncated` and `x-rift-next-index` are
+ * upstream's own headers, carrying upstream's own **scalar** index, and they mean here exactly what
+ * they mean against a standalone engine.
  */
 export type RequestLogState =
   | {
       kind: "rows";
       rows: RecordedRequest[];
-      coverage: Coverage;
       truncated: boolean;
       /**
        * The cursor the response that produced these rows issued, carried here rather than in a
        * ref so that it lives and dies with the cached rows it belongs to — see `useRequestLog`.
-       * `null` means the merge offered no cursor, so the next poll starts from the beginning.
+       * `null` means the node offered no cursor, so the next poll starts from the beginning.
        */
       cursor: string | null;
       /**
        * Cursored polls since the last full read. `useRequestLog` drops the cursor once this
        * reaches `BASELINE_EVERY`, which is what stops the accumulated list drifting permanently
-       * away from what the fleet actually holds.
+       * away from what the node actually holds.
        */
       pollsSinceBaseline: number;
     }
@@ -214,26 +208,15 @@ export type RequestLogState =
 
 /**
  * Re-read the whole journal every this-many cursored polls. At the 2 s request-log cadence that is
- * roughly a minute, which bounds how long this screen can show rows the fleet has already cleared
+ * roughly a minute, which bounds how long this screen can show rows the node has already cleared
  * or evicted — see the reasoning in `useRequestLog`.
  */
 const BASELINE_EVERY = 30;
 
 /**
- * Rows in recorded-timestamp order, the same order a single merged page arrives in.
- *
- * `Array.prototype.sort` is stable, so rows whose `timestamp` is absent — an entry from an engine
- * predating the field, which `RequestLog.tsx` renders as `—` — keep their arrival order relative
- * to each other instead of being shuffled by a comparator that cannot rank them.
- */
-function byTimestamp(rows: RecordedRequest[]): RecordedRequest[] {
-  return [...rows].sort((a, b) => (a.timestamp ?? "").localeCompare(b.timestamp ?? ""));
-}
-
-/**
  * A failed read resolves to `{ kind: "unknown" }` rather than rejecting, because on this screen the
  * two outcomes are different sentences and the query's own error state cannot tell them apart: an
- * empty array and an unreachable merge both arrive here as "no rows to show". `readLog` is the only
+ * empty array and an unreachable node both arrive here as "no rows to show". `readLog` is the only
  * place that decision is made for the body; a transport failure (the `catch` below) is the same
  * verdict for a different reason.
  *
@@ -268,65 +251,61 @@ export function useRequestLog(port: number): UseQueryResult<RequestLogState> {
        * Deltas, but never forever: every `BASELINE_EVERY` polls the cursor is dropped and the whole
        * journal is re-read.
        *
-       * The server stamps `x-rift-next-index` on every 200, so a cursor, once held, is never
+       * The engine stamps `x-rift-next-index` on every 200, so a cursor, once held, is never
        * offered back as `null` — accumulating on it unconditionally means this screen never
-       * reconciles with the fleet again. Three things then drift, and none of them announce
+       * reconciles with the node again. Three things then drift, and none of them announce
        * themselves: a clear issued anywhere *other* than this tab (another operator, the CLI, an
        * SDK) leaves every pre-clear row on screen for good, because the clear neither regresses the
-       * token nor sets `truncated`; rows the fleet has since evicted under retention stay here
-       * forever, so `request-total` counts a journal no node holds; and `[...held.rows, ...delta]`
+       * token nor sets `truncated`; rows the node has since evicted under retention stay here
+       * forever, so `request-total` counts a journal nothing holds; and `[...held.rows, ...delta]`
        * re-copies a list that only grows, on the very screen an operator leaves open for an hour.
        *
-       * Re-baselining bounds all three by time rather than trying to detect each one. The token's
-       * `generation` field could eventually detect the clear case precisely (it is carried for
-       * exactly that, though nothing reads it yet), but a periodic full read is what makes the
-       * other two correct as well, and it costs one uncursored read per minute against a 2 s poll.
+       * Re-baselining bounds all three by time rather than trying to detect each one. A periodic
+       * full read is what makes all three correct, and it costs one uncursored read per minute
+       * against a 2 s poll.
        */
       const resumable =
         held?.kind === "rows" && held.cursor !== null && held.pollsSinceBaseline < BASELINE_EVERY;
       const since = resumable && held?.kind === "rows" ? held.cursor : null;
       const path = since === null ? requestsPath(port) : `${requestsPath(port)}?since=${since}`;
       try {
-        const merged = await apiGetMerged<unknown>(path);
-        const local = readLog(merged.data);
+        const read = await apiGetDecorated<unknown>(path);
+        const local = readLog(read.data);
         if (local.kind === "unknown") return local;
         const resuming = since !== null && held?.kind === "rows";
         /*
-         * A cursored fetch is the delta the merge is handing over on top of what this screen
-         * already holds; an uncursored one is the merge's whole current answer, so it replaces.
+         * A cursored fetch is the delta this node is handing over on top of what the screen already
+         * holds; an uncursored one is the node's whole current answer, so it replaces.
          *
-         * The concatenation is re-sorted because the contract says it must be: pages are ordered
-         * by recorded timestamp *within* a page, and `openapi-ee.yaml` spells out that
-         * concatenating them is not a globally sorted stream — a peer that becomes reachable
-         * between polls contributes entries older than everything already returned. That is the
-         * same degraded-fan-out moment the partial label exists to announce, so appending blind
-         * would put a chronological screen out of order exactly when it is being relied on. This
-         * is not the client-side *merge* the design doc bans — the server merged; this only
-         * restores order across pages the server itself declares unordered.
+         * Appended verbatim, and no longer re-sorted (D-74, #552). The sort existed because the
+         * old merged read concatenated per-node pages that the contract itself declared not to be
+         * a globally sorted stream — a peer coming back between polls contributed entries older
+         * than everything already returned. There are no peers in this read: one engine's journal
+         * is an append-only sequence, and `?since=` continues it exactly where the last response
+         * stopped, so page order *is* record order and re-sorting could only ever move rows the
+         * engine had already placed correctly.
          */
-        const rows = resuming ? byTimestamp([...held.rows, ...local.rows]) : local.rows;
+        const rows = resuming ? [...held.rows, ...local.rows] : local.rows;
         return {
           kind: "rows",
           rows,
-          coverage: coverageFor(merged.partial),
           /*
-           * Sticky across the accumulation, unlike `partial`. The server sets `x-rift-truncated`
-           * on the one read whose position predates the shard watermark; the next poll presents a
-           * position above it and the header is gone — but the hole it announced is permanent and
-           * sits in the middle of the rows still on screen. A notice that erased itself after one
-           * 2 s tick would be a swallowed warning on the one screen built to keep "incomplete" and
-           * "empty" distinguishable. Cleared by the baseline re-read, which is the point at which
-           * the rows it describes are replaced. (`partial` is correctly per-response: an unreached
-           * shard's position does not advance, so the next merge picks it up.)
+           * Sticky across the accumulation. The engine sets `x-rift-truncated` on the one read
+           * whose `since` predates the retention watermark; the next poll presents a position above
+           * it and the header is gone — but the hole it announced is permanent and sits in the
+           * middle of the rows still on screen. A notice that erased itself after one 2 s tick
+           * would be a swallowed warning on the one screen built to keep "incomplete" and "empty"
+           * distinguishable. Cleared by the baseline re-read, which is the point at which the rows
+           * it describes are replaced.
            */
-          truncated: merged.truncated || (resuming && held.kind === "rows" && held.truncated),
-          cursor: merged.next,
+          truncated: read.truncated || (resuming && held.kind === "rows" && held.truncated),
+          cursor: read.next,
           pollsSinceBaseline: resuming ? held.pollsSinceBaseline + 1 : 0,
         };
       } catch (error) {
         return {
           kind: "unknown",
-          reason: error instanceof Error ? error.message : "the merge could not be reached",
+          reason: error instanceof Error ? error.message : "this node could not be reached",
         };
       }
     },
@@ -713,43 +692,6 @@ export function useClearRequests(): UseMutationResult<CommitOutcome, Error, { po
  *
  * `combine` folds the results in the query layer so the screen sees one value rather than N.
  */
-/** One recorded request, tagged with the imposter and flow it was read from. */
-export type FleetRequestRow = FleetRequestPage["requests"][number];
-
-/**
- * The fleet-wide request journal — one read (#362), not the N-way client fan-out it replaces.
- *
- * The admin front now does the merge itself: `GET /admin/requests` walks every imposter the fleet
- * serves and hands back one ordered page, so this hook is a single `apiGet` — no
- * `useQueries`, no per-port cap, no client-side union.
- *
- * `coverage` is carried rather than dropped, same reasoning as `useImposters`' `partial`: the
- * server may cap how many imposters one page walks (`coverage.capped`/`coverage.omitted`), and a
- * capped page rendered as the whole fleet is exactly the wrong-but-quiet failure this type exists
- * to prevent. Ordering is still the part to be honest about even though the merge is now the
- * server's: rows are ordered by each request's own recorded timestamp, stamped by whichever node
- * served it, so entries recorded within milliseconds of each other on clock-skewed nodes can still
- * transpose — `RequestLog.tsx`'s caveat banner says so.
- *
- * The wire order is oldest-first, same as the per-imposter journal it merges (openapi-ee.yaml's
- * `savedRequests` description) — the right convention for a resumable cursor walk, and the wrong
- * one for a screen an operator reads top-down. Reversed here, once, rather than in the screen, so
- * every caller of this hook sees the newest-first order the log has always shown.
- */
-export function useFleetRequests(): UseQueryResult<{
-  rows: FleetRequestRow[];
-  coverage: FleetJournalCoverage;
-}> {
-  return useQuery({
-    queryKey: ["fleet-requests"],
-    queryFn: async () => {
-      const page = await apiGet<FleetRequestPage>(API_PATHS.fleetRequests);
-      return { rows: [...page.requests].reverse(), coverage: page.coverage };
-    },
-    ...POLLED,
-  });
-}
-
 export function useAllScenarios(
   ports: readonly number[],
 ): { rows: { port: number; state: ScenarioState }[]; pending: boolean } {

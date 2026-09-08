@@ -286,7 +286,8 @@ docs rather than discovered in one.
 
 3 voters for HA (survives 1), 5 for comfort (survives 2); learners beyond 9
 add data-plane capacity without consensus weight. Per node: flow shard ≤ 100k
-entries (LRU-shed above), journal ≤ ports × shard cap × avg entry, config SM =
+entries (LRU-shed above), the recorded-request journal bounded by upstream's own
+per-imposter retention, config SM =
 fleet config size (small), Raft log bounded by snapshot cadence. Disk: state
 dir on real block storage (fsync latency is the `sync`-durability floor);
 tens of GB is generous. Network: everything assumes single-DC LAN — the
