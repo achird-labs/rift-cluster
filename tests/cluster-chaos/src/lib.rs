@@ -323,8 +323,44 @@ impl Cluster {
         cluster.wait_all_ready(UP_TIMEOUT).await?;
         let t = record("ready", t);
         cluster.wait_cluster_formed(UP_TIMEOUT).await?;
-        record("formed", t);
+        let t = record("formed", t);
+        // The front (Envoy) is a separate container with its own startup; the
+        // fleet being formed says nothing about whether it has bound its
+        // listener yet. With live readiness (#548) a scenario can reach its
+        // first write through the front ~300 ms after the nodes come up, which
+        // is faster than Envoy starts — the write then dies with "connection
+        // reset by peer" on :42525. Wait for Envoy's own readiness before
+        // handing the stack over, so the scenario measures Rift, not Envoy.
+        if cluster.files.iter().any(|f| f.contains("chaos.overlay")) {
+            cluster.wait_front_ready(UP_TIMEOUT).await?;
+            record("front", t);
+        }
         Ok(cluster)
+    }
+
+    /// Wait until the front (Envoy, `chaos.overlay.yml`) has bound its listeners.
+    ///
+    /// Envoy's admin `/ready` answers 200 only once every listener is
+    /// accepting, which is the fact a scenario's first write through
+    /// `FRONT_PORT` depends on. Polled because container start is asynchronous
+    /// with respect to the fleet's own readiness.
+    pub async fn wait_front_ready(&self, timeout: Duration) -> anyhow::Result<()> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if probe(ENVOY_ADMIN_PORT, "/ready")
+                .await
+                .is_ok_and(|s| s == 200)
+            {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                let _ = self.compose(&["ps"]);
+                bail!(
+                    "the front never reported ready on :{ENVOY_ADMIN_PORT}/ready within {timeout:?}"
+                );
+            }
+            tokio::time::sleep(POLL).await;
+        }
     }
 
     /// Wait until the fleet has actually formed a cluster, not merely started.
