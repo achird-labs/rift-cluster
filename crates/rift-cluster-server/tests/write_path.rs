@@ -3821,3 +3821,337 @@ async fn a_space_stub_body_cannot_choose_its_own_space() {
 
     server.shutdown().await;
 }
+
+// ---------------------------------------------------------------------------
+// #565: an imposter's flow state is the imposter's; a deleted imposter has none.
+
+/// A converged two-node fleet: a solo founder and a joiner seeded from it, both
+/// `Ready`. The joiner's data plane is reached through its `/__rift/{port}/`
+/// gateway (see `state_ops_cluster.rs` for why the port itself is not used).
+async fn two_node_cluster() -> (TempDir, ComposedServer, TempDir, ComposedServer) {
+    let founder_state = TempDir::new().expect("tempdir");
+    let founder = compose::start(cluster_cli(&founder_state, &["--cluster-allow-solo"]))
+        .await
+        .expect("founder starts");
+    wait_ready(&founder).await;
+    let seed = founder.cluster_addr().expect("cluster addr").to_string();
+    let joiner_state = TempDir::new().expect("tempdir");
+    let joiner = compose::start(cluster_cli(&joiner_state, &["--cluster-seeds", &seed]))
+        .await
+        .expect("joiner joins");
+    wait_ready(&joiner).await;
+    (founder_state, founder, joiner_state, joiner)
+}
+
+/// The smoke check's scenario imposter (`deploy/compose/smoke.sh`): `checkout`
+/// goes `Started → paid` on the first `/pay` (200) and refuses every later one
+/// (409). `local` reads, deliberately: each node then answers the scenario
+/// listing from its **own** shard, which is what turns "the scenario is
+/// `Started`" into a claim about every node rather than about the owner.
+/// `/warm` is the readiness probe and touches no scenario.
+fn scenario_imposter(port: u16, context_scope: Option<&str>) -> serde_json::Value {
+    let mut flow_state = json!({ "readConsistency": "local" });
+    if let Some(scope) = context_scope {
+        flow_state["contextScope"] = json!(scope);
+    }
+    json!({
+        "port": port,
+        "protocol": "http",
+        "_rift": { "flowState": flow_state },
+        "stubs": [
+            {
+                "scenarioName": "checkout",
+                "requiredScenarioState": "Started",
+                "newScenarioState": "paid",
+                "predicates": [{ "equals": { "path": "/pay" } }],
+                "responses": [{ "is": { "statusCode": 200, "body": "payment accepted" } }],
+            },
+            {
+                "scenarioName": "checkout",
+                "requiredScenarioState": "paid",
+                "predicates": [{ "equals": { "path": "/pay" } }],
+                "responses": [{ "is": { "statusCode": 409, "body": "already paid" } }],
+            },
+            {
+                "predicates": [{ "equals": { "path": "/warm" } }],
+                "responses": [{ "is": { "statusCode": 200, "body": "warm" } }],
+            },
+        ],
+    })
+}
+
+/// One data-plane request through `admin`'s gateway; status and body.
+async fn gateway(admin: &str, port: u16, path: &str) -> (u16, String) {
+    let response = reqwest::get(format!("http://{admin}/__rift/{port}{path}"))
+        .await
+        .expect("gateway request");
+    let status = response.status().as_u16();
+    (status, response.text().await.unwrap_or_default())
+}
+
+/// Poll until `admin`'s engine serves `port` (the `/warm` stub answers).
+async fn wait_gateway(admin: &str, port: u16) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        if gateway(admin, port, "/warm").await == (200, "warm".to_owned()) {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{admin} never served imposter {port} through its gateway"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// Poll until `admin` no longer knows `port` (the delete has applied there).
+async fn wait_gone(admin: &str, port: u16) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let read = reqwest::get(format!("http://{admin}/imposters/{port}"))
+            .await
+            .expect("get imposter");
+        if read.status().as_u16() == 404 {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{admin} still serves imposter {port} after the delete"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// The `checkout` scenario's state as `admin`'s node reports it — from its own
+/// shard, since the imposter reads `local`.
+async fn scenario_state(admin: &str, port: u16) -> String {
+    let body: serde_json::Value =
+        reqwest::get(format!("http://{admin}/imposters/{port}/scenarios"))
+            .await
+            .expect("list scenarios")
+            .json()
+            .await
+            .expect("scenarios json");
+    body["scenarios"]
+        .as_array()
+        .unwrap_or_else(|| panic!("scenarios array: {body}"))
+        .iter()
+        .find(|s| s["name"] == "checkout")
+        .and_then(|s| s["state"].as_str())
+        .unwrap_or_else(|| panic!("checkout scenario listed: {body}"))
+        .to_owned()
+}
+
+/// Poll until `admin`'s own copy reports `want` — a write lands on the owner
+/// and reaches the other holder by an asynchronous push.
+async fn wait_scenario_state(admin: &str, port: u16, want: &str) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let state = scenario_state(admin, port).await;
+        if state == want {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{admin} reports scenario state {state:?}, wanted {want:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// #565 / the D-5 amendment: deleting an imposter drops its flow state on every
+/// node, so an identical re-creation starts at `Started` everywhere and its
+/// first `/pay` is accepted — the smoke check's scenario section on a second
+/// run against the same fleet, which is exactly where this was found.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_recreated_imposter_starts_its_scenario_from_scratch_on_every_node() {
+    let (_fs, founder, _js, joiner) = two_node_cluster().await;
+    let founder_admin = founder.admin_addr().to_string();
+    let joiner_admin = joiner.admin_addr().to_string();
+    let port = reserve_port();
+    let client = reqwest::Client::new();
+
+    let created = client
+        .post(format!("http://{founder_admin}/imposters"))
+        .json(&scenario_imposter(port, None))
+        .send()
+        .await
+        .expect("post imposter");
+    assert_eq!(created.status().as_u16(), 201);
+    wait_gateway(&founder_admin, port).await;
+    wait_gateway(&joiner_admin, port).await;
+
+    // Drive the scenario to `paid` through one node; the other sees it.
+    assert_eq!(
+        gateway(&founder_admin, port, "/pay").await,
+        (200, "payment accepted".to_owned())
+    );
+    wait_scenario_state(&joiner_admin, port, "paid").await;
+    assert_eq!(scenario_state(&founder_admin, port).await, "paid");
+
+    let deleted = client
+        .delete(format!("http://{founder_admin}/imposters/{port}"))
+        .send()
+        .await
+        .expect("delete imposter");
+    assert_eq!(deleted.status().as_u16(), 200);
+    wait_gone(&joiner_admin, port).await;
+
+    // Identical re-creation, through the other node this time.
+    let recreated = client
+        .post(format!("http://{joiner_admin}/imposters"))
+        .json(&scenario_imposter(port, None))
+        .send()
+        .await
+        .expect("re-create imposter");
+    assert_eq!(recreated.status().as_u16(), 201);
+    wait_gateway(&founder_admin, port).await;
+    wait_gateway(&joiner_admin, port).await;
+
+    // Every node's own shard has forgotten yesterday's state: no polling here,
+    // the clear ran at apply time on each node, before the re-create applied.
+    assert_eq!(
+        scenario_state(&founder_admin, port).await,
+        "Started",
+        "the founder must not carry the deleted imposter's scenario state"
+    );
+    assert_eq!(
+        scenario_state(&joiner_admin, port).await,
+        "Started",
+        "the joiner must not carry the deleted imposter's scenario state"
+    );
+    // The line that failed on the fleet: the first `/pay` after re-creation.
+    assert_eq!(
+        gateway(&joiner_admin, port, "/pay").await,
+        (200, "payment accepted".to_owned()),
+        "a re-created imposter's first /pay is accepted, not refused as already paid"
+    );
+    wait_scenario_state(&founder_admin, port, "paid").await;
+    assert_eq!(
+        gateway(&founder_admin, port, "/pay").await.0,
+        409,
+        "and the new state is shared across nodes as before"
+    );
+
+    joiner.shutdown().await;
+    founder.shutdown().await;
+}
+
+/// Pins D-5: replacing an imposter's config on the same port — changed stubs,
+/// through the replicated `PUT /imposters` — is a config change, not a delete,
+/// and does not reset its scenario on any node. Only a delete clears.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn replacing_an_imposters_stubs_keeps_its_scenario_state() {
+    let (_fs, founder, _js, joiner) = two_node_cluster().await;
+    let founder_admin = founder.admin_addr().to_string();
+    let joiner_admin = joiner.admin_addr().to_string();
+    let port = reserve_port();
+    let client = reqwest::Client::new();
+
+    let created = client
+        .post(format!("http://{founder_admin}/imposters"))
+        .json(&scenario_imposter(port, None))
+        .send()
+        .await
+        .expect("post imposter");
+    assert_eq!(created.status().as_u16(), 201);
+    wait_gateway(&founder_admin, port).await;
+    wait_gateway(&joiner_admin, port).await;
+    assert_eq!(gateway(&joiner_admin, port, "/pay").await.0, 200);
+    wait_scenario_state(&founder_admin, port, "paid").await;
+
+    // Same port, one more stub: an in-place edit for the engine, and — were it
+    // ever a wholesale replace — still not a delete.
+    let mut replacement = scenario_imposter(port, None);
+    replacement["stubs"]
+        .as_array_mut()
+        .expect("stubs")
+        .push(json!({
+            "predicates": [{ "equals": { "path": "/ping" } }],
+            "responses": [{ "is": { "statusCode": 200, "body": "pong" } }],
+        }));
+    let replaced = client
+        .put(format!("http://{founder_admin}/imposters"))
+        .json(&json!({ "imposters": [replacement] }))
+        .send()
+        .await
+        .expect("put imposters");
+    assert_eq!(replaced.status().as_u16(), 200);
+    for admin in [&founder_admin, &joiner_admin] {
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        while gateway(admin, port, "/ping").await != (200, "pong".to_owned()) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{admin} never served the replacement config"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(
+            scenario_state(admin, port).await,
+            "paid",
+            "{admin}: a replaced imposter keeps its scenario state (D-5)"
+        );
+    }
+    assert_eq!(gateway(&founder_admin, port, "/pay").await.0, 409);
+
+    joiner.shutdown().await;
+    founder.shutdown().await;
+}
+
+/// #565's boundary: a `fleet`-scoped context is not the imposter's — it is the
+/// fleet's, shared by every imposter that opts in — so deleting the imposter
+/// leaves it in place and a re-creation resumes it. Only `i<port>:` is dropped.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_fleet_scoped_flow_survives_deleting_its_imposter() {
+    let (_fs, founder, _js, joiner) = two_node_cluster().await;
+    let founder_admin = founder.admin_addr().to_string();
+    let joiner_admin = joiner.admin_addr().to_string();
+    let port = reserve_port();
+    let client = reqwest::Client::new();
+
+    // Open admin plane: no principal, so the FleetAdmin gate does not apply.
+    let created = client
+        .post(format!("http://{founder_admin}/imposters"))
+        .json(&scenario_imposter(port, Some("fleet")))
+        .send()
+        .await
+        .expect("post imposter");
+    assert_eq!(created.status().as_u16(), 201);
+    wait_gateway(&founder_admin, port).await;
+    wait_gateway(&joiner_admin, port).await;
+    assert_eq!(gateway(&founder_admin, port, "/pay").await.0, 200);
+    wait_scenario_state(&joiner_admin, port, "paid").await;
+
+    let deleted = client
+        .delete(format!("http://{founder_admin}/imposters/{port}"))
+        .send()
+        .await
+        .expect("delete imposter");
+    assert_eq!(deleted.status().as_u16(), 200);
+    wait_gone(&joiner_admin, port).await;
+
+    let recreated = client
+        .post(format!("http://{joiner_admin}/imposters"))
+        .json(&scenario_imposter(port, Some("fleet")))
+        .send()
+        .await
+        .expect("re-create imposter");
+    assert_eq!(recreated.status().as_u16(), 201);
+    wait_gateway(&founder_admin, port).await;
+    wait_gateway(&joiner_admin, port).await;
+
+    for admin in [&founder_admin, &joiner_admin] {
+        assert_eq!(
+            scenario_state(admin, port).await,
+            "paid",
+            "{admin}: the fleet namespace outlives any one imposter"
+        );
+    }
+    assert_eq!(
+        gateway(&joiner_admin, port, "/pay").await,
+        (409, "already paid".to_owned())
+    );
+
+    joiner.shutdown().await;
+    founder.shutdown().await;
+}

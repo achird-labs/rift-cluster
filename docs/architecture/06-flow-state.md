@@ -81,6 +81,20 @@ identifiers. A `tenant`-scoped imposter's listing is served to its tenant: the
 It also settles a limitation the durable tier records below: a repair path could
 not previously tell which imposter a `flow_id` belonged to. Now the id says.
 
+The prefix is also what makes an imposter's state *deletable* (#565, the D-5
+amendment). Single-node Rift drops an imposter's store instance with the
+imposter; here every imposter on a node shares one `FlowNet`, so a deleted
+imposter's state would otherwise sit in the shard until its TTL and greet an
+identically re-created imposter with yesterday's scenario. So a committed
+`DeleteImposter` / `DeleteAll` drops the port's `i<port>:` namespace on **every
+node**, from the state machine's apply loop — the same per-node, once-per-entry
+discipline as the config reconcile, so it also covers a delete replayed on join
+or installed by a snapshot; a cold-start reconcile additionally sweeps any
+`i<port>:` namespace the committed configs no longer name, for a delete that
+committed while the node was down. `f:` and `t<tenant>:` are not any one
+imposter's and are never dropped by a delete, and a config change on the port
+(a `PutImposter`) is not a delete and keeps the state.
+
 Scope is per-imposter and not a cluster-wide setting, because it is a property
 of what an imposter's contexts *mean* — the same reason `readConsistency` is
 per-imposter. See `docs/rift-cluster-server.md` for the knob, the behaviour change it

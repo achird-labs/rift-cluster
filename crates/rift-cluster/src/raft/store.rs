@@ -56,7 +56,7 @@
 //! fatal to the node, and that is the correct severity for a log that can no
 //! longer be applied.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::future::Future;
 use std::ops::{Bound, RangeBounds};
 use std::path::{Path, PathBuf};
@@ -89,6 +89,7 @@ use crate::control::{
     PreconditionTarget, Principal, Quotas, Role, SessionKey, StubEdit, StubEditScript, Tenant,
     TenantConfigUsage, TenantId, routes_installed_for,
 };
+use crate::stores::flow::FlowNet;
 use crate::stores::journal::ClusterJournal;
 use crate::stores::sequencer::SequencingRegistry;
 
@@ -817,6 +818,12 @@ pub struct RedbStateMachine {
     engine: Option<Arc<ImposterManager>>,
     /// Per-port sequencing modes, refreshed from every applied config set (#466).
     sequencing: Option<Arc<SequencingRegistry>>,
+    /// This node's flow-state shard, reached for exactly one thing: dropping a
+    /// deleted imposter's `i<port>:` namespace when the engine removes the
+    /// imposter (#565, the D-5 amendment). `None` in storage tests and on a
+    /// node with no flow subsystem — the tables and the engine drive are
+    /// unaffected; only the clear is skipped.
+    flow_net: Option<Arc<FlowNet>>,
     /// The front door's hot-swappable compiled table (issue #131). `None` in
     /// storage tests and on a node that never binds a front door — routes are
     /// still replicated and readable from `sm_routes` either way, this is only
@@ -890,6 +897,7 @@ impl RedbStateMachine {
             snapshot_idx: Arc::new(AtomicU64::new(0)),
             engine: None,
             sequencing: None,
+            flow_net: None,
             routes: None,
             apply_failures: Arc::new(Mutex::new(BTreeMap::new())),
             journal: OnceLock::new(),
@@ -915,6 +923,23 @@ impl RedbStateMachine {
     #[must_use]
     pub fn with_sequencing_registry(mut self, registry: Arc<SequencingRegistry>) -> Self {
         self.sequencing = Some(registry);
+        self
+    }
+
+    /// Attach this node's flow-state shard, so a committed `DeleteImposter` /
+    /// `DeleteAll` drops the deleted port's imposter-scoped flow state on this
+    /// node (#565, the D-5 amendment). Same before-`Raft::new` contract as
+    /// [`Self::with_engine`]: a delete replayed during a join or installed by
+    /// a snapshot must clear too, not just a live commit.
+    ///
+    /// The apply loop is where this belongs for the same reason the sequencing
+    /// registry lives here: it is the one place every node sees every
+    /// committed config change, in order, exactly once — which is what makes
+    /// the clear deterministic across the fleet rather than a request one node
+    /// happened to receive.
+    #[must_use]
+    pub fn with_flow_net(mut self, flow_net: Arc<FlowNet>) -> Self {
+        self.flow_net = Some(flow_net);
         self
     }
 
@@ -1966,6 +1991,13 @@ impl RedbStateMachine {
             };
             (config_action, routes_action)
         };
+        // The ports the tables name, for the orphan sweep below. `None` when
+        // the config set will not parse: with no trustworthy desired set the
+        // sweep, like the engine sync, does nothing rather than guess.
+        let desired_ports: Option<BTreeSet<u16>> = match &config_action {
+            EngineAction::Sync(desired) => Some(desired.iter().filter_map(|c| c.port).collect()),
+            _ => None,
+        };
         // Unattributed: this materializes a whole table on restart, not one
         // caller's write, so there is no principal to name.
         self.drive_engine(vec![
@@ -1973,6 +2005,9 @@ impl RedbStateMachine {
             AttributedAction::unattributed(routes_action),
         ])
         .await;
+        if let Some(desired_ports) = desired_ports {
+            self.sweep_orphaned_imposter_state(&desired_ports).await;
+        }
 
         // Blocker 2: rehydrate this node's local journal from the durable generations table —
         // see this method's doc for why nothing else does. Gated on a bound journal before
@@ -3296,7 +3331,19 @@ impl RedbStateMachine {
                     sequencing.apply(&desired);
                 }
                 match engine.apply_config(desired).await {
-                    Ok(report) => self.record_report(&report, &desired_ports),
+                    Ok(report) => {
+                        self.record_report(&report, &desired_ports);
+                        // The delete-path half of D-5 (#565): the ports the
+                        // engine actually removed — `deleted`, never
+                        // `replaced`/`stub_patched`, which are config changes
+                        // that keep their runtime state — lose their flow
+                        // state on this node. After the engine call, so the
+                        // clear follows the removal it belongs to: a port the
+                        // engine failed to remove keeps serving, and keeps
+                        // its state, until the next sync succeeds.
+                        self.clear_imposter_state(report.deleted.iter().copied())
+                            .await;
+                    }
                     Err(e) => {
                         tracing::error!(error = %e, "engine refused the applied config set");
                         self.apply_failures.lock().insert(0, e.to_string());
@@ -3402,6 +3449,62 @@ impl RedbStateMachine {
             }
         }
         Ok(())
+    }
+
+    /// Drop each port's imposter-scoped flow state on this node (#565, the D-5
+    /// amendment). A no-op without a bound flow net, and per port a no-op when
+    /// the shard holds nothing under it.
+    async fn clear_imposter_state(&self, ports: impl IntoIterator<Item = u16>) {
+        let Some(flow_net) = &self.flow_net else {
+            return;
+        };
+        for port in ports {
+            let flows = flow_net.clear_imposter_scope(port).await;
+            if flows > 0 {
+                tracing::info!(port, flows, "dropped a deleted imposter's flow state");
+            }
+        }
+    }
+
+    /// The reconcile-time half of #565: drop the imposter-scoped namespaces
+    /// this node's shard holds for ports the applied config set no longer
+    /// names.
+    ///
+    /// The live path clears from the engine's `deleted` report, which needs the
+    /// engine to have *had* the imposter. On a cold start it did not: the engine
+    /// is process-local and empty until `reconcile_engine`, and `compose` runs
+    /// that only once this node has caught up to the leader's applied index —
+    /// so a delete committed while this node was down is applied against an
+    /// empty engine, reports nothing deleted, and the shard reopened from disk
+    /// still holds the port's state. The same holds for a snapshot installed
+    /// before the first reconcile. Here the comparison that the engine could
+    /// not make is made against the tables instead.
+    ///
+    /// Deliberately **not** run on every live sync. A live sync runs at this
+    /// node's applied index, and a replica push for an imposter created at a
+    /// later index — from an owner that has already applied it — can land in
+    /// this shard before this node applies that entry; sweeping then would drop
+    /// a live flow's replica copy, which nothing repairs until takeover. At
+    /// reconcile the node has just caught up to the leader and is not yet
+    /// `Ready`, which is as narrow as that window gets; the residual is a copy
+    /// the owner still holds, never the authoritative one.
+    async fn sweep_orphaned_imposter_state(&self, desired_ports: &BTreeSet<u16>) {
+        let Some(flow_net) = &self.flow_net else {
+            return;
+        };
+        let orphaned: Vec<u16> = flow_net
+            .imposter_ports_held()
+            .into_iter()
+            .filter(|port| !desired_ports.contains(port))
+            .collect();
+        if orphaned.is_empty() {
+            return;
+        }
+        tracing::info!(
+            ports = ?orphaned,
+            "reconcile found flow state for imposters that no longer exist; dropping it"
+        );
+        self.clear_imposter_state(orphaned).await;
     }
 
     /// Fold a successful sync's report into the failure map, under one lock:
@@ -4368,7 +4471,9 @@ mod tests {
         FLEET_SCOPE, Principal, PrincipalId, Quotas, Role, StubEdit, StubEditScript, TenantId,
     };
     use crate::raft::TypeConfig;
+    use crate::stores::flow::FlowNet;
     use crate::stores::journal::ClusterJournal;
+    use crate::stores::shard::{Durability, FlowShard, ShardConfig, Versioned};
 
     struct RedbBuilder;
 
@@ -4852,6 +4957,181 @@ mod tests {
         .expect("apply delete-all");
         assert_eq!(engine.count(), 0);
         assert!(sm.configured_ports().expect("ports").is_empty());
+
+        engine.shutdown().await;
+    }
+
+    /// A state machine with an engine AND a flow shard attached, plus a clone
+    /// of the shard to seed and inspect through (the net owns the other).
+    async fn fresh_sm_with_flow_net(
+        engine: Arc<ImposterManager>,
+    ) -> (TempDir, RedbStateMachine, FlowShard) {
+        let td = TempDir::new().expect("tempdir");
+        let (_, sm) = new(td.path().join("raft.redb")).await.expect("open store");
+        let shard = FlowShard::in_memory(ShardConfig::default());
+        let net = FlowNet::new(shard.clone());
+        let sm = sm.with_engine(engine).with_flow_net(net);
+        (td, sm, shard)
+    }
+
+    /// One live entry under `flow_id`, as an owner would have written it.
+    async fn seed_flow(shard: &FlowShard, flow_id: &str) {
+        shard
+            .set(
+                flow_id,
+                "checkout",
+                Versioned {
+                    m_idx: 1,
+                    v: 1,
+                    origin: 1,
+                    expires_at: 0,
+                    value: json!("paid"),
+                    deleted: false,
+                },
+                Durability::None,
+            )
+            .await
+            .expect("seed");
+    }
+
+    /// #565 / the D-5 amendment: a committed `DeleteImposter` drops the deleted
+    /// port's imposter-scoped flow state on this node — and nothing else. A
+    /// sibling port's `i<port>:` state, a fleet-scoped `f:` flow and a
+    /// tenant-scoped `t<tenant>:` flow are not the deleted imposter's to lose.
+    /// A `PutImposter` over the same port with changed stubs is a config
+    /// change, not a delete, and keeps the state (D-5). `DeleteAll` clears
+    /// every deleted port the same way.
+    #[tokio::test]
+    async fn a_committed_delete_drops_only_that_ports_imposter_scoped_flow_state() {
+        let engine = Arc::new(ImposterManager::new());
+        let (_td, mut sm, shard) = fresh_sm_with_flow_net(engine.clone()).await;
+        sm.apply(vec![
+            entry(1, put(1, 18094, json!([{ "id": "a" }]))),
+            entry(2, put(2, 18095, json!([]))),
+        ])
+        .await
+        .expect("apply puts");
+        assert_eq!(engine.count(), 2);
+
+        // What a scenario on each imposter, a fleet-scoped context and a
+        // tenant-scoped context leave in this node's shard.
+        for flow in [
+            "i18094:checkout",
+            "i18095:checkout",
+            "f:checkout",
+            "tacme:checkout",
+        ] {
+            seed_flow(&shard, flow).await;
+        }
+        assert_eq!(shard.flow_count(), 4);
+
+        // A config change on the port is not a delete: its state stays (D-5).
+        sm.apply(vec![entry(
+            3,
+            put(3, 18094, json!([{ "id": "a" }, { "id": "b" }])),
+        )])
+        .await
+        .expect("apply replace");
+        assert!(
+            shard.get("i18094:checkout", "checkout").is_some(),
+            "a replaced imposter keeps its scenario state"
+        );
+
+        sm.apply(vec![entry(
+            4,
+            request(
+                4,
+                ControlOp::DeleteImposter {
+                    tenant: TenantId::default(),
+                    port: 18094,
+                },
+            ),
+        )])
+        .await
+        .expect("apply delete");
+        assert_eq!(engine.count(), 1);
+        assert!(
+            shard.get("i18094:checkout", "checkout").is_none(),
+            "the deleted imposter's namespace is dropped on this node"
+        );
+        for kept in ["i18095:checkout", "f:checkout", "tacme:checkout"] {
+            assert!(
+                shard.get(kept, "checkout").is_some(),
+                "{kept} is not the deleted imposter's state and must survive"
+            );
+        }
+
+        // Re-creating the port starts from nothing, and deleting it again with
+        // nothing held is a no-op, not a failure.
+        sm.apply(vec![entry(5, put(5, 18094, json!([{ "id": "a" }])))])
+            .await
+            .expect("apply re-create");
+        assert!(shard.get("i18094:checkout", "checkout").is_none());
+        sm.apply(vec![entry(
+            6,
+            request(
+                6,
+                ControlOp::DeleteAll {
+                    tenant: TenantId::default(),
+                },
+            ),
+        )])
+        .await
+        .expect("apply delete-all");
+        assert_eq!(engine.count(), 0);
+        assert!(
+            shard.get("i18095:checkout", "checkout").is_none(),
+            "delete-all drops every deleted port's namespace"
+        );
+        assert!(shard.get("f:checkout", "checkout").is_some());
+        assert!(shard.get("tacme:checkout", "checkout").is_some());
+        assert!(
+            sm.apply_failures().is_empty(),
+            "the clears are not engine failures: {:?}",
+            sm.apply_failures()
+        );
+
+        engine.shutdown().await;
+    }
+
+    /// #565, the cold-start half: a delete this node never applied against a
+    /// live engine — it was down, or the entry arrived before the engine was
+    /// rebuilt — leaves the port's flow state on disk with no `deleted` report
+    /// to clear it. `reconcile_engine` compares the shard against the tables
+    /// and drops what no committed imposter names; what the tables do name is
+    /// kept, and so are the shared namespaces.
+    #[tokio::test]
+    async fn reconcile_drops_flow_state_of_imposters_the_tables_no_longer_name() {
+        let engine = Arc::new(ImposterManager::new());
+        let (_td, mut sm, shard) = fresh_sm_with_flow_net(engine.clone()).await;
+        // Applied against an engine that is about to be "restarted": the
+        // tables keep 18096 and lose 18097 without the engine ever having
+        // bound 18097 at the time of its delete.
+        sm.apply(vec![entry(1, put(1, 18096, json!([])))])
+            .await
+            .expect("apply put");
+        for flow in ["i18096:checkout", "i18097:checkout", "f:checkout"] {
+            seed_flow(&shard, flow).await;
+        }
+
+        sm.reconcile_engine().await.expect("reconcile");
+        assert_eq!(engine.count(), 1, "the engine is rebuilt from the tables");
+        assert!(
+            shard.get("i18097:checkout", "checkout").is_none(),
+            "a namespace no committed imposter names is dropped at reconcile"
+        );
+        assert!(
+            shard.get("i18096:checkout", "checkout").is_some(),
+            "a live imposter's state is untouched by the sweep"
+        );
+        assert!(
+            shard.get("f:checkout", "checkout").is_some(),
+            "the fleet namespace names no port and is never swept"
+        );
+
+        // Idempotent: a second reconcile finds nothing orphaned.
+        sm.reconcile_engine().await.expect("reconcile again");
+        assert!(shard.get("i18096:checkout", "checkout").is_some());
 
         engine.shutdown().await;
     }

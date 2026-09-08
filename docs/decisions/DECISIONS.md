@@ -109,7 +109,8 @@ D-23.
 ### D-5 — Two-level, order-aware reconcile (LCS edit script) on top of by-id/positional stub CRUD
 - **Status:** amended
 - **Decided:** 2026-07-01 · RFC-001 v2
-- **Code:** crates/rift-cluster/src/control.rs, vendor/rift/crates/rift-mock-core/src/imposter/reconcile.rs
+- **Implemented by:** #565 (the delete-path amendment)
+- **Code:** crates/rift-cluster/src/control.rs, vendor/rift/crates/rift-mock-core/src/imposter/reconcile.rs, crates/rift-cluster/src/raft/store.rs, crates/rift-cluster/src/stores/flow.rs
 
 Whole-imposter replace per change resets runtime state cluster-wide; set-diff (v2 draft 1) missed
 reorders and reordered keyless edits — order is match priority, so the edit script must be
@@ -121,6 +122,23 @@ explicit `StubEditScript` (`Add`/`ReplaceById`/`DeleteById`/`Move`), applied all
 are matched by `stub_key` (explicit id, else an occurrence-counted content hash), surviving keys
 keep their slot state, a pure reorder costs nothing, and a change touching more than half the
 stubs falls back to a wholesale replace. Order-awareness holds; "LCS" does not.
+
+**Amendment (2026-09-08, #565 — the delete path):** "a replicated write never resets an untouched
+imposter's runtime state" has an inverse that was never stated, and the fleet had it wrong: **an
+imposter's state is the imposter's, and a deleted imposter has none.** A committed
+`DeleteImposter` or `DeleteAll` drops the deleted port's imposter-scoped flow state (`i<port>:`,
+D-20's ring key) on **every node**, from the apply loop — each node clears its own shard when its
+engine reports the port removed, so the clear is deterministic, once per node per committed
+delete, and covers a delete replayed on join or installed by a snapshot; `reconcile_engine`
+additionally drops any `i<port>:` namespace the tables no longer name, which is what covers a
+delete committed while the node was down. Single-node Rift gets this for free by dropping the
+imposter's store instance; one shared `FlowNet` per node (D-7) has to do it explicitly. What is
+*not* cleared, by the same rule: a `PutImposter` over an existing port (a config change keeps its
+state — the first paragraph of this entry), a `fleet`-scoped (`f:`) or `tenant`-scoped
+(`t<tenant>:`) context (shared by construction, not any one imposter's to drop), and any other
+port's namespace (ports are fleet-unique across tenants, so `i<port>:` never names another
+tenant's). Sequencer cursors already go with the imposter via upstream's `reset_scope` hook (D-8,
+D-57); proxyOnce markers via the apply arm (#226).
 
 ### D-6 — Redis impls of the new traits are cluster; existing `RedisFlowStore` (incl. U-1 CAS) stays OSS
 - **Status:** amended
