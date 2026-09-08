@@ -18,8 +18,7 @@ use std::time::{Duration, Instant};
 
 use rift_cluster::stores::ClusterJournal;
 use rift_cluster::{
-    ADMIT_CURRENCY_WAIT, Authority, ControlRequest, DEFAULT_TENANT, NodeConfig, NodeId, RaftNode,
-    Router,
+    ADMIT_CURRENCY_WAIT, Authority, ControlRequest, NodeConfig, NodeId, RaftNode, Router,
 };
 use tempfile::TempDir;
 
@@ -226,7 +225,7 @@ impl TestCluster {
             let mut live = self.live().peekable();
             let converged = live.peek().is_some()
                 && live.all(|n| {
-                    n.get_imposter(DEFAULT_TENANT, port)
+                    n.get_imposter(port)
                         .expect("read config")
                         .and_then(name_of)
                         .as_deref()
@@ -1091,117 +1090,9 @@ fn bulky_request(port: u16, tag: &str, target_bytes: usize) -> ControlRequest {
         issued_at_secs: 0,
         expected_revision: None,
         op: rift_cluster::ControlOp::PutImposter {
-            tenant: rift_cluster::TenantId::default(),
             config: Box::new(config),
         },
     }
-}
-
-fn submit_request(op_id: u128, issued_at_secs: u64, op: rift_cluster::ControlOp) -> ControlRequest {
-    ControlRequest {
-        op_id: uuid::Uuid::from_u128(op_id),
-        principal: Some("default/alice".to_owned()),
-        issued_at_secs,
-        expected_revision: None,
-        op,
-    }
-}
-
-/// AC2: a quota refusal is a *committed* decision — the same `Failed` outcome at
-/// the same revision on all three nodes. That is what §11 open question 1 turns
-/// on: the refusal is discoverable through `op_status` precisely because it is
-/// in the log, not because the submitter saw an error.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_quota_refusal_is_the_same_committed_decision_on_every_node() {
-    let _serial = TEST_LOCK.lock().await;
-    let mut cluster = TestCluster::start(3).await;
-    assert!(cluster.wait_for_leader(LEADER_DEADLINE).await.is_some());
-
-    let leader = cluster.leader().expect("a leader");
-    leader
-        .write(submit_request(
-            1,
-            1_700_000_000,
-            rift_cluster::ControlOp::TenantPut {
-                tenant: rift_cluster::TenantId::new("acme"),
-                display_name: "Acme".to_owned(),
-                quotas: rift_cluster::control::Quotas {
-                    max_imposters: 1,
-                    ..rift_cluster::control::Quotas::default()
-                },
-                journal_retention_secs: 0,
-            },
-        ))
-        .await
-        .expect("tenant put commits");
-
-    let imposter = |port: u16| {
-        serde_json::from_value(serde_json::json!({
-            "port": port,
-            "protocol": "http",
-            "host": "127.0.0.1",
-        }))
-        .expect("test config parses")
-    };
-
-    let first = leader
-        .write(submit_request(
-            2,
-            1_700_000_001,
-            rift_cluster::ControlOp::PutImposter {
-                tenant: rift_cluster::TenantId::new("acme"),
-                config: Box::new(imposter(18091)),
-            },
-        ))
-        .await
-        .expect("first imposter commits");
-    assert_eq!(first.outcome, rift_cluster::ControlOutcome::Applied);
-
-    let refused = leader
-        .write(submit_request(
-            3,
-            1_700_000_002,
-            rift_cluster::ControlOp::PutImposter {
-                tenant: rift_cluster::TenantId::new("acme"),
-                config: Box::new(imposter(18092)),
-            },
-        ))
-        .await
-        .expect("the refusal is a committed write, not a transport error");
-    let rift_cluster::ControlOutcome::Failed { .. } = &refused.outcome else {
-        panic!("the second imposter is over the ceiling: {refused:?}");
-    };
-
-    assert!(
-        refused.revision > first.revision,
-        "a refusal is a committed entry with a revision of its own: {refused:?}"
-    );
-
-    // The refusal really is the same decision everywhere: every node applies the
-    // revision that refused it, and on every node the first imposter landed while
-    // the second did not. A node that applied the entry differently — or skipped
-    // it — would hold a different table from its peers.
-    for node in cluster.live() {
-        assert!(
-            node.await_local_applied(refused.revision, CONVERGE_DEADLINE)
-                .await,
-            "node {} never applied the refusing revision {}",
-            node.id(),
-            refused.revision
-        );
-        assert!(
-            node.imposter_config("acme", 18091).expect("read").is_some(),
-            "node {} lost the imposter that was within quota",
-            node.id()
-        );
-        assert!(
-            node.imposter_config("acme", 18092).expect("read").is_none(),
-            "node {} landed the imposter the quota refused",
-            node.id()
-        );
-    }
-
-    cluster.shutdown_all().await;
 }
 
 /// The fleet's name survives a process death (issue #373).
@@ -1235,7 +1126,6 @@ async fn the_fleet_name_survives_a_node_restart() {
                 .map_or(0, |d| d.as_secs()),
             expected_revision: None,
             op: rift_cluster::ControlOp::FleetNamePut {
-                tenant: rift_cluster::TenantId::new(rift_cluster::FLEET_SCOPE),
                 name: "rift-prod-eu".to_owned(),
             },
         })
@@ -1704,11 +1594,7 @@ async fn a_joiner_is_caught_up_by_a_multi_mebibyte_snapshot() {
     let deadline = Instant::now() + CONVERGE_BY;
     let mut converged = false;
     while Instant::now() < deadline {
-        if joiner
-            .imposter_config(DEFAULT_TENANT, last_port)
-            .expect("read")
-            .is_some()
-        {
+        if joiner.imposter_config(last_port).expect("read").is_some() {
             converged = true;
             break;
         }
@@ -1825,11 +1711,7 @@ async fn a_snapshot_catch_up_does_not_disturb_a_fleet_that_already_has_quorum() 
         if let Some(leader) = n1.status().current_leader {
             leaders_seen.insert(leader);
         }
-        if n3
-            .imposter_config(DEFAULT_TENANT, 19547)
-            .expect("read")
-            .is_some()
-        {
+        if n3.imposter_config(19547).expect("read").is_some() {
             converged = true;
             break;
         }

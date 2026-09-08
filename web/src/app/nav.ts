@@ -1,4 +1,3 @@
-import type { Capability } from "./rbac.ts";
 import type { Route } from "./routing.ts";
 
 export const ISSUE_URL = (issue: number): string =>
@@ -12,13 +11,12 @@ export const ISSUE_URL = (issue: number): string =>
  * just stops spending a line of vertical space on a label. The unbuilt group is last on purpose:
  * it is a roadmap, so it reads after the things that work.
  */
-export const NAV_GROUPS = ["mocks", "fleet", "administration", "planned"] as const;
+export const NAV_GROUPS = ["mocks", "fleet", "planned"] as const;
 export type NavGroup = (typeof NAV_GROUPS)[number];
 
 export const GROUP_LABEL: Record<NavGroup, string> = {
   mocks: "Mocks",
   fleet: "Fleet",
-  administration: "Administration",
   planned: "Not yet shipped",
 };
 
@@ -32,14 +30,18 @@ export const GROUP_LABEL: Record<NavGroup, string> = {
  */
 export type ShortLabel = string;
 
-/** A screen this slice built. `requires` decides whether it is offered, not whether it is permitted. */
+/**
+ * A screen this slice built.
+ *
+ * No `requires`: since #550 there is one credential and one identity, so there is no role that
+ * could be offered a smaller nav than another. Every live entry is offered to whoever is signed in.
+ */
 export type LiveEntry = {
   kind: "live";
   id: string;
   label: string;
   short?: ShortLabel;
   route: Route;
-  requires: Capability;
   group: Exclude<NavGroup, "planned">;
   /**
    * A geometric mark, not an icon font: `default-src 'self'` blocks a CDN and self-hosting an icon
@@ -83,7 +85,6 @@ export const NAV: readonly NavEntry[] = [
     id: "imposters",
     label: "Imposters",
     route: { screen: "imposters" },
-    requires: "imposter.read",
     group: "mocks",
     glyph: "▤",
   },
@@ -93,9 +94,6 @@ export const NAV: readonly NavEntry[] = [
     label: "Front door routes",
     short: "Front door",
     route: { screen: "routes" },
-    // The table is read with `Action::ImposterRead`; writing it needs `imposter.write`, which the
-    // screen gates per control rather than hiding the whole screen from an operator who may read it.
-    requires: "imposter.read",
     group: "mocks",
     glyph: "▤",
   },
@@ -105,10 +103,6 @@ export const NAV: readonly NavEntry[] = [
     label: "Flow state & scenarios",
     short: "Flow state",
     route: { screen: "scenarios", port: null, flow: null },
-    // The weakest thing the screen can do, deliberately. Its controls gate individually — reset is
-    // Operator, set-state and the flow-state write are Editor — so requiring a write capability
-    // here would hide the whole screen from a viewer entitled to read every scenario on it.
-    requires: "scenario.read",
     group: "mocks",
     glyph: "▤",
   },
@@ -117,7 +111,6 @@ export const NAV: readonly NavEntry[] = [
     id: "requests",
     label: "Requests",
     route: { screen: "requests", port: null },
-    requires: "imposter.read",
     group: "mocks",
     glyph: "▤",
   },
@@ -127,26 +120,8 @@ export const NAV: readonly NavEntry[] = [
     label: "Cluster & fleet",
     short: "Fleet",
     route: { screen: "cluster" },
-    requires: "fleet.read",
     group: "fleet",
     glyph: "◈",
-  },
-  {
-    kind: "live",
-    id: "administration",
-    label: "Tenancy & principals",
-    short: "Tenancy",
-    // `principals`, not `tenants`: the tenants tab is `ClusterAdmin`, while this entry is offered to
-    // anyone holding `tenant.manage`. Landing a TenantAdmin on a tab its role cannot open — and
-    // whose probe renders a bare refusal with no tab bar — left the role with no route to the two
-    // surfaces it exists for. `principals` requires exactly the capability that gates this entry.
-    route: { screen: "admin", tab: "principals", tenant: null },
-    // Gates on the weakest admin capability, not `imposter.*`: viewer/operator/editor hold none of
-    // `CAPABILITY_MATRIX`'s admin capabilities, so the entry (and every control inside the screen)
-    // is invisible below tenant-admin, where `tenant.manage` starts.
-    requires: "tenant.manage",
-    group: "administration",
-    glyph: "◇",
   },
 ];
 

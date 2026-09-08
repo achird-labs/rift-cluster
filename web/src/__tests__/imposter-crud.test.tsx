@@ -4,7 +4,7 @@ import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { Imposters } from "../screens/Imposters.tsx";
-import { renderInApp, stubFetch, whoamiWith } from "./harness.tsx";
+import { renderInApp, stubFetch } from "./harness.tsx";
 
 const IMPOSTER = { port: 4545, protocol: "http", name: "checkout-api", enabled: true, stubs: [] };
 
@@ -30,16 +30,6 @@ async function toReview(user: ReturnType<typeof userEvent.setup>): Promise<void>
 }
 
 describe("creating an imposter", () => {
-  it("is not offered to a role that cannot write", async () => {
-    // Presentation only — the admin front refuses the same principal either way — but a button that
-    // can only ever answer 403 is worse than no button.
-    stubFetch(LISTED);
-    renderInApp(<Imposters />, { whoami: whoamiWith("operator") });
-
-    await screen.findByTestId("imposters-scope-label");
-    expect(screen.queryByTestId("new-imposter")).toBeNull();
-  });
-
   it("sends the port explicitly, because the fleet cannot assign one", async () => {
     /*
      * `createImposter` requires the port in the body: an auto-assigned port cannot replicate, since
@@ -47,7 +37,7 @@ describe("creating an imposter", () => {
      * a console that omitted it would get a 400 the operator could do nothing about.
      */
     const { calls } = stubFetch({ ...LISTED, "/imposters ": { json: IMPOSTER } });
-    renderInApp(<Imposters />, { whoami: whoamiWith("editor") });
+    renderInApp(<Imposters />);
 
     const user = userEvent.setup();
     await user.click(await screen.findByTestId("new-imposter"));
@@ -70,7 +60,7 @@ describe("creating an imposter", () => {
      * depend on, so finding out at the end would mean re-deciding the first stub too.
      */
     stubFetch(LISTED);
-    renderInApp(<Imposters />, { whoami: whoamiWith("editor") });
+    renderInApp(<Imposters />);
 
     const user = userEvent.setup();
     await user.click(await screen.findByTestId("new-imposter"));
@@ -85,7 +75,7 @@ describe("creating an imposter", () => {
     // Upstream fails loudly rather than silently serving cleartext, so a form that let this through
     // would only relay that error later.
     stubFetch(LISTED);
-    renderInApp(<Imposters />, { whoami: whoamiWith("editor") });
+    renderInApp(<Imposters />);
 
     const user = userEvent.setup();
     await user.click(await screen.findByTestId("new-imposter"));
@@ -107,7 +97,7 @@ describe("deleting an imposter", () => {
     // The two are granted together today. This asserts the console asks the question the server
     // actually answers, so the day `authz.rs` moves one the table is what fails.
     stubFetch(LISTED);
-    renderInApp(<Imposters />, { whoami: whoamiWith("operator") });
+    renderInApp(<Imposters />);
 
     await screen.findByTestId("imposters-scope-label");
     expect(screen.queryByTestId("delete-imposter-4545")).toBeNull();
@@ -115,7 +105,7 @@ describe("deleting an imposter", () => {
 
   it("asks before it deletes, and names what goes", async () => {
     stubFetch(LISTED);
-    renderInApp(<Imposters />, { whoami: whoamiWith("editor") });
+    renderInApp(<Imposters />);
 
     await userEvent.setup().click(await screen.findByTestId("delete-imposter-4545"));
 
@@ -130,7 +120,7 @@ describe("deleting an imposter", () => {
 
   it("sends the delete once confirmed", async () => {
     stubFetch({ ...LISTED, "/imposters/4545": { status: 204 } });
-    renderInApp(<Imposters />, { whoami: whoamiWith("editor") });
+    renderInApp(<Imposters />);
 
     const user = userEvent.setup();
     await user.click(await screen.findByTestId("delete-imposter-4545"));

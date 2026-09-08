@@ -148,8 +148,8 @@ async fn put_routes_commits_and_dispatches_through_the_front_door() {
         .expect("revision header present")
         .to_owned();
     assert!(
-        revision.starts_with("default@"),
-        "revision names the tenant and log index: {revision}"
+        revision.starts_with("routes@"),
+        "the portless token names the route table and the log index: {revision}"
     );
     let op_id = seen
         .header("rift-cluster-op-id")
@@ -286,7 +286,7 @@ async fn a_stale_if_match_cannot_clobber_the_route_table() {
     let client = reqwest::Client::new();
 
     // The read path answers a revision, portless: a route table has no single
-    // record to qualify the token with, so the tenant segment stands alone.
+    // record to qualify the token with, so the `routes` subject stands alone.
     let seen = Seen::of(
         reqwest::get(format!("http://{admin}/front-door/routes"))
             .await
@@ -299,7 +299,7 @@ async fn a_stale_if_match_cannot_clobber_the_route_table() {
         .expect("GET must answer a revision to condition on")
         .to_owned();
     assert!(
-        empty_revision.starts_with("default@"),
+        empty_revision.starts_with("routes@"),
         "portless token: {empty_revision}"
     );
 
@@ -633,81 +633,9 @@ async fn cluster_off_front_door_is_upstream_unchanged() {
     server.shutdown().await;
 }
 
-/// Pins D-68 on the other side of the rule: the default tenant's table *is* compiled into the
-/// front door, and both route endpoints report that in the body (issue #536). Without this the
-/// flag could be hardcoded `false` and the non-default test in `tenancy_api.rs` would still pass.
-///
-/// Also pins that the decoration changed nothing else: status stays `200` and the write still
-/// carries its `Rift-Cluster-Revision` token, which is what a caller feeds back as `If-Match`.
-#[tokio::test]
-async fn the_default_tenants_route_table_reports_installed() {
-    let state = TempDir::new().expect("tempdir");
-    let server = compose::start(cluster_cli(&state, &[]))
-        .await
-        .expect("solo cluster starts");
-    wait_ready(&server).await;
-    let admin = server.admin_addr();
-    let port = reserve_port();
-
-    // Installed is a property of the tenant, not of having written any routes.
-    let empty: serde_json::Value = reqwest::get(format!("http://{admin}/front-door/routes"))
-        .await
-        .expect("get routes")
-        .json()
-        .await
-        .expect("json");
-    assert_eq!(
-        empty,
-        json!({ "routes": [], "installed": true }),
-        "an empty default table is still an installed one: {empty}"
-    );
-
-    let put = reqwest::Client::new()
-        .put(format!("http://{admin}/front-door/routes"))
-        .json(&one_route("svc", "/svc", port))
-        .send()
-        .await
-        .expect("put routes");
-    assert_eq!(
-        put.status().as_u16(),
-        200,
-        "status is unchanged by the flag"
-    );
-    assert!(
-        put.headers().get("rift-cluster-revision").is_some(),
-        "the revision token a caller feeds back as If-Match survives the decoration"
-    );
-    let written: serde_json::Value = put.json().await.expect("json");
-    assert_eq!(
-        written,
-        json!({
-            "routes": [{
-                "id": "svc",
-                "priority": 0,
-                "match": { "path_prefix": "/svc" },
-                "target": { "port": port, "strip_prefix": false },
-                "enabled": true,
-            }],
-            "installed": true,
-        }),
-        "{written}"
-    );
-
-    let read: serde_json::Value = reqwest::get(format!("http://{admin}/front-door/routes"))
-        .await
-        .expect("get routes")
-        .json()
-        .await
-        .expect("json");
-    assert_eq!(read, written, "read and write agree: {read}");
-
-    server.shutdown().await;
-}
-
 /// `GET /front-door/routes`' own contract calls its body "a config document a client `PUT`s back
-/// verbatim". Adding `installed` to that body must not break it: `RouteTable` sets no
-/// `deny_unknown_fields`, so the key is ignored on parse and the round-trip stores an identical
-/// table (issue #536).
+/// verbatim", and since #550 the body is exactly a `RouteTable` — no `installed` decoration to
+/// be ignored on parse. The round trip must be a fixed point.
 #[tokio::test]
 async fn a_route_table_body_put_back_verbatim_round_trips() {
     let state = TempDir::new().expect("tempdir");
@@ -732,10 +660,12 @@ async fn a_route_table_body_put_back_verbatim_round_trips() {
         .json()
         .await
         .expect("json");
-    assert_eq!(first["installed"], json!(true), "precondition: {first}");
+    assert!(
+        first.get("installed").is_none(),
+        "D-68's `installed` decoration left with tenancy (#550): {first}"
+    );
 
-    // The whole body back, `installed` and all — exactly what a client that read then wrote would
-    // send.
+    // The whole body back — exactly what a client that read then wrote would send.
     let echoed = client
         .put(format!("http://{admin}/front-door/routes"))
         .json(&first)

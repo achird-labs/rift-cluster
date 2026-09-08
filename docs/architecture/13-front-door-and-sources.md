@@ -17,13 +17,12 @@ seam U-11).
 
 ## The front door: many imposters, one port, zero client cooperation
 
-> **Amended by D-68** (2026-09-01, #536): the "Tenancy-aware" bullet below said only that the
-> default tenant's routes are compiled into the listener. It is now also *published*: both
-> `PUT` and `GET /front-door/routes` answer `installed: <bool>` beside the table, so a tenant
-> writing a table that can never dispatch learns it on the write. Since #545 (D-71, RFC-007
-> §3.2) those two endpoints are the only place the flag appears: the per-route dispatch counters
-> this chapter once described are gone, the request log being what answers "is this route taking
-> traffic".
+> **Amended by D-68** (2026-09-01, #536), then **superseded by D-73** (RFC-007 §3.2, #550): the
+> "Tenancy-aware" bullet below is gone with tenancy. There is **one fleet-wide route table** and
+> every stored route is compiled into the listener, so the `installed` flag D-68 added to
+> `PUT`/`GET /front-door/routes` would be a constant `true` and is removed from both. D-68 is
+> worth reading anyway: it is the clearest evidence that tenancy had leaked into the router, which
+> is the argument RFC-007 §3.2 makes for removing it rather than freezing it.
 
 Chapter 2's gateway mode asks the *client* to name the target imposter
 (the `/__rift/8080` path prefix — the header and subdomain forms were withdrawn
@@ -71,16 +70,12 @@ Design points that carry weight (full spec in #19):
   its socket — a node whose :9090 bind failed still serves :9090's imposter
   through the front door. On Kubernetes and behind managed LBs this makes the
   front-door port the *only* data port a Service ever needs to expose.
-- **Tenancy-aware** (#17): routes belong to tenants and may only target their
-  tenant's imposters; shared catch-alls are fleet-admin territory. Only the
-  default tenant's routes are actually compiled into the listener — see
-  Chapter 8, and `routes_installed_for`, which is the one definition of that
-  rule. **Both route endpoints publish that fact** (#536, D-68): `PUT` and
-  `GET /front-door/routes` answer `installed: <bool>` beside the table, from
-  that same function, so a tenant that writes a table which can never dispatch
-  learns it at the moment it writes rather than discovering it later. The flag
-  is a read-only decoration on the response — it is not part of the stored
-  table, and a `PUT` body claiming `installed: true` is ignored.
+- **One table, fleet-wide** (#550, D-73): there is a single replicated route
+  table, every route in it is compiled into the listener, and a route may target
+  any imposter the fleet holds. `PUT /front-door/routes` replaces it as a unit
+  and `GET` answers it; both bodies are a plain `RouteTable`. The `installed`
+  decoration D-68 added is gone — with nothing filtered out of the compiled set
+  it could only ever say `true`.
 
 ## What this buys, concretely
 

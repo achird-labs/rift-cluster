@@ -378,7 +378,7 @@ impl JournalCursor {
     }
 }
 
-/// A reader's position across every *covered port* of a tenant's fleet (issue #362) — what the
+/// A reader's position across every *covered port* of the fleet (issue #362) — what the
 /// fleet request walk hands back and takes in.
 ///
 /// This is a different shape from [`JournalCursor`], not an extension of one. A `JournalCursor` is
@@ -388,7 +388,7 @@ impl JournalCursor {
 /// per-port cursor per port, which is exactly what this holds.
 ///
 /// **Only covered ports occupy a row.** Coverage is capped (see `JournalNet::fleet_page`), so this
-/// token is bounded by that cap rather than by how many imposters the tenant owns. A port that
+/// token is bounded by that cap rather than by how many imposters the fleet holds. A port that
 /// leaves coverage loses its row; what re-entry means is the walk's join rule, not the token's.
 ///
 /// `BTreeMap` for [`JournalCursor::pos`]'s reason, one level up: the encoding must be byte-stable

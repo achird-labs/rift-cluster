@@ -582,7 +582,7 @@ async fn send_append(
 /// halve the batch and retry at once, which is the only response that can make
 /// progress. A lagging follower catching up across several 4-8 MiB entries hits
 /// this the moment `max_payload_entries` batches them past the transport's cap;
-/// it never fired before the quota-sized entries of #278/#285 existed. Only
+/// it never fired before the large entries of #278/#285 existed. Only
 /// AppendEntries can act on the hint, so `vote` and `install_snapshot` keep the
 /// original mapping.
 fn map_append_err(

@@ -8,7 +8,6 @@ import {
   useImposters,
   useRequestLog,
 } from "../app/queries.ts";
-import { useSession } from "../app/session.tsx";
 import { toHash } from "../app/routing.ts";
 import {
   Confirm,
@@ -47,18 +46,12 @@ export function RequestLog({ port }: { port: number | null }): ReactNode {
 function Log({ port }: { port: number }): ReactNode {
   const [offset, setOffset] = useState(0);
   const log = useRequestLog(port);
-  const { can } = useSession();
   const clear = useClearRequests();
   const [confirming, setConfirming] = useState(false);
-  // `Action::SavedRequestsClear`, not `LifecycleToggle` — separate actions that happen to share a
-  // role today. See `rbac.ts`.
-  const mayClear = can("requests.clear");
-  const mayWriteStubs = can("imposter.write");
 
   // Same read `ImposterDetail` drives its editor from: the body carries the stub list this screen's
   // shadow warning needs, and the `Rift-Cluster-Revision` header is the `If-Match` a save is
-  // conditioned on. Called unconditionally (never behind `mayWriteStubs`) because a hook cannot come
-  // and go across renders — `ImposterDetail` makes the same call.
+  // conditioned on.
   const imposter = useImposter(port);
   /*
    * `Array.isArray`, not a cast. The stub list arrives over the wire and this screen is the one an
@@ -108,19 +101,15 @@ function Log({ port }: { port: number }): ReactNode {
         <p className="muted">
           Imposter <Ident>{port}</Ident>
         </p>
-        {mayClear ? (
-          <>
-            <div className="spacer" />
-            <button
-              className="btn sm danger"
-              type="button"
-              data-testid="clear-requests"
-              onClick={() => setConfirming(true)}
-            >
-              Clear this imposter&rsquo;s log
-            </button>
-          </>
-        ) : null}
+        <div className="spacer" />
+        <button
+          className="btn sm danger"
+          type="button"
+          data-testid="clear-requests"
+          onClick={() => setConfirming(true)}
+        >
+          Clear this imposter&rsquo;s log
+        </button>
       </header>
 
       {clear.isError ? (
@@ -183,7 +172,7 @@ function Log({ port }: { port: number }): ReactNode {
         </div>
       ) : null}
 
-      {mayWriteStubs && editing !== null && !editorReady ? (
+      {editing !== null && !editorReady ? (
         <div className="banner warn" data-testid="stub-gone" role="status">
           <span className="b-glyph" aria-hidden="true">
             &#9650;
@@ -195,7 +184,7 @@ function Log({ port }: { port: number }): ReactNode {
         </div>
       ) : null}
 
-      {mayWriteStubs && editorReady && editing !== null ? (
+      {editorReady && editing !== null ? (
         <>
           {/*
             Gated on `kind === "new"`, not merely on the editor being open. The sentence is about
@@ -239,7 +228,6 @@ function Log({ port }: { port: number }): ReactNode {
           state={log.data}
           offset={offset}
           onOffset={setOffset}
-          mayWriteStubs={mayWriteStubs}
           onEdit={openEditor}
           editorOpen={editorOpen}
         />
@@ -252,14 +240,12 @@ function Rows({
   state,
   offset,
   onOffset,
-  mayWriteStubs,
   onEdit,
   editorOpen,
 }: {
   state: { kind: "rows"; rows: RecordedRequest[] } | { kind: "unknown"; reason: string };
   offset: number;
   onOffset: (next: number) => void;
-  mayWriteStubs: boolean;
   editorOpen: boolean;
   onEdit: (target: StubTarget) => void;
 }): ReactNode {
@@ -355,7 +341,6 @@ function Rows({
                 <Row
                   key={`${start + index}`}
                   request={request}
-                  mayWriteStubs={mayWriteStubs}
                   editorOpen={editorOpen}
                   onEdit={onEdit}
                 />
@@ -474,12 +459,10 @@ function StubCell({ outcome }: { outcome: MatchOutcome | undefined }): ReactNode
 
 function Row({
   request,
-  mayWriteStubs,
   editorOpen,
   onEdit,
 }: {
   request: RecordedRequest;
-  mayWriteStubs: boolean;
   editorOpen: boolean;
   onEdit: (target: StubTarget) => void;
 }): ReactNode {
@@ -551,9 +534,7 @@ function Row({
               </div>
             </dl>
             <Diagnostics outcome={request.matchOutcome} />
-            {mayWriteStubs ? (
-              <StubRowAction request={request} onEdit={onEdit} editorOpen={editorOpen} />
-            ) : null}
+            <StubRowAction request={request} onEdit={onEdit} editorOpen={editorOpen} />
           </td>
         </tr>
       ) : null}
@@ -561,12 +542,7 @@ function Row({
   );
 }
 
-/**
- * "Stub this" / "Open stub", per `rowActionFor` (#250).
- *
- * Gated on `imposter.write` by the caller, same as every other write control on this screen — this
- * component assumes it is only mounted when that capability is present.
- */
+/** "Stub this" / "Open stub", per `rowActionFor` (#250). */
 function StubRowAction({
   request,
   onEdit,
@@ -829,7 +805,7 @@ function formatQuery(query: Record<string, string> | undefined): string {
  * The fleet request journal — every imposter's recorded traffic in one table.
  *
  * Read, not assembled: `useFleetRequests` is one call to `GET /admin/requests` (#362), which walks
- * every imposter the caller's tenant owns and merges them server-side. This screen renders that
+ * every imposter the fleet serves and merges them server-side. This screen renders that
  * page and states what the response itself says about it — the coverage cap, and the ordering
  * guarantee the endpoint documents.
  *
@@ -909,7 +885,7 @@ function MergedJournal(): ReactNode {
       {rows.length === 0 && !fleet.isPending && !fleet.isError ? (
         <Empty
           testId="merged-journal-empty"
-          title="No requests recorded across this tenant"
+          title="No requests recorded across the fleet"
           body="Recording is off by default for imposters created outside the console. An imposter with recording off answers normally and keeps nothing."
         />
       ) : null}

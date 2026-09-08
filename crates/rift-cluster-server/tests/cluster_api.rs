@@ -97,18 +97,13 @@ async fn config_and_imposters_report_committed_state() {
         .await
         .expect("committed write");
 
-    // Tenant-qualified rows, not bare ports (issue #182). `/_cluster/*` is the *operator* surface
-    // and stays fleet-wide — it answers "what has this node converged on", and once more than one
-    // tenant's config can be applied, the honest answer names the tenant.
+    // `/_cluster/*` is the *operator* surface: it answers "what has this node converged on",
+    // fleet-wide. One row per port, which is the whole key since #550 removed tenancy.
     let config = get(&client, fixture.addr, "/_cluster/config").await;
-    assert_eq!(
-        config["ports"],
-        serde_json::json!([{ "tenant": "default", "port": 4545 }])
-    );
+    assert_eq!(config["ports"], serde_json::json!([{ "port": 4545 }]));
 
     let imposters = get(&client, fixture.addr, "/_cluster/imposters").await;
     assert_eq!(imposters["imposters"][0]["port"], 4545);
-    assert_eq!(imposters["imposters"][0]["tenant"], "default");
     assert_eq!(
         imposters["imposters"][0]["config"]["protocol"], "http",
         "the committed body is reported as JSON, not an escaped string"
@@ -187,7 +182,7 @@ async fn control_plane_routes_are_not_shadowed_by_the_operator_surface() {
 /// unknown (or lapsed) id is a 404, not an empty success.
 #[tokio::test]
 async fn ops_endpoint_reports_applied_pending_and_unknown() {
-    use rift_cluster::{ControlOp, ControlOutcome, ControlRequest, TenantId};
+    use rift_cluster::{ControlOp, ControlOutcome, ControlRequest};
 
     let fixture = start().await;
     let client = client(Some(SECRET));
@@ -202,7 +197,6 @@ async fn ops_endpoint_reports_applied_pending_and_unknown() {
             issued_at_secs: 0,
             expected_revision: None,
             op: ControlOp::PutImposter {
-                tenant: TenantId::default(),
                 config: serde_json::from_value(
                     serde_json::json!({ "port": 4546, "protocol": "http" }),
                 )
@@ -224,10 +218,9 @@ async fn ops_endpoint_reports_applied_pending_and_unknown() {
 
     // Failed ops are terminal and queryable too. The op just has to fail
     // deterministically — what this test is about is the `/_cluster/ops` state
-    // machine, not the reason. It used to name a non-default tenant, which
-    // stopped failing when #159 lifted the single-tenant gate; a *malformed*
-    // tenant slug is refused by `validate` for as long as tenant ids have a
-    // shape, so it keeps the `detail` assertion below meaningful.
+    // machine, not the reason. An empty fleet name is refused by `validate` for
+    // as long as a fleet name has to render as something, which keeps the
+    // `detail` assertion below meaningful.
     let failed_id = uuid::Uuid::from_u128(0xFA11);
     fixture
         .node
@@ -236,8 +229,8 @@ async fn ops_endpoint_reports_applied_pending_and_unknown() {
             principal: None,
             issued_at_secs: 0,
             expected_revision: None,
-            op: ControlOp::DeleteAll {
-                tenant: TenantId::new("Not A Slug"),
+            op: ControlOp::FleetNamePut {
+                name: String::new(),
             },
         })
         .await
@@ -248,7 +241,7 @@ async fn ops_endpoint_reports_applied_pending_and_unknown() {
         reported["detail"]
             .as_str()
             .expect("detail")
-            .contains("tenant"),
+            .contains("fleet name"),
         "{reported}"
     );
 
@@ -261,10 +254,7 @@ async fn ops_endpoint_reports_applied_pending_and_unknown() {
             principal: None,
             issued_at_secs: 0,
             expected_revision: None,
-            op: ControlOp::DeleteImposter {
-                tenant: TenantId::default(),
-                port: 4547,
-            },
+            op: ControlOp::DeleteImposter { port: 4547 },
         })
         .expect("park");
     let reported = get(

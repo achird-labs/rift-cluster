@@ -22,9 +22,7 @@ pub mod proxy;
 pub mod sequencer;
 pub mod shard;
 
-pub use flow::{
-    ClusteredFlowStoreProvider, FlowBindConfig, FlowCounts, FlowNet, SpaceRow, flow_routes,
-};
+pub use flow::{ClusteredFlowStoreProvider, FlowBindConfig, FlowNet, SpaceRow, flow_routes};
 pub use flow_config::{ContextScope, FlowConfig, ReadConsistency, ResolvedKnobs};
 // `JournalCursor`/`CursorError` join this list because the front door names them directly
 // (issue #225): it decodes the client's `?since=` token before the read and encodes the issued

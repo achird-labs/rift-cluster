@@ -121,6 +121,29 @@ cluster-secret
 {{- end -}}
 
 {{/*
+The Secret the ADMIN API key is read from, or empty when there is none.
+
+Empty is a legitimate answer, unlike `rift-cluster.secretName` above: an unset admin key leaves the
+admin plane open, which is this chart's default and the reference deployment's. So this returns ""
+and the StatefulSet renders no `MB_APIKEY` env entry at all, rather than failing the install.
+*/}}
+{{- define "rift-cluster.adminApiKeySecretName" -}}
+{{- if .Values.adminApiKey.existingSecret -}}
+{{- .Values.adminApiKey.existingSecret -}}
+{{- else if .Values.adminApiKey.create -}}
+{{- printf "%s-admin-api-key" (include "rift-cluster.fullname" .) -}}
+{{- end -}}
+{{- end -}}
+
+{{- define "rift-cluster.adminApiKeySecretKey" -}}
+{{- if .Values.adminApiKey.existingSecret -}}
+{{- .Values.adminApiKey.existingSecretKey -}}
+{{- else -}}
+admin-api-key
+{{- end -}}
+{{- end -}}
+
+{{/*
 terminationGracePeriodSeconds, DERIVED — see `leaveTimeoutSeconds` in values.yaml.
 
 `2 * leaveTimeout + 10`. The rule the raw manifest states in a comment ("raise them together, never

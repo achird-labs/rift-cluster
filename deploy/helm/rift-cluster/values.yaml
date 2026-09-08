@@ -66,6 +66,27 @@ clusterSecret:
   # a randomly generated secret that changes on every upgrade would break peer auth fleet-wide.
   value: ""
 
+# The ADMIN plane's credential — optional, and unset by default.
+#
+# Unset, the admin API is open: anyone who can reach port 2525 can configure the fleet. That is the
+# right default for a chart whose first install is usually a private namespace, and it is what the
+# reference compose file and `deploy/k8s/statefulset.yaml` do too. Set it and the *whole* admin
+# plane closes behind that one key, sent as `Authorization: <key>`. `/healthz`, `/readyz` and the
+# imposter data plane stay open either way — the mock is the thing under test, so putting a
+# credential in front of it would break every caller it exists to serve.
+#
+# Shaped like `clusterSecret` above, and read the same way: point `existingSecret` at a Secret you
+# manage, or set `create: true` with a `value` for a test environment. The difference is that
+# leaving all of it empty is legitimate here — the chart renders no `MB_APIKEY` at all rather than
+# refusing.
+adminApiKey:
+  existingSecret: ""
+  existingSecretKey: admin-api-key
+  create: false
+  # Only read when `create: true`. Empty with `create: true` is refused rather than rendered: an
+  # empty `MB_APIKEY` is not "no credential", it is a credential nobody can present.
+  value: ""
+
 resources:
   requests:
     cpu: 250m

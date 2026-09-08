@@ -12,7 +12,6 @@ import {
   usePromoteRecording,
   useRecordedStubs,
 } from "../app/queries.ts";
-import { useSession } from "../app/session.tsx";
 import {
   Confirm,
   Empty,
@@ -56,9 +55,6 @@ export function RecordingPanel({
   imposter: Imposter;
   revision: string | null;
 }): ReactNode {
-  const { can } = useSession();
-  const mayWrite = can("imposter.write");
-  const mayClear = can("requests.clear");
   const state = recordingState(imposter.stubs);
 
   const [formOpen, setFormOpen] = useState(false);
@@ -79,14 +75,14 @@ export function RecordingPanel({
   // traffic yet is the normal state for the first minute of every recording, so that is a live
   // footgun rather than a hypothetical one.
   const recordedCount = recorded.isSuccess ? recorded.data.length : 0;
-  const mayPromoteNow = mayWrite && state === "recording" && recordedCount > 0;
+  const mayPromoteNow = state === "recording" && recordedCount > 0;
 
   return (
     <section className="card" data-testid="recording-panel">
       <div className="card-head">
         <h2>Recording</h2>
         <div className="spacer" />
-        {state !== "recording" && mayWrite && !formOpen ? (
+        {state !== "recording" && !formOpen ? (
           <button className="btn sm" type="button" onClick={() => setFormOpen(true)}>
             Start recording
           </button>
@@ -96,7 +92,7 @@ export function RecordingPanel({
             Stop &amp; promote
           </button>
         ) : null}
-        {state === "recording" && mayClear ? (
+        {state === "recording" ? (
           <button
             className="btn sm danger"
             type="button"
@@ -147,10 +143,9 @@ export function RecordingPanel({
               },
               {
                 // Closed on any outcome the fleet accepted, not only `applied`. An `unobservable`
-                // commit *was* accepted — the op-status projection that would confirm it is
-                // fleet-admin-gated, so most principals never see the confirmation — and leaving
-                // the dialog open with no message reads as failure, which is how an operator ends
-                // up promoting twice. The note below says what is actually known.
+                // commit *was* accepted — this node simply could not answer for the op that carries
+                // it — and leaving the dialog open with no message reads as failure, which is how
+                // an operator ends up promoting twice. The note below says what is actually known.
                 onSuccess: () => setPromptingPromote(false),
               },
             );
@@ -180,9 +175,8 @@ export function RecordingPanel({
 
       {/*
        * An accepted-but-unconfirmed write says so, rather than saying nothing. Under
-       * `--cluster-admin-async` the write answers 202 and the op-status projection that would
-       * confirm it is fleet-admin-gated, so for most principals this is the *ordinary* outcome —
-       * silence here would read as failure for a write that landed.
+       * `--cluster-admin-async` the write answers 202, and a node that cannot resolve the op id
+       * cannot confirm it — silence here would read as failure for a write that landed.
        */}
       {promote.data?.kind === "unobservable" ? (
         <UnconfirmedNote reason={promote.data.reason} />
@@ -242,13 +236,12 @@ export function RecordingPanel({
  * answers, so another node's matches record nothing here. Shown in every state, including Empty —
  * before any recording starts is exactly when this caveat is cheapest to act on.
  *
- * **Suppressed only on a confirmed single-node fleet.** `/_fleet/*` authorizes
- * `Action::ClusterAdmin`, so for every role below fleet-admin — including the editors who do most
- * of the recording — the read answers 403/404. Treating that as "one node" would hide the warning
- * from exactly the people it is for, and would be a fact invented from a failed read. So the three
- * states are kept apart the way `fleetView.ts`'s `viewConfidence` requires: only a **reading** that
- * says `singleNode` silences this; an unavailable or not-yet-asked read still warns, and says that
- * it could not confirm the fleet's size.
+ * **Suppressed only on a confirmed single-node fleet.** A node started without `--cluster` serves
+ * no `/_fleet/*` at all, so the read can answer 403/404. Treating that as "one node" would hide the
+ * warning from exactly the people it is for, and would be a fact invented from a failed read. So
+ * the three states are kept apart the way `fleetView.ts`'s `viewConfidence` requires: only a
+ * **reading** that says `singleNode` silences this; an unavailable or not-yet-asked read still
+ * warns, and says that it could not confirm the fleet's size.
  */
 function FleetCaveat(): ReactNode {
   const fleet = useFleetView({ polled: false });
@@ -278,9 +271,8 @@ function FleetCaveat(): ReactNode {
         </p>
         {state.kind === "read" ? null : (
           <p className="muted" data-testid="recording-fleet-unconfirmed">
-            This fleet&rsquo;s size could not be read from here — <Ident>/_fleet/*</Ident> needs a
-            FleetAdmin binding — so this warning is shown whether or not the fleet has more than one
-            node.
+            This fleet&rsquo;s size could not be read from here — <Ident>/_fleet/*</Ident> did not
+            answer — so this warning is shown whether or not the fleet has more than one node.
           </p>
         )}
       </div>

@@ -74,12 +74,12 @@ describe("resolving a parked write", () => {
     // way, that this module exists to stop.
     stubOpStatus({
       "op-a": [{ body: { state: "applied", revision: 1 } }],
-      "op-b": [{ body: { state: "failed", detail: "port claimed by another tenant" } }],
+      "op-b": [{ body: { state: "failed", detail: "port is already claimed" } }],
     });
     const outcome = await pollCommit(["op-a", "op-b"], { intervalMs: 0 });
     expect(outcome.kind).toBe("failed");
     expect(outcome).toMatchObject({
-      detail: "port claimed by another tenant (1 of 2 had already applied)",
+      detail: "port is already claimed (1 of 2 had already applied)",
     });
   });
 
@@ -95,13 +95,13 @@ describe("resolving a parked write", () => {
   });
 });
 
-describe("a write this principal cannot observe is not a failed write", () => {
+describe("a write this node cannot observe is not a failed write", () => {
   /*
-   * `GET /_fleet/ops/{opId}` is fleet-scoped (ClusterAdmin/FleetAdmin only) and its 404
-   * deliberately conflates "unknown op", "malformed id" and "caller lacks fleet scope". So an
-   * ordinary tenant admin toggling an imposter cannot poll at all — and the write has very likely
-   * committed. Calling that `failed` would be the same collapse this issue is about, inverted:
-   * asserting an outcome nobody observed.
+   * `GET /_fleet/ops/{opId}` answers 404 for an op this node cannot resolve, and deliberately
+   * conflates "unknown op" with "malformed id" and "not caught up to it yet". We only ever poll
+   * ids the server just minted, so the write has very likely committed. Calling that `failed`
+   * would be the same collapse this module is about, inverted: asserting an outcome nobody
+   * observed.
    */
   it("reports a 404 from the fleet projection as unobservable, not failed", async () => {
     stubOpStatus({ "op-1": [{ status: 404 }] });

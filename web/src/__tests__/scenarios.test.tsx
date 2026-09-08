@@ -4,7 +4,7 @@ import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { Scenarios } from "../screens/Scenarios.tsx";
-import { renderInApp, stubFetch, whoamiWith } from "./harness.tsx";
+import { renderInApp, stubFetch } from "./harness.tsx";
 
 const PORT = 4545;
 const FLOW = "checkout-1";
@@ -60,22 +60,17 @@ afterEach(() => {
  * one its panel lives on — by hash, the way a bookmark would, rather than by clicking through.
  */
 function renderScreen(
-  role: Parameters<typeof whoamiWith>[0],
   flow: string | null = FLOW,
   tab: "scenarios" | "spaces" | "defs" = "scenarios",
 ) {
   if (tab !== "scenarios") window.location.hash = `#/?tab=${tab}`;
-  return renderInApp(<Scenarios port={PORT} flow={flow} />, {
-    whoami: whoamiWith(role, ["acme"]),
-    tenants: ["acme"],
-    tenant: "acme",
-  });
+  return renderInApp(<Scenarios port={PORT} flow={flow} />);
 }
 
 describe("scenarios — the states, under the flow they belong to", () => {
   it("lists every scenario with its state, naming the flow they were read under", async () => {
     stubFetch(healthy());
-    renderScreen("viewer");
+    renderScreen();
 
     expect((await screen.findByTestId("scenario-state-checkout")).textContent).toContain(
       "awaiting-payment",
@@ -88,7 +83,7 @@ describe("scenarios — the states, under the flow they belong to", () => {
 
   it("says an imposter has no scenarios rather than leaving the panel blank", async () => {
     stubFetch(healthy({ [SCENARIOS_PATH]: { json: { flowId: FLOW, scenarios: [] } } }));
-    renderScreen("viewer");
+    renderScreen();
 
     await screen.findByTestId("scenarios-empty");
     expect(screen.queryByTestId("scenarios-unknown")).toBeNull();
@@ -98,7 +93,7 @@ describe("scenarios — the states, under the flow they belong to", () => {
     // The distinction the issue names. An empty table here would tell an operator their stubs
     // declare no scenarios — a confident statement about their configuration, made from a failed read.
     stubFetch(healthy({ [SCENARIOS_PATH]: { status: 503 } }));
-    renderScreen("viewer");
+    renderScreen();
 
     const unknown = await screen.findByTestId("scenarios-unknown");
     expect(unknown.textContent).toMatch(/unknown, not empty/i);
@@ -106,33 +101,10 @@ describe("scenarios — the states, under the flow they belong to", () => {
   });
 });
 
-describe("scenario controls are gated on the action that authorizes each one", () => {
-  it("offers a viewer neither reset nor set-state", async () => {
+describe("scenario controls", () => {
+  it("offers both the reset and the per-scenario set-state", async () => {
     stubFetch(healthy());
-    renderScreen("viewer");
-
-    await screen.findByTestId("scenario-state-checkout");
-    expect(screen.queryByTestId("reset-scenarios")).toBeNull();
-    expect(screen.queryByTestId("set-scenario-state-checkout")).toBeNull();
-  });
-
-  it("offers an operator reset but NOT set-state", async () => {
-    /*
-     * The asymmetry that makes this table worth transcribing. `POST .../scenarios/reset` maps to
-     * `Action::ScenarioReset` (Operator) and `PUT .../scenarios/{name}/state` to
-     * `Action::ScenarioWrite` (Editor) — different arms of `role_allows`. Gating both on one
-     * "may write scenarios" notion would draw an operator a control that answers 403 every time.
-     */
-    stubFetch(healthy());
-    renderScreen("operator");
-
-    await screen.findByTestId("reset-scenarios");
-    expect(screen.queryByTestId("set-scenario-state-checkout")).toBeNull();
-  });
-
-  it("offers an editor both", async () => {
-    stubFetch(healthy());
-    renderScreen("editor");
+    renderScreen();
 
     await screen.findByTestId("reset-scenarios");
     await screen.findByTestId("set-scenario-state-checkout");
@@ -146,7 +118,7 @@ describe("scenario controls are gated on the action that authorizes each one", (
       [`/imposters/${PORT}/scenarios/checkout/state`]: { json: { flowId: FLOW, name: "checkout", state: "paid" } },
     });
     stubFetch(routes);
-    renderScreen("editor");
+    renderScreen();
 
     const user = userEvent.setup();
     await user.click(await screen.findByTestId("set-scenario-state-checkout"));
@@ -170,7 +142,7 @@ describe("scenario controls are gated on the action that authorizes each one", (
      * refused — a failure that looks exactly like a no-op.
      */
     stubFetch(healthy({ [`/imposters/${PORT}/scenarios/checkout/state`]: { status: 403 } }));
-    renderScreen("editor");
+    renderScreen();
 
     const user = userEvent.setup();
     await user.click(await screen.findByTestId("set-scenario-state-checkout"));
@@ -193,7 +165,7 @@ describe("scenario controls are gated on the action that authorizes each one", (
     // when the screen first painted — and submitting it after the scenario moved would silently
     // revert it. Seeding on open is what keeps the prefill and the displayed cell the same fact.
     stubFetch(healthy());
-    renderScreen("editor");
+    renderScreen();
 
     await userEvent.setup().click(await screen.findByTestId("set-scenario-state-checkout"));
     const input = (await screen.findByTestId("scenario-state-input")) as HTMLInputElement;
@@ -204,7 +176,7 @@ describe("scenario controls are gated on the action that authorizes each one", (
     // Same trap on the reset route: an omitted `flowId` resets the imposter's default flow, which
     // is never what a screen scoped to a named space means.
     stubFetch(healthy({ [`/imposters/${PORT}/scenarios/reset`]: { json: { flowId: FLOW, reset: true } } }));
-    renderScreen("operator");
+    renderScreen();
 
     const user = userEvent.setup();
     await user.click(await screen.findByTestId("reset-scenarios"));
@@ -226,7 +198,7 @@ describe("a space's stubs are not the imposter's stubs", () => {
      * resolve to that flow, and they never appear on the imposter's own stub list.
      */
     stubFetch(healthy());
-    renderScreen("viewer", FLOW, "spaces");
+    renderScreen(FLOW, "spaces");
 
     const table = await screen.findByTestId("space-stubs");
     expect(table.textContent).toBeTruthy();
@@ -255,7 +227,7 @@ describe("a space's stubs are not the imposter's stubs", () => {
         },
       }),
     );
-    renderScreen("viewer", FLOW, "spaces");
+    renderScreen(FLOW, "spaces");
 
     const warning = await screen.findByTestId("space-stub-shadow-warning");
     expect(warning.textContent).toMatch(/matches every request in this space/i);
@@ -267,7 +239,7 @@ describe("a space's stubs are not the imposter's stubs", () => {
     // `healthy()`'s default space is exactly this: one predicate-less stub, nothing after it. That
     // is an ordinary space-wide default, and warning about it would be crying wolf.
     stubFetch(healthy());
-    renderScreen("viewer", FLOW, "spaces");
+    renderScreen(FLOW, "spaces");
 
     await screen.findByTestId("space-stubs");
     expect(screen.queryByTestId("space-stub-shadow-warning")).toBeNull();
@@ -275,7 +247,7 @@ describe("a space's stubs are not the imposter's stubs", () => {
 
   it("reports how many requests resolved to the space", async () => {
     stubFetch(healthy());
-    renderScreen("viewer", FLOW, "spaces");
+    renderScreen(FLOW, "spaces");
     expect((await screen.findByTestId("space-requests")).textContent).toContain("7");
   });
 
@@ -283,7 +255,7 @@ describe("a space's stubs are not the imposter's stubs", () => {
     // "Nothing reached this space" is the question the operator is asking, not an answer the
     // console may supply on the node's behalf.
     stubFetch(healthy({ [SPACE_PATH]: { json: { space: FLOW, stubs: [], scenarios: [] } } }));
-    renderScreen("viewer", FLOW, "spaces");
+    renderScreen(FLOW, "spaces");
     await waitFor(async () =>
       expect((await screen.findByTestId("space-requests")).textContent).toContain("—"),
     );
@@ -299,7 +271,7 @@ describe("a space's stubs are not the imposter's stubs", () => {
         },
       }),
     );
-    renderScreen("viewer", FLOW, "spaces");
+    renderScreen(FLOW, "spaces");
     expect((await screen.findByTestId("space-owner")).textContent).toContain("3");
   });
 
@@ -314,7 +286,7 @@ describe("a space's stubs are not the imposter's stubs", () => {
         },
       }),
     );
-    renderScreen("viewer", FLOW, "spaces");
+    renderScreen(FLOW, "spaces");
     await waitFor(async () =>
       expect((await screen.findByTestId("space-owner")).textContent).toContain("—"),
     );
@@ -322,38 +294,28 @@ describe("a space's stubs are not the imposter's stubs", () => {
 
   it("renders a space holding nothing as an answer", async () => {
     stubFetch(healthy({ [SPACE_PATH]: { json: { space: FLOW, stubs: [], scenarios: [], numberOfRequests: 0 } } }));
-    renderScreen("viewer", FLOW, "spaces");
+    renderScreen(FLOW, "spaces");
     await screen.findByTestId("space-empty");
     expect(screen.queryByTestId("space-unknown")).toBeNull();
   });
 
   it("renders a space that could not be read as the absence of one", async () => {
     stubFetch(healthy({ [SPACE_PATH]: { status: 503 } }));
-    renderScreen("viewer", FLOW, "spaces");
+    renderScreen(FLOW, "spaces");
     await screen.findByTestId("space-unknown");
     expect(screen.queryByTestId("space-empty")).toBeNull();
   });
 
-  it("offers a viewer neither teardown nor stub-scoping", async () => {
+  it("offers the teardown control", async () => {
     stubFetch(healthy());
-    renderScreen("viewer", FLOW, "spaces");
-    await screen.findByTestId("space-stubs");
-    expect(screen.queryByTestId("space-teardown")).toBeNull();
-    expect(screen.queryByTestId("space-add-stub")).toBeNull();
-  });
-
-  it("offers an operator teardown but NOT stub-scoping", async () => {
-    // `SpaceTeardown` is Operator, `SpaceStubWrite` is Editor — the same disturb/redefine split as
-    // the scenario controls.
-    stubFetch(healthy());
-    renderScreen("operator", FLOW, "spaces");
+    renderScreen(FLOW, "spaces");
     await screen.findByTestId("space-teardown");
     expect(screen.queryByTestId("space-add-stub")).toBeNull();
   });
 
   it("offers an editor both", async () => {
     stubFetch(healthy());
-    renderScreen("editor", FLOW, "spaces");
+    renderScreen(FLOW, "spaces");
     await screen.findByTestId("space-add-stub");
     await screen.findByTestId("space-teardown");
   });
@@ -372,7 +334,7 @@ describe("active spaces — the imposter's own listing (#374)", () => {
         },
       }),
     );
-    renderScreen("viewer", FLOW, "spaces");
+    renderScreen(FLOW, "spaces");
 
     const row = await screen.findByTestId("active-space-row-qa-flow");
     expect(row.textContent).toContain("qa-flow");
@@ -394,7 +356,7 @@ describe("active spaces — the imposter's own listing (#374)", () => {
         },
       }),
     );
-    renderScreen("viewer", FLOW, "spaces");
+    renderScreen(FLOW, "spaces");
 
     expect((await screen.findByTestId("active-space-owner-qa-flow")).textContent).toBe(bigOwner);
   });
@@ -410,7 +372,7 @@ describe("active spaces — the imposter's own listing (#374)", () => {
         },
       }),
     );
-    renderScreen("viewer", FLOW, "spaces");
+    renderScreen(FLOW, "spaces");
 
     const partial = await screen.findByTestId("active-spaces-partial");
     expect(partial.textContent).toMatch(/not the complete list/i);
@@ -420,7 +382,7 @@ describe("active spaces — the imposter's own listing (#374)", () => {
 
   it("renders `spaces: []` with `partial: false` as a definite 'no spaces' state", async () => {
     stubFetch(healthy({ [SPACES_PATH]: { json: { spaces: [], partial: false } } }));
-    renderScreen("viewer", FLOW, "spaces");
+    renderScreen(FLOW, "spaces");
 
     await screen.findByTestId("active-spaces-empty");
     expect(screen.queryByTestId("active-spaces-partial")).toBeNull();
@@ -430,7 +392,7 @@ describe("active spaces — the imposter's own listing (#374)", () => {
     // The rule this whole panel exists to enforce: an empty list under a degraded read means
     // "cannot tell you", not "this imposter has none" — the exact defect class #365/#366/#368 hit.
     stubFetch(healthy({ [SPACES_PATH]: { json: { spaces: [], partial: true } } }));
-    renderScreen("viewer", FLOW, "spaces");
+    renderScreen(FLOW, "spaces");
 
     await screen.findByTestId("active-spaces-partial");
     expect(screen.queryByTestId("active-spaces-empty")).toBeNull();
@@ -438,7 +400,7 @@ describe("active spaces — the imposter's own listing (#374)", () => {
 
   it("renders an absent durability knob as unknown, never as a default value", async () => {
     stubFetch(healthy({ [SPACES_PATH]: { json: { spaces: [], partial: false } } }));
-    renderScreen("viewer", FLOW, "spaces");
+    renderScreen(FLOW, "spaces");
 
     const durability = await screen.findByTestId("active-spaces-durability");
     expect(durability.textContent).toMatch(/unknown/i);
@@ -460,7 +422,7 @@ describe("active spaces — the imposter's own listing (#374)", () => {
         },
       }),
     );
-    renderScreen("viewer", FLOW, "spaces");
+    renderScreen(FLOW, "spaces");
 
     const durability = await screen.findByTestId("active-spaces-durability");
     expect(durability.textContent).toContain("sync");
@@ -470,28 +432,10 @@ describe("active spaces — the imposter's own listing (#374)", () => {
 
   it("renders an unreadable listing as unknown, never as an imposter with no spaces", async () => {
     stubFetch(healthy({ [SPACES_PATH]: { status: 503 } }));
-    renderScreen("viewer", FLOW, "spaces");
+    renderScreen(FLOW, "spaces");
 
     const unknown = await screen.findByTestId("active-spaces-unknown");
     expect(unknown.textContent).toMatch(/unknown, not empty/i);
-    expect(screen.queryByTestId("active-spaces-empty")).toBeNull();
-  });
-
-  it("renders the fleet-scope refusal distinctly from the generic partial banner", async () => {
-    stubFetch(
-      healthy({
-        [SPACES_PATH]: {
-          json: { spaces: [], partial: true, unavailable: "fleet-scope" },
-        },
-      }),
-    );
-    renderScreen("viewer", FLOW, "spaces");
-
-    const banner = await screen.findByTestId("active-spaces-fleet-scope");
-    expect(banner.textContent).toMatch(/contextScope.*fleet/i);
-    expect(banner.textContent).toMatch(/not a failure/i);
-    // Neither the generic partial banner nor the definite empty state renders alongside it.
-    expect(screen.queryByTestId("active-spaces-partial")).toBeNull();
     expect(screen.queryByTestId("active-spaces-empty")).toBeNull();
   });
 
@@ -503,12 +447,13 @@ describe("active spaces — the imposter's own listing (#374)", () => {
         },
       }),
     );
-    renderScreen("viewer", FLOW, "spaces");
+    renderScreen(FLOW, "spaces");
 
     const banner = await screen.findByTestId("active-spaces-scope-unresolved");
     expect(banner.textContent).toMatch(/could not read/i);
     expect(banner.textContent).toMatch(/retry/i);
-    expect(screen.queryByTestId("active-spaces-fleet-scope")).toBeNull();
+    // The generic partial banner must not render alongside it: the listing was not attempted at
+    // all, so "incomplete" would overstate what the node did.
     expect(screen.queryByTestId("active-spaces-partial")).toBeNull();
     expect(screen.queryByTestId("active-spaces-empty")).toBeNull();
   });
@@ -522,7 +467,7 @@ describe("flow state", () => {
     // There is no list-entries route. The panel therefore asks for a key rather than pretending to
     // offer an inventory it cannot build.
     stubFetch(healthy({ [ENTRY_PATH]: { json: { flowId: FLOW, key: KEY, value: { items: 2 } } } }));
-    renderScreen("viewer");
+    renderScreen();
 
     const user = userEvent.setup();
     await user.type(await screen.findByTestId("flow-state-key"), KEY);
@@ -534,12 +479,12 @@ describe("flow state", () => {
   it("does not claim a key is unset on a 404 it cannot attribute", async () => {
     /*
      * `getFlowStateEntry` documents 404 as "no such entry" — but RFC-002 §8.4 renders
-     * `NotBoundToTenant` as 404 too, and so does a missing imposter. Rendering all three as "not
+     * a missing imposter answers 404 too. Rendering both as "not
      * set" would tell an operator their key is empty when they may simply be reading an imposter
      * that is not theirs.
      */
     stubFetch(healthy({ [ENTRY_PATH]: { status: 404 } }));
-    renderScreen("viewer");
+    renderScreen();
 
     const user = userEvent.setup();
     await user.type(await screen.findByTestId("flow-state-key"), KEY);
@@ -552,7 +497,7 @@ describe("flow state", () => {
   it("renders a stored null as a value, not as an absent key", async () => {
     // The contract declares `value` as any JSON including `null`, so a null is stored data.
     stubFetch(healthy({ [ENTRY_PATH]: { json: { flowId: FLOW, key: KEY, value: null } } }));
-    renderScreen("viewer");
+    renderScreen();
 
     const user = userEvent.setup();
     await user.type(await screen.findByTestId("flow-state-key"), KEY);
@@ -570,52 +515,21 @@ describe("flow state", () => {
     await screen.findByTestId("flow-state-result");
   }
 
-  it("offers an operator clear but NOT set — the server gates the write on space.stubWrite", async () => {
-    /*
-     * The mapping that is not guessable from the route. `PUT .../flow-state/{flow}/{key}` is
-     * classified as `imposter.write` with a space, which `principal.rs::map_action` turns into
-     * `Action::SpaceStubWrite` (Editor) — there is no `FlowStateWrite`. The `DELETE` beside it maps
-     * to `Action::FlowStateClear` (Operator).
-     *
-     * So this panel is deliberately asymmetric for an operator, and making it symmetrical would
-     * mean drawing a control the server refuses.
-     */
+  it("offers set, clear-this-key and clear-all once a key is on screen", async () => {
     stubFetch(healthy({ [ENTRY_PATH]: { json: { flowId: FLOW, key: KEY, value: 1 } } }));
-    renderScreen("operator");
-    await readTheKey();
-
-    await screen.findByTestId("flow-state-clear-key");
-    await screen.findByTestId("flow-state-clear-all");
-    expect(screen.queryByTestId("flow-state-set")).toBeNull();
-  });
-
-  it("offers an editor the set control the operator is refused", async () => {
-    stubFetch(healthy({ [ENTRY_PATH]: { json: { flowId: FLOW, key: KEY, value: 1 } } }));
-    renderScreen("editor");
+    renderScreen();
     await readTheKey();
 
     await screen.findByTestId("flow-state-set");
-  });
-
-  it("offers a viewer no flow-state write at all, even with a key on screen", async () => {
-    stubFetch(healthy({ [ENTRY_PATH]: { json: { flowId: FLOW, key: KEY, value: 1 } } }));
-    renderScreen("viewer");
-    await readTheKey();
-
-    expect(screen.queryByTestId("flow-state-set")).toBeNull();
-    expect(screen.queryByTestId("flow-state-clear-key")).toBeNull();
-    expect(screen.queryByTestId("flow-state-clear-all")).toBeNull();
+    await screen.findByTestId("flow-state-clear-key");
+    await screen.findByTestId("flow-state-clear-all");
   });
 });
 
 describe("choosing what to look at", () => {
   it("asks which imposter when the route names none", async () => {
     stubFetch({ "/imposters": { json: { imposters: [{ port: PORT, name: "checkout-api" }] } } });
-    renderInApp(<Scenarios port={null} flow={null} />, {
-      whoami: whoamiWith("viewer", ["acme"]),
-      tenants: ["acme"],
-      tenant: "acme",
-    });
+    renderInApp(<Scenarios port={null} flow={null} />);
 
     expect((await screen.findByRole("link", { name: /open/i })).getAttribute("href")).toBe(
       `#/scenarios/${PORT}`,
@@ -631,7 +545,7 @@ describe("choosing what to look at", () => {
         json: { space: "resolved-default", stubs: [], scenarios: [], numberOfRequests: 0 },
       },
     });
-    renderScreen("viewer", null);
+    renderScreen(null);
 
     // `waitFor`, not a bare `find`: the strip renders immediately with a placeholder and the
     // resolved id only lands when the scenario read does. Asserting on first paint would pass on

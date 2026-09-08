@@ -34,9 +34,29 @@ use std::time::Duration;
 
 use hyper::Method;
 use rift_cluster::{NodeId, RaftNode};
+use serde::Deserialize;
 
 use crate::cluster_api::{BindFields, health_body, members_body, op_body};
 use crate::readiness::Readiness;
+
+/// `PUT /admin/fleet/name` (issue #373): the fleet's operator-facing name.
+///
+/// Lives here rather than on the tenancy surface it was written for (#550 removed that): a fleet
+/// name is fleet state, the same kind of thing `/_fleet/*` reports, and it has no other home.
+/// The path keeps its `/admin/` spelling because it is a write on the admin surface, not a read
+/// on the `/_fleet/*` projection.
+pub(crate) const FLEET_NAME_PATH: &str = "/admin/fleet/name";
+
+/// The `PUT /admin/fleet/name` body.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct FleetNameBody {
+    /// Required, deliberately not `#[serde(default)]`: an operator who omitted the field asked
+    /// for nothing, and a blank fleet name is the confusing state this whole feature exists to
+    /// remove, not a neutral default to fall back to. A missing field is a `BadRequest`, same as
+    /// any other malformed body.
+    pub name: String,
+}
 
 /// A recognized `/_fleet/*` route.
 #[derive(Debug, Clone, PartialEq, Eq)]

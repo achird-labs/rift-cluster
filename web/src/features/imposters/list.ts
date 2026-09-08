@@ -8,7 +8,7 @@ type Imposter = components["schemas"]["Imposter"];
 /**
  * Finding, narrowing and ordering a list this console already holds.
  *
- * Client-side by construction: `GET /imposters` returns the tenant's whole set and the screen has it
+ * Client-side by construction: `GET /imposters` returns the fleet's whole set and the screen has it
  * in hand, so a server-side query parameter would add a round trip, a second source of truth for
  * "what is in this list", and a reason for the filtered count to disagree with the rendered rows.
  *

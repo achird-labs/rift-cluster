@@ -4,13 +4,7 @@ import { cleanup, render } from "@testing-library/react";
 import type { ReactElement } from "react";
 import { afterEach, vi } from "vitest";
 
-import type { components } from "../api/schema.ts";
 import { createQueryClient } from "../app/query.ts";
-import { selectableTenants } from "../app/rbac.ts";
-import { SessionProvider } from "../app/session.tsx";
-
-type WhoAmI = components["schemas"]["WhoAmI"];
-type Role = components["schemas"]["Role"];
 
 // Registered here rather than in a global `setupFiles`: only the jsdom-flavoured tests import this
 // module, and `cleanup` needs a document. Without it, every test after the first queries a body
@@ -83,46 +77,24 @@ export function stubFetch(routes: Record<string, Reply>): {
   return { calls, requests };
 }
 
-export function whoamiWith(role: Role, tenants: string[] = ["acme"]): WhoAmI {
-  return {
-    principalId: "p-test",
-    authorizationDisabled: false,
-    bindings: tenants.map((tenant) => ({ tenant, role })),
-  };
-}
-
 /**
  * Renders `ui` inside the same providers `main.tsx` mounts — the real `createQueryClient()`, not a
  * test-local one. A test client with retries and polling disabled would pass while the shipped
  * configuration polled a hidden tab forever.
+ *
+ * No session wrapper since #550: there is one credential and one identity, so a screen has no
+ * per-principal behaviour left to model. `App` decides signed-in-or-not and mounts `Shell`; a
+ * screen rendered here is already past that decision, exactly as it is in the running console.
  */
 export function renderInApp(
   ui: ReactElement,
   options: {
-    whoami: WhoAmI;
-    tenant?: string | null;
-    tenants?: string[];
     /** Pass one in to inspect the caches afterwards; otherwise the real production client is used. */
     client?: QueryClient;
-  } = {
-    whoami: whoamiWith("fleet-admin"),
-  },
+  } = {},
 ): ReturnType<typeof render> {
   const client = options.client ?? createQueryClient();
-  const tenants = options.tenants ?? [];
-  // Defaults to a tenant the principal is actually bound to, because that is what `App` resolves to
-  // and what the operator sees. Defaulting to `null` would model a session with no selection, which
-  // lands in `default` — a tenant these fixtures are deliberately not bound to — so every test would
-  // silently be exercising an unbound principal.
-  const initialTenant =
-    options.tenant === undefined ? (selectableTenants(options.whoami)[0] ?? null) : options.tenant;
-  return render(
-    <QueryClientProvider client={client}>
-      <SessionProvider whoami={options.whoami} tenants={tenants} initialTenant={initialTenant}>
-        {ui}
-      </SessionProvider>
-    </QueryClientProvider>,
-  );
+  return render(<QueryClientProvider client={client}>{ui}</QueryClientProvider>);
 }
 
 /** Drive the browser's own tab-visibility signal, which is what the polling gate listens to. */

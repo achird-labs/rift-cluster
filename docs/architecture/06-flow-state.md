@@ -26,17 +26,13 @@ the store from `ContextScope` (`_rift.flowState.contextScope`) and the port.
 | Scope | Prefix | Meaning |
 |---|---|---|
 | `imposter` (default) | `i<port>:` | Per-imposter namespace — the single-node semantics, restored |
-| `tenant` (#288) | `t<tenant>:` | One namespace per tenant, across that tenant's imposters — never reachable from another tenant's |
-| `fleet` | `f:` | One namespace fleet-wide — imposters deliberately share contexts across tenants; admission requires `FleetAdmin` |
+| `fleet` | `f:` | One namespace fleet-wide — imposters deliberately share contexts |
 
-The tenant arm has one wrinkle the other two do not: the tenant is not in
-`ImposterConfig` (RFC-002 keeps it on the control-plane record, invisible to
-the core schema). The provider therefore resolves it once, at `provide` time,
-from the state machine's owner of the port — ports are fleet-unique across
-tenants, so port → tenant is a function — and a store whose tenant cannot be
-resolved renders `t??:`, its own defensive namespace, never a real tenant's and
-never the fleet's (the same rule the portless `i?:` arm follows; a tenant id
-cannot contain `?`, so the placeholder is unreachable by any admitted tenant).
+> **Amended by D-73** (RFC-007 §3.2, #550): the third scope, `tenant` (`t<tenant>:`), left with
+> tenancy. A config declaring it is **refused at admission by name**, with a `400` citing #550 and
+> the two values that remain — never aliased to either, because folding it into one would change
+> which imposters share flow state without saying so. `fleet` is no longer gated by a role either:
+> there is one administrator, so there is no boundary for a fleet-wide namespace to cross.
 
 Two properties make this the right seam:
 
@@ -50,33 +46,22 @@ Two properties make this the right seam:
   than passing ids through bare, so a caller-chosen id that happens to look like
   `i6400:cart` still cannot address imposter 6400's `cart`.
 
-`f:` is disjoint from `i<port>:`, but it is **not** per-tenant: the prefix carries
-no tenant component, and one `FlowNet` shard serves every imposter on a node. So
-two tenants that both opt into `fleet` share one namespace and can read or
-overwrite each other's flow state by naming the same id. That is inherent to what
-`fleet` means — a fleet-wide namespace by design; tenant isolation is what
-`tenant` scope is for — which is why admitting a config that sets it requires
-`FleetAdmin` (RFC-005 §S1, issue #288): the admin front refuses any other
-principal's client-supplied config carrying the knob with a `400` before
-anything commits. Under the open
-admin plane (no principal) nothing gates, as nothing else does. The gate is on
-*setting* the scope: a stub edit on an admitted fleet-scoped imposter is not
-gated, and a store built before its config row is visible renders `t??:` only
-until the next op resolves the tenant.
+`f:` is disjoint from `i<port>:`, but it names no narrower owner: the prefix
+carries nothing but the tag, and one `FlowNet` shard serves every imposter on a
+node. So every imposter that opts into `fleet` shares one namespace and can read
+or overwrite another's flow state by naming the same id. That is inherent to what
+`fleet` means — a fleet-wide namespace by design — and it is why `imposter` is
+the default. Choosing `fleet` is a deliberate act by the one administrator; it
+used to require a `FleetAdmin` role, which stopped meaning anything when there
+stopped being roles (#550).
 
-The consequence for admin surfaces is the part worth stating, because it is not
-obvious from the table: **a fleet-scoped imposter's spaces are not enumerable
-per-imposter, except by a `FleetAdmin`.** `GET /imposters/{port}/spaces` (issue
-#374) refuses them for every other caller with `unavailable: "fleet-scope"` rather
-than scanning `f:`, which would hand one tenant another tenant's flow ids, entry
-counts and owning nodes; a `FleetAdmin` binding — whose whole role is to cross
-every tenant's boundary — is served the real fleet-wide list (#288). Reading a
-*named* space (`GET .../spaces/{flowId}`) is unaffected: it answers about an id
-the caller already holds, whereas a listing is what turns "know the id" into
-"enumerate them", and flow ids routinely come from request headers
-(`flowIdSource: header:X-Session`), so the ids themselves can carry customer
-identifiers. A `tenant`-scoped imposter's listing is served to its tenant: the
-`t<tenant>:` prefix bounds the scan by construction.
+`GET /imposters/{port}/spaces` (issue #374) therefore **serves** a fleet-scoped
+imposter's listing. It used to refuse one with `unavailable: "fleet-scope"`,
+because scanning `f:` would have handed one tenant another tenant's flow ids,
+entry counts and owning nodes — a real concern that no longer has a subject.
+The one refusal that remains is `scope-unresolved`: an imposter whose own config
+cannot be read or parsed has an unknown namespace, and guessing would risk
+scanning the wrong one and reporting it complete.
 
 It also settles a limitation the durable tier records below: a repair path could
 not previously tell which imposter a `flow_id` belonged to. Now the id says.
@@ -239,7 +224,7 @@ flow_meta: flow_id        → { last_touch }                  // TTL + LRU sweep
 
 `flow_meta` carries `last_touch` and nothing else: TTL and LRU both order by it, and neither needs
 a count. An entry count is therefore not a stored figure — it is the size of the flow's in-memory
-mirror, which is what the per-tenant usage fan-out (#372) reads. In memory the LRU order is
+mirror, which is what the usage fan-out (#372) reads. In memory the LRU order is
 `(last_touch, touch_seq)` (#408): `last_touch` is millisecond wall-clock and bursty writes tie
 on it, so a process-wide touch sequence breaks the tie — the victim among tied flows is the least
 recently touched, never a flow a caller is mid-write on. The sequence is not persisted; recovery

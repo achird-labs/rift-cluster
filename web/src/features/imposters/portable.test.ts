@@ -7,7 +7,7 @@ import {
   PROJECTION_OPTIONS,
   exportOptionsQuery,
   exportQuery,
-  exportSetFilename,
+  EXPORT_SET_FILENAME,
   importPlan,
   parseImportDocument,
   renderSetDocument,
@@ -63,8 +63,7 @@ describe("export projections", () => {
   it("names the file by port, and by name when there is one", () => {
     expect(exportFilename(4545, "billing")).toBe("imposter-4545-billing.json");
     expect(exportFilename(4545, undefined)).toBe("imposter-4545.json");
-    expect(exportSetFilename("acme")).toBe("imposters-acme.json");
-    expect(exportSetFilename(null)).toBe("imposters.json");
+    expect(EXPORT_SET_FILENAME).toBe("imposters.json");
   });
 
   it("keeps a name with awkward characters usable as a filename", () => {

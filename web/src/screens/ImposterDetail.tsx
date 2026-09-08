@@ -13,7 +13,6 @@ import {
   useImposter,
   useTryStub,
 } from "../app/queries.ts";
-import { useSession } from "../app/session.tsx";
 import { toHash, useHashQuery } from "../app/routing.ts";
 import { DetailRail } from "../components/detailRail.tsx";
 import { Pending } from "../components/pending.tsx";
@@ -81,15 +80,11 @@ const DETAIL_FIELDS: readonly Pick<ImposterColumn, "key" | "label">[] = [
  * revision travels from this read into the editor and no further logic is allowed to invent one.
  */
 export function ImposterDetail({ port }: { port: number }): ReactNode {
-  const { can, tenant } = useSession();
   const imposter = useImposter(port);
   const [editing, setEditing] = useState<StubTarget | null>(null);
   const [cloning, setCloning] = useState(false);
-  const mayWrite = can("imposter.write");
-  const mayRead = can("imposter.read");
-  // Only to annotate this port's place on the ring. A principal without the fleet scope gets the
-  // rail without the epoch, never a 404 on a screen whose own read succeeded.
-  const fleet = useFleetView({ enabled: can("fleet.read") });
+  // Only to annotate this port's place on the ring.
+  const fleet = useFleetView();
 
   // In the hash query so a tab is linkable and survives a reload, the same rule the imposter
   // list's filters follow. An unknown value falls back rather than throwing: a stale bookmark
@@ -110,8 +105,8 @@ export function ImposterDetail({ port }: { port: number }): ReactNode {
 
   return (
     <section className="screen">
-      {/* The name and port together, then the identity line under them —
-          tenant and revision, which are the two things an operator checks before editing. */}
+      {/* The name and port together, then the revision under them — what an operator checks
+          before editing. */}
       <header className="screen-head detail-head">
         <a className="btn" href={toHash({ screen: "imposters" })}>
           &larr; Imposters
@@ -121,26 +116,18 @@ export function ImposterDetail({ port }: { port: number }): ReactNode {
             {name ?? UNNAMED} <Ident>{port}</Ident>
           </h1>
           <p className="scope-label">
-            tenant <Ident>{tenant ?? "—"}</Ident>
-            {revision === null ? null : (
-              <>
-                {" · "}
-                <Ident>{revision}</Ident>
-              </>
-            )}
+            {revision === null ? "no revision" : <Ident>{revision}</Ident>}
           </p>
         </div>
         <div className="spacer" />
-        {mayWrite ? (
-          <button
-            className="btn"
-            type="button"
-            data-testid="clone-imposter"
-            onClick={() => setCloning(true)}
-          >
-            Duplicate
-          </button>
-        ) : null}
+        <button
+          className="btn"
+          type="button"
+          data-testid="clone-imposter"
+          onClick={() => setCloning(true)}
+        >
+          Duplicate
+        </button>
       </header>
 
       <DetailTabs current={tab} onPick={setTab} />
@@ -153,7 +140,6 @@ export function ImposterDetail({ port }: { port: number }): ReactNode {
           {cloning ? (
             <CloneImposter
               port={port}
-              tenant={tenant}
               onDone={() => setCloning(false)}
               onCancel={() => setCloning(false)}
             />
@@ -169,7 +155,6 @@ export function ImposterDetail({ port }: { port: number }): ReactNode {
                   port={port}
                   imposter={imposter.data.data}
                   revision={imposter.data.revision}
-                  mayWrite={mayWrite}
                   editing={editing}
                   onEdit={setEditing}
                 />
@@ -187,9 +172,7 @@ export function ImposterDetail({ port }: { port: number }): ReactNode {
           {tab === "settings" ? (
             <>
               <RiftKnobs imposter={imposter.data.data} />
-              {mayRead ? (
-                <ExportImposterControl port={port} name={imposter.data.data.name} tenant={tenant} />
-              ) : null}
+              <ExportImposterControl port={port} name={imposter.data.data.name} />
               <dl className="tiles">
                 {DETAIL_FIELDS.map((field) => (
                   <div key={field.key} className="tile">
@@ -302,7 +285,7 @@ function OwnershipTab({
               {fleet === undefined ? (
                 <Pending
                   issue={361}
-                  reason="The fleet projection is scoped to fleet.read, and this principal is refused it."
+                  reason="This node served no fleet projection, so there is nothing to read the epoch from."
                 />
               ) : (
                 <Ident>{fleet.ringEpoch}</Ident>
@@ -322,7 +305,7 @@ function OwnershipTab({
           {fleet === undefined ? (
             <Pending
               issue={369}
-              reason="The fleet projection is scoped to fleet.read, and this principal is refused it."
+              reason="This node served no fleet projection, so there is nothing to read the epoch from."
             />
           ) : (
             <ul className="bind-status-list">
@@ -378,18 +361,11 @@ function BindStatusValue({ status }: { status: BindState }): ReactNode {
  * one: an operator about to do something irreversible should see the whole set, because the
  * question "is this the one I want" is only answerable next to the alternatives.
  *
- * Each is gated on the capability that authorizes the call rather than on a blanket "may write" —
- * `rbac.ts` makes the point that transcribing the real action is what stops the table going stale.
  */
 function DangerZone({ port, name }: { port: number; name: string | undefined }): ReactNode {
-  const { can } = useSession();
   const clear = useClearRequests();
   const remove = useDeleteImposter();
   const [confirming, setConfirming] = useState<"clear" | "delete" | null>(null);
-
-  const mayClear = can("requests.clear");
-  const mayDelete = can("imposter.delete");
-  if (!mayClear && !mayDelete) return null;
 
   return (
     <div className="card danger-zone" data-testid="danger-zone">
@@ -400,26 +376,22 @@ function DangerZone({ port, name }: { port: number; name: string | undefined }):
           it.
         </p>
         <div className="row">
-          {mayClear ? (
-            <button
-              className="btn danger"
-              type="button"
-              data-testid="danger-clear-requests"
-              onClick={() => setConfirming("clear")}
-            >
-              Clear recorded requests
-            </button>
-          ) : null}
-          {mayDelete ? (
-            <button
-              className="btn danger"
-              type="button"
-              data-testid="danger-delete-imposter"
-              onClick={() => setConfirming("delete")}
-            >
-              Delete imposter
-            </button>
-          ) : null}
+          <button
+            className="btn danger"
+            type="button"
+            data-testid="danger-clear-requests"
+            onClick={() => setConfirming("clear")}
+          >
+            Clear recorded requests
+          </button>
+          <button
+            className="btn danger"
+            type="button"
+            data-testid="danger-delete-imposter"
+            onClick={() => setConfirming("delete")}
+          >
+            Delete imposter
+          </button>
         </div>
       </div>
 
@@ -545,11 +517,9 @@ function RiftKnobs({ imposter }: { imposter: Imposter }): ReactNode {
 function ExportImposterControl({
   port,
   name,
-  tenant,
 }: {
   port: number;
   name: string | undefined;
-  tenant: string | null;
 }): ReactNode {
   const [busy, setBusy] = useState<ExportProjection | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -565,7 +535,7 @@ function ExportImposterControl({
        * `_links` naming the serving node. Unstable across exports, and it would put captured
        * credentials into a file this screen tells the operator to commit. See `portable.ts`.
        */
-      const setText = await apiGetText(`/imposters${exportQuery(projection)}`, { tenant });
+      const setText = await apiGetText(`/imposters${exportQuery(projection)}`);
       const selected = selectImposter(setText, port);
       if (selected.kind === "error") throw new Error(selected.message);
       const text = selected.text;
@@ -624,12 +594,10 @@ function ExportImposterControl({
  */
 function CloneImposter({
   port,
-  tenant,
   onDone,
   onCancel,
 }: {
   port: number;
-  tenant: string | null;
   onDone: () => void;
   onCancel: () => void;
 }): ReactNode {
@@ -652,7 +620,7 @@ function CloneImposter({
       // Same reason as the export above: the per-port route would hand back the request journal and
       // `_links`, and `{ ...source }` would copy both into the new imposter — exactly what the
       // dialog promises does NOT happen.
-      const setText = await apiGetText(`/imposters${exportQuery("as-configured")}`, { tenant });
+      const setText = await apiGetText(`/imposters${exportQuery("as-configured")}`);
       const selected = selectImposter(setText, port);
       if (selected.kind === "error") throw new Error(selected.message);
       const text = selected.text;
@@ -731,14 +699,12 @@ function Stubs({
   port,
   imposter,
   revision,
-  mayWrite,
   editing,
   onEdit,
 }: {
   port: number;
   imposter: Imposter;
   revision: string | null;
-  mayWrite: boolean;
   editing: StubTarget | null;
   onEdit: (target: StubTarget | null) => void;
 }): ReactNode {
@@ -758,12 +724,7 @@ function Stubs({
      * an operator opened a stub to change it.
      */
     <div className="stub-workspace">
-      <StubList
-        stubs={stubs}
-        editing={editing}
-        mayWrite={mayWrite}
-        onEdit={onEdit}
-      />
+      <StubList stubs={stubs} editing={editing} onEdit={onEdit} />
 
       <div className="stub-pane">
       {open ? (
@@ -791,7 +752,6 @@ function Stubs({
           port={port}
           stubs={stubs}
           revision={revision}
-          mayWrite={mayWrite}
           onEdit={onEdit}
         />
       )}
@@ -811,12 +771,10 @@ function Stubs({
 function StubList({
   stubs,
   editing,
-  mayWrite,
   onEdit,
 }: {
   stubs: Stub[] | undefined;
   editing: StubTarget | null;
-  mayWrite: boolean;
   onEdit: (target: StubTarget | null) => void;
 }): ReactNode {
   const entries = matchOrder(stubs);
@@ -872,16 +830,14 @@ function StubList({
         </ol>
       )}
 
-      {mayWrite ? (
-        <button
-          type="button"
-          className="stub-list-add"
-          data-testid="stub-list-add"
-          onClick={() => onEdit({ kind: "new" })}
-        >
-          + add stub
-        </button>
-      ) : null}
+      <button
+        type="button"
+        className="stub-list-add"
+        data-testid="stub-list-add"
+        onClick={() => onEdit({ kind: "new" })}
+      >
+        + add stub
+      </button>
     </aside>
   );
 }
@@ -890,13 +846,11 @@ function StubTable({
   port,
   stubs,
   revision,
-  mayWrite,
   onEdit,
 }: {
   port: number;
   stubs: Stub[] | undefined;
   revision: string | null;
-  mayWrite: boolean;
   onEdit: (target: StubTarget) => void;
 }): ReactNode {
   if (stubs === undefined) {
@@ -924,7 +878,7 @@ function StubTable({
           <th className="numeric">Predicates</th>
           <th className="numeric">Responses</th>
           <th>Try</th>
-          {mayWrite ? <th>Actions</th> : null}
+          <th>Actions</th>
         </tr>
       </thead>
       <tbody>
@@ -948,31 +902,20 @@ function StubTable({
             <td className="numeric">
               <Ident>{stub.responses?.length ?? UNKNOWN}</Ident>
             </td>
-            {/*
-              Its own cell, always present. Copying a curl is a READ — it exercises the mock rather
-              than changing it — so gating it on `mayWrite` would deny the try-it affordance to
-              exactly the role most likely to be diagnosing why a stub is not matching.
-            */}
             <td>
               <CopyCurlButton port={port} stub={stub} />
               <TryStubButton port={port} stub={stub} />
             </td>
-            {mayWrite ? (
-              <td>
-                <StubActions port={port} stub={stub} revision={revision} onEdit={onEdit} />
-              </td>
-            ) : null}
+            <td>
+              <StubActions port={port} stub={stub} revision={revision} onEdit={onEdit} />
+            </td>
           </tr>
         ))}
       </tbody>
     </table>
       </div>
-      {/*
-        Once, under the table — not once per row. Gated on `mayWrite` as well as on the stubs
-        themselves: a viewer has no Actions column at all, so an explanation of why a button they
-        cannot see is disabled would be answering a question they never asked.
-      */}
-      {mayWrite && stubs.some((stub) => stub.id === undefined) ? (
+      {/* Once, under the table — not once per row. */}
+      {stubs.some((stub) => stub.id === undefined) ? (
         <p className="hint" id={IDLESS_NOTE_ID} data-testid={IDLESS_NOTE_ID}>
           {IDLESS_REASON}
         </p>
@@ -1094,12 +1037,10 @@ function tryEnvelope(sample: Sample): TrySpec {
 }
 
 function TryStubButton({ port, stub }: { port: number; stub: Stub }): ReactNode {
-  const { can } = useSession();
   const send = useTryStub(port);
 
   const projection = projectPredicates(stub);
-  const mayTry = can("imposter.try");
-  if (!mayTry || projection.kind !== "predicates") return null;
+  if (projection.kind !== "predicates") return null;
 
   const sample = sampleRequest(projection.items);
   const key = stub.id ?? "unnamed";

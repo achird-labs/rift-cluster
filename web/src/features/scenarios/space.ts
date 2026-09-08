@@ -60,11 +60,11 @@ export type SpaceState = { kind: "space"; space: Space } | { kind: "unknown"; re
  * One flow-state entry's read, as the **three** outcomes it actually has.
  *
  * The middle case is the one worth naming. `getFlowStateEntry` documents `404` as "no such entry",
- * so an absent key is an ordinary domain answer rather than a failure — but RFC-002 §8.4 renders
- * `NotBoundToTenant` as `404` as well, and a `404` for "no such imposter" is in the same status.
- * A screen that renders every 404 as "not set" would tell an operator their key is unset when the
- * truth may be that they are reading someone else's imposter. So `absent` states what the status
- * licenses and no more, and `readFlowStateEntry` is the only place that reasoning lives.
+ * so an absent key is an ordinary domain answer rather than a failure — but a `404` for "no such
+ * imposter" arrives in the same status. A screen that renders every 404 as "not set" would tell an
+ * operator their key is unset when the truth may be that the imposter itself is gone. So `absent`
+ * states what the status licenses and no more, and `readFlowStateEntry` is the only place that
+ * reasoning lives.
  */
 export type FlowStateRead =
   | { kind: "value"; entry: FlowStateEntry }
@@ -187,20 +187,20 @@ export type SpaceDurability = { value: "none" | "async" | "sync"; source: "defau
 /**
  * Why a listing was refused outright rather than merely incomplete (#374).
  *
- * Both reasons imply `spaces: []` and `partial: true`, but they are not one fact wearing two
- * names — a caller that only checked `partial` could not tell "some node was slow, try again"
- * from "this scope cannot ever be listed", and the screen owes an operator a different sentence
- * for each:
+ * It implies `spaces: []` and `partial: true`, but it is not the same fact as `partial` alone: a
+ * caller that only checked `partial` could not tell "some node was slow, try again" from "this
+ * node will not attempt the listing at all", and the screen owes an operator a different sentence
+ * for each.
  *
- * - `"fleet-scope"`: the imposter's `contextScope` is `"fleet"`, whose `f:` namespace carries no
- *   tenant component — listing it would either scan nothing (wrong prefix) or leak every other
- *   tenant's fleet-scoped flows (right prefix, no filter). A policy refusal, not a failure: it
- *   will not improve on a retry.
+ * One reason left. `"fleet-scope"` was the other — a fleet-scoped imposter's `f:` namespace
+ * carried no tenant component, so listing it would have leaked every other tenant's flows. #550
+ * removed tenancy, so there is nothing to leak across and the server dropped the variant.
+ *
  * - `"scope-unresolved"`: the imposter's own flow-state config could not be read or parsed, so
  *   which scope it holds is unknown and guessing would enumerate the wrong namespace. Transient —
  *   a retry may succeed once the node catches up or the config is fixed.
  */
-export type SpaceListUnavailable = "fleet-scope" | "scope-unresolved";
+export type SpaceListUnavailable = "scope-unresolved";
 
 /**
  * `listSpaces`'s body: every space this imposter holds, fleet-wide.
@@ -268,11 +268,7 @@ export function readSpaceList(body: unknown): SpaceListState {
   // is not this console's business to guess at, and reading it as `null` ("no reason given") would
   // let a future server-side reason silently fall back to the generic partial banner instead of
   // surfacing as the unrecognised body it actually is.
-  if (
-    payload.unavailable !== undefined &&
-    payload.unavailable !== "fleet-scope" &&
-    payload.unavailable !== "scope-unresolved"
-  ) {
+  if (payload.unavailable !== undefined && payload.unavailable !== "scope-unresolved") {
     return {
       kind: "unknown",
       reason: "this node answered with an unrecognised reason the listing was unavailable",

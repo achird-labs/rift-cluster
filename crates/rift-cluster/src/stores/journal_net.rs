@@ -383,7 +383,7 @@ fn advanced_by(cursor: &JournalCursor, entry: &ShardEntry) -> JournalCursor {
 pub struct Coverage {
     /// Ports this page walked, ascending.
     pub covered: Vec<u16>,
-    /// Ports the cap excluded, ascending. Empty whenever the tenant owns no more ports than the cap.
+    /// Ports the cap excluded, ascending. Empty whenever the fleet holds no more ports than the cap.
     pub omitted: Vec<u16>,
 }
 
@@ -1099,12 +1099,12 @@ impl JournalNet {
     ///
     /// **Only covered ports are touched.** `read_shard_since` creates a port's shard on first
     /// touch, and [`ClusterJournal::known_ports`] is what drives the tick's `peers x ports` fan-out
-    /// — so touching every port a tenant owns would enroll all of them in the tick and make the
+    /// — so touching every port the fleet holds would enroll all of them in the tick and make the
     /// fleet's inter-node traffic grow with imposter count. Ranking therefore peeks
     /// ([`ClusterJournal::newest_timestamp`], which does *not* create) and only the covered set is
     /// walked, keeping enrollment bounded by `cap`.
     ///
-    /// The visible consequence, which the answer declares rather than hides: in a tenant that owns
+    /// The visible consequence, which the answer declares rather than hides: in a fleet that holds
     /// more than `cap` ports, a port with no recorded traffic ranks stale and is omitted — and an
     /// omitted port is named in [`Coverage::omitted`], never silently dropped.
     #[must_use]

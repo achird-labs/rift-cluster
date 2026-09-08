@@ -87,10 +87,7 @@ fn an_exhausted_block_panics_rather_than_reusing_a_port() {
 #[test]
 fn a_seen_response_reports_status_cluster_headers_and_body() {
     let mut headers = HeaderMap::new();
-    headers.insert(
-        "rift-cluster-revision",
-        HeaderValue::from_static("default:1@7"),
-    );
+    headers.insert("rift-cluster-revision", HeaderValue::from_static("1@7"));
     headers.insert("content-type", HeaderValue::from_static("application/json"));
 
     let rendered = Seen {
@@ -102,7 +99,7 @@ fn a_seen_response_reports_status_cluster_headers_and_body() {
 
     assert!(rendered.contains("404"), "{rendered}");
     assert!(
-        rendered.contains("rift-cluster-revision: default:1@7"),
+        rendered.contains("rift-cluster-revision: 1@7"),
         "the header that names the failure mode must survive into the message: {rendered}"
     );
     assert!(rendered.contains("not found"), "{rendered}");

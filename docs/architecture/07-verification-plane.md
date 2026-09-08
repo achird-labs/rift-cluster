@@ -225,8 +225,8 @@ holds — so this is specific to handing out a token per event.
 ### Across every imposter at once (issue #362)
 
 The same walk again, one level up: `GET /admin/requests` and
-`GET /admin/requests/stream` serve across **every imposter the caller's tenant
-owns** what the two routes above serve for one. Both terminate at the front —
+`GET /admin/requests/stream` serve across **every imposter the fleet has
+applied** what the two routes above serve for one. Both terminate at the front —
 there is no upstream fleet surface to proxy to, and a per-node one could not
 answer for a fleet anyway.
 
@@ -251,7 +251,7 @@ its own version namespace and a scope tag, so a per-imposter token presented her
 misread as a position. The pre-#223 bare scalar is refused here too: it names a
 position in no port in particular.
 
-**The cap is the honest part (D-32).** A tenant can own more imposters than one
+**The cap is the honest part (D-32).** A fleet can hold more imposters than one
 answer can carry, so coverage ranks ports by their most recent recorded entry and
 keeps `--cluster-fleet-journal-port-cap` of them (default 100). What it leaves
 out it *names*: every response carries `coverage: {covered, total, omitted,
@@ -279,21 +279,14 @@ splicing them into one seq-sorted list would push a port's high-water mark past
 entries it never emitted. `fleet_stream_order` keys on the pair; a test
 mutation-verifies that collapsing the key is caught.
 
-**Scope is the tenant, not the fleet**, which is what keeps the `/events`
-asymmetry below coherent. The port set is `tenant_owned_ports` on applied state,
-so another tenant's imposter cannot enter the walk at all — ownership by
-construction rather than by check, which is why these two routes carry neither a
-per-port ownership gate nor a FleetAdmin one, and are authorized as the ordinary
-`imposter.read` the per-imposter read already is.
+**The port set is the fleet's**, re-resolved from applied state on every read and
+on every drain of a stream — never frozen at connect, because an imposter created
+after the connect belongs in the walk and a deleted one does not.
 
-**`GET /events` stays proxied per-node and FleetAdmin-gated**, and the asymmetry
-is deliberate: its payload spans every tenant and is not yet filtered
-server-side, so the gate is stricter than RFC-002 §4.2 asks until #163 lands the
-filtering. The per-port tail is different in kind — it carries one imposter's
-requests and is authorized as the ordinary port-scoped `imposter.read` it always
-was. Terminating it changed no authorization posture at all. (Earlier revisions
-of this chapter described *both* streams as FleetAdmin-gated; only the firehose
-ever was.)
+**`GET /events` stays proxied per-node.** It is upstream's own firehose, answered
+by whichever node the request reached; this front merges the *per-port* tail
+instead, which is what the routes above are. The asymmetry is that one is
+upstream's surface and the other is this crate's.
 
 ## proxyOnce: exactly-once recording via an owner claim
 

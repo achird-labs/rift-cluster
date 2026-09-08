@@ -395,7 +395,7 @@ impl FlowShard {
     }
 
     /// A snapshot of every held flow's live entry count, keyed by its
-    /// (already scoped) flow id — the per-tenant usage rollup's building
+    /// (already scoped) flow id — the usage rollup's building
     /// block (#372).
     ///
     /// Counts only what [`Self::get`] would also serve: not-yet-expired AND

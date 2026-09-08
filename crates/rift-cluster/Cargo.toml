@@ -38,7 +38,6 @@ subtle.workspace = true
 rand.workspace = true
 parking_lot.workspace = true
 arc-swap.workspace = true
-argon2.workspace = true
 
 openraft.workspace = true
 redb.workspace = true

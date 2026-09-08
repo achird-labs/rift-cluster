@@ -34,10 +34,11 @@ code = ["crates/rift-cluster/src/**"]
 note = "v3.2. §7.1/§7.2/§7.4 superseded by D-15 (gossip → Raft); Appendix C is now a pointer to the register."
 
 ["docs/rfc/RFC-002-multi-tenancy-and-rbac.md"]
-status = "current"
+status = "superseded"
 verified_sha = ""
 verified_on = ""
-code = ["crates/rift-cluster-server/src/authz.rs", "crates/rift-cluster-server/src/principal.rs", "crates/rift-cluster-server/src/tenancy.rs", "crates/rift-cluster-server/src/authorizer.rs", "crates/rift-cluster-server/src/admin_front.rs"]
+code = []
+note = "Superseded in full by D-73 (RFC-007 §3.2, #550): tenants, principals, bindings, roles and quotas no longer exist; its audit half went with D-71 (#546). Retained as history; describes no code."
 
 ["docs/rfc/RFC-004-spec-driven-mocking.md"]
 status = "amended"
@@ -54,10 +55,11 @@ code = []
 note = "Superseded in full by D-71 (RFC-007 §3.2, #549): data sources, datasets and the blob store no longer exist. Retained as history; describes no code."
 
 ["docs/rfc/RFC-006-web-console-and-mcp.md"]
-status = "current"
+status = "amended"
 verified_sha = ""
 verified_on = ""
 code = ["web/src/**", "crates/rift-cluster-server/src/console.rs", "crates/rift-cluster-server/src/session.rs", "crates/rift-cluster-server/src/fleet.rs"]
+note = "§4, §5.3, §8.3, §8.4, §9.2 and §9.3 amended by D-73 (#550) and carry callouts; §8 as a whole is retired by D-71 (#547)."
 
 ["docs/rfc/RFC-007-distributed-core.md"]
 status = "current"
@@ -80,9 +82,10 @@ code = ["crates/rift-cluster-server/src/compose.rs"]
 
 ["docs/architecture/03-control-plane.md"]
 status = "current"
-verified_sha = "1a7b52b78"
-verified_on = "2026-08-26"
-code = ["crates/rift-cluster/src/raft/**"]
+verified_sha = ""
+verified_on = ""
+code = ["crates/rift-cluster/src/raft/**", "crates/rift-cluster/src/rpc/**"]
+note = "Gained chapter 8's cluster-internal security section in #550 (D-73), hence the added rpc glob."
 
 ["docs/architecture/04-write-path.md"]
 status = "current"
@@ -97,7 +100,7 @@ verified_on = "2026-08-28"
 code = ["crates/rift-cluster/src/stores/flow.rs", "crates/rift-cluster/src/stores/shard.rs"]
 
 ["docs/architecture/06-flow-state.md"]
-status = "current"
+status = "amended"
 verified_sha = "0135ae018"
 verified_on = "2026-09-07"
 code = ["crates/rift-cluster/src/stores/flow.rs", "crates/rift-cluster/src/stores/flow_config.rs", "crates/rift-cluster/src/stores/shard.rs", "crates/rift-cluster/src/raft/ring.rs"]
@@ -109,10 +112,11 @@ verified_on = "2026-08-29"
 code = ["crates/rift-cluster/src/stores/journal.rs", "crates/rift-cluster/src/stores/journal_net.rs", "crates/rift-cluster/src/stores/journal_seq.rs", "crates/rift-cluster/src/stores/proxy.rs"]
 
 ["docs/architecture/08-tenancy-security.md"]
-status = "current"
-verified_sha = "9e0433dd0"
-verified_on = "2026-08-25"
-code = ["crates/rift-cluster-server/src/authz.rs", "crates/rift-cluster-server/src/principal.rs", "crates/rift-cluster-server/src/tenancy.rs", "crates/rift-cluster-server/src/session.rs", "crates/rift-cluster/src/rpc/**"]
+status = "superseded"
+verified_sha = ""
+verified_on = ""
+code = []
+note = "Retired by D-71/D-73 (#550). Its two non-tenancy sections were moved out: the cluster port's peer secret to 03-control-plane.md, and /_fleet/*, PUT /admin/fleet/name and the console session exchange to 10-operations.md. The rest is history; describes no code."
 
 ["docs/architecture/09-durability-failure.md"]
 status = "current"
@@ -122,9 +126,10 @@ code = ["crates/rift-cluster/src/raft/store.rs", "crates/rift-cluster/src/stores
 
 ["docs/architecture/10-operations.md"]
 status = "current"
-verified_sha = "550ea954e"
-verified_on = "2026-08-26"
-code = ["crates/rift-cluster-server/src/cli.rs", "crates/rift-cluster-server/src/probes.rs", "crates/rift-cluster-server/src/readiness.rs", "deploy/**"]
+verified_sha = ""
+verified_on = ""
+code = ["crates/rift-cluster-server/src/cli.rs", "crates/rift-cluster-server/src/probes.rs", "crates/rift-cluster-server/src/readiness.rs", "crates/rift-cluster-server/src/fleet.rs", "crates/rift-cluster-server/src/session.rs", "deploy/**"]
+note = "Gained chapter 8's admin-credential, session-exchange and /_fleet/* sections in #550 (D-73), hence the added fleet.rs/session.rs globs."
 
 ["docs/architecture/11-upstream-boundary.md"]
 status = "current"
@@ -139,11 +144,11 @@ verified_on = "2026-08-29"
 code = ["tests/cluster-chaos/**", "crates/rift-cluster/tests/**"]
 
 ["docs/architecture/13-front-door-and-sources.md"]
-status = "current"
+status = "amended"
 verified_sha = "9e0433dd0"
 verified_on = "2026-08-25"
 code = []
-note = "The front-door chapter. Its sources half was retired by D-71 (#549); the file keeps its name until #554 renames it."
+note = "The front-door chapter. Its sources half was retired by D-71 (#549) and its tenancy half by D-73 (#550); the file keeps its name until #554 renames it."
 
 ["docs/architecture/14-cloud-deployment.md"]
 status = "current"
@@ -158,7 +163,8 @@ verified_on = "2026-08-25"
 code = ["deploy/**"]
 
 ["docs/design/console/README.md"]
-status = "current"
-verified_sha = "9e0433dd0"
-verified_on = "2026-08-25"
+status = "amended"
+verified_sha = ""
+verified_on = ""
 code = ["web/src/**"]
+note = "The Administration screen and the route table's not-installed treatment are retired by D-73 (#550) and carry callouts; the prototype HTML is a design artifact and still renders them."

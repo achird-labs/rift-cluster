@@ -5,7 +5,7 @@ import { describe, expect, it, vi } from "vitest";
 
 import { createQueryClient } from "../app/query.ts";
 import { ImposterDetail } from "../screens/ImposterDetail.tsx";
-import { type Reply, renderInApp, stubFetch, whoamiWith } from "./harness.tsx";
+import { type Reply, renderInApp, stubFetch } from "./harness.tsx";
 
 /**
  * Issue #335: the console's Send button.
@@ -62,7 +62,7 @@ async function send(): Promise<void> {
 describe("the Send button", () => {
   it("posts the request derived from the stub's own predicates", async () => {
     const { requests } = fleet(ANSWERED);
-    renderInApp(<ImposterDetail port={PORT} />, { whoami: whoamiWith("operator") });
+    renderInApp(<ImposterDetail port={PORT} />);
 
     await send();
 
@@ -82,7 +82,7 @@ describe("the Send button", () => {
 
   it("shows the status, headers and body the imposter answered", async () => {
     fleet(ANSWERED);
-    renderInApp(<ImposterDetail port={PORT} />, { whoami: whoamiWith("operator") });
+    renderInApp(<ImposterDetail port={PORT} />);
 
     await send();
 
@@ -100,7 +100,7 @@ describe("the Send button", () => {
     fleet({
       json: { status: 404, headers: [], body: "no such route", elapsedMs: 2 },
     });
-    renderInApp(<ImposterDetail port={PORT} />, { whoami: whoamiWith("operator") });
+    renderInApp(<ImposterDetail port={PORT} />);
 
     await send();
 
@@ -114,7 +114,7 @@ describe("the Send button", () => {
     // A 502 means the exchange never happened. Showing it in the response panel as "status 502"
     // would tell the operator their mock returned 502, which is a different bug to chase.
     fleet({ status: 502, json: { code: "backend-unavailable", message: "could not reach it" } });
-    renderInApp(<ImposterDetail port={PORT} />, { whoami: whoamiWith("operator") });
+    renderInApp(<ImposterDetail port={PORT} />);
 
     await send();
 
@@ -126,7 +126,7 @@ describe("the Send button", () => {
     fleet({
       json: { status: 200, headers: [], body: "xxx", truncated: true, elapsedMs: 1 },
     });
-    renderInApp(<ImposterDetail port={PORT} />, { whoami: whoamiWith("operator") });
+    renderInApp(<ImposterDetail port={PORT} />);
 
     await send();
 
@@ -139,7 +139,7 @@ describe("the Send button", () => {
     fleet({
       json: { status: 200, headers: [], body: "��", bodyLossy: true, elapsedMs: 1 },
     });
-    renderInApp(<ImposterDetail port={PORT} />, { whoami: whoamiWith("operator") });
+    renderInApp(<ImposterDetail port={PORT} />);
 
     await send();
 
@@ -160,7 +160,7 @@ describe("the Send button", () => {
         elapsedMs: 1,
       },
     });
-    renderInApp(<ImposterDetail port={PORT} />, { whoami: whoamiWith("operator") });
+    renderInApp(<ImposterDetail port={PORT} />);
 
     await send();
 
@@ -196,7 +196,7 @@ describe("the Send button", () => {
     // it re-renders the bare element *outside* the providers `renderInApp` mounted, which is a
     // different failure. Invalidating is also the real mechanism — it is what a save does.
     const client = createQueryClient();
-    renderInApp(<ImposterDetail port={PORT} />, { whoami: whoamiWith("operator"), client });
+    renderInApp(<ImposterDetail port={PORT} />, { client });
     await send();
     expect((await screen.findByTestId(`try-result-${STUB.id}`)).textContent).toContain("old");
 
@@ -206,15 +206,6 @@ describe("the Send button", () => {
     await client.invalidateQueries();
 
     await waitFor(() => expect(screen.queryByTestId(`try-result-${STUB.id}`)).toBeNull());
-  });
-
-  it("is offered to an Operator and withheld from a Viewer, who keeps Copy curl", async () => {
-    fleet(ANSWERED);
-    renderInApp(<ImposterDetail port={PORT} />, { whoami: whoamiWith("viewer") });
-
-    // The line #335 settled: a Viewer may compose a request, but not have the server send one.
-    expect(await screen.findByTestId(`copy-curl-${STUB.id}`)).not.toBeNull();
-    expect(screen.queryByTestId(`try-stub-${STUB.id}`)).toBeNull();
   });
 
   it("offers neither control for a stub whose predicates cannot be modelled", async () => {
@@ -227,7 +218,7 @@ describe("the Send button", () => {
       [`/imposters/${PORT}`]: { json: imposter([unmodellable]) },
       [TRY_PATH]: ANSWERED,
     });
-    renderInApp(<ImposterDetail port={PORT} />, { whoami: whoamiWith("operator") });
+    renderInApp(<ImposterDetail port={PORT} />);
 
     await screen.findByText(/billing/);
     await waitFor(() => expect(screen.queryByTestId("copy-curl-s-9")).toBeNull());
@@ -249,7 +240,7 @@ describe("the Send button", () => {
       [`/imposters/${PORT}`]: { json: imposter([caveated]) },
       [TRY_PATH]: ANSWERED,
     });
-    renderInApp(<ImposterDetail port={PORT} />, { whoami: whoamiWith("operator") });
+    renderInApp(<ImposterDetail port={PORT} />);
 
     const button = await screen.findByTestId("try-stub-s-8");
     expect(button).not.toBeNull();

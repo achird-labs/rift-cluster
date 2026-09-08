@@ -1,14 +1,11 @@
 /** @vitest-environment jsdom */
-import { screen, waitFor, within } from "@testing-library/react";
+import { screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { TENANT_HEADER } from "../api/client.ts";
 import { Shell } from "../app/Shell.tsx";
 import { plannedEntries } from "../app/nav.ts";
-import { TENANT_STORAGE_KEY, initialTenant } from "../app/session.tsx";
-import { preferenceStore, resetPreferenceStore } from "../app/storage.ts";
-import { renderInApp, stubFetch, whoamiWith } from "./harness.tsx";
+import { renderInApp, stubFetch } from "./harness.tsx";
 
 const QUIET = {
   "/imposters": { json: { imposters: [] } },
@@ -18,8 +15,6 @@ const QUIET = {
 
 afterEach(() => {
   vi.unstubAllGlobals();
-  preferenceStore().removeItem(TENANT_STORAGE_KEY);
-  resetPreferenceStore();
   window.location.hash = "";
 });
 
@@ -32,7 +27,7 @@ describe("nav — a visible roadmap, not a 404", () => {
     // reaches for — RFC-006 §4 asks for a visible roadmap, and an empty one is a state, not a
     // reason to delete the shape.
     stubFetch(QUIET);
-    renderInApp(<Shell />, { whoami: whoamiWith("fleet-admin") });
+    renderInApp(<Shell />);
 
     await screen.findByTestId("nav-imposters");
     expect(plannedEntries()).toEqual([]);
@@ -41,134 +36,21 @@ describe("nav — a visible roadmap, not a 404", () => {
 
   it("navigates between the live screens without a page load", async () => {
     stubFetch(QUIET);
-    renderInApp(<Shell />, { whoami: whoamiWith("fleet-admin") });
+    renderInApp(<Shell />);
 
     await userEvent.setup().click(await screen.findByRole("link", { name: /cluster & fleet/i }));
     await waitFor(() => expect(window.location.hash).toBe("#/cluster"));
   });
 
-  it("does not offer the cluster screen to a principal the fleet projection 404s", async () => {
-    // Hiding it is UX only — `/_fleet/*` still 404s the same principal — but offering a screen that
-    // can only ever render an error is worse than not offering it.
+  it("offers the cluster screen even when the fleet projection is refusing", async () => {
+    // `QUIET` answers `/_fleet/*` with 404. The entry stays: since #550 there is one identity and
+    // one credential, so a 404 here is the fleet's state rather than a limit on this operator, and
+    // the screen's own refusal note is what says so. Hiding the entry would leave an operator with
+    // no route to the screen that explains it.
     stubFetch(QUIET);
-    renderInApp(<Shell />, { whoami: whoamiWith("viewer") });
+    renderInApp(<Shell />);
 
-    await screen.findByTestId("nav-imposters");
-    expect(screen.queryByTestId("nav-cluster")).toBeNull();
-  });
-});
-
-describe("tenant switcher", () => {
-  it("is absent for a single-tenant principal", async () => {
-    // There is nothing to switch between, and an inert control implies otherwise.
-    stubFetch(QUIET);
-    renderInApp(<Shell />, { whoami: whoamiWith("editor", ["acme"]), tenants: ["acme"] });
-
-    await screen.findByTestId("nav-imposters");
-    expect(screen.queryByTestId("tenant-switcher")).toBeNull();
-  });
-
-  it("is present for a multi-tenant principal and lists their bound tenants", async () => {
-    stubFetch(QUIET);
-    renderInApp(<Shell />, {
-      whoami: whoamiWith("editor", ["acme", "globex"]),
-      tenants: ["acme", "globex"],
-    });
-
-    const switcher = await screen.findByTestId("tenant-switcher");
-    expect(within(switcher).getByRole("option", { name: "acme" })).toBeTruthy();
-    expect(within(switcher).getByRole("option", { name: "globex" })).toBeTruthy();
-  });
-
-  it("re-issues reads under the newly selected tenant", async () => {
-    stubFetch(QUIET);
-    renderInApp(<Shell />, {
-      whoami: whoamiWith("editor", ["acme", "globex"]),
-      tenants: ["acme", "globex"],
-      tenant: "acme",
-    });
-    await screen.findByTestId("nav-imposters");
-
-    await userEvent.setup().selectOptions(await screen.findByTestId("tenant-switcher"), "globex");
-
-    const mock = globalThis.fetch as unknown as { mock: { calls: [string, RequestInit][] } };
-    await waitFor(() => {
-      const tenants = mock.mock.calls
-        .filter(([path]) => path === "/imposters")
-        .map(([, init]) => (init.headers as Record<string, string>)[TENANT_HEADER]);
-      expect(tenants).toContain("globex");
-    });
-  });
-
-  it("persists the selection per browser, under a namespaced key", async () => {
-    stubFetch(QUIET);
-    renderInApp(<Shell />, {
-      whoami: whoamiWith("editor", ["acme", "globex"]),
-      tenants: ["acme", "globex"],
-      tenant: "acme",
-    });
-    await userEvent.setup().selectOptions(await screen.findByTestId("tenant-switcher"), "globex");
-
-    await waitFor(() => expect(preferenceStore().getItem(TENANT_STORAGE_KEY)).toBe("globex"));
-    // The next mount is what the operator experiences as "it remembered".
-    expect(initialTenant(["acme", "globex"])).toBe("globex");
-    expect(TENANT_STORAGE_KEY).toBe("rift-console.tenant");
-  });
-
-  it("ignores a remembered tenant the principal is no longer bound to", () => {
-    // Otherwise every read goes out under an `X-Rift-Tenant` that 404s (RFC-002 §8.4) and the
-    // console looks broken rather than re-defaulted.
-    preferenceStore().setItem(TENANT_STORAGE_KEY, "a-tenant-they-lost");
-    expect(initialTenant(["acme", "globex"])).toBe("acme");
-  });
-
-  it("never leaves the selection unset while there is a tenant to pick", () => {
-    // The bug this pins: an unset selection sends no `X-Rift-Tenant`, so the request lands in
-    // `default` — while the switcher, having nothing to display, would show the first tenant in
-    // the list. The label and the header would then disagree on every read, and re-selecting the
-    // displayed option fires no change event, so the operator could not even correct it.
-    expect(initialTenant(["acme", "globex"])).toBe("acme");
-    expect(initialTenant(["zeta", "default", "acme"])).toBe("default");
-    expect(initialTenant([])).toBeNull();
-  });
-
-  it("shows the tenant the requests actually carry, not merely the first in the list", async () => {
-    stubFetch(QUIET);
-    renderInApp(<Shell />, {
-      whoami: whoamiWith("editor", ["acme", "globex"]),
-      tenants: ["acme", "globex"],
-      tenant: "globex",
-    });
-
-    const switcher = (await screen.findByTestId("tenant-switcher")) as HTMLSelectElement;
-    const mock = globalThis.fetch as unknown as { mock: { calls: [string, RequestInit][] } };
-    await waitFor(() => {
-      const read = mock.mock.calls.find(([path]) => path === "/imposters");
-      expect((read?.[1]?.headers as Record<string, string>)[TENANT_HEADER]).toBe(switcher.value);
-    });
-  });
-});
-
-describe("identity", () => {
-  it("shows the principal and the role it holds in the tenant in view", async () => {
-    stubFetch(QUIET);
-    renderInApp(<Shell />, { whoami: whoamiWith("operator", ["acme"]), tenants: ["acme"], tenant: "acme" });
-
-    const identity = await screen.findByTestId("identity");
-    expect(identity.textContent).toContain("p-test");
-    expect(identity.textContent).toMatch(/operator/i);
-  });
-
-  it("says plainly when the fleet enforces nothing at all", async () => {
-    // `authorizationDisabled` is a distinct fact from "an authenticated principal with no
-    // bindings", and rendering it as an ordinary identity would hide an unsecured admin plane.
-    stubFetch(QUIET);
-    renderInApp(<Shell />, {
-      whoami: { principalId: null, authorizationDisabled: true, bindings: [] },
-    });
-
-    const identity = await screen.findByTestId("identity");
-    expect(identity.textContent).toMatch(/authorization disabled/i);
+    expect(await screen.findByTestId("nav-cluster")).toBeTruthy();
   });
 });
 
@@ -203,22 +85,21 @@ describe("the fleet name in the top bar", () => {
     },
   };
 
-  it("shows the name beside the tenant", async () => {
+  it("shows the name in the top bar", async () => {
     stubFetch(NAMED);
-    renderInApp(<Shell />, { whoami: whoamiWith("fleet-admin") });
+    renderInApp(<Shell />);
 
     expect((await screen.findByTestId("topbar-fleet-name")).textContent).toContain("rift-prod-eu");
   });
 
-  it("shows nothing at all when the fleet read is not available to this principal", async () => {
-    // `QUIET` answers `/_fleet/members` with 404 — the shape a principal without a fleet-scoped
-    // binding sees (RFC-002 §8.4). The badge must stay absent rather than render a placeholder:
-    // an operator who cannot read the fleet is not thereby on an unnamed one, and every screen
-    // would otherwise carry a permanent empty label.
+  it("shows nothing at all when the fleet read fails", async () => {
+    // `QUIET` answers `/_fleet/members` with 404. The badge must stay absent rather than render a
+    // placeholder: a fleet whose name could not be read is not thereby an unnamed one, and every
+    // screen would otherwise carry a permanent empty label.
     stubFetch(QUIET);
-    renderInApp(<Shell />, { whoami: whoamiWith("operator", ["acme"]), tenant: "acme" });
+    renderInApp(<Shell />);
 
-    await screen.findByTestId("identity");
+    await screen.findByTestId("nav-imposters");
     expect(screen.queryByTestId("topbar-fleet-name")).toBeNull();
   });
 
@@ -232,9 +113,9 @@ describe("the fleet name in the top bar", () => {
         json: { ...NAMED["/_fleet/members"].json, fleet_name: null },
       },
     });
-    renderInApp(<Shell />, { whoami: whoamiWith("fleet-admin") });
+    renderInApp(<Shell />);
 
-    await screen.findByTestId("identity");
+    await screen.findByTestId("nav-imposters");
     expect(screen.queryByTestId("topbar-fleet-name")).toBeNull();
   });
 });

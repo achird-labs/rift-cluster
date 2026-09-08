@@ -29,16 +29,17 @@ function fleetThatSignsOut(): { deleted: () => boolean } {
         signedOut = true;
         return Promise.resolve(new Response(null, { status: 204 }));
       }
-      if (path === "/admin/whoami") {
+      if (path === "/_fleet/health") {
         return Promise.resolve(
           signedOut
             ? new Response(JSON.stringify({ errors: [{ message: "no session" }] }), { status: 401 })
             : new Response(
                 JSON.stringify({
-                  principalId: "key:abc",
-                  displayName: "Demo Editor",
-                  authorizationDisabled: false,
-                  bindings: [{ tenant: "default", role: "editor" }],
+                  ready: true,
+                  state: "ready",
+                  pending_gates: [],
+                  isolated: false,
+                  ring: { m_idx: 1, members: [1] },
                 }),
                 { status: 200 },
               ),
@@ -54,9 +55,9 @@ function fleetThatSignsOut(): { deleted: () => boolean } {
 describe("signing out returns the operator to the login screen", () => {
   it("renders the login screen after the session ends", async () => {
     // The failure this pins: `queryClient.clear()` empties the cache but leaves the mounted
-    // `whoami` observer holding its last successful result, so nothing refetches and the console
-    // keeps rendering the previous principal's shell. Asserting on the cache — as the first
-    // version of this test did — passes against exactly that bug.
+    // session-probe observer holding its last successful result, so nothing refetches and the
+    // console keeps rendering the signed-out shell. Asserting on the cache — as the first version
+    // of this test did — passes against exactly that bug.
     const fleet = fleetThatSignsOut();
     render(
       <QueryClientProvider client={createQueryClient()}>
@@ -64,7 +65,7 @@ describe("signing out returns the operator to the login screen", () => {
       </QueryClientProvider>,
     );
 
-    await screen.findByTestId("identity");
+    await screen.findByTestId("nav-imposters");
     await userEvent.setup().click(await screen.findByTestId("sign-out"));
 
     await waitFor(() => expect(fleet.deleted()).toBe(true));

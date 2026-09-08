@@ -7,20 +7,32 @@
 use std::time::Duration;
 
 use clap::Parser;
-use rift_cluster::control::{FLEET_SCOPE, PrincipalId, Role};
 use rift_cluster::rpc::{AlwaysHealthy, RpcClient, RpcClientConfig, Signer};
-use rift_cluster::{ControlOp, ControlRequest, RaftNode, TenantId};
+use rift_cluster::{ControlOp, ControlRequest, RaftNode};
 use rift_cluster_server::cli::EeCli;
 use rift_cluster_server::compose::{self, ComposedServer};
 use tempfile::TempDir;
 
 mod common;
 
+use common::ports::{reserve_addr, reserve_port};
 use common::seen::Seen;
 
 const SECRET: &str = "fleet-session-secret";
 
+/// The fleet's one admin credential (D-73). Every fixture here runs with the plane closed,
+/// because an open plane authenticates everything and would make each of these tests pass
+/// whether or not the gate works.
+const API_KEY: &str = "fleet-session-api-key";
+
+/// A single-node fleet: the shape most of these tests need.
 fn cluster_cli(state: &TempDir, extra: &[&str]) -> EeCli {
+    let mut args = vec!["--cluster-allow-solo"];
+    args.extend_from_slice(extra);
+    cluster_on(state, "127.0.0.1:0", &args)
+}
+
+fn cluster_on(state: &TempDir, bind: &str, extra: &[&str]) -> EeCli {
     let mut args = vec![
         "rift-cluster-server".to_owned(),
         "--port".to_owned(),
@@ -28,15 +40,16 @@ fn cluster_cli(state: &TempDir, extra: &[&str]) -> EeCli {
         "--metrics-port".to_owned(),
         "0".to_owned(),
         "--cluster".to_owned(),
-        "--cluster-allow-solo".to_owned(),
         "--cluster-bind".to_owned(),
-        "127.0.0.1:0".to_owned(),
+        bind.to_owned(),
         "--cluster-probe-bind".to_owned(),
         "127.0.0.1:0".to_owned(),
         "--cluster-secret".to_owned(),
         SECRET.to_owned(),
         "--cluster-state-dir".to_owned(),
         state.path().to_string_lossy().into_owned(),
+        "--api-key".to_owned(),
+        API_KEY.to_owned(),
     ];
     args.extend(extra.iter().map(|s| (*s).to_owned()));
     EeCli::try_parse_from(args).expect("parses")
@@ -73,42 +86,6 @@ async fn seed(node: &RaftNode, op_id: u128, op: ControlOp) {
     assert_eq!(response.outcome, rift_cluster::ControlOutcome::Applied);
 }
 
-/// A fleet admin, which is the only role `/_fleet/*` admits (RFC-006 §12 Q3, settled in
-/// `docs/architecture/08-tenancy-security.md`).
-async fn seed_fleet_admin(node: &RaftNode, op_id: &mut u128, raw_key: &str) -> PrincipalId {
-    let principal = rift_cluster::control::Principal {
-        id: rift_cluster::control::api_key_principal_id(raw_key),
-        display_name: "fleet".to_owned(),
-        auth: rift_cluster::control::AuthSource::ApiKey {
-            hash: rift_cluster::control::hash_api_key(raw_key),
-        },
-        disabled: false,
-    };
-    let id = principal.id.clone();
-    seed(
-        node,
-        *op_id,
-        ControlOp::PrincipalPut {
-            tenant: TenantId::default(),
-            principal,
-        },
-    )
-    .await;
-    *op_id += 1;
-    seed(
-        node,
-        *op_id,
-        ControlOp::BindingPut {
-            tenant: TenantId::new(FLEET_SCOPE),
-            principal_id: id.clone(),
-            role: Role::FleetAdmin,
-        },
-    )
-    .await;
-    *op_id += 1;
-    id
-}
-
 /// Pull the `rift_session` cookie value out of a `Set-Cookie` header.
 fn session_cookie(seen: &Seen) -> String {
     let raw = seen
@@ -134,13 +111,10 @@ async fn curl_can_log_in_hold_a_cookie_and_read_fleet_health() {
         .await
         .expect("solo cluster starts");
     wait_ready(&server).await;
-    let node = server.node().expect("clustered");
     let admin = server.admin_addr().to_string();
     let client = reqwest::Client::new();
-    let mut op_id = 1u128;
 
-    let key = "fleet-session-login";
-    seed_fleet_admin(node, &mut op_id, key).await;
+    let key = API_KEY;
 
     let response = client
         .post(format!("http://{admin}/session"))
@@ -203,7 +177,6 @@ async fn fleet_projection_matches_the_cluster_port_shapes() {
         .await
         .expect("solo cluster starts");
     wait_ready(&server).await;
-    let node = server.node().expect("clustered");
     let admin = server.admin_addr().to_string();
     let cluster: std::net::SocketAddr = server
         .cluster_addr()
@@ -217,10 +190,8 @@ async fn fleet_projection_matches_the_cluster_port_shapes() {
         RpcClientConfig::default(),
     );
     let client = reqwest::Client::new();
-    let mut op_id = 1u128;
 
-    let key = "fleet-shape-parity";
-    seed_fleet_admin(node, &mut op_id, key).await;
+    let key = API_KEY;
 
     for (fleet_path, cluster_path) in [
         ("/_fleet/members", "/_cluster/members"),
@@ -320,22 +291,19 @@ async fn the_bearer_path_is_unchanged_and_exempt_from_csrf() {
         .await
         .expect("solo cluster starts");
     wait_ready(&server).await;
-    let node = server.node().expect("clustered");
     let admin = server.admin_addr().to_string();
     let client = reqwest::Client::new();
-    let mut op_id = 1u128;
 
-    let key = "fleet-bearer-unchanged";
-    seed_fleet_admin(node, &mut op_id, key).await;
+    let key = API_KEY;
 
     // A read.
     let seen = Seen::of(
         client
-            .get(format!("http://{admin}/admin/whoami"))
+            .get(format!("http://{admin}/openapi.json"))
             .header("authorization", key)
             .send()
             .await
-            .expect("whoami"),
+            .expect("contract read"),
     )
     .await;
     assert_eq!(seen.status, 200, "bearer read must be unaffected: {seen}");
@@ -359,10 +327,10 @@ async fn the_bearer_path_is_unchanged_and_exempt_from_csrf() {
     // No credential at all is still refused the way it was.
     let seen = Seen::of(
         client
-            .get(format!("http://{admin}/admin/whoami"))
+            .get(format!("http://{admin}/openapi.json"))
             .send()
             .await
-            .expect("anon whoami"),
+            .expect("anon contract read"),
     )
     .await;
     assert_eq!(seen.status, 401, "an anonymous read must still 401: {seen}");
@@ -378,13 +346,10 @@ async fn cookie_mutations_require_the_csrf_header() {
         .await
         .expect("solo cluster starts");
     wait_ready(&server).await;
-    let node = server.node().expect("clustered");
     let admin = server.admin_addr().to_string();
     let client = reqwest::Client::new();
-    let mut op_id = 1u128;
 
-    let key = "fleet-csrf";
-    seed_fleet_admin(node, &mut op_id, key).await;
+    let key = API_KEY;
 
     let login = Seen::of(
         client
@@ -401,11 +366,11 @@ async fn cookie_mutations_require_the_csrf_header() {
     // A cookie-authenticated read needs no CSRF header — only state-changing requests do.
     let seen = Seen::of(
         client
-            .get(format!("http://{admin}/admin/whoami"))
+            .get(format!("http://{admin}/openapi.json"))
             .header("cookie", &cookie)
             .send()
             .await
-            .expect("cookie whoami"),
+            .expect("cookie contract read"),
     )
     .await;
     assert_eq!(seen.status, 200, "a cookie read must not need CSRF: {seen}");
@@ -446,80 +411,6 @@ async fn cookie_mutations_require_the_csrf_header() {
     server.shutdown().await;
 }
 
-/// AC6: revoking a binding cuts a live **session**, not just a live bearer.
-///
-/// This is the criterion a TTL cache over session→bindings would silently break — the named mutant
-/// `c25_key_revocation_survives_a_partition` exists to catch. The cookie proves authentication only;
-/// bindings are re-resolved from applied state on every request, so the revocation lands
-/// immediately rather than at the end of the session's 8-hour TTL.
-#[tokio::test]
-async fn revoking_a_binding_cuts_a_live_session() {
-    let state = TempDir::new().expect("tempdir");
-    let server = compose::start(cluster_cli(&state, &[]))
-        .await
-        .expect("solo cluster starts");
-    wait_ready(&server).await;
-    let node = server.node().expect("clustered");
-    let admin = server.admin_addr().to_string();
-    let client = reqwest::Client::new();
-    let mut op_id = 1u128;
-
-    let key = "fleet-revoke";
-    let principal_id = seed_fleet_admin(node, &mut op_id, key).await;
-
-    let login = Seen::of(
-        client
-            .post(format!("http://{admin}/session"))
-            .json(&serde_json::json!({ "apiKey": key }))
-            .send()
-            .await
-            .expect("login"),
-    )
-    .await;
-    let cookie = format!("rift_session={}", session_cookie(&login));
-
-    // The session works.
-    let seen = Seen::of(
-        client
-            .get(format!("http://{admin}/_fleet/health"))
-            .header("cookie", &cookie)
-            .send()
-            .await
-            .expect("health before revocation"),
-    )
-    .await;
-    assert_eq!(seen.status, 200, "{seen}");
-
-    // Revoke the fleet binding out from under the live cookie.
-    seed(
-        node,
-        op_id,
-        ControlOp::BindingDelete {
-            tenant: TenantId::new(FLEET_SCOPE),
-            principal_id: principal_id.clone(),
-        },
-    )
-    .await;
-
-    let seen = Seen::of(
-        client
-            .get(format!("http://{admin}/_fleet/health"))
-            .header("cookie", &cookie)
-            .send()
-            .await
-            .expect("health after revocation"),
-    )
-    .await;
-    assert_ne!(
-        seen.status, 200,
-        "the cookie still reads fleet health after its binding was revoked — a cache over \
-         session -> bindings has been introduced, which is exactly the mutant C25 exists to \
-         catch: {seen}"
-    );
-
-    server.shutdown().await;
-}
-
 /// AC7: rotating the session-signing key invalidates every outstanding session at once.
 ///
 /// Structural rather than swept: every token carries the key record's revision, and verification
@@ -535,10 +426,9 @@ async fn rotating_the_signing_key_invalidates_every_session() {
     let node = server.node().expect("clustered");
     let admin = server.admin_addr().to_string();
     let client = reqwest::Client::new();
-    let mut op_id = 1u128;
+    let op_id = 1u128;
 
-    let key = "fleet-rotate";
-    seed_fleet_admin(node, &mut op_id, key).await;
+    let key = API_KEY;
 
     let login = Seen::of(
         client
@@ -569,7 +459,6 @@ async fn rotating_the_signing_key_invalidates_every_session() {
         node,
         op_id,
         ControlOp::SessionKeyPut {
-            tenant: TenantId::new(FLEET_SCOPE),
             key: "f".repeat(64),
         },
     )
@@ -592,81 +481,6 @@ async fn rotating_the_signing_key_invalidates_every_session() {
     server.shutdown().await;
 }
 
-/// `/_fleet/*` is `ClusterAdmin` — FleetAdmin exclusively (RFC-006 §12 Q3, settled in Chapter 8).
-///
-/// The decision is only real if a non-fleet-admin is actually refused, so that is what is asserted
-/// rather than the presence of the route.
-#[tokio::test]
-async fn fleet_routes_refuse_a_non_fleet_admin() {
-    let state = TempDir::new().expect("tempdir");
-    let server = compose::start(cluster_cli(&state, &[]))
-        .await
-        .expect("solo cluster starts");
-    wait_ready(&server).await;
-    let node = server.node().expect("clustered");
-    let admin = server.admin_addr().to_string();
-    let client = reqwest::Client::new();
-    let mut op_id = 1u128;
-
-    // A principal bound only inside a tenant, never on the fleet scope.
-    let tenant_key = "fleet-tenant-only";
-    let principal = rift_cluster::control::Principal {
-        id: rift_cluster::control::api_key_principal_id(tenant_key),
-        display_name: "tenant admin".to_owned(),
-        auth: rift_cluster::control::AuthSource::ApiKey {
-            hash: rift_cluster::control::hash_api_key(tenant_key),
-        },
-        disabled: false,
-    };
-    let id = principal.id.clone();
-    seed(
-        node,
-        op_id,
-        ControlOp::PrincipalPut {
-            tenant: TenantId::default(),
-            principal,
-        },
-    )
-    .await;
-    op_id += 1;
-    seed(
-        node,
-        op_id,
-        ControlOp::BindingPut {
-            tenant: TenantId::default(),
-            principal_id: id,
-            role: Role::TenantAdmin,
-        },
-    )
-    .await;
-
-    // The ops route is included deliberately. It is the only projected route with a path parameter
-    // and the only one whose legitimate answer for a missing resource is a 404, which makes it the
-    // one most likely to be special-cased later — "handle the 404 first" would ship an
-    // unauthenticated read of fleet op status with every other test still green.
-    for path in [
-        "/_fleet/members",
-        "/_fleet/health",
-        "/_fleet/ops/0189dcf0-0454-4e0b-a10c-8a8f8dccce1f",
-    ] {
-        let seen = Seen::of(
-            client
-                .get(format!("http://{admin}{path}"))
-                .header("authorization", tenant_key)
-                .send()
-                .await
-                .expect("fleet read"),
-        )
-        .await;
-        assert_ne!(
-            seen.status, 200,
-            "{path} served fleet topology to a principal with no fleet-scoped binding: {seen}"
-        );
-    }
-
-    server.shutdown().await;
-}
-
 /// `GET /_fleet/ops/{opId}` really routes and really reports a committed op.
 ///
 /// The third projected route, and the one `every_direct_route_is_actually_served` cannot speak to
@@ -683,10 +497,9 @@ async fn fleet_ops_reports_a_committed_op() {
     let node = server.node().expect("clustered");
     let admin = server.admin_addr().to_string();
     let client = reqwest::Client::new();
-    let mut op_id = 1u128;
+    let op_id = 1u128;
 
-    let key = "fleet-ops-poll";
-    seed_fleet_admin(node, &mut op_id, key).await;
+    let key = API_KEY;
 
     // A committed op with an id we know, so the poll target actually exists.
     let known = uuid::Uuid::from_u128(op_id);
@@ -694,7 +507,6 @@ async fn fleet_ops_reports_a_committed_op() {
         node,
         op_id,
         ControlOp::PutRoutes {
-            tenant: TenantId::default(),
             table: Default::default(),
         },
     )
@@ -756,8 +568,7 @@ async fn fleet_members_carries_the_fleet_name() {
     let client = reqwest::Client::new();
     let mut op_id = 1u128;
 
-    let key = "fleet-name-read";
-    seed_fleet_admin(node, &mut op_id, key).await;
+    let key = API_KEY;
 
     let members = |client: reqwest::Client, admin: String| async move {
         Seen::of(
@@ -790,7 +601,6 @@ async fn fleet_members_carries_the_fleet_name() {
         node,
         op_id,
         ControlOp::FleetNamePut {
-            tenant: TenantId::new(FLEET_SCOPE),
             name: "rift-prod-eu".to_owned(),
         },
     )
@@ -807,63 +617,6 @@ async fn fleet_members_carries_the_fleet_name() {
         seen.json().get("fleet_name_unavailable"),
         Some(&serde_json::Value::Bool(false)),
         "{seen}"
-    );
-
-    server.shutdown().await;
-}
-
-/// The legacy `--api-key` cannot hold a console session.
-///
-/// It resolves to a synthetic identity with no principal row, and a session token names a principal
-/// that every later request re-reads. Minting one would answer `200` with a cookie that
-/// authenticates never — so the exchange is refused outright instead. Regression test for a defect
-/// review caught: without this, a fleet mid-migration off `--api-key` would see "login worked, then
-/// everything is 401" with nothing in the logs to explain it.
-///
-/// Pins D-46: `POST /session` with the legacy `--api-key` is `400`, never a cookie.
-#[tokio::test]
-async fn the_legacy_api_key_cannot_mint_a_session() {
-    let state = TempDir::new().expect("tempdir");
-    let legacy = "legacy-console-key";
-    let server = compose::start(cluster_cli(&state, &["--api-key", legacy]))
-        .await
-        .expect("solo cluster starts");
-    wait_ready(&server).await;
-    let admin = server.admin_addr().to_string();
-    let client = reqwest::Client::new();
-
-    // It still authenticates as a bearer — this slice must not break the migration path.
-    let seen = Seen::of(
-        client
-            .get(format!("http://{admin}/admin/whoami"))
-            .header("authorization", legacy)
-            .send()
-            .await
-            .expect("legacy whoami"),
-    )
-    .await;
-    assert_eq!(
-        seen.status, 200,
-        "the legacy key must still work as a bearer: {seen}"
-    );
-
-    // But it cannot be exchanged for a cookie.
-    let seen = Seen::of(
-        client
-            .post(format!("http://{admin}/session"))
-            .json(&serde_json::json!({ "apiKey": legacy }))
-            .send()
-            .await
-            .expect("legacy login"),
-    )
-    .await;
-    assert_eq!(
-        seen.status, 400,
-        "the legacy key must be refused a session rather than handed an unusable one: {seen}"
-    );
-    assert!(
-        seen.header("set-cookie").is_none(),
-        "a refused login must not set a cookie: {seen}"
     );
 
     server.shutdown().await;
@@ -891,6 +644,242 @@ async fn deleting_a_session_clears_the_cookie() {
     assert_eq!(seen.status, 204, "{seen}");
     let raw = seen.header("set-cookie").expect("logout clears the cookie");
     assert!(raw.contains("Max-Age=0"), "cookie is not cleared: {raw}");
+
+    server.shutdown().await;
+}
+
+/// **The one credential mints a session, and the cookie alone reads every node** (#550, D-73).
+///
+/// This is the test the proxy leg needs. `admin_front` authenticates a cookie itself, then hands
+/// the request to the loopback listener — which since #550 runs open-source Rift's own
+/// `--api-key` gate, a raw constant-time compare against `Authorization`. A cookie-authenticated
+/// request carries no `Authorization` at all, so unless the front *injects* the configured key on
+/// that leg, `GET /imposters` answers `401` on a fleet where the login just succeeded. Before
+/// #550 the front forwarded the session token as the credential, which upstream's compare will
+/// never accept.
+///
+/// Both proxied shapes are driven — the collection listing and the single-imposter read — because
+/// they take different decoration paths through `handle` and could plausibly be wired
+/// differently. Two nodes, and the login happens on exactly one of them: the signing key is
+/// replicated state, so a cookie minted on the founder must verify on the joiner with no second
+/// login and no shared process state beyond the Raft log.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_api_key_mints_a_session_and_the_cookie_is_accepted_on_every_node() {
+    let founder_state = TempDir::new().expect("tempdir");
+    let joiner_state = TempDir::new().expect("tempdir");
+    let founder_bind = reserve_addr();
+
+    let founder = compose::start(cluster_on(
+        &founder_state,
+        &founder_bind,
+        &["--cluster-allow-solo"],
+    ))
+    .await
+    .expect("founder starts");
+    wait_ready(&founder).await;
+    let joiner = compose::start(cluster_on(
+        &joiner_state,
+        &reserve_addr(),
+        &["--cluster-seeds", &founder_bind],
+    ))
+    .await
+    .expect("joiner starts");
+    wait_ready(&joiner).await;
+
+    let founder_admin = founder.admin_addr().to_string();
+    let joiner_admin = joiner.admin_addr().to_string();
+    let client = reqwest::Client::new();
+    let port = reserve_port();
+
+    // Something to read back. Written with the key as a bearer, which is the curl path.
+    let seen = Seen::of(
+        client
+            .post(format!("http://{founder_admin}/imposters"))
+            .header("authorization", API_KEY)
+            .json(&serde_json::json!({ "port": port, "protocol": "http" }))
+            .send()
+            .await
+            .expect("create imposter"),
+    )
+    .await;
+    assert_eq!(seen.status, 201, "the key creates an imposter: {seen}");
+
+    // Log in once, on the founder.
+    let login = Seen::of(
+        client
+            .post(format!("http://{founder_admin}/session"))
+            .json(&serde_json::json!({ "apiKey": API_KEY }))
+            .send()
+            .await
+            .expect("login"),
+    )
+    .await;
+    assert_eq!(login.status, 200, "the API key mints a session: {login}");
+    let cookie = format!("rift_session={}", session_cookie(&login));
+
+    // Every node, both proxied read shapes, cookie only — no `Authorization` anywhere.
+    for admin in [&founder_admin, &joiner_admin] {
+        // The joiner applies the imposter through the log, which is not instantaneous.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let seen = Seen::of(
+                client
+                    .get(format!("http://{admin}/imposters/{port}"))
+                    .header("cookie", &cookie)
+                    .send()
+                    .await
+                    .expect("single imposter read"),
+            )
+            .await;
+            assert_ne!(
+                seen.status, 401,
+                "a cookie-authenticated proxied read was refused on {admin} — the front is not \
+                 injecting the configured --api-key on the loopback leg: {seen}"
+            );
+            if seen.status == 200 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{admin} never applied the imposter: {seen}"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        let seen = Seen::of(
+            client
+                .get(format!("http://{admin}/imposters"))
+                .header("cookie", &cookie)
+                .send()
+                .await
+                .expect("imposter listing"),
+        )
+        .await;
+        assert_eq!(
+            seen.status, 200,
+            "the cookie must read the listing on {admin}: {seen}"
+        );
+    }
+
+    joiner.shutdown().await;
+    founder.shutdown().await;
+}
+
+/// The gate is real: with `--api-key` set, an unauthenticated admin request is refused on every
+/// surface this front serves — terminated, proxied and directly-served alike.
+///
+/// Without this the whole suite would pass against a front that authenticated nobody, because
+/// every other test presents a credential.
+#[tokio::test]
+async fn a_keyed_fleet_refuses_an_unauthenticated_request_on_every_surface() {
+    let state = TempDir::new().expect("tempdir");
+    let server = compose::start(cluster_cli(&state, &[]))
+        .await
+        .expect("solo cluster starts");
+    wait_ready(&server).await;
+    let admin = server.admin_addr().to_string();
+    let client = reqwest::Client::new();
+
+    for path in [
+        // Directly served.
+        "/openapi.json",
+        "/front-door/routes",
+        "/_fleet/health",
+        // Terminated.
+        "/admin/requests",
+        // Proxied to the loopback.
+        "/imposters",
+        // Not classified by anything — the route-existence oracle.
+        "/no/such/route",
+    ] {
+        let seen = Seen::of(
+            client
+                .get(format!("http://{admin}{path}"))
+                .send()
+                .await
+                .expect("anonymous read"),
+        )
+        .await;
+        assert_eq!(
+            seen.status, 401,
+            "{path} answered an anonymous caller on a keyed fleet: {seen}"
+        );
+    }
+
+    // A *wrong* key is refused too, and is never an invitation to look for a cookie.
+    let seen = Seen::of(
+        client
+            .get(format!("http://{admin}/openapi.json"))
+            .header("authorization", "not-the-key")
+            .send()
+            .await
+            .expect("wrong-key read"),
+    )
+    .await;
+    assert_eq!(seen.status, 401, "{seen}");
+
+    server.shutdown().await;
+}
+
+/// `/__rift/{port}/*` is data-plane traffic and stays open on a keyed fleet — and, critically,
+/// the admin credential is never injected onto it: the gateway leg reaches the imposter, where an
+/// `Authorization` header would land in its predicates and its recorded request log.
+#[tokio::test]
+async fn the_gateway_stays_open_and_never_carries_the_admin_key() {
+    let state = TempDir::new().expect("tempdir");
+    let server = compose::start(cluster_cli(&state, &[]))
+        .await
+        .expect("solo cluster starts");
+    wait_ready(&server).await;
+    let admin = server.admin_addr().to_string();
+    let client = reqwest::Client::new();
+    let port = reserve_port();
+
+    let seen = Seen::of(
+        client
+            .post(format!("http://{admin}/imposters"))
+            .header("authorization", API_KEY)
+            .json(&serde_json::json!({
+                "port": port,
+                "protocol": "http",
+                "stubs": [{ "responses": [{ "is": { "statusCode": 204 } }] }],
+            }))
+            .send()
+            .await
+            .expect("create imposter"),
+    )
+    .await;
+    assert_eq!(seen.status, 201, "{seen}");
+
+    // No credential: the gateway must answer anyway.
+    let seen = Seen::of(
+        client
+            .get(format!("http://{admin}/__rift/{port}/anything"))
+            .send()
+            .await
+            .expect("gateway request"),
+    )
+    .await;
+    assert_eq!(
+        seen.status, 204,
+        "gateway traffic must not be gated by the admin key: {seen}"
+    );
+
+    // And the imposter never saw an `Authorization` header.
+    let seen = Seen::of(
+        client
+            .get(format!("http://{admin}/imposters/{port}/savedRequests"))
+            .header("authorization", API_KEY)
+            .send()
+            .await
+            .expect("saved requests"),
+    )
+    .await;
+    assert_eq!(seen.status, 200, "{seen}");
+    assert!(
+        !seen.body.to_lowercase().contains("authorization"),
+        "the admin key leaked into the imposter's recorded request: {seen}"
+    );
 
     server.shutdown().await;
 }

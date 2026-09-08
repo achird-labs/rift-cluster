@@ -15,14 +15,11 @@ import { type CommitOutcome, applied, settle } from "../features/writes/commit.t
 import { keyedAttempt } from "../features/writes/idempotency.ts";
 import {
   API_PATHS,
-  bindingPath,
   frontDoorRoutePath,
   imposterPath,
   lifecyclePath,
   flowStateEntryPath,
   flowStatePath,
-  principalPath,
-  principalsPath,
   recordedStubsPath,
   requestsPath,
   savedProxyResponsesPath,
@@ -34,11 +31,9 @@ import {
   spacesPath,
   stubByIdPath,
   stubsPath,
-  tenantPath,
   tryImposterPath,
 } from "../api/paths.ts";
 import type { components } from "../api/schema.ts";
-import { stripApiKey } from "../features/admin/key.ts";
 import {
   type Coverage,
   type RecordedRequest,
@@ -58,7 +53,6 @@ import {
 import { type Route, normalizeTable } from "../features/routes/order.ts";
 import { type FleetView, fleetView } from "./fleetView.ts";
 import { POLLED, POLLED_REQUESTS } from "./query.ts";
-import { useSession } from "./session.tsx";
 
 type Imposter = components["schemas"]["Imposter"];
 type Stub = components["schemas"]["Stub"];
@@ -67,31 +61,12 @@ export type TrySpec = components["schemas"]["TryRequest"];
 export type TryResult = components["schemas"]["TryResponse"];
 type FleetMembers = components["schemas"]["FleetMembers"];
 type FleetHealth = components["schemas"]["FleetHealth"];
-/** The table as *answered* — the stored rows plus the tenant's install fact (D-68). */
-type RouteTableView = components["schemas"]["RouteTableView"];
-type Tenant = components["schemas"]["Tenant"];
-type TenantWrite = components["schemas"]["TenantWrite"];
-type Principal = components["schemas"]["Principal"];
-type PrincipalCreate = components["schemas"]["PrincipalCreate"];
-type PrincipalUpdate = components["schemas"]["PrincipalUpdate"];
-type IssuedPrincipal = components["schemas"]["IssuedPrincipal"];
-type Role = components["schemas"]["Role"];
+type RouteTable = components["schemas"]["RouteTable"];
 type FleetRequestPage = components["schemas"]["FleetRequestPage"];
 export type FleetJournalCoverage = components["schemas"]["FleetJournalCoverage"];
 
 /**
- * The tenant is part of every query key, not just the request headers.
- *
- * Without it, switching tenants would show the previous tenant's imposters from cache until the
- * refetch landed — one tenant's data rendered under another tenant's name, which is the worst
- * possible way to be briefly wrong in a multi-tenant console.
- */
-function key(parts: readonly unknown[], tenant: string | null): unknown[] {
-  return [...parts, { tenant }];
-}
-
-/**
- * The tenant's imposters, and whether the fleet sum on them is complete.
+ * Every imposter the fleet serves, and whether the fleet sum on them is complete.
  *
  * `partial` is carried rather than dropped because `numberOfRequests` is a **fleet** figure
  * (issue #363): the front rewrites each entry's count to the sum across every node's slot for that
@@ -106,11 +81,10 @@ function key(parts: readonly unknown[], tenant: string | null): unknown[] {
 export type ImposterList = { imposters: Imposter[]; partial: boolean };
 
 export function useImposters(): UseQueryResult<ImposterList> {
-  const { tenant } = useSession();
   return useQuery({
-    queryKey: key(["imposters"], tenant),
+    queryKey: ["imposters"],
     queryFn: async (): Promise<ImposterList> => {
-      const read = await apiGetMerged<{ imposters?: Imposter[] }>(API_PATHS.imposters, { tenant });
+      const read = await apiGetMerged<{ imposters?: Imposter[] }>(API_PATHS.imposters);
       // `imposters` is optional in the contract, so an absent array is a shape the schema permits —
       // a domain-optional read, not a swallowed failure. A non-2xx has already thrown in `client`.
       return { imposters: read.data.imposters ?? [], partial: read.partial };
@@ -136,12 +110,11 @@ export function useImposters(): UseQueryResult<ImposterList> {
 export function useTryStub(
   port: number,
 ): UseMutationResult<TryResult, Error, { request: TrySpec }> {
-  const { tenant } = useSession();
   return useMutation({
     mutationFn: async ({ request }) => {
       // Unkeyed (#389): the contract does not declare `Idempotency-Key` on this route, and
       // the fleet would ignore one — see `UNDECLARED` in features/writes/idempotency.ts.
-      const sent = await apiSend<TryResult>("POST", tryImposterPath(port), request, { tenant });
+      const sent = await apiSend<TryResult>("POST", tryImposterPath(port), request);
       return applied(sent);
     },
   });
@@ -150,15 +123,11 @@ export function useTryStub(
 /**
  * This node's own fleet reading.
  *
- * `enabled` is a caller's decision, not a fixed capability check, because the two callers want
- * opposite things from a principal that lacks the scope. The Cluster screen asks anyway and renders
- * the 404 as "fleet-scoped, not available to you" — someone who followed a bookmark deserves that
- * sentence. The imposter list only wants the reading to *qualify* what it shows, so it does not
- * ask: two guaranteed 404s behind every list load would be noise that means nothing.
+ * Always asked. It used to carry an `enabled` flag so a screen could decline to ask on behalf of a
+ * principal whose role would only ever get a 404; #550 removed roles, so the read either lands or
+ * says why, and every caller wants the same thing from it.
  */
-export function useFleetView(
-  options: { enabled?: boolean; polled?: boolean } = {},
-): UseQueryResult<FleetView> {
+export function useFleetView(options: { polled?: boolean } = {}): UseQueryResult<FleetView> {
   return useQuery({
     queryKey: ["fleet"],
     queryFn: async () => {
@@ -172,7 +141,6 @@ export function useFleetView(
       ]);
       return fleetView(members, health.data, health.partial);
     },
-    enabled: options.enabled ?? true,
     /*
      * `polled: false` reads the fleet once per mount instead of every 5s. `RecordingPanel`'s single
      * caller wants this reading only to name a caveat about fleet size, which changes on membership
@@ -200,15 +168,14 @@ export function useLifecycleToggle(): UseMutationResult<
   Error,
   { port: number; enable: boolean }
 > {
-  const { tenant } = useSession();
   const client = useQueryClient();
   const keyed = keyedAttempt();
   return useMutation({
     mutationFn: async ({ port, enable }) => {
       const sent = await keyed((idempotencyKey) =>
-        apiSend("POST", lifecyclePath(port, enable), undefined, { tenant, idempotencyKey }),
+        apiSend("POST", lifecyclePath(port, enable), undefined, { idempotencyKey }),
       );
-      const outcome = await settle(sent, { tenant });
+      const outcome = await settle(sent);
       if (outcome.kind === "failed") throw new Error(outcome.detail);
       return outcome;
     },
@@ -277,9 +244,8 @@ function byTimestamp(rows: RecordedRequest[]): RecordedRequest[] {
  * delays the distinction this whole screen is built to preserve.
  */
 export function useRequestLog(port: number): UseQueryResult<RequestLogState> {
-  const { tenant } = useSession();
   const client = useQueryClient();
-  const queryKey = key(["requests", port], tenant);
+  const queryKey = ["requests", port];
   return useQuery({
     queryKey,
     queryFn: async (): Promise<RequestLogState> => {
@@ -321,7 +287,7 @@ export function useRequestLog(port: number): UseQueryResult<RequestLogState> {
       const since = resumable && held?.kind === "rows" ? held.cursor : null;
       const path = since === null ? requestsPath(port) : `${requestsPath(port)}?since=${since}`;
       try {
-        const merged = await apiGetMerged<unknown>(path, { tenant });
+        const merged = await apiGetMerged<unknown>(path);
         const local = readLog(merged.data);
         if (local.kind === "unknown") return local;
         const resuming = since !== null && held?.kind === "rows";
@@ -376,10 +342,9 @@ export function useRequestLog(port: number): UseQueryResult<RequestLogState> {
  * write always quotes the revision of the state the operator was actually looking at.
  */
 export function useImposter(port: number): UseQueryResult<RevisionedRead<Imposter>> {
-  const { tenant } = useSession();
   return useQuery({
-    queryKey: key(["imposter", port], tenant),
-    queryFn: () => apiGetWithRevision<Imposter>(imposterPath(port), { tenant }),
+    queryKey: ["imposter", port],
+    queryFn: () => apiGetWithRevision<Imposter>(imposterPath(port)),
     ...POLLED,
   });
 }
@@ -422,27 +387,19 @@ export type StubWrite = {
  * update wearing a different hat.
  */
 function useStubWrite(
-  send: (
-    write: StubWrite,
-    tenant: string | null,
-    idempotencyKey: string,
-  ) => Promise<SendResult<unknown>>,
+  send: (write: StubWrite, idempotencyKey: string) => Promise<SendResult<unknown>>,
 ): UseMutationResult<CommitOutcome, Error, StubWrite> {
-  const { tenant } = useSession();
   const client = useQueryClient();
   const keyed = keyedAttempt();
   return useMutation({
     mutationFn: async (write) => {
       const conflict = async (): Promise<never> => {
-        const fresh = await apiGetWithRevision<Imposter>(imposterPath(write.port), { tenant });
+        const fresh = await apiGetWithRevision<Imposter>(imposterPath(write.port));
         const theirs = (fresh.data.stubs ?? []).find((stub) => stub.id === write.stubId) ?? null;
         throw new StubConflict(theirs, fresh.revision);
       };
       try {
-        const outcome = await settle(
-          await keyed((idempotencyKey) => send(write, tenant, idempotencyKey)),
-          { tenant },
-        );
+        const outcome = await settle(await keyed((idempotencyKey) => send(write, idempotencyKey)));
         if (outcome.kind === "failed") {
           /*
            * Under `--cluster-admin-async` the precondition is judged inside apply, AFTER the 202 —
@@ -464,9 +421,8 @@ function useStubWrite(
 }
 
 export function usePutStub(): UseMutationResult<CommitOutcome, Error, StubWrite> {
-  return useStubWrite((write, tenant, idempotencyKey) =>
+  return useStubWrite((write, idempotencyKey) =>
     apiSend("PUT", stubByIdPath(write.port, write.stubId), write.body, {
-      tenant,
       ifMatch: write.revision,
       idempotencyKey,
     }),
@@ -474,9 +430,8 @@ export function usePutStub(): UseMutationResult<CommitOutcome, Error, StubWrite>
 }
 
 export function useDeleteStub(): UseMutationResult<CommitOutcome, Error, StubWrite> {
-  return useStubWrite((write, tenant, idempotencyKey) =>
+  return useStubWrite((write, idempotencyKey) =>
     apiSend("DELETE", stubByIdPath(write.port, write.stubId), undefined, {
-      tenant,
       ifMatch: write.revision,
       idempotencyKey,
     }),
@@ -491,9 +446,8 @@ export function useDeleteStub(): UseMutationResult<CommitOutcome, Error, StubWri
  * It carries the same `If-Match`, so appending cannot clobber a concurrent edit either.
  */
 export function useAddStub(): UseMutationResult<CommitOutcome, Error, StubWrite> {
-  return useStubWrite((write, tenant, idempotencyKey) =>
+  return useStubWrite((write, idempotencyKey) =>
     apiSend("POST", stubsPath(write.port), addStubBody(write.body), {
-      tenant,
       ifMatch: write.revision,
       idempotencyKey,
     }),
@@ -529,11 +483,10 @@ export function useRecordedStubs(
   port: number,
   options: { enabled?: boolean } = {},
 ): UseQueryResult<Stub[]> {
-  const { tenant } = useSession();
   return useQuery({
-    queryKey: key(["recorded-stubs", port], tenant),
+    queryKey: ["recorded-stubs", port],
     queryFn: async () => {
-      const body = await apiGet<Imposter>(recordedStubsPath(port), { tenant });
+      const body = await apiGet<Imposter>(recordedStubsPath(port));
       // `stubs` is optional in the contract, same reasoning as `useImposters`.
       return body.stubs ?? [];
     },
@@ -556,9 +509,8 @@ export function useRecordedStubs(
  * field it never reads is cheaper than a second write pipeline that duplicates the conflict handling.
  */
 export function usePromoteRecording(): UseMutationResult<CommitOutcome, Error, StubWrite> {
-  return useStubWrite((write, tenant, idempotencyKey) =>
+  return useStubWrite((write, idempotencyKey) =>
     apiSend("PUT", stubsPath(write.port), write.body, {
-      tenant,
       ifMatch: write.revision,
       idempotencyKey,
     }),
@@ -569,21 +521,18 @@ export function usePromoteRecording(): UseMutationResult<CommitOutcome, Error, S
  * Discard everything a recording has captured so far, without touching the proxy stub itself — the
  * imposter keeps recording; only what it has captured up to now is cleared.
  *
- * Gated by the caller on `requests.clear`, not `imposter.write`: `DELETE .../savedProxyResponses` is
- * not terminated by the admin front, so it reaches upstream and `principal.rs::map_action` folds it
- * onto the same `Action::SavedRequestsClear` as clearing the request log (RFC-002 §4.1). See
- * `rbac.ts`'s `requests.clear` note for the specific mapping this transcribes.
+ * `DELETE .../savedProxyResponses` is not terminated by the admin front — it proxies upstream to
+ * the embedded engine's own admin API.
  */
 export function useDiscardRecording(): UseMutationResult<CommitOutcome, Error, { port: number }> {
-  const { tenant } = useSession();
   const client = useQueryClient();
   const keyed = keyedAttempt();
   return useMutation({
     mutationFn: async ({ port }) => {
       const sent = await keyed((idempotencyKey) =>
-        apiSend("DELETE", savedProxyResponsesPath(port), undefined, { tenant, idempotencyKey }),
+        apiSend("DELETE", savedProxyResponsesPath(port), undefined, { idempotencyKey }),
       );
-      const outcome = await settle(sent, { tenant });
+      const outcome = await settle(sent);
       if (outcome.kind === "failed") throw new Error(outcome.detail);
       return outcome;
     },
@@ -606,15 +555,14 @@ export function useDiscardRecording(): UseMutationResult<CommitOutcome, Error, {
  * refusal, which is the check that matters and the only one that sees the whole fleet.
  */
 export function useCreateImposter(): UseMutationResult<CommitOutcome, Error, Imposter> {
-  const { tenant } = useSession();
   const client = useQueryClient();
   const keyed = keyedAttempt();
   return useMutation({
     mutationFn: async (body) => {
       const sent = await keyed((idempotencyKey) =>
-        apiSend("POST", API_PATHS.imposters, body, { tenant, idempotencyKey }),
+        apiSend("POST", API_PATHS.imposters, body, { idempotencyKey }),
       );
-      const outcome = await settle(sent, { tenant });
+      const outcome = await settle(sent);
       if (outcome.kind === "failed") throw new Error(outcome.detail);
       return outcome;
     },
@@ -637,15 +585,14 @@ export function useImportAddImposter(): UseMutationResult<
   Error,
   Record<string, unknown>
 > {
-  const { tenant } = useSession();
   const client = useQueryClient();
   const keyed = keyedAttempt();
   return useMutation({
     mutationFn: async (imposter) => {
       const sent = await keyed((idempotencyKey) =>
-        apiSend("POST", API_PATHS.imposters, imposter, { tenant, idempotencyKey }),
+        apiSend("POST", API_PATHS.imposters, imposter, { idempotencyKey }),
       );
-      const outcome = await settle(sent, { tenant });
+      const outcome = await settle(sent);
       if (outcome.kind === "failed") throw new Error(outcome.detail);
       return outcome;
     },
@@ -654,26 +601,25 @@ export function useImportAddImposter(): UseMutationResult<
 }
 
 /**
- * Replace the tenant's whole imposter set with an imported document (#251, "Replace all").
+ * Replace the fleet's whole imposter set with an imported document (#251, "Replace all").
  *
- * The caller gates this on `imposter.delete` as well as `imposter.write` and routes it through the
- * destructive `Confirm` modal — every imposter this fleet currently serves that the document does
- * not name is gone once this lands, and neither of those facts is visible from this hook.
+ * The caller routes this through the destructive `Confirm` modal — every imposter this fleet
+ * currently serves that the document does not name is gone once this lands, and that fact is not
+ * visible from this hook.
  */
 export function useReplaceImposters(): UseMutationResult<
   CommitOutcome,
   Error,
   { imposters: Record<string, unknown>[] }
 > {
-  const { tenant } = useSession();
   const client = useQueryClient();
   const keyed = keyedAttempt();
   return useMutation({
     mutationFn: async (body) => {
       const sent = await keyed((idempotencyKey) =>
-        apiSend("PUT", API_PATHS.imposters, body, { tenant, idempotencyKey }),
+        apiSend("PUT", API_PATHS.imposters, body, { idempotencyKey }),
       );
-      const outcome = await settle(sent, { tenant });
+      const outcome = await settle(sent);
       if (outcome.kind === "failed") throw new Error(outcome.detail);
       return outcome;
     },
@@ -684,22 +630,18 @@ export function useReplaceImposters(): UseMutationResult<
 /**
  * Delete an imposter, and everything hanging off it.
  *
- * Authorized by `Action::ImposterDelete`, which is why the screen gates on `imposter.delete` rather
- * than `imposter.write` even though the two are granted together today (see `rbac.ts`).
- *
  * Both caches are invalidated: the detail read is keyed by port, and leaving it would let a
  * back-navigation render a deleted imposter from cache as though it still existed.
  */
 export function useDeleteImposter(): UseMutationResult<CommitOutcome, Error, { port: number }> {
-  const { tenant } = useSession();
   const client = useQueryClient();
   const keyed = keyedAttempt();
   return useMutation({
     mutationFn: async ({ port }) => {
       const sent = await keyed((idempotencyKey) =>
-        apiSend("DELETE", imposterPath(port), undefined, { tenant, idempotencyKey }),
+        apiSend("DELETE", imposterPath(port), undefined, { idempotencyKey }),
       );
-      const outcome = await settle(sent, { tenant });
+      const outcome = await settle(sent);
       if (outcome.kind === "failed") throw new Error(outcome.detail);
       return outcome;
     },
@@ -721,15 +663,14 @@ export function useDeleteImposter(): UseMutationResult<CommitOutcome, Error, { p
  * is untouched, which is the same scope caveat the screen already keeps in front of the reader.
  */
 export function useClearRequests(): UseMutationResult<CommitOutcome, Error, { port: number }> {
-  const { tenant } = useSession();
   const client = useQueryClient();
   const keyed = keyedAttempt();
   return useMutation({
     mutationFn: async ({ port }) => {
       const sent = await keyed((idempotencyKey) =>
-        apiSend("DELETE", requestsPath(port), undefined, { tenant, idempotencyKey }),
+        apiSend("DELETE", requestsPath(port), undefined, { idempotencyKey }),
       );
-      const outcome = await settle(sent, { tenant });
+      const outcome = await settle(sent);
       if (outcome.kind === "failed") throw new Error(outcome.detail);
       return outcome;
     },
@@ -778,8 +719,8 @@ export type FleetRequestRow = FleetRequestPage["requests"][number];
 /**
  * The fleet-wide request journal — one read (#362), not the N-way client fan-out it replaces.
  *
- * The admin front now does the merge itself: `GET /admin/requests` walks every imposter the
- * caller's tenant owns and hands back one ordered page, so this hook is a single `apiGet` — no
+ * The admin front now does the merge itself: `GET /admin/requests` walks every imposter the fleet
+ * serves and hands back one ordered page, so this hook is a single `apiGet` — no
  * `useQueries`, no per-port cap, no client-side union.
  *
  * `coverage` is carried rather than dropped, same reasoning as `useImposters`' `partial`: the
@@ -799,11 +740,10 @@ export function useFleetRequests(): UseQueryResult<{
   rows: FleetRequestRow[];
   coverage: FleetJournalCoverage;
 }> {
-  const { tenant } = useSession();
   return useQuery({
-    queryKey: key(["fleet-requests"], tenant),
+    queryKey: ["fleet-requests"],
     queryFn: async () => {
-      const page = await apiGet<FleetRequestPage>(API_PATHS.fleetRequests, { tenant });
+      const page = await apiGet<FleetRequestPage>(API_PATHS.fleetRequests);
       return { rows: [...page.requests].reverse(), coverage: page.coverage };
     },
     ...POLLED,
@@ -813,13 +753,12 @@ export function useFleetRequests(): UseQueryResult<{
 export function useAllScenarios(
   ports: readonly number[],
 ): { rows: { port: number; state: ScenarioState }[]; pending: boolean } {
-  const { tenant } = useSession();
   return useQueries({
     queries: ports.map((port) => ({
-      queryKey: key(["scenarios", port, null], tenant),
+      queryKey: ["scenarios", port, null],
       queryFn: async (): Promise<ScenarioState> => {
         try {
-          return readScenarios(await apiGet<unknown>(scenariosPath(port, null), { tenant }));
+          return readScenarios(await apiGet<unknown>(scenariosPath(port, null)));
         } catch (error) {
           return {
             kind: "unknown" as const,
@@ -841,12 +780,11 @@ export function useAllScenarios(
 }
 
 export function useScenarios(port: number, flow: string | null): UseQueryResult<ScenarioState> {
-  const { tenant } = useSession();
   return useQuery({
-    queryKey: key(["scenarios", port, flow], tenant),
+    queryKey: ["scenarios", port, flow],
     queryFn: async (): Promise<ScenarioState> => {
       try {
-        return readScenarios(await apiGet<unknown>(scenariosPath(port, flow), { tenant }));
+        return readScenarios(await apiGet<unknown>(scenariosPath(port, flow)));
       } catch (error) {
         return {
           kind: "unknown",
@@ -865,15 +803,14 @@ export function useScenarios(port: number, flow: string | null): UseQueryResult<
  * there is no route that lists spaces, so a space cannot be read before its id is known.
  */
 export function useSpace(port: number, flowId: string | null): UseQueryResult<SpaceState> {
-  const { tenant } = useSession();
   return useQuery({
-    queryKey: key(["space", port, flowId], tenant),
+    queryKey: ["space", port, flowId],
     queryFn: async (): Promise<SpaceState> => {
       // `enabled` below keeps this unreachable with a null flow; the guard is here so the type
       // narrows rather than being asserted away.
       if (flowId === null) return { kind: "unknown", reason: "no flow selected" };
       try {
-        return readSpace(await apiGet<unknown>(spacePath(port, flowId), { tenant }));
+        return readSpace(await apiGet<unknown>(spacePath(port, flowId)));
       } catch (error) {
         return {
           kind: "unknown",
@@ -895,12 +832,11 @@ export function useSpace(port: number, flowId: string | null): UseQueryResult<Sp
  * ids and existing ones pick up entries, the same reasoning `useScenarios` and `useSpace` follow.
  */
 export function useSpaces(port: number): UseQueryResult<SpaceListState> {
-  const { tenant } = useSession();
   return useQuery({
-    queryKey: key(["spaces", port], tenant),
+    queryKey: ["spaces", port],
     queryFn: async (): Promise<SpaceListState> => {
       try {
-        return readSpaceList(await apiGet<unknown>(spacesPath(port), { tenant }));
+        return readSpaceList(await apiGet<unknown>(spacesPath(port)));
       } catch (error) {
         return {
           kind: "unknown",
@@ -925,16 +861,15 @@ export function useFlowStateEntry(
   flowId: string | null,
   entryKey: string | null,
 ): UseQueryResult<FlowStateRead> {
-  const { tenant } = useSession();
   return useQuery({
-    queryKey: key(["flow-state", port, flowId, entryKey], tenant),
+    queryKey: ["flow-state", port, flowId, entryKey],
     queryFn: async (): Promise<FlowStateRead> => {
       if (flowId === null || entryKey === null) {
         return { kind: "unknown", reason: "no key requested" };
       }
       try {
         return readFlowStateEntry(
-          await apiGet<unknown>(flowStateEntryPath(port, flowId, entryKey), { tenant }),
+          await apiGet<unknown>(flowStateEntryPath(port, flowId, entryKey)),
         );
       } catch (error) {
         if (error instanceof ApiError && error.status === 404) return { kind: "absent" };
@@ -960,16 +895,15 @@ export function useSetScenarioState(): UseMutationResult<
   Error,
   { port: number; name: string; state: string; flowId: string | null }
 > {
-  const { tenant } = useSession();
   const client = useQueryClient();
   const keyed = keyedAttempt();
   return useMutation({
     mutationFn: async ({ port, name, state, flowId }) => {
       const body = flowId === null ? { state } : { state, flowId };
       const sent = await keyed((idempotencyKey) =>
-        apiSend("PUT", scenarioStatePath(port, name), body, { tenant, idempotencyKey }),
+        apiSend("PUT", scenarioStatePath(port, name), body, { idempotencyKey }),
       );
-      const outcome = await settle(sent, { tenant });
+      const outcome = await settle(sent);
       if (outcome.kind === "failed") throw new Error(outcome.detail);
       return outcome;
     },
@@ -986,7 +920,6 @@ export function useResetScenarios(): UseMutationResult<
   Error,
   { port: number; flowId: string | null }
 > {
-  const { tenant } = useSession();
   const client = useQueryClient();
   const keyed = keyedAttempt();
   return useMutation({
@@ -996,10 +929,10 @@ export function useResetScenarios(): UseMutationResult<
           "POST",
           scenariosResetPath(port),
           flowId === null ? {} : { flowId },
-          { tenant, idempotencyKey },
+          { idempotencyKey },
         ),
       );
-      const outcome = await settle(sent, { tenant });
+      const outcome = await settle(sent);
       if (outcome.kind === "failed") throw new Error(outcome.detail);
       return outcome;
     },
@@ -1016,14 +949,13 @@ export function useTeardownSpace(): UseMutationResult<
   Error,
   { port: number; flowId: string }
 > {
-  const { tenant } = useSession();
   const client = useQueryClient();
   return useMutation({
     mutationFn: async ({ port, flowId }) => {
       // Unkeyed (#389): the contract does not declare `Idempotency-Key` on this route, and
       // the fleet would ignore one — see `UNDECLARED` in features/writes/idempotency.ts.
-      const sent = await apiSend("DELETE", spacePath(port, flowId), undefined, { tenant });
-      const outcome = await settle(sent, { tenant });
+      const sent = await apiSend("DELETE", spacePath(port, flowId), undefined);
+      const outcome = await settle(sent);
       if (outcome.kind === "failed") throw new Error(outcome.detail);
       return outcome;
     },
@@ -1045,15 +977,14 @@ export function useAddSpaceStub(): UseMutationResult<
   Error,
   { port: number; flowId: string; body: RawJsonBody }
 > {
-  const { tenant } = useSession();
   const client = useQueryClient();
   const keyed = keyedAttempt();
   return useMutation({
     mutationFn: async ({ port, flowId, body }) => {
       const sent = await keyed((idempotencyKey) =>
-        apiSend("POST", spaceStubsPath(port, flowId), body, { tenant, idempotencyKey }),
+        apiSend("POST", spaceStubsPath(port, flowId), body, { idempotencyKey }),
       );
-      const outcome = await settle(sent, { tenant });
+      const outcome = await settle(sent);
       if (outcome.kind === "failed") throw new Error(outcome.detail);
       return outcome;
     },
@@ -1066,30 +997,22 @@ export function useAddSpaceStub(): UseMutationResult<
   });
 }
 
-/**
- * Write one flow-state value.
- *
- * Gated in the UI on `space.stubWrite`, not on a flow-state capability — there is no
- * `FlowStateWrite` action, and `principal.rs::map_action` classifies this route as
- * `Action::SpaceStubWrite`. See the capability's own note in `rbac.ts`.
- */
+/** Write one flow-state value. */
 export function useSetFlowStateEntry(): UseMutationResult<
   CommitOutcome,
   Error,
   { port: number; flowId: string; key: string; body: RawJsonBody }
 > {
-  const { tenant } = useSession();
   const client = useQueryClient();
   const keyed = keyedAttempt();
   return useMutation({
     mutationFn: async ({ port, flowId, key: entryKey, body }) => {
       const sent = await keyed((idempotencyKey) =>
         apiSend("PUT", flowStateEntryPath(port, flowId, entryKey), body, {
-          tenant,
           idempotencyKey,
         }),
       );
-      const outcome = await settle(sent, { tenant });
+      const outcome = await settle(sent);
       if (outcome.kind === "failed") throw new Error(outcome.detail);
       return outcome;
     },
@@ -1109,7 +1032,6 @@ export function useClearFlowState(): UseMutationResult<
   Error,
   { port: number; flowId: string; key?: string }
 > {
-  const { tenant } = useSession();
   const client = useQueryClient();
   const keyed = keyedAttempt();
   return useMutation({
@@ -1119,9 +1041,9 @@ export function useClearFlowState(): UseMutationResult<
           ? flowStatePath(port, flowId)
           : flowStateEntryPath(port, flowId, entryKey);
       const sent = await keyed((idempotencyKey) =>
-        apiSend("DELETE", path, undefined, { tenant, idempotencyKey }),
+        apiSend("DELETE", path, undefined, { idempotencyKey }),
       );
-      const outcome = await settle(sent, { tenant });
+      const outcome = await settle(sent);
       if (outcome.kind === "failed") throw new Error(outcome.detail);
       return outcome;
     },
@@ -1130,39 +1052,18 @@ export function useClearFlowState(): UseMutationResult<
 }
 
 /**
- * The tenant's stored table, plus whether its routes are compiled into the shared front door.
+ * The fleet's stored front-door table.
  *
- * All three states of `installed` carry weight: `false` is a tenant whose table can never take a
- * dispatch, `true` is the default tenant's, and `undefined` is a node that did not say — a
- * pre-D-68 body, which is what a rolling upgrade looks like from here. Absent is deliberately not
- * `false`: the screen renders that as a confident structural claim, and a fact the console could
- * not read is not a fact that came back negative. Since #545 this read (and the `PUT` echo) is the
- * only place the flag is published (D-68, amended), so there is no second source to fall back on
- * and nothing to prefer between.
+ * Just the rows. `GET`/`PUT /front-door/routes` used to answer a `RouteTableView` — the rows plus
+ * an `installed` boolean saying whether *this tenant's* table was compiled into the shared front
+ * door (D-68). #550 left one fleet-wide table, so every stored route is installed and the flag,
+ * the view schema and the console's whole not-installed treatment went with it.
  */
-export type RouteTableRead = { routes: Route[]; installed: boolean | undefined };
-
-/**
- * The wire body as the screen reads it.
- *
- * A missing flag folds to `undefined` rather than failing the query: refusing a body without it
- * would blank the whole screen for the length of every rolling upgrade. `typeof` rather than a
- * plain read because the generated type calls `installed` required, which a pre-D-68 node is not
- * obliged to have known.
- */
-function readRouteTable(body: RouteTableView | null | undefined): RouteTableRead {
-  return {
-    routes: normalizeTable(body),
-    installed: typeof body?.installed === "boolean" ? body.installed : undefined,
-  };
-}
-
-export function useRouteTable(): UseQueryResult<RouteTableRead> {
-  const { tenant } = useSession();
+export function useRouteTable(): UseQueryResult<Route[]> {
   return useQuery({
-    queryKey: key(["front-door-routes"], tenant),
-    queryFn: async (): Promise<RouteTableRead> =>
-      readRouteTable(await apiGet<RouteTableView>(API_PATHS.frontDoorRoutes, { tenant })),
+    queryKey: ["front-door-routes"],
+    queryFn: async (): Promise<Route[]> =>
+      normalizeTable(await apiGet<RouteTable>(API_PATHS.frontDoorRoutes)),
     ...POLLED,
   });
 }
@@ -1189,35 +1090,27 @@ export class RouteTableConflict extends Error {
  * server-side precondition on this route (filed as a follow-up).
  */
 export function usePutRoutes(): UseMutationResult<
-  { stored: RouteTableView | null; outcome: CommitOutcome },
+  { stored: RouteTable | null; outcome: CommitOutcome },
   Error,
   { draft: Route[]; base: Route[] }
 > {
-  const { tenant } = useSession();
   const client = useQueryClient();
   const keyed = keyedAttempt();
   return useMutation({
     mutationFn: async ({ draft, base }) => {
-      /*
-       * Compared as rows, never as the whole body: `installed` is a property of the tenant rather
-       * than of the table — which is why the server keeps it off `RouteTable` entirely (D-68) —
-       * so letting it into this comparison would report a conflict against a table nobody edited.
-       */
-      const current = normalizeTable(
-        await apiGet<RouteTableView>(API_PATHS.frontDoorRoutes, { tenant }),
-      );
+      const current = normalizeTable(await apiGet<RouteTable>(API_PATHS.frontDoorRoutes));
       if (JSON.stringify(current) !== JSON.stringify(base)) {
         throw new RouteTableConflict(current);
       }
       const sent = await keyed((idempotencyKey) =>
-        apiSend<RouteTableView>(
+        apiSend<RouteTable>(
           "PUT",
           API_PATHS.frontDoorRoutes,
           { routes: draft },
-          { tenant, idempotencyKey },
+          { idempotencyKey },
         ),
       );
-      const outcome = await settle(sent, { tenant });
+      const outcome = await settle(sent);
       if (outcome.kind === "failed") throw new Error(outcome.detail);
       /*
        * A parked write has no body to adopt — the `202` carries op ids, not the stored table — so
@@ -1235,15 +1128,10 @@ export function usePutRoutes(): UseMutationResult<
      * older `loaded` and reverts the screen to it. It converges, but a save that briefly shows as
      * undone — and stays that way if the refetch fails — is exactly the kind of quiet lie this
      * console is being careful about elsewhere.
-     *
-     * The `installed` flag rides along, which is the write half of D-68: a `PUT` is the one moment
-     * an operator could act on the fact that a non-default tenant's table will never dispatch, so
-     * the answer to their own write is what tells them — not a poll of a fan-out that may not
-     * answer at all.
      */
     onSuccess: ({ stored }) => {
       if (stored === null) return;
-      client.setQueryData(key(["front-door-routes"], tenant), () => readRouteTable(stored));
+      client.setQueryData(["front-door-routes"], () => normalizeTable(stored));
     },
     onSettled: () => client.invalidateQueries({ queryKey: ["front-door-routes"] }),
   });
@@ -1256,237 +1144,17 @@ export function usePutRoutes(): UseMutationResult<
  * cannot take an unrelated concurrent edit down with it.
  */
 export function useDeleteRoute(): UseMutationResult<CommitOutcome, Error, { routeId: string }> {
-  const { tenant } = useSession();
   const client = useQueryClient();
   const keyed = keyedAttempt();
   return useMutation({
     mutationFn: async ({ routeId }) => {
       const sent = await keyed((idempotencyKey) =>
-        apiSend("DELETE", frontDoorRoutePath(routeId), undefined, { tenant, idempotencyKey }),
+        apiSend("DELETE", frontDoorRoutePath(routeId), undefined, { idempotencyKey }),
       );
-      const outcome = await settle(sent, { tenant });
+      const outcome = await settle(sent);
       if (outcome.kind === "failed") throw new Error(outcome.detail);
       return outcome;
     },
     onSettled: () => client.invalidateQueries({ queryKey: ["front-door-routes"] }),
-  });
-}
-
-/**
- * The admin plane (RFC-002). Every one of these routes addresses its tenant through the URL path,
- * never `X-Rift-Tenant` — see `paths.ts` — so, unlike the hooks above, none of these pass `tenant`
- * to `apiGet`/`apiSend`.
- */
-
-const ADMIN_TENANTS_KEY = ["admin-tenants"];
-const adminTenantKey = (tenantId: string): unknown[] => ["admin-tenant", tenantId];
-const adminPrincipalsKey = (tenantId: string): unknown[] => ["admin-principals", tenantId];
-
-/**
- * The tenant list, and whether its usage figures are complete.
- *
- * `flowEntries` on each tenant's `usage` is gathered by a fleet fan-out (#372), so the same
- * `Rift-Cluster-Partial` discipline `useImposters` applies to `numberOfRequests` (#363) applies
- * here: `apiGet` would discard the header the server stamps when a peer did not answer in time,
- * and the console would render a floor as if it were a total. `imposters`/`stubsPerImposter` come
- * from the replicated config set instead — unaffected by the fan-out — so only `flowEntries` reads
- * this flag; see `QuotaUsed` in `Admin.tsx`.
- */
-export type TenantList = { tenants: Tenant[]; partial: boolean };
-
-/**
- * `enabled` is the caller's decision because `TenantList` is `Action::ClusterAdmin` scoped to the
- * **fleet**, not to the caller's tenant. A tenant-admin holds no `*` binding, so this read is a
- * permanent 404 for them — asking anyway turns their Administration landing into a red error every
- * five seconds, which is the failure the `cluster.admin` capability was introduced to stop.
- */
-export function useTenants(options: { enabled?: boolean } = {}): UseQueryResult<TenantList> {
-  return useQuery({
-    queryKey: ADMIN_TENANTS_KEY,
-    queryFn: async (): Promise<TenantList> => {
-      const read = await apiGetMerged<Tenant[]>(API_PATHS.tenants);
-      return { tenants: read.data, partial: read.partial };
-    },
-    enabled: options.enabled ?? true,
-    ...POLLED,
-  });
-}
-
-/**
- * A pure existence-and-permission probe for one tenant (RFC-002 §8.4).
- *
- * The screen must never render anything from this query's data — only whether it errored, and with
- * which status. The API's anti-oracle (a cross-tenant probe and a nonexistent tenant answer
- * byte-identical `404`s) only holds if the console does not rebuild a distinguishing signal on top
- * of it by rendering content that happens to differ between the two.
- */
-export function useTenantProbe(
-  tenantId: string,
-  options: { enabled: boolean },
-): UseQueryResult<Tenant> {
-  return useQuery({
-    queryKey: adminTenantKey(tenantId),
-    queryFn: () => apiGet<Tenant>(tenantPath(tenantId)),
-    enabled: options.enabled,
-    ...POLLED,
-  });
-}
-
-export function useCreateTenant(): UseMutationResult<unknown, Error, TenantWrite> {
-  const client = useQueryClient();
-  const keyed = keyedAttempt();
-  return useMutation({
-    mutationFn: async (body) =>
-      applied(
-        await keyed((idempotencyKey) =>
-          apiSend("POST", API_PATHS.tenants, body, { idempotencyKey }),
-        ),
-      ),
-    onSettled: () => client.invalidateQueries({ queryKey: ADMIN_TENANTS_KEY }),
-  });
-}
-
-export function useSaveTenant(): UseMutationResult<
-  unknown,
-  Error,
-  { tenantId: string; body: TenantWrite }
-> {
-  const client = useQueryClient();
-  const keyed = keyedAttempt();
-  return useMutation({
-    mutationFn: async ({ tenantId, body }) =>
-      applied(
-        await keyed((idempotencyKey) =>
-          apiSend("PUT", tenantPath(tenantId), body, { idempotencyKey }),
-        ),
-      ),
-    onSettled: (_data, _error, vars) => {
-      client.invalidateQueries({ queryKey: ADMIN_TENANTS_KEY });
-      client.invalidateQueries({ queryKey: adminTenantKey(vars.tenantId) });
-    },
-  });
-}
-
-export function useDeleteTenant(): UseMutationResult<unknown, Error, { tenantId: string }> {
-  const client = useQueryClient();
-  const keyed = keyedAttempt();
-  return useMutation({
-    mutationFn: async ({ tenantId }) =>
-      applied(
-        await keyed((idempotencyKey) =>
-          apiSend("DELETE", tenantPath(tenantId), undefined, { idempotencyKey }),
-        ),
-      ),
-    onSettled: () => client.invalidateQueries({ queryKey: ADMIN_TENANTS_KEY }),
-  });
-}
-
-export function usePrincipals(tenantId: string): UseQueryResult<Principal[]> {
-  return useQuery({
-    queryKey: adminPrincipalsKey(tenantId),
-    queryFn: () => apiGet<Principal[]>(principalsPath(tenantId)),
-    ...POLLED,
-  });
-}
-
-/**
- * Mint a principal, handing the raw key to the caller **out of band**.
- *
- * `onIssued` receives the one-time `apiKey`; the mutation itself resolves to the *stripped* record,
- * so React Query never stores the key anywhere. Returning the full response and sanitising it in
- * `onSuccess` is not enough: `useMutation` keeps its own copy of the resolved value in the
- * MutationCache, where `setQueryData` cannot reach it, and it stays readable from the client (and
- * React Query Devtools) for `gcTime` after the panel is dismissed. The key exists for one moment,
- * and the only place it lives is the component state `onIssued` writes it into.
- */
-export function useCreatePrincipal(
-  tenantId: string,
-  onIssued: (issued: IssuedPrincipal) => void,
-): UseMutationResult<Omit<IssuedPrincipal, "apiKey">, Error, PrincipalCreate> {
-  const client = useQueryClient();
-  return useMutation({
-    mutationFn: async (body) => {
-      // No idempotency key (#371): the admin front rejects the header outright when minting a
-      // principal — the credential is generated per request and shown once, so a replayed
-      // request cannot return the one the original attempt issued.
-      const issued = applied(await apiSend<IssuedPrincipal>("POST", principalsPath(tenantId), body));
-      onIssued(issued);
-      return stripApiKey(issued);
-    },
-    onSuccess: (created) => {
-      client.setQueryData<Principal[]>(adminPrincipalsKey(tenantId), (existing) =>
-        existing === undefined
-          ? existing
-          : [...existing, { ...created, auth: "apiKey", disabled: false }],
-      );
-    },
-  });
-}
-
-export function useSavePrincipal(): UseMutationResult<
-  unknown,
-  Error,
-  { tenantId: string; principalId: string; body: PrincipalUpdate }
-> {
-  const client = useQueryClient();
-  const keyed = keyedAttempt();
-  return useMutation({
-    mutationFn: ({ tenantId, principalId, body }) =>
-      keyed((idempotencyKey) =>
-        apiSend("PUT", principalPath(tenantId, principalId), body, { idempotencyKey }),
-      ).then(applied),
-    onSettled: (_data, _error, vars) =>
-      client.invalidateQueries({ queryKey: adminPrincipalsKey(vars.tenantId) }),
-  });
-}
-
-export function useDeletePrincipal(): UseMutationResult<
-  unknown,
-  Error,
-  { tenantId: string; principalId: string }
-> {
-  const client = useQueryClient();
-  const keyed = keyedAttempt();
-  return useMutation({
-    mutationFn: ({ tenantId, principalId }) =>
-      keyed((idempotencyKey) =>
-        apiSend("DELETE", principalPath(tenantId, principalId), undefined, { idempotencyKey }),
-      ).then(applied),
-    onSettled: (_data, _error, vars) =>
-      client.invalidateQueries({ queryKey: adminPrincipalsKey(vars.tenantId) }),
-  });
-}
-
-export function usePutBinding(): UseMutationResult<
-  unknown,
-  Error,
-  { tenantId: string; principalId: string; role: Role }
-> {
-  const client = useQueryClient();
-  const keyed = keyedAttempt();
-  return useMutation({
-    mutationFn: ({ tenantId, principalId, role }) =>
-      keyed((idempotencyKey) =>
-        apiSend("PUT", bindingPath(tenantId, principalId), { role }, { idempotencyKey }),
-      ).then(applied),
-    onSettled: (_data, _error, vars) =>
-      client.invalidateQueries({ queryKey: adminPrincipalsKey(vars.tenantId) }),
-  });
-}
-
-export function useDeleteBinding(): UseMutationResult<
-  unknown,
-  Error,
-  { tenantId: string; principalId: string }
-> {
-  const client = useQueryClient();
-  const keyed = keyedAttempt();
-  return useMutation({
-    mutationFn: ({ tenantId, principalId }) =>
-      keyed((idempotencyKey) =>
-        apiSend("DELETE", bindingPath(tenantId, principalId), undefined, { idempotencyKey }),
-      ).then(applied),
-    onSettled: (_data, _error, vars) =>
-      client.invalidateQueries({ queryKey: adminPrincipalsKey(vars.tenantId) }),
   });
 }

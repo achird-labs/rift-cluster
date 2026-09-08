@@ -24,8 +24,8 @@ import { expect, fixture, goToScreen, signIn, test } from "./fixture.ts";
  * The nav, by role and accessible name rather than by class.
  *
  * It was `nav.rail` until the bar went horizontal, and a locator that a pure restyle can break is a
- * locator asserting the wrong thing: what this baseline is about is the set of entries a role is
- * offered, which the accessible name identifies and the class name only happened to.
+ * locator asserting the wrong thing: what this baseline is about is the set of entries the bar
+ * draws, which the accessible name identifies and the class name only happened to.
  */
 const navBar = (page: Page) => page.getByRole("navigation", { name: "Console sections" });
 
@@ -37,21 +37,14 @@ const VOLATILE = [
 
 test.describe("component baselines", () => {
   test("the nav bar", async ({ page }) => {
-    await signIn(page, "fleet-admin");
-    await expect(navBar(page)).toHaveScreenshot("nav-fleet-admin.png");
+    // One baseline, not one per role: #550 left a single identity, so the bar has one shape. It
+    // still catches a group whose entries all disappear yet keeps drawing its separator.
+    await signIn(page);
+    await expect(navBar(page)).toHaveScreenshot("nav.png");
   });
 
-  test("the nav bar as a viewer, where most entries are not drawn", async ({ page }) => {
-    // The bar's shape *is* the RBAC surface. A baseline here fails if a control starts being
-    // offered to a role that cannot use it — the failure mode `rbac.ts` exists to prevent, caught
-    // visually rather than by assertion. Under the top-bar layout it also catches a group whose
-    // every entry is filtered away still drawing its separator.
-    await signIn(page, "viewer");
-    await expect(navBar(page)).toHaveScreenshot("nav-viewer.png");
-  });
-
-  test("the topbar with identity and sign-out", async ({ page }) => {
-    await signIn(page, "editor");
+  test("the topbar with the fleet name and sign-out", async ({ page }) => {
+    await signIn(page);
     await expect(page.locator("header.topbar")).toHaveScreenshot("topbar.png");
   });
 
@@ -66,7 +59,7 @@ test.describe("component baselines", () => {
      * box **checked**, because the bug was precisely that a checked box rendered identically to an
      * unchecked one.
      */
-    await signIn(page, "editor");
+    await signIn(page);
     await goToScreen(page, "/imposters");
     await page.getByTestId("new-imposter").click();
     await expect(page.getByTestId("new-imposter-wizard")).toHaveScreenshot("new-imposter-form.png");
@@ -75,7 +68,7 @@ test.describe("component baselines", () => {
   test("a checkbox renders differently checked and unchecked", async ({ page }) => {
     // Belt and braces alongside the baseline above, and it needs no committed image: if the two
     // states are pixel-identical the control is not rendering its state at all.
-    await signIn(page, "editor");
+    await signIn(page);
     await goToScreen(page, "/imposters");
     await page.getByTestId("new-imposter").click();
     const box = page.getByTestId("new-imposter-form").getByRole("checkbox");
@@ -86,12 +79,12 @@ test.describe("component baselines", () => {
   });
 
   test("the imposter table", async ({ page }) => {
-    await signIn(page, "editor");
+    await signIn(page);
     await goToScreen(page, "/imposters");
     /*
      * `.card:has(table.dense)`, not `.card").first()`.
      *
-     * The first card on this screen stopped being the table when #251 added the tenant export
+     * The first card on this screen stopped being the table when #251 added the whole-set export
      * control above it, and the baseline has been a picture of two export buttons ever since — so
      * the table this test is named for has had no visual coverage at all, silently. A locator that
      * says which card it wants cannot drift that way again.
@@ -112,7 +105,7 @@ test.describe("component baselines", () => {
   });
 
   test("the fleet stat tiles", async ({ page }) => {
-    await signIn(page, "fleet-admin");
+    await signIn(page);
     await goToScreen(page, "/cluster");
     await expect(page.locator(".tiles").first()).toHaveScreenshot("fleet-tiles.png", {
       mask: VOLATILE.map((selector) => page.locator(selector)),
@@ -137,14 +130,14 @@ test.describe("component baselines", () => {
      * that turns a per-space reset into one an operator thinks is global.
      */
     const { imposters } = fixture();
-    await signIn(page, "editor");
+    await signIn(page);
     await goToScreen(page, `/scenarios/${imposters[0]}`);
     await expect(page.getByTestId("scenarios-scope")).toHaveScreenshot("scenarios-scope.png");
   });
 
   test("the stub editor with its summary", async ({ page }) => {
     const { imposters } = fixture();
-    await signIn(page, "editor");
+    await signIn(page);
     await goToScreen(page, `/imposters/${imposters[0]}`);
     await page.getByRole("button", { name: /add stub/i }).click();
     // The summary's warning state: a new stub carries no predicates and matches everything.
@@ -153,7 +146,7 @@ test.describe("component baselines", () => {
   });
 
   test("the confirm dialog for a destructive act", async ({ page }) => {
-    await signIn(page, "editor");
+    await signIn(page);
     await goToScreen(page, "/imposters");
     await page.getByTestId("delete-imposter-4645").click();
     await expect(page.getByTestId("confirm-delete-imposter")).toHaveScreenshot("confirm.png");

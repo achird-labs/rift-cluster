@@ -1,8 +1,5 @@
 import { useEffect, useState } from "react";
 
-/** The three admin screens (RFC-002 §4), one route each so a bookmark or a "back" reaches the tab it left. */
-export type AdminTab = "tenants" | "principals" | "bindings";
-
 /** The screens C4 ships. Everything else in the nav is a planned entry with no route (see `nav.ts`). */
 export type Route =
   | { screen: "imposters" }
@@ -18,9 +15,7 @@ export type Route =
    * there is nothing an all-flows view could read. The screen sends no `flowId`, and the imposter
    * echoes back the one it resolved.
    */
-  | { screen: "scenarios"; port: number | null; flow: string | null }
-  /** `tenant: null` is "no tenant chosen yet" — `tenants` alone still lists every tenant it may read. */
-  | { screen: "admin"; tab: AdminTab; tenant: string | null };
+  | { screen: "scenarios"; port: number | null; flow: string | null };
 
 const IMPOSTERS: Route = { screen: "imposters" };
 
@@ -49,7 +44,6 @@ export function parseHash(hash: string): Route {
   const segments = path.replace(/^#\/?/, "").split("/").filter(Boolean);
   const [head, ...tail] = segments;
 
-  if (head === "admin") return parseAdmin(tail);
   if (head === "scenarios") return parseScenarios(tail);
   // Every other screen takes at most one more segment; a longer hash is a stale or hand-edited
   // bookmark, not a route any of them recognise.
@@ -105,17 +99,6 @@ function parseScenarios(tail: string[]): Route {
   }
 }
 
-function parseAdmin(tail: string[]): Route {
-  const [tabSegment, tenantSegment, ...rest] = tail;
-  if (rest.length > 0) return IMPOSTERS;
-  const tab = parseAdminTab(tabSegment);
-  return tab === null ? IMPOSTERS : { screen: "admin", tab, tenant: tenantSegment ?? null };
-}
-
-function parseAdminTab(raw: string | undefined): AdminTab | null {
-  return raw === "tenants" || raw === "principals" || raw === "bindings" ? raw : null;
-}
-
 /** A port, or `null` — including for input that `Number()` would happily coerce (`""`, `"4545.5"`). */
 function parsePort(raw: string): number | null {
   if (!/^\d+$/.test(raw)) return null;
@@ -140,10 +123,6 @@ export function toHash(route: Route): string {
       return route.flow === null
         ? `#/scenarios/${route.port}`
         : `#/scenarios/${route.port}/${encodeURIComponent(route.flow)}`;
-    case "admin":
-      return route.tenant === null
-        ? `#/admin/${route.tab}`
-        : `#/admin/${route.tab}/${route.tenant}`;
   }
 }
 

@@ -3,10 +3,10 @@ import { screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { CSRF_HEADER, TENANT_HEADER } from "../api/client.ts";
+import { CSRF_HEADER } from "../api/client.ts";
 import { IMPOSTER_COLUMNS } from "../app/contract.ts";
 import { Imposters } from "../screens/Imposters.tsx";
-import { renderInApp, stubFetch, whoamiWith } from "./harness.tsx";
+import { renderInApp, stubFetch } from "./harness.tsx";
 
 const TWO = {
   imposters: [
@@ -22,7 +22,7 @@ afterEach(() => {
 describe("imposter list", () => {
   it("renders only fields the Imposter schema declares", async () => {
     stubFetch({ "/imposters": { json: TWO }, "/_fleet/members": { status: 404 }, "/_fleet/health": { status: 404 } });
-    renderInApp(<Imposters />, { whoami: whoamiWith("editor") });
+    renderInApp(<Imposters />);
 
     expect(await screen.findByText("billing")).toBeTruthy();
     expect(screen.getByText("4545")).toBeTruthy();
@@ -51,7 +51,7 @@ describe("imposter list", () => {
       "/_fleet/members": { status: 404 },
       "/_fleet/health": { status: 404 },
     });
-    renderInApp(<Imposters />, { whoami: whoamiWith("viewer") });
+    renderInApp(<Imposters />);
 
     const billing = within(await screen.findByTestId("imposter-row-4545"));
     expect(billing.getByText("3")).toBeTruthy();
@@ -63,7 +63,7 @@ describe("imposter list", () => {
       "/_fleet/members": { status: 404 },
       "/_fleet/health": { status: 404 },
     });
-    renderInApp(<Imposters />, { whoami: whoamiWith("viewer") });
+    renderInApp(<Imposters />);
 
     // The absent-vs-zero distinction this column already cared about, now reachable: `0 ?? UNKNOWN`
     // must stay `0`, which a truthiness check would have turned into `—`.
@@ -77,7 +77,7 @@ describe("imposter list", () => {
       "/_fleet/members": { status: 404 },
       "/_fleet/health": { status: 404 },
     });
-    renderInApp(<Imposters />, { whoami: whoamiWith("viewer") });
+    renderInApp(<Imposters />);
 
     /*
      * Scoped to the stubs cell, not the row.
@@ -90,10 +90,10 @@ describe("imposter list", () => {
     expect((await screen.findByTestId("imposter-cell-stubs-4547")).textContent).toBe("—");
   });
 
-  it("says whose view this is, and does not claim the tenant is empty", async () => {
+  it("says whose view this is, and does not claim the fleet is empty", async () => {
     // A console that says "no imposters" is asserting a fleet-wide fact from one node's answer.
     stubFetch({ "/imposters": { json: { imposters: [] } }, "/_fleet/members": { status: 404 }, "/_fleet/health": { status: 404 } });
-    renderInApp(<Imposters />, { whoami: whoamiWith("viewer") });
+    renderInApp(<Imposters />);
 
     const empty = await screen.findByTestId("imposters-empty");
     expect(empty.textContent).toMatch(/this node/i);
@@ -106,22 +106,22 @@ describe("imposter list", () => {
       "/_fleet/members": { json: { node_id: 1, is_leader: false, current_leader: null, last_applied: 5, voters: [1, 2, 3] } },
       "/_fleet/health": { json: { ready: true, state: "ready", pending_gates: [], isolated: true, ring: { m_idx: 3, members: [1, 2, 3] } } },
     });
-    renderInApp(<Imposters />, { whoami: whoamiWith("fleet-admin") });
+    renderInApp(<Imposters />);
 
     const empty = await screen.findByTestId("imposters-empty");
     await waitFor(() => expect(empty.textContent).toMatch(/cannot confirm/i));
   });
 
   it("says the empty list is unqualified when the fleet reading itself failed", async () => {
-    // A FleetAdmin whose `/_fleet/*` read 500s has lost the signal that would say whether an empty
-    // list can be trusted. Folding that into "nothing to report" would present the gap as a clean
+    // A `/_fleet/*` read that 500s has lost the signal that would say whether an empty list can
+    // be trusted. Folding that into "nothing to report" would present the gap as a clean
     // reading — the same mistake as saying "no imposters" from a degraded node.
     stubFetch({
       "/imposters": { json: { imposters: [] } },
       "/_fleet/members": { status: 500, json: { message: "boom" } },
       "/_fleet/health": { status: 500, json: { message: "boom" } },
     });
-    renderInApp(<Imposters />, { whoami: whoamiWith("fleet-admin") });
+    renderInApp(<Imposters />);
 
     const empty = await screen.findByTestId("imposters-empty");
     // Longer than the default: a 500 earns one retry under the shared policy, so the caveat only
@@ -133,11 +133,11 @@ describe("imposter list", () => {
     );
   });
 
-  it("does not caveat the list for a principal who never had the fleet scope", async () => {
+  it("does not caveat the list when the fleet read was never asked for", async () => {
     // The other side of the same distinction: a viewer is *refused* the projection, which is not
     // evidence of anything. A permanent warning here is one operators would learn to ignore.
     stubFetch({ "/imposters": { json: { imposters: [] } } });
-    renderInApp(<Imposters />, { whoami: whoamiWith("viewer") });
+    renderInApp(<Imposters />);
 
     const empty = await screen.findByTestId("imposters-empty");
     expect(empty.textContent).not.toMatch(/cannot confirm/i);
@@ -155,7 +155,7 @@ describe("lifecycle toggle (the one mutation in C4)", () => {
       "/_fleet/members": { status: 404 },
       "/_fleet/health": { status: 404 },
     });
-    renderInApp(<Imposters />, { whoami: whoamiWith("operator") });
+    renderInApp(<Imposters />);
     await screen.findByText("billing");
 
     const user = userEvent.setup();
@@ -180,31 +180,11 @@ describe("lifecycle toggle (the one mutation in C4)", () => {
       "/_fleet/members": { status: 404 },
       "/_fleet/health": { status: 404 },
     });
-    renderInApp(<Imposters />, { whoami: whoamiWith("operator") });
+    renderInApp(<Imposters />);
     await screen.findByText("shipping");
 
     await userEvent.setup().click(screen.getByRole("button", { name: /enable shipping/i }));
     await waitFor(() => expect(calls).toContain("/imposters/4546/enable"));
-  });
-
-  it("carries the tenant in view on both the read and the write", async () => {
-    stubFetch({
-      "/imposters": { json: TWO },
-      "/imposters/4545/disable": { json: { message: "disabled" } },
-      "/_fleet/members": { status: 404 },
-      "/_fleet/health": { status: 404 },
-    });
-    renderInApp(<Imposters />, { whoami: whoamiWith("operator", ["acme", "globex"]), tenant: "globex", tenants: ["acme", "globex"] });
-    await screen.findByText("billing");
-    await userEvent.setup().click(screen.getByRole("button", { name: /disable billing/i }));
-
-    const mock = globalThis.fetch as unknown as { mock: { calls: [string, RequestInit][] } };
-    await waitFor(() => {
-      const write = mock.mock.calls.find(([path]) => path === "/imposters/4545/disable");
-      expect((write?.[1]?.headers as Record<string, string>)[TENANT_HEADER]).toBe("globex");
-    });
-    const read = mock.mock.calls.find(([path]) => path === "/imposters");
-    expect((read?.[1]?.headers as Record<string, string>)[TENANT_HEADER]).toBe("globex");
   });
 
   it("surfaces a refused toggle instead of leaving the row looking changed", async () => {
@@ -216,7 +196,7 @@ describe("lifecycle toggle (the one mutation in C4)", () => {
       "/_fleet/members": { status: 404 },
       "/_fleet/health": { status: 404 },
     });
-    renderInApp(<Imposters />, { whoami: whoamiWith("operator") });
+    renderInApp(<Imposters />);
     await screen.findByText("billing");
     await userEvent.setup().click(screen.getByRole("button", { name: /disable billing/i }));
 
@@ -224,19 +204,10 @@ describe("lifecycle toggle (the one mutation in C4)", () => {
   });
 });
 
-describe("RBAC-correct visibility", () => {
-  it("shows a viewer no lifecycle affordance at all", async () => {
+describe("the lifecycle affordance", () => {
+  it("names the imposter it would act on", async () => {
     stubFetch({ "/imposters": { json: TWO }, "/_fleet/members": { status: 404 }, "/_fleet/health": { status: 404 } });
-    renderInApp(<Imposters />, { whoami: whoamiWith("viewer") });
-    await screen.findByText("billing");
-
-    expect(screen.queryByRole("button", { name: /disable/i })).toBeNull();
-    expect(screen.queryByRole("button", { name: /enable/i })).toBeNull();
-  });
-
-  it("shows an operator the lifecycle affordance", async () => {
-    stubFetch({ "/imposters": { json: TWO }, "/_fleet/members": { status: 404 }, "/_fleet/health": { status: 404 } });
-    renderInApp(<Imposters />, { whoami: whoamiWith("operator") });
+    renderInApp(<Imposters />);
     await screen.findByText("billing");
 
     expect(screen.getByRole("button", { name: /disable billing/i })).toBeTruthy();
@@ -272,7 +243,7 @@ describe("every rendered cell comes from the declared column table", () => {
     // field the contract never declared, and the type system never sees it. This asserts against
     // the rendered DOM instead, so an extra column is a failure wherever it was added.
     stubFetch({ "/imposters": { json: TWO }, "/_fleet/members": { status: 404 }, "/_fleet/health": { status: 404 } });
-    renderInApp(<Imposters />, { whoami: whoamiWith("viewer") });
+    renderInApp(<Imposters />);
     await screen.findByText("billing");
 
     // The sort affordance (#252) appends an `aria-hidden` arrow to whichever column is sorted, so
@@ -281,26 +252,25 @@ describe("every rendered cell comes from the declared column table", () => {
     const headers = [...screen.getAllByRole("columnheader")].map((cell) =>
       cell.textContent?.replace(/[\u25b2\u25bc]/g, "").trim(),
     );
+    // The two control columns carry no visible label — the selection column's header holds the
+    // select-all checkbox, and the actions column is named only to assistive tech.
     expect(headers).toEqual([
+      "",
       ...IMPOSTER_COLUMNS.map((column) => column.label),
       ...DERIVED_COLUMNS,
+      "",
     ]);
 
-    // A viewer gets neither the lifecycle column nor the bulk-selection one (it holds none of the
-    // bulk actions), so the cell count is exactly the declared columns.
-    const cells = within(screen.getByTestId("imposter-row-4545")).getAllByRole("cell");
-    expect(cells.length).toBe(IMPOSTER_COLUMNS.length + DERIVED_COLUMNS.length);
   });
 
-  it("adds exactly two control columns for a role that holds the actions, and no data column", async () => {
+  it("adds exactly two control columns, and no data column", async () => {
     /*
-     * An operator holds `imposter.lifecycle` and `requests.clear`, so the row carries two columns
-     * that are not data: the bulk-selection checkbox (#252) and the lifecycle control. Both are
-     * named here rather than left as a bare `+2`, so a third one appearing has to be justified by
-     * editing this sentence.
+     * The row carries two columns that are not data: the bulk-selection checkbox (#252) and the
+     * lifecycle control. Both are named here rather than left as a bare `+2`, so a third one
+     * appearing has to be justified by editing this sentence.
      */
     stubFetch({ "/imposters": { json: TWO }, "/_fleet/members": { status: 404 }, "/_fleet/health": { status: 404 } });
-    renderInApp(<Imposters />, { whoami: whoamiWith("operator") });
+    renderInApp(<Imposters />);
     await screen.findByText("billing");
 
     const cells = within(screen.getByTestId("imposter-row-4545")).getAllByRole("cell");
@@ -323,7 +293,7 @@ describe("an imposter with no name", () => {
       "/_fleet/members": { status: 404 },
       "/_fleet/health": { status: 404 },
     });
-    renderInApp(<Imposters />, { whoami: whoamiWith("editor") });
+    renderInApp(<Imposters />);
 
     const cell = await screen.findByTestId("imposter-name-4545");
     const link = cell.closest("a");
@@ -337,7 +307,7 @@ describe("an imposter with no name", () => {
       "/_fleet/members": { status: 404 },
       "/_fleet/health": { status: 404 },
     });
-    renderInApp(<Imposters />, { whoami: whoamiWith("editor") });
+    renderInApp(<Imposters />);
 
     const cell = await screen.findByTestId("imposter-name-4545");
     // `—` is "the response did not tell us"; this imposter genuinely has no name, and a link
@@ -350,7 +320,7 @@ describe("an imposter with no name", () => {
 
   it("leaves a named imposter's link unlabelled, since its text already names it", async () => {
     stubFetch({ "/imposters": { json: TWO }, "/_fleet/members": { status: 404 }, "/_fleet/health": { status: 404 } });
-    renderInApp(<Imposters />, { whoami: whoamiWith("editor") });
+    renderInApp(<Imposters />);
 
     const cell = await screen.findByTestId("imposter-name-4545");
     expect(cell.closest("a")!.getAttribute("aria-label")).toBeNull();
@@ -365,7 +335,7 @@ describe("dense tables (200 imposters, 40-character names, narrow window)", () =
       "/_fleet/members": { status: 404 },
       "/_fleet/health": { status: 404 },
     });
-    renderInApp(<Imposters />, { whoami: whoamiWith("viewer") });
+    renderInApp(<Imposters />);
 
     const cell = await screen.findByTestId("imposter-name-4545");
     expect(cell.textContent!.length).toBeLessThan(long.length);
@@ -381,7 +351,7 @@ describe("dense tables (200 imposters, 40-character names, narrow window)", () =
       enabled: true,
     }));
     stubFetch({ "/imposters": { json: { imposters: many } }, "/_fleet/members": { status: 404 }, "/_fleet/health": { status: 404 } });
-    renderInApp(<Imposters />, { whoami: whoamiWith("viewer") });
+    renderInApp(<Imposters />);
 
     await screen.findByText("4000");
     expect(screen.getAllByTestId(/^imposter-row-/).length).toBe(200);
@@ -401,7 +371,7 @@ describe("a parked write is not reported as saved (#211)", () => {
       "/_fleet/members": { status: 404 },
       "/_fleet/health": { status: 404 },
     });
-    renderInApp(<Imposters />, { whoami: whoamiWith("fleet-admin") });
+    renderInApp(<Imposters />);
     await screen.findByText("billing");
 
     await userEvent.setup().click(screen.getByRole("button", { name: /disable billing/i }));
@@ -416,21 +386,21 @@ describe("a parked write is not reported as saved (#211)", () => {
       "/imposters": { json: TWO },
       "/imposters/4545/disable": { json: { opId: "op-8" }, status: 202 },
       "/_fleet/ops/op-8": {
-        json: { state: "failed", revision: 3, detail: "port claimed by another tenant" },
+        json: { state: "failed", revision: 3, detail: "port is already claimed" },
       },
       "/_fleet/members": { status: 404 },
       "/_fleet/health": { status: 404 },
     });
-    renderInApp(<Imposters />, { whoami: whoamiWith("fleet-admin") });
+    renderInApp(<Imposters />);
     await screen.findByText("billing");
 
     await userEvent.setup().click(screen.getByRole("button", { name: /disable billing/i }));
 
     const alert = await screen.findByRole("alert");
-    expect(alert.textContent).toContain("port claimed by another tenant");
+    expect(alert.textContent).toContain("port is already claimed");
   });
 
-  it("says accepted-not-confirmed when this principal cannot read the op status", async () => {
+  it("says accepted-not-confirmed when the op status cannot be read", async () => {
     /*
      * The case that makes the three-valued outcome load-bearing. `/_fleet/ops/*` is fleet-scoped and
      * answers 404 to everyone else, so an ordinary operator's write is accepted, almost certainly
@@ -444,7 +414,7 @@ describe("a parked write is not reported as saved (#211)", () => {
       "/_fleet/members": { status: 404 },
       "/_fleet/health": { status: 404 },
     });
-    renderInApp(<Imposters />, { whoami: whoamiWith("operator") });
+    renderInApp(<Imposters />);
     await screen.findByText("billing");
 
     await userEvent.setup().click(screen.getByRole("button", { name: /disable billing/i }));
@@ -460,11 +430,10 @@ describe("#251 — import", () => {
   const FLEET = { "/_fleet/members": { status: 404 }, "/_fleet/health": { status: 404 } };
 
   /** Render the list and open the import panel, which lives behind a toggle. */
-  async function openImport(role: "editor" | "viewer" | "fleet-admin" = "editor"): Promise<void> {
-    renderInApp(<Imposters />, { whoami: whoamiWith(role) });
+  async function openImport(): Promise<void> {
+    renderInApp(<Imposters />);
     await screen.findByText("billing");
-    const toggle = screen.queryByTestId("open-import");
-    if (toggle !== null) await userEvent.setup().click(toggle);
+    await userEvent.setup().click(screen.getByTestId("open-import"));
   }
 
   async function paste(text: string): Promise<void> {
@@ -537,15 +506,11 @@ describe("#251 — import", () => {
     expect(writes).toBe(2);
   });
 
-  it("offers replace-all to a role holding imposter.delete", async () => {
-    /*
-     * The previous version of this test could not fail: it rendered the default role (which holds
-     * everything), then asserted `expect(x).toBeTruthy()` inside `if (x !== null)`. Both branches
-     * passed unconditionally, so it read as coverage of the authorization rule while checking
-     * nothing. Asserted directly now, in both directions — see the viewer case below.
-     */
+  it("offers both an add and a replace-all once a document parses", async () => {
+    // Asserted directly rather than inside an `if`: a control that is merely *present when present*
+    // is what this pair of assertions exists to rule out.
     stubFetch({ "/imposters": { json: TWO }, ...FLEET });
-    await openImport("editor");
+    await openImport();
     await paste(JSON.stringify({ port: 9000, protocol: "http" }));
 
     expect(await screen.findByTestId("import-add")).toBeTruthy();
@@ -556,7 +521,7 @@ describe("#251 — import", () => {
     // Replace-all is the destructive one, and the number it destroys is not visible from the
     // document being imported — it is a fact about the fleet.
     stubFetch({ "/imposters": { json: TWO }, ...FLEET });
-    await openImport("editor");
+    await openImport();
     await paste(JSON.stringify({ port: 9000, protocol: "http" }));
     await userEvent.setup().click(screen.getByTestId("import-replace"));
 
@@ -565,15 +530,6 @@ describe("#251 — import", () => {
     expect(confirm.textContent).toContain("2");
   });
 
-  it("offers a viewer no import at all", async () => {
-    stubFetch({ "/imposters": { json: TWO }, ...FLEET });
-    await openImport("viewer");
-    // No toggle for a viewer, so no panel — and none reachable by any other route either.
-    expect(screen.queryByTestId("open-import")).toBeNull();
-    expect(screen.queryByTestId("import-panel")).toBeNull();
-    // Export is a read affordance and stays.
-    expect(screen.getByTestId("export-imposters")).toBeTruthy();
-  });
 });
 
 describe("the fleet-sum request tile (#363)", () => {
@@ -590,7 +546,7 @@ describe("the fleet-sum request tile (#363)", () => {
 
   it("sums every imposter's count and says the sum spans the fleet", async () => {
     stubFetch({ ...FLEET, "/imposters": { json: withCounts(7, 5) } });
-    renderInApp(<Imposters />, { whoami: whoamiWith("viewer") });
+    renderInApp(<Imposters />);
     await screen.findByText("billing");
 
     expect((await screen.findByTestId("tile-requests")).textContent).toBe("12");
@@ -607,7 +563,7 @@ describe("the fleet-sum request tile (#363)", () => {
       ...FLEET,
       "/imposters": { json: withCounts(7, 5), headers: { "rift-cluster-partial": "true" } },
     });
-    renderInApp(<Imposters />, { whoami: whoamiWith("viewer") });
+    renderInApp(<Imposters />);
     await screen.findByText("billing");
 
     expect((await screen.findByTestId("tile-requests")).textContent).toBe("12");
@@ -619,7 +575,7 @@ describe("the fleet-sum request tile (#363)", () => {
   // means something, which is the rule the request log's scope strip already follows.
   it("carries no caveat when the merge reached every node", async () => {
     stubFetch({ ...FLEET, "/imposters": { json: withCounts(7, 5) } });
-    renderInApp(<Imposters />, { whoami: whoamiWith("viewer") });
+    renderInApp(<Imposters />);
     await screen.findByText("billing");
 
     await screen.findByTestId("tile-requests");
@@ -633,7 +589,7 @@ describe("the fleet-sum request tile (#363)", () => {
    */
   it("shows no total when a row carried no count at all", async () => {
     stubFetch({ ...FLEET, "/imposters": { json: withCounts(7, undefined) } });
-    renderInApp(<Imposters />, { whoami: whoamiWith("viewer") });
+    renderInApp(<Imposters />);
     await screen.findByText("billing");
 
     const tile = await screen.findByTestId("tile-requests");
@@ -669,7 +625,7 @@ describe("the control-plane panel's per-voter applied indices (#361)", () => {
       "/_fleet/members": { json: MEMBERS },
       "/_fleet/health": { json: HEALTH },
     });
-    renderInApp(<Imposters />, { whoami: whoamiWith("fleet-admin") });
+    renderInApp(<Imposters />);
 
     // The peer's index is the point: before #361 only this node's row carried a number.
     expect((await screen.findByTestId("applied-1")).textContent).toBe("415");
@@ -686,7 +642,7 @@ describe("the control-plane panel's per-voter applied indices (#361)", () => {
       "/_fleet/members": { json: MEMBERS },
       "/_fleet/health": { json: HEALTH },
     });
-    renderInApp(<Imposters />, { whoami: whoamiWith("fleet-admin") });
+    renderInApp(<Imposters />);
 
     const cell = await screen.findByTestId("applied-3");
     expect(cell.textContent).toBe("—");
@@ -703,7 +659,7 @@ describe("the control-plane panel's per-voter applied indices (#361)", () => {
       "/_fleet/members": { json: { ...MEMBERS, members: [MEMBERS.members[0]] } },
       "/_fleet/health": { json: HEALTH },
     });
-    renderInApp(<Imposters />, { whoami: whoamiWith("fleet-admin") });
+    renderInApp(<Imposters />);
 
     expect((await screen.findByTestId("applied-1")).textContent).toBe("415");
     expect((await screen.findByTestId("applied-3")).textContent).toBe("—");
@@ -735,7 +691,7 @@ describe("the parked-intent depth tile (#360)", () => {
       "/_fleet/members": { json: MEMBERS },
       "/_fleet/health": { json: health({ parked_intents: 4, parked_intents_fleet: 11 }) },
     });
-    renderInApp(<Imposters />, { whoami: whoamiWith("fleet-admin") });
+    renderInApp(<Imposters />);
     await screen.findByText("billing");
 
     // The fleet sum, not this node's 4 — the label says fleet, so the number must be.
@@ -757,7 +713,7 @@ describe("the parked-intent depth tile (#360)", () => {
         headers: { "rift-cluster-partial": "true" },
       },
     });
-    renderInApp(<Imposters />, { whoami: whoamiWith("fleet-admin") });
+    renderInApp(<Imposters />);
     await screen.findByText("billing");
 
     expect((await screen.findByTestId("tile-parked")).textContent).toBe("11");
@@ -775,7 +731,7 @@ describe("the parked-intent depth tile (#360)", () => {
       "/_fleet/members": { json: MEMBERS },
       "/_fleet/health": { json: health({ parked_intents: null }) },
     });
-    renderInApp(<Imposters />, { whoami: whoamiWith("fleet-admin") });
+    renderInApp(<Imposters />);
     await screen.findByText("billing");
 
     const tile = await screen.findByTestId("tile-parked");
@@ -783,15 +739,15 @@ describe("the parked-intent depth tile (#360)", () => {
     expect(screen.getByText(/could not read its own queue/i)).toBeTruthy();
   });
 
-  // "You may not ask" and "the answer is none" are different facts, so a principal refused the
+  // "Not read" and "the answer is none" are different facts, so a screen that never obtained the
   // fleet read gets no tile rather than a zero.
-  it("omits the tile entirely for a principal without fleet.read", async () => {
+  it("omits the tile entirely when the fleet read did not land", async () => {
     stubFetch({
       "/imposters": { json: TWO },
       "/_fleet/members": { status: 403 },
       "/_fleet/health": { status: 403 },
     });
-    renderInApp(<Imposters />, { whoami: whoamiWith("editor") });
+    renderInApp(<Imposters />);
     await screen.findByText("billing");
 
     expect(screen.queryByTestId("tile-parked")).toBeNull();

@@ -141,17 +141,17 @@ describe("degraded detection", () => {
 
 describe("viewConfidence", () => {
   it("makes no claim when the projection was never asked for", () => {
-    // Fleet-scoped, so every role below FleetAdmin is refused it and the imposter list does not
+    // The imposter list does not
     // even try. Asserting "partial" on that absence would put a permanent warning on a healthy
     // console; asserting "complete" would be a claim nothing supports. It says neither.
     const confidence = viewConfidence({ kind: "not-asked" });
     expect(confidence).toEqual({ partial: false, reason: null, unknown: false });
   });
 
-  it("does not fold a failed read into a principal who never asked", () => {
-    // The distinction that matters: a FleetAdmin whose `/_fleet/*` read failed has *lost* the
-    // signal that would say whether an empty list can be trusted. Reporting that as "not asked"
-    // would present the gap as a clean reading.
+  it("does not fold a failed read into a read that was never asked for", () => {
+    // The distinction that matters: a `/_fleet/*` read that *failed* has lost the signal that
+    // would say whether an empty list can be trusted. Reporting that as "not asked" would present
+    // the gap as a clean reading.
     const confidence = viewConfidence({ kind: "unavailable" });
     expect(confidence.unknown).toBe(true);
     expect(confidence.partial).toBe(false);

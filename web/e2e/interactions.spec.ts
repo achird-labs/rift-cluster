@@ -5,20 +5,18 @@ import { expect, fixture, goToScreen, signIn, test } from "./fixture.ts";
  *
  * `smoke.spec.ts` proves every screen loads; this one proves the things an operator actually *does*
  * work. Each test creates what it needs with a name of its own and removes it, because the fixture
- * is one stateful node shared serially — a test that leaves a tenant behind changes the next run's
- * baselines.
+ * is one stateful node shared serially — a test that leaves an imposter behind changes the next
+ * run's baselines.
  *
- * ## All eight pass, and every failure along the way was this spec's own
+ * ## Every failure along the way was this spec's own
  *
- * Worth recording, because two of them looked exactly like broken features and one produced a real
- * product fix anyway.
+ * Worth recording, because two of them looked exactly like broken features.
  *
- * - Wrong labels: the tenant field is "Tenant id", not "Id"; the principal form's submit is "Mint"
- *   ("Create principal" opens it); the stub row's button reads "Edit" but its accessible name is
- *   `Edit <stubId>`, because the id moved into `aria-label` when the labels were shortened.
+ * - Wrong labels: the stub row's button reads "Edit" but its accessible name is `Edit <stubId>`,
+ *   because the id moved into `aria-label` when the labels were shortened.
  * - Strict-mode violations: `getByText` matched a table cell *and* a row button, so a locator
- *   resolving to two elements failed as though nothing had rendered. Both the binding and the
- *   added stub had in fact been created.
+ *   resolving to two elements failed as though nothing had rendered. The added stub had in fact
+ *   been created.
  * - A missing `baseURL`: the conflict test opened a second browser context for realism, and
  *   `newContext()` does not inherit it — every relative request went nowhere, no write landed, the
  *   revision never moved, and the save under test succeeded. It waited out its timeout for a
@@ -26,68 +24,11 @@ import { expect, fixture, goToScreen, signIn, test } from "./fixture.ts";
  * - A race on the pinned revision: the editor pins `If-Match` at first render, so opening it before
  *   the imposter read lands pins `null`, which disables Save outright.
  *
- * The tenants case was the one that was not a test bug on both sides: `TenantDelete` is a tombstone
- * (RFC-002 §3.3) and the table rendered a deleted tenant identically to a live one, so a working
- * delete read as a silent failure. The table now shows the state and drops the controls.
- *
  * Locator rules that came out of it: `getByText` matches text nodes only, so a button carrying its
  * target in `aria-label` does not collide with it; `getByRole("cell")` matches the cell's accessible
  * name, which in these tables concatenates a display name with a truncated id and so matches neither
  * cleanly. Prefer `locator("tr", { hasText })` for a row.
  */
-
-test.describe("tenants: the full lifecycle", () => {
-  test("creates, edits and deletes a tenant", async ({ page }) => {
-    await signIn(page, "fleet-admin");
-    await goToScreen(page, "/admin/tenants/default");
-
-    await page.getByRole("button", { name: /create tenant/i }).click();
-    // "Tenant id", not "Id" — and `^id$` would also match the table's own column header.
-    await page.getByLabel(/tenant id/i).fill("e2e-temp");
-    await page.getByLabel(/display name/i).fill("Temporary");
-    await page.getByRole("form", { name: /create tenant/i }).getByRole("button", { name: /^create tenant$/i }).click();
-
-    await expect(page.getByText("e2e-temp")).toBeVisible();
-
-    // And it is gone again, so the next run starts where this one did.
-    const row = page.locator("tr", { hasText: "e2e-temp" });
-    await row.getByRole("button", { name: /delete/i }).click();
-    const confirm = page.getByTestId("confirm-destructive");
-    if (await confirm.isVisible().catch(() => false)) await confirm.click();
-    /*
-     * The row stays. `TenantDelete` is a tombstone (RFC-002 §3.3), so what must be true is that the
-     * table *says so* — it used to render a deleted tenant identically to a live one, which is how
-     * a working delete reads as a silent failure. The switcher filters them separately.
-     */
-    const deleted = page.locator("tr", { hasText: "e2e-temp" });
-    await expect(deleted).toContainText(/deleted/i, { timeout: 10_000 });
-    // And no controls on a tombstone: "Delete" whose only outcome is no change teaches the operator
-    // the first one did not work.
-    await expect(deleted.getByRole("button")).toHaveCount(0);
-  });
-});
-
-test.describe("bindings: granting and revoking a role", () => {
-  test("binds a principal into a tenant and unbinds it again", async ({ page }) => {
-    await signIn(page, "fleet-admin");
-
-    // Mint one to bind, so this does not depend on the fixture's own principals.
-    await goToScreen(page, "/admin/principals/acme");
-    await page.getByRole("button", { name: /create principal/i }).click();
-    await page.getByLabel(/display name/i).fill("E2E Bindee");
-    // The form's submit is "Mint" — "Create principal" is the button that opens it.
-    await page.getByRole("button", { name: /^mint$/i }).click();
-    await expect(page.locator("tr", { hasText: "E2E Bindee" }).first()).toBeVisible();
-
-    // The key panel is shown once and must be dismissible without losing the row behind it.
-    await page.getByRole("button", { name: /dismiss/i }).click();
-    await expect(page.getByTestId("minted-key")).toHaveCount(0);
-    await expect(page.locator("tr", { hasText: "E2E Bindee" }).first()).toBeVisible();
-
-    await goToScreen(page, "/admin/bindings/acme");
-    await expect(page.getByTestId("binding-row").first()).toBeVisible();
-  });
-});
 
 test.describe("stubs: the conflict flow", () => {
   test("refuses a stale write and offers both sides rather than merging", async ({ page }) => {
@@ -96,9 +37,9 @@ test.describe("stubs: the conflict flow", () => {
      * write lands; the first save must be refused with both versions on screen and no automatic
      * merge. Driven with two browser contexts because that is the real shape of it.
      */
-    const { imposters, keys } = fixture();
+    const { imposters, apiKey } = fixture();
     const port = imposters[0];
-    await signIn(page, "editor");
+    await signIn(page);
     await goToScreen(page, `/imposters/${port}`);
     // `/^edit /` with the trailing space, not `/^edit$/`: the button's visible text is "Edit" but
     // its accessible name is `Edit <stubId>`, because the id moved into `aria-label` when the
@@ -130,12 +71,12 @@ test.describe("stubs: the conflict flow", () => {
      * editor, so anything that commits a write is a second writer as far as this flow is concerned.
      */
     const read = await page.request.get(`/imposters/${port}`, {
-      headers: { Authorization: keys.editor },
+      headers: { Authorization: apiKey },
     });
     const revision = read.headers()["rift-cluster-revision"] ?? "";
     expect(revision, "the read must carry a revision to write against").not.toBe("");
     const wrote = await page.request.post(`/imposters/${port}/stubs`, {
-      headers: { Authorization: keys.editor, "If-Match": revision },
+      headers: { Authorization: apiKey, "If-Match": revision },
       data: { stub: { id: "e2e-conflict", responses: [{ is: { statusCode: 200 } }] } },
     });
     // Asserted, not assumed: a second write that quietly failed would leave the revision where the
@@ -168,7 +109,7 @@ test.describe("the stub JSON pane, in the editor the console ships", () => {
      * on its own could pass against a broken editor.
      */
     const { imposters } = fixture();
-    await signIn(page, "editor");
+    await signIn(page);
     await goToScreen(page, `/imposters/${imposters[0]}`);
     await page.getByRole("button", { name: /edit get-order/i }).click();
 
@@ -178,7 +119,7 @@ test.describe("the stub JSON pane, in the editor the console ships", () => {
 
   test("refuses unparseable JSON and disables the save rather than sending it", async ({ page }) => {
     const { imposters } = fixture();
-    await signIn(page, "editor");
+    await signIn(page);
     await goToScreen(page, `/imposters/${imposters[1]}`);
     await page.getByRole("button", { name: /add stub/i }).click();
     await expect(page.getByTestId("stub-editor")).toBeVisible();
@@ -200,7 +141,7 @@ test.describe("the stub JSON pane, in the editor the console ships", () => {
 
 test.describe("front-door routes: pre-flight validation", () => {
   test("refuses a duplicate id at the point of typing", async ({ page }) => {
-    await signIn(page, "editor");
+    await signIn(page);
     await goToScreen(page, "/routes");
     await page.getByTestId("add-route").click();
     await page.getByLabel(/^id$/i).fill("checkout"); // already in the seeded table
@@ -212,7 +153,7 @@ test.describe("front-door routes: pre-flight validation", () => {
   test("names the strip-without-prefix error the fleet would raise", async ({ page }) => {
     // `RouteTable::validate` refuses the whole table for this; the editor mirrors it so the
     // operator is not told by a rejected save.
-    await signIn(page, "editor");
+    await signIn(page);
     await goToScreen(page, "/routes");
     await page.getByTestId("add-route").click();
     await page.getByLabel(/^id$/i).fill("e2e-strip");
@@ -226,7 +167,7 @@ test.describe("front-door routes: pre-flight validation", () => {
 
 test.describe("imposters: create then remove", () => {
   test("creates one, sees it listed, and deletes it", async ({ page }) => {
-    await signIn(page, "editor");
+    await signIn(page);
     await goToScreen(page, "/imposters");
     await page.getByTestId("new-imposter").click();
     await page.getByLabel(/^port$/i).fill("4788");
@@ -247,7 +188,7 @@ test.describe("imposters: create then remove", () => {
   test("adds a stub to an imposter and it appears in the list", async ({ page }) => {
     // The write that was broken until this branch: `POST /stubs` needs a `{stub}` envelope.
     const { imposters } = fixture();
-    await signIn(page, "editor");
+    await signIn(page);
     await goToScreen(page, `/imposters/${imposters[1]}`);
     await page.getByRole("button", { name: /add stub/i }).click();
     await page.getByRole("button", { name: /not found 404/i }).click();

@@ -105,13 +105,13 @@ async function shownTotal(page: Page): Promise<number> {
 }
 
 test.beforeAll(async ({ browser }) => {
-  const { keys } = fixture();
+  const { apiKey } = fixture();
   const context = await browser.newContext();
   const page = await context.newPage();
 
   for (const entry of CORPUS) {
     const created = await page.request.post("/imposters", {
-      headers: { Authorization: keys.editor, "Content-Type": "application/json" },
+      headers: { Authorization: apiKey, "Content-Type": "application/json" },
       data: entry.body,
     });
     expect(
@@ -137,7 +137,7 @@ test.beforeAll(async ({ browser }) => {
   // Move one scenario off its default so the screen has a value it could plausibly get wrong. The
   // other is left alone on purpose: the oracle must agree with the fleet about both.
   const moved = await page.request.put(`/imposters/${SCENARIOS}/scenarios/checkout/state`, {
-    headers: { Authorization: keys.editor, "Content-Type": "application/json" },
+    headers: { Authorization: apiKey, "Content-Type": "application/json" },
     data: { state: "awaiting-payment" },
   });
   expect(moved.ok(), `could not set a scenario state — ${moved.status()} ${await moved.text()}`).toBeTruthy();
@@ -148,13 +148,13 @@ test.beforeAll(async ({ browser }) => {
 test.afterAll(async ({ browser }) => {
   // Asserted, not best-effort: a leaked corpus imposter changes the imposter-table baseline
   // `visual.spec.ts` takes later in the same run, and that failure would name the wrong file.
-  const { keys } = fixture();
+  const { apiKey } = fixture();
   const context = await browser.newContext();
   const page = await context.newPage();
   const leaked: number[] = [];
   for (const entry of CORPUS) {
     const response = await page.request.delete(`/imposters/${entry.port}`, {
-      headers: { Authorization: keys.editor },
+      headers: { Authorization: apiKey },
     });
     if (!response.ok()) leaked.push(entry.port);
   }
@@ -168,11 +168,11 @@ test.afterAll(async ({ browser }) => {
  */
 test.describe("the request log agrees with the fleet", () => {
   test("the total it reports is the number of requests the API holds", async ({ page }) => {
-    const { keys } = fixture();
-    await signIn(page, "editor");
+    const { apiKey } = fixture();
+    await signIn(page);
 
     for (const port of [REQUESTS_FEW, REQUESTS_PAGED]) {
-      const expected = await apiRequests(page, port, keys.editor);
+      const expected = await apiRequests(page, port, apiKey);
       await page.goto(`/console/#/requests/${port}`);
       await expect(page.getByTestId("request-total")).toBeVisible();
       expect(await shownTotal(page), `:${port} total`).toBe(expected.length);
@@ -185,9 +185,9 @@ test.describe("the request log agrees with the fleet", () => {
      * are THESE requests. Checked on the short log so the whole log fits one page and the comparison
      * is one for one.
      */
-    const { keys } = fixture();
-    await signIn(page, "editor");
-    const expected = await apiRequests(page, REQUESTS_FEW, keys.editor);
+    const { apiKey } = fixture();
+    await signIn(page);
+    const expected = await apiRequests(page, REQUESTS_FEW, apiKey);
     await page.goto(`/console/#/requests/${REQUESTS_FEW}`);
 
     const rows = page.getByTestId("request-row");
@@ -202,9 +202,9 @@ test.describe("the request log agrees with the fleet", () => {
      * reports 50 is lying about the fleet, and one that renders all 55 has quietly dropped the
      * pager. Both are only visible by comparing the two numbers against the API.
      */
-    const { keys } = fixture();
-    await signIn(page, "editor");
-    const expected = await apiRequests(page, REQUESTS_PAGED, keys.editor);
+    const { apiKey } = fixture();
+    await signIn(page);
+    const expected = await apiRequests(page, REQUESTS_PAGED, apiKey);
     expect(expected.length, "the paged corpus did not record enough traffic").toBeGreaterThan(PAGE_SIZE);
 
     await page.goto(`/console/#/requests/${REQUESTS_PAGED}`);
@@ -215,9 +215,9 @@ test.describe("the request log agrees with the fleet", () => {
   test("an imposter that recorded nothing says so, rather than reporting a count", async ({ page }) => {
     // Empty is not unknown. `request-log-unknown` is the banner for a read that failed, and showing
     // it here would turn "nothing happened yet" into "this node is broken".
-    const { keys } = fixture();
-    await signIn(page, "editor");
-    expect(await apiRequests(page, REQUESTS_EMPTY, keys.editor)).toEqual([]);
+    const { apiKey } = fixture();
+    await signIn(page);
+    expect(await apiRequests(page, REQUESTS_EMPTY, apiKey)).toEqual([]);
 
     await page.goto(`/console/#/requests/${REQUESTS_EMPTY}`);
     await expect(page.getByTestId("request-log-empty")).toBeVisible();
@@ -228,9 +228,9 @@ test.describe("the request log agrees with the fleet", () => {
 
 test.describe("the scenarios screen agrees with the fleet", () => {
   test("every scenario the API reports is on screen with exactly that state", async ({ page }) => {
-    const { keys } = fixture();
-    await signIn(page, "editor");
-    const { scenarios } = await apiScenarios(page, SCENARIOS, keys.editor);
+    const { apiKey } = fixture();
+    await signIn(page);
+    const { scenarios } = await apiScenarios(page, SCENARIOS, apiKey);
     expect(scenarios.length, "the corpus declared no scenarios, so nothing below is asserted").toBeGreaterThan(0);
 
     await page.goto(`/console/#/scenarios/${SCENARIOS}`);
@@ -243,9 +243,9 @@ test.describe("the scenarios screen agrees with the fleet", () => {
   });
 
   test("it invents no scenario the API did not report", async ({ page }) => {
-    const { keys } = fixture();
-    await signIn(page, "editor");
-    const { scenarios } = await apiScenarios(page, SCENARIOS, keys.editor);
+    const { apiKey } = fixture();
+    await signIn(page);
+    const { scenarios } = await apiScenarios(page, SCENARIOS, apiKey);
 
     await page.goto(`/console/#/scenarios/${SCENARIOS}`);
     // Every state cell on screen, whatever its name — the count must match the fleet's list.
@@ -259,9 +259,9 @@ test.describe("the scenarios screen agrees with the fleet", () => {
      * as unreadable for exactly that reason — so a screen naming a different flow than the one the
      * states came from is attributing them to the wrong space.
      */
-    const { keys } = fixture();
-    await signIn(page, "editor");
-    const { flowId } = await apiScenarios(page, SCENARIOS, keys.editor);
+    const { apiKey } = fixture();
+    await signIn(page);
+    const { flowId } = await apiScenarios(page, SCENARIOS, apiKey);
     expect(flowId, "the fleet echoed no flow, so this assertion would be vacuous").toBeTruthy();
 
     await page.goto(`/console/#/scenarios/${SCENARIOS}`);

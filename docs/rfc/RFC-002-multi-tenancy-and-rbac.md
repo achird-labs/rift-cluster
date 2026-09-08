@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | v1 — design complete, implementation-ready; ships as **Phase T**, parallel to RFC-001 Phases 2–3 |
+| **Status** | v1 — **superseded by D-73** (RFC-007 §3.2, #550) |
 | **Tracking issue** | [achird-labs/rift-cluster#17](https://github.com/achird-labs/rift-cluster/issues/17) |
 | **Canonical location** | `rift-cluster:docs/rfc/RFC-002-multi-tenancy-and-rbac.md` |
 | **Depends on** | **ADR-001** (Raft control plane) and **#14** — the state machine this RFC's records live in. Nothing here works on an eventually-consistent store; see §3.1 |
@@ -11,6 +11,25 @@
 | **Date** | 2026-07-23 |
 
 ---
+
+> **Retired by D-73** (RFC-007 §3.2, #550): this RFC is superseded **in full**. Tenants,
+> principals, role bindings, the five roles, quotas, the `X-Rift-Tenant` header, the
+> `/admin/tenants*` and `/admin/whoami` surfaces and the indistinguishable-404 rule no longer
+> exist — nothing below is served or built. Its audit half was already retired by D-71 (#546).
+>
+> **What replaced it, in one line:** one credential. Open-source Rift's `--api-key`, set ⇒ the
+> whole admin plane is closed to it and unset ⇒ open; `POST /session` exchanges that key for the
+> console's cookie. Everyone who can administer the fleet can administer all of it, and isolation
+> between teams is two fleets rather than one feature (RFC-007 §3.3).
+>
+> **Why, in one line:** tenancy was the largest surface in the system and the one that leaked
+> into core correctness — D-68 existed because only the default tenant's routes were ever
+> compiled into the router. The full argument is RFC-007 §2 and §3.2.
+>
+> The document stays as the record of what was designed and shipped. Read it for the reasoning
+> (the ownership model, the 404-vs-403 rule, the argon2id cost note); do not read it as a
+> description of any code. Several later decisions cite it as their *origin* — those citations
+> are history, not a claim that the mechanism is live.
 
 ## 1. Summary
 

@@ -159,7 +159,7 @@ describe("every displayed field is traceable to the contract", () => {
 
 describe("the client is the only door to the network", () => {
   it("calls fetch from nowhere but api/client.ts", () => {
-    // A screen calling `fetch` directly bypasses the tenant header, the CSRF header and the
+    // A screen calling `fetch` directly bypasses the CSRF header, the credentials mode and the
     // non-2xx-becomes-an-error rule in one step, and none of the other tests would notice.
     const offenders = sourceFiles(SRC)
       .filter((path) => !path.endsWith(join("api", "client.ts")))

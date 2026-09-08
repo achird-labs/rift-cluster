@@ -155,7 +155,7 @@ export function ImposterFilters({
             Bind failures{" "}
             <Pending
               issue={369}
-              reason="The fleet projection is out of scope for this principal, so the console cannot tell which imposters failed to bind anywhere."
+              reason="This node served no fleet projection, so the console cannot tell which imposters failed to bind anywhere."
             />
           </span>
         )}

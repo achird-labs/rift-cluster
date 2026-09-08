@@ -29,6 +29,15 @@
         "value": { "type": "string" }
       }
     },
+    "adminApiKey": {
+      "type": "object",
+      "properties": {
+        "existingSecret": { "type": "string" },
+        "existingSecretKey": { "type": "string", "minLength": 1 },
+        "create": { "type": "boolean" },
+        "value": { "type": "string" }
+      }
+    },
     "service": {
       "type": "object",
       "properties": {

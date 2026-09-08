@@ -28,7 +28,7 @@ use rift_cluster::stores::{
 };
 use rift_cluster::{
     Authority, ControlRequest, KeyClass, NodeConfig, NodeId, OwnedKey, RaftNode, RecordedStub,
-    RecordedStubPlacement, TenantId,
+    RecordedStubPlacement,
 };
 use rift_cluster_base::seams::{
     BackendUnavailable, ClaimOutcome, ClaimToken, ImposterConfig, ProxyRecordingStore,
@@ -187,20 +187,15 @@ async fn install_imposter(members: &[ProxyMember], port: u16, mode: &str) {
     members[0]
         .node
         .submit(mint(rift_cluster::ControlOp::PutImposter {
-            tenant: TenantId::new("default"),
             config: Box::new(proxy_imposter(port, mode)),
         }))
         .await
         .expect("imposter commits");
     let deadline = Instant::now() + CONVERGE;
     loop {
-        let applied = members.iter().all(|m| {
-            m.node
-                .get_imposter("default", port)
-                .ok()
-                .flatten()
-                .is_some()
-        });
+        let applied = members
+            .iter()
+            .all(|m| m.node.get_imposter(port).ok().flatten().is_some());
         if applied {
             break;
         }
@@ -349,7 +344,7 @@ fn sig_owned_by(members: &[ProxyMember], port: u16, want: usize) -> RequestSigna
 fn applied_stubs(member: &ProxyMember, port: u16) -> Vec<serde_json::Value> {
     let raw = member
         .node
-        .get_imposter("default", port)
+        .get_imposter(port)
         .expect("read applied config")
         .expect("imposter present");
     let config: serde_json::Value = serde_json::from_str(&raw).expect("config parses");
@@ -763,12 +758,7 @@ async fn new_owner_answers_already_recorded_from_applied_table() {
     let deadline = Instant::now() + CONVERGE;
     loop {
         if joiner.node.ring().members().len() == 3
-            && joiner
-                .node
-                .get_imposter("default", TEST_PORT)
-                .ok()
-                .flatten()
-                .is_some()
+            && joiner.node.get_imposter(TEST_PORT).ok().flatten().is_some()
         {
             break;
         }
@@ -831,7 +821,6 @@ async fn clear_deletes_recorded_markers_fleet_wide() {
     members[1]
         .node
         .submit(mint(rift_cluster::ControlOp::ProxyRecordedClear {
-            tenant: TenantId::new("default"),
             port: TEST_PORT,
         }))
         .await

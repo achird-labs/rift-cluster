@@ -153,6 +153,97 @@ sequencing is suspected of costing more than one RPC.
 loss window, measured. The flow-shard tests read it for exactly that; nobody has
 chosen a threshold for it that would be meaningful across deployments.
 
+## The admin credential, console sessions and the fleet projection
+
+*Moved here from Chapter 8 by D-73 (#550), which retired that chapter's tenancy body, and
+rewritten for one credential. Operating the admin plane is an operations question.*
+
+### One key, or none
+
+The admin plane has exactly one credential: open-source Rift's `--api-key` (`MB_APIKEY`), sent as
+the **raw** `Authorization` header value — no `Bearer ` prefix, none stripped — and compared in
+constant time. **Set ⇒ the whole admin plane is closed to that key. Unset ⇒ the plane is open**,
+exactly as an unclustered `rift` behaves; there is no second switch and no grace window (D-73,
+superseding D-44's principal-counting rule). A blank or whitespace-only key is a misconfiguration
+and **fails closed** rather than degrading to "no auth", because a request with no `Authorization`
+header reaches the comparison as `""` and would otherwise match.
+
+Two surfaces stay open regardless:
+
+- **`/healthz` and `/readyz`** on the probe listener — a liveness probe that needs a credential is
+  a probe that fails for the wrong reason.
+- **`/__rift/{port}/*`**, the data-plane gateway. Upstream exempts this prefix from its own key
+  gate, and the front does not merely skip the check: it must not *inject* the key on that leg
+  either, because the request reaches the imposter, where an `Authorization` header would land in
+  its predicates and its recorded request log.
+
+There is no per-resource authorization. Whoever holds the key administers the whole fleet;
+isolation between teams is two fleets, not a feature (RFC-007 §3.3).
+
+### The loopback leg carries the key, not the caller's credential
+
+The public admin listener is this crate's front; the core admin retreats to an ephemeral loopback
+port the front proxies to, and **that listener runs upstream's own key gate**. The front therefore
+authenticates first and then presents the *configured* key on both internal legs — the proxied
+reads, and the re-read that renders a committed write. It does not forward what the caller sent: a
+cookie-authenticated request has no `Authorization` at all, and forwarding a session token would be
+refused by a raw compare. Getting this wrong is a confusing failure rather than a quiet one — the
+write commits and only the render is refused, so the client is told `401` about a change that
+landed.
+
+### `POST /session` — how a browser holds the credential
+
+A browser should not keep the key after login, so `POST /session` exchanges it once for an
+HMAC-signed cookie (`HttpOnly`, `Secure`, `SameSite=Strict`, 8-hour `Max-Age`); `DELETE /session`
+clears it. The key that signs the token is a fleet-wide control-plane record, so **every node
+verifies from its own applied state and a login is not a Raft write** — only the first mint and any
+rotation are. A cookie minted on one node is accepted by every other.
+
+That record carries an actual secret into the replicated log — the one op that does, and
+deliberately. The distinction is what the secret means *outside* the fleet: an op naming a
+credential for a third-party system would spread power that exists somewhere else, and none does;
+this key is **fleet-internal and meaningless anywhere else**, and cannot be stored hashed, because
+verifying an HMAC requires the key itself — a digest would make the cookie unverifiable by anyone,
+including us. It therefore sits inside the same trust boundary as the state directory, which
+already holds all committed config. Deriving it from the cluster secret instead was considered and
+rejected: that secret is optional (`--cluster-insecure`), so an unauthenticated fleet would have
+nothing to derive from.
+
+**Rotation is the containment, and it is structural.** Every token carries the key record's
+`revision`; verification refuses a token whose revision is not the current one, so writing a new
+key invalidates every outstanding session at once without sweeping a table. It is also the **only**
+revocation: with one credential there is no principal to disable, so the documented bounds are the
+8-hour `Max-Age` and signing-key rotation, and nothing else. A fleet running with no `--api-key`
+has nothing to exchange and answers `400` rather than handing out a cookie that proves nothing.
+
+**What the cookie proves.** Authentication, and nothing more — its subject is the constant
+`"admin"` and `session::verify` answers `Result<(), _>`, because there is no identity for it to
+resolve to. CSRF is `SameSite=Strict` plus a required `X-Rift-CSRF` header on cookie-authenticated
+mutations; a bearer-authenticated request is exempt, because a bearer cannot be attached by a
+victim's browser, which is the entire attack. That `403` is the only one this front produces.
+
+### `/_fleet/*` — the read-only projection
+
+The console cannot hold the cluster-port HMAC secret, so the admin port terminates a **read-only
+projection** of the operator surface: `GET /_fleet/members`, `/_fleet/health`, `/_fleet/ops/:id`.
+`/_cluster/*` on the cluster port is unchanged, and node-vs-node comparison still means asking each
+node directly. The projection may *add* to the cluster port's body (the per-voter members fan-out,
+the fleet-wide parked-intent sum) but never drop or restate a field — the two ports answering the
+same question differently is the failure it exists to avoid.
+
+RFC-006 §12 Q3 asked whether this should be visible below the operator tier. That question was
+settled as `ClusterAdmin`-only and is now **moot**: there is one tier. `/_fleet/*` is authenticated
+like every other admin route.
+
+### `PUT /admin/fleet/name`
+
+The only fleet-scoped *write* on the admin port, and the reason this route is worth naming: it is
+not a projection. It is replicated rather than a per-node flag so two nodes cannot disagree about
+what the fleet is called (`ControlOp::FleetNamePut` records the control-plane reasoning). The
+operationally relevant half is that the name is **a label, never an identity**: nothing
+authorizes, addresses or routes by it, so a fleet renamed mid-flight changes what an operator sees
+and nothing about what anyone may do. Node ids remain what every decision is made against.
+
 ## Runbooks (sketches; full versions ship with the harness)
 
 The `cluster …` subcommands sketched below are **not built**: the binary has

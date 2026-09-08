@@ -75,7 +75,7 @@ const CORPUS: Corpus[] = [
   },
 ];
 
-/** What the admin API says the tenant holds — the oracle every assertion below is measured against. */
+/** What the admin API says the fleet holds — the oracle every assertion below is measured against. */
 async function apiImposters(
   page: Page,
   key: string,
@@ -89,9 +89,9 @@ async function apiImposters(
 /**
  * The index of a column in the rendered table, by its header label.
  *
- * Not a hard-coded number: the leading select column and the trailing actions column are both
- * role-dependent, so a fixed index silently reads the wrong cell for some roles. Header and body
- * rows carry matching leading cells, so the header's own index is the honest one.
+ * Not a hard-coded number: the table carries a leading select column and a trailing actions column
+ * that a fixed index would silently read across. Header and body rows carry matching leading cells,
+ * so the header's own index is the honest one.
  */
 async function columnIndex(page: Page, label: RegExp): Promise<number> {
   const headers = await page.locator("table.dense thead th").allTextContents();
@@ -109,12 +109,12 @@ async function columnIndex(page: Page, label: RegExp): Promise<number> {
  */
 test.describe("the imposter list agrees with the fleet", () => {
   test.beforeAll(async ({ browser }) => {
-    const { keys } = fixture();
+    const { apiKey } = fixture();
     const context = await browser.newContext();
     const page = await context.newPage();
     for (const entry of CORPUS) {
       const response = await page.request.post("/imposters", {
-        headers: { Authorization: keys.editor, "Content-Type": "application/json" },
+        headers: { Authorization: apiKey, "Content-Type": "application/json" },
         data: entry.body,
       });
       expect(
@@ -129,13 +129,13 @@ test.describe("the imposter list agrees with the fleet", () => {
     // Best-effort, but it must not be silent: a leaked corpus imposter changes the imposter-table
     // baseline `visual.spec.ts` takes later in the same run, and that failure would point at the
     // wrong file entirely.
-    const { keys } = fixture();
+    const { apiKey } = fixture();
     const context = await browser.newContext();
     const page = await context.newPage();
     const leaked: number[] = [];
     for (const entry of CORPUS) {
       const response = await page.request.delete(`/imposters/${entry.port}`, {
-        headers: { Authorization: keys.editor },
+        headers: { Authorization: apiKey },
       });
       if (!response.ok()) leaked.push(entry.port);
     }
@@ -144,9 +144,9 @@ test.describe("the imposter list agrees with the fleet", () => {
   });
 
   test("every imposter the API returns has a row, and no row is invented", async ({ page }) => {
-    const { keys } = fixture();
-    await signIn(page, "editor");
-    const expected = await apiImposters(page, keys.editor);
+    const { apiKey } = fixture();
+    await signIn(page);
+    const expected = await apiImposters(page, apiKey);
     const ports = expected.flatMap((imposter) => (imposter.port === undefined ? [] : [imposter.port]));
     expect(ports.length, "the fleet returned nothing, so nothing below would be asserted").toBeGreaterThan(
       CORPUS.length,
@@ -166,9 +166,9 @@ test.describe("the imposter list agrees with the fleet", () => {
      * in the same payload — and no fixture-based test can see that, because the fixture decides
      * which field it sends.
      */
-    const { keys } = fixture();
-    await signIn(page, "editor");
-    const expected = await apiImposters(page, keys.editor);
+    const { apiKey } = fixture();
+    await signIn(page);
+    const expected = await apiImposters(page, apiKey);
     const stubs = await columnIndex(page, /^stubs$/i);
 
     for (const imposter of expected) {
@@ -184,9 +184,9 @@ test.describe("the imposter list agrees with the fleet", () => {
      * the defect was a link that was never rendered, and a crawler only clicks what exists.
      * Reachability has to be asserted against the fleet's list rather than against the page's.
      */
-    const { keys } = fixture();
-    await signIn(page, "editor");
-    const expected = await apiImposters(page, keys.editor);
+    const { apiKey } = fixture();
+    await signIn(page);
+    const expected = await apiImposters(page, apiKey);
 
     for (const imposter of expected) {
       if (imposter.port === undefined) continue;
@@ -201,7 +201,7 @@ test.describe("the imposter list agrees with the fleet", () => {
   test("a nameless imposter's link says which imposter it opens", async ({ page }) => {
     // Reachable is not the same as usable: the visible text no longer identifies the row, so the
     // accessible name has to carry the port or the link announces as nothing.
-    await signIn(page, "editor");
+    await signIn(page);
     const cell = page.getByTestId("imposter-name-4901");
     await expect(cell).toHaveText("(unnamed)");
     await expect(cell.locator("xpath=ancestor::a")).toHaveAttribute(
@@ -211,7 +211,7 @@ test.describe("the imposter list agrees with the fleet", () => {
   });
 
   test("following a nameless imposter's link lands on its detail screen", async ({ page }) => {
-    await signIn(page, "editor");
+    await signIn(page);
     await page.getByTestId("imposter-name-4901").click();
     await expect(page).toHaveURL(/#\/imposters\/4901$/);
     // The heading, not `detail-port`: the contract fields moved onto the detail screen's Settings
@@ -223,18 +223,18 @@ test.describe("the imposter list agrees with the fleet", () => {
   });
 
   test("zero stubs reads as 0, never as unknown", async ({ page }) => {
-    const { keys } = fixture();
-    await signIn(page, "editor");
+    const { apiKey } = fixture();
+    await signIn(page);
     const stubs = await columnIndex(page, /^stubs$/i);
     const cell = page.getByTestId("imposter-row-4902").locator("td").nth(stubs);
     await expect(cell).toHaveText("0");
     // And the fleet agrees it is zero rather than absent, so the screen is not merely self-consistent.
-    const api = (await apiImposters(page, keys.editor)).find((i) => i.port === 4902);
+    const api = (await apiImposters(page, apiKey)).find((i) => i.port === 4902);
     expect(api?.stubCount).toBe(0);
   });
 
   test("a long name truncates for display without breaking its link", async ({ page }) => {
-    await signIn(page, "editor");
+    await signIn(page);
     const cell = page.getByTestId("imposter-name-4903");
     const shown = (await cell.textContent()) ?? "";
     expect(shown.length).toBeLessThan("corpus-checkout-service-integration-sandbox-eu-west-1".length);
@@ -247,7 +247,7 @@ test.describe("the imposter list agrees with the fleet", () => {
   });
 
   test("a non-ASCII name renders and links", async ({ page }) => {
-    await signIn(page, "editor");
+    await signIn(page);
     const cell = page.getByTestId("imposter-name-4904");
     await expect(cell).toHaveText("corpus-café-日本語");
     await expect(cell.locator("xpath=ancestor::a")).toHaveAttribute("href", "#/imposters/4904");
@@ -256,7 +256,7 @@ test.describe("the imposter list agrees with the fleet", () => {
   test("id-less stubs get inert controls and exactly one shared explanation", async ({ page }) => {
     // #324: two id-less stubs, so this also pins that the reason is not repeated per row — which is
     // what made the Actions column hold a paragraph and blew the row to ~200px.
-    await signIn(page, "editor");
+    await signIn(page);
     await page.goto("/console/#/imposters/4905");
     await expect(page.getByTestId("stub-row-0")).toBeVisible();
 

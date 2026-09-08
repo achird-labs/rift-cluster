@@ -44,7 +44,7 @@ use xxhash_rust::xxh64::xxh64;
 
 use crate::bridge::{Bridge, BridgeConfig, CallerClass};
 use crate::control::{
-    ControlOp, ControlOutcome, ControlRequest, RecordedStub, RecordedStubPlacement, TenantId,
+    ControlOp, ControlOutcome, ControlRequest, RecordedStub, RecordedStubPlacement,
 };
 use crate::metrics;
 use crate::raft::ring::{KeyClass, OwnedKey};
@@ -79,7 +79,7 @@ const SUBMIT_DEADLINE: Duration = Duration::from_secs(8);
 /// upstream call bounded by ownership changes.
 const COMPLETE_CACHE_TTL: Duration = Duration::from_secs(120);
 
-/// How long a resolved `(tenant, mode)` for a port is trusted before re-reading applied
+/// How long a resolved mode for a port is trusted before re-reading applied
 /// config. Modes change only when an imposter is replaced — rare — while `try_claim` runs
 /// per proxied request on the data plane; 2 s keeps the table read off the hot path without
 /// letting a replaced imposter's mode linger meaningfully. A request in flight *across* a
@@ -133,7 +133,6 @@ enum PortMode {
 
 #[derive(Clone)]
 struct PortIdentity {
-    tenant: String,
     mode: PortMode,
     resolved_at: Instant,
 }
@@ -261,7 +260,7 @@ impl ProxyNet {
         self.next_token.fetch_add(1, Ordering::SeqCst)
     }
 
-    /// Resolve `(tenant, mode)` for a port from applied config, through a short TTL cache.
+    /// Resolve a port's proxy mode from applied config, through a short TTL cache.
     fn port_identity(&self, port: u16) -> Result<PortIdentity, ProxyStoreError> {
         if let Some(hit) = self.mode_cache.lock().get(&port)
             && hit.resolved_at.elapsed() < MODE_CACHE_TTL
@@ -269,18 +268,8 @@ impl ProxyNet {
             return Ok(hit.clone());
         }
         let (node, _ring) = self.view().map_err(ProxyStoreError::Unavailable)?;
-        let tenant = node
-            .configured_ports()
-            .map_err(|e| ProxyStoreError::Unavailable(format!("proxy store: {e}")))?
-            .into_iter()
-            .find_map(|(tenant, p)| (p == port).then(|| tenant.as_str().to_owned()))
-            .ok_or_else(|| {
-                ProxyStoreError::Unavailable(format!(
-                    "proxy store: no applied imposter on port {port}"
-                ))
-            })?;
         let config_json = node
-            .get_imposter(&tenant, port)
+            .get_imposter(port)
             .map_err(|e| ProxyStoreError::Unavailable(format!("proxy store: {e}")))?
             .ok_or_else(|| {
                 ProxyStoreError::Unavailable(format!(
@@ -289,7 +278,6 @@ impl ProxyNet {
             })?;
         let mode = parse_proxy_mode(&config_json);
         let identity = PortIdentity {
-            tenant,
             mode,
             resolved_at: Instant::now(),
         };
@@ -350,7 +338,7 @@ impl ProxyNet {
                 reason: "proxy store: owner is isolated from the cluster".to_owned(),
             };
         }
-        match node.proxy_recorded(&req.tenant, req.port, &req.sig_hash) {
+        match node.proxy_recorded(req.port, &req.sig_hash) {
             Ok(Some(_)) => return ClaimReply::AlreadyRecorded,
             Ok(None) => {}
             Err(e) => {
@@ -438,7 +426,6 @@ impl ProxyNet {
             issued_at_secs: now_secs(),
             expected_revision: None,
             op: ControlOp::ProxyRecorded {
-                tenant: TenantId::new(req.tenant.clone()),
                 port: req.port,
                 sig_hash: req.sig_hash.clone(),
                 resp: req.resp,
@@ -478,7 +465,7 @@ impl ProxyNet {
                     SettleReply::Done
                 }
                 ControlOutcome::Failed { reason } => {
-                    // A committed refusal (imposter deleted, quota): release so the
+                    // A committed refusal (the imposter was deleted): release so the
                     // signature is retryable, and say why.
                     self.pending.lock().remove(&slot);
                     SettleReply::Unavailable { reason }
@@ -523,7 +510,7 @@ impl ProxyNet {
 
     fn owner_lookup(&self, req: &LookupReq) -> LookupReply {
         let resp_json = match self.view() {
-            Ok((node, _)) => match node.proxy_recorded(&req.tenant, req.port, &req.sig_hash) {
+            Ok((node, _)) => match node.proxy_recorded(req.port, &req.sig_hash) {
                 Ok(Some(json)) => Some(json),
                 Ok(None) => self.completed_lookup(&node, req.port, &req.sig_hash),
                 Err(e) => {
@@ -667,7 +654,6 @@ impl OwnerRefusal {
 
 #[derive(Debug, Serialize, Deserialize)]
 struct ClaimReq {
-    tenant: String,
     port: u16,
     sig_hash: String,
     m_idx: u64,
@@ -685,7 +671,6 @@ enum ClaimReply {
 
 #[derive(Debug, Serialize, Deserialize)]
 struct ReleaseReq {
-    tenant: String,
     port: u16,
     sig_hash: String,
     token: u64,
@@ -694,7 +679,6 @@ struct ReleaseReq {
 
 #[derive(Debug, Serialize, Deserialize)]
 struct CompleteReq {
-    tenant: String,
     port: u16,
     sig_hash: String,
     token: u64,
@@ -722,7 +706,6 @@ enum SettleReply {
 
 #[derive(Debug, Serialize, Deserialize)]
 struct LookupReq {
-    tenant: String,
     port: u16,
     sig_hash: String,
 }
@@ -813,7 +796,6 @@ impl ClusterProxyStore {
 
     fn blocking_claim(
         &self,
-        tenant: &str,
         port: u16,
         sig: &RequestSignature,
     ) -> Result<ClaimOutcome, ProxyStoreError> {
@@ -825,7 +807,6 @@ impl ClusterProxyStore {
         let net = Arc::clone(&self.net);
         let hash = sig_hash(sig);
         let key = format!("{port}:{hash}");
-        let tenant = tenant.to_owned();
         let outcome = bridge
             .call(CallerClass::DataPlane, CLAIM_OP_DEADLINE, async move {
                 // Two attempts: a `Fenced`/`NotOwner` redirect means membership moved
@@ -836,7 +817,6 @@ impl ClusterProxyStore {
                     let (node, ring) = net.view().map_err(RpcError::Handler)?;
                     let owner = ProxyNet::owner_of(&ring, &key)?;
                     let req = ClaimReq {
-                        tenant: tenant.clone(),
                         port,
                         sig_hash: hash.clone(),
                         m_idx: ring.m_idx(),
@@ -886,7 +866,6 @@ impl ClusterProxyStore {
 
     fn blocking_settle(
         &self,
-        tenant: &str,
         port: u16,
         sig: &RequestSignature,
         token: ClaimToken,
@@ -901,7 +880,6 @@ impl ClusterProxyStore {
         let net = Arc::clone(&self.net);
         let hash = sig_hash(sig);
         let key = format!("{port}:{hash}");
-        let tenant = tenant.to_owned();
         let reply = bridge
             .call(CallerClass::DataPlane, SETTLE_OP_DEADLINE, async move {
                 let mut last = None;
@@ -913,7 +891,6 @@ impl ClusterProxyStore {
                     // At most OWNER_REDIRECT_ATTEMPTS copies, once per recording — not per
                     // request — so the copy is cheaper than restructuring around it.
                     let req = CompleteReq {
-                        tenant: tenant.clone(),
                         port,
                         sig_hash: hash.clone(),
                         token: token.value(),
@@ -959,7 +936,6 @@ impl ClusterProxyStore {
     /// request records and merge determinism lives in the apply, not in a claim.
     fn blocking_publish_unclaimed(
         &self,
-        tenant: &str,
         port: u16,
         sig: &RequestSignature,
         resp: RecordedResponse,
@@ -972,7 +948,6 @@ impl ClusterProxyStore {
             .ok_or_else(|| ProxyStoreError::Unavailable("proxy store: not bound".to_owned()))?;
         let net = Arc::clone(&self.net);
         let hash = sig_hash(sig);
-        let tenant = TenantId::new(tenant);
         bridge
             .call(CallerClass::DataPlane, SETTLE_OP_DEADLINE, async move {
                 let (node, _) = net.view().map_err(RpcError::Handler)?;
@@ -982,7 +957,6 @@ impl ClusterProxyStore {
                     issued_at_secs: now_secs(),
                     expected_revision: None,
                     op: ControlOp::ProxyRecorded {
-                        tenant,
                         port,
                         // proxyAlways merges by predicate equality at apply; the marker row
                         // still lands per signature, first-wins, which is harmless — the
@@ -1024,9 +998,7 @@ impl ClusterProxyStore {
     ) -> Result<(), ProxyStoreError> {
         let identity = self.net.port_identity(port)?;
         match identity.mode {
-            PortMode::Once => {
-                self.blocking_settle(&identity.tenant, port, &sig, token, resp, Some(recorded))
-            }
+            PortMode::Once => self.blocking_settle(port, &sig, token, resp, Some(recorded)),
             // proxyAlways and proxyTransparent both publish without a claim. Transparent
             // never records *responses*, but the engine's stub generation is gated on
             // `predicateGenerators`, not mode — a transparent imposter with generators
@@ -1034,7 +1006,7 @@ impl ClusterProxyStore {
             // store the sole publisher, dropping it here would be the silent regression
             // the module doc forbids for proxyAlways, applied to the third mode.
             PortMode::Always | PortMode::Transparent => {
-                self.blocking_publish_unclaimed(&identity.tenant, port, &sig, resp, Some(recorded))
+                self.blocking_publish_unclaimed(port, &sig, resp, Some(recorded))
             }
         }
     }
@@ -1062,9 +1034,7 @@ impl ProxyRecordingStore for ClusterProxyStore {
         // mid-shutdown or a cache miss racing a delete — both "not now", never "go ahead".
         let identity = self.net.port_identity(port).map_err(refused)?;
         match identity.mode {
-            PortMode::Once => self
-                .blocking_claim(&identity.tenant, port, sig)
-                .map_err(refused),
+            PortMode::Once => self.blocking_claim(port, sig).map_err(refused),
             // proxyAlways / proxyTransparent never gate — the claim is a formality so the
             // caller path is uniform, exactly as `LocalProxyStore` answers. Nothing is being
             // arbitrated, so there is nothing to refuse.
@@ -1098,7 +1068,6 @@ impl ProxyRecordingStore for ClusterProxyStore {
             let (node, ring) = net.view().map_err(RpcError::Handler)?;
             let owner = ProxyNet::owner_of(&ring, &key)?;
             let req = ReleaseReq {
-                tenant: identity.tenant,
                 port,
                 sig_hash: hash,
                 token: token.value(),
@@ -1132,7 +1101,7 @@ impl ProxyRecordingStore for ClusterProxyStore {
         let identity = self.net.port_identity(port)?;
         match identity.mode {
             // A stub-less proxyOnce recording: the consensus row is the replay source.
-            PortMode::Once => self.blocking_settle(&identity.tenant, port, &sig, token, resp, None),
+            PortMode::Once => self.blocking_settle(port, &sig, token, resp, None),
             // proxyAlways with no generated stub publishes nothing: there is no stub to
             // replicate and the mode never replays from `lookup`. Upstream's in-memory
             // response list exists to feed later stub generation, which the clustered
@@ -1178,12 +1147,15 @@ impl ProxyRecordingStore for ClusterProxyStore {
     }
 
     fn lookup(&self, port: u16, sig: &RequestSignature) -> Option<RecordedResponse> {
-        let identity = self.net.port_identity(port).ok()?;
+        // Fail closed on a port whose applied config cannot be resolved — the same guard
+        // `try_claim` opens with, and for the same reason: a port the store cannot identify
+        // has no recording to replay and no owner worth asking for one.
+        self.net.port_identity(port).ok()?;
         let hash = sig_hash(sig);
         // Local applied state first: after the op applies everywhere this answers with no
         // RPC, and after the recorded stub applies the engine stops asking altogether.
         if let Ok((node, _)) = self.net.view()
-            && let Ok(Some(json)) = node.proxy_recorded(&identity.tenant, port, &hash)
+            && let Ok(Some(json)) = node.proxy_recorded(port, &hash)
         {
             match serde_json::from_str(&json) {
                 Ok(resp) => return Some(resp),
@@ -1208,7 +1180,6 @@ impl ProxyRecordingStore for ClusterProxyStore {
                 let (node, ring) = net.view().map_err(RpcError::Handler)?;
                 let owner = ProxyNet::owner_of(&ring, &key)?;
                 let req = LookupReq {
-                    tenant: identity.tenant,
                     port,
                     sig_hash: hash,
                 };

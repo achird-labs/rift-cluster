@@ -1,7 +1,7 @@
 import { expect, fixture, goToScreen, signIn, test } from "./fixture.ts";
 
 /**
- * Layer 1: every screen loads in a real browser, as each role, with a clean console.
+ * Layer 1: every screen loads in a real browser, with a clean console.
  *
  * The `test` fixture fails on any browser console error, so each of these is also asserting that no
  * CSP directive was violated, no chunk failed to load and no query rejected unhandled — the things
@@ -36,24 +36,16 @@ test.describe("the shipped console loads", () => {
   });
 
   for (const { hash, heading } of SCREENS) {
-    test(`renders ${hash} as fleet-admin`, async ({ page }) => {
-      await signIn(page, "fleet-admin");
+    test(`renders ${hash}`, async ({ page }) => {
+      await signIn(page);
       await goToScreen(page, hash);
       await expect(page.getByRole("heading", { level: 1 })).toHaveText(heading);
     });
   }
 
-  test("renders the administration screens as fleet-admin", async ({ page }) => {
-    await signIn(page, "fleet-admin");
-    for (const tab of ["tenants", "principals", "bindings"]) {
-      await goToScreen(page, `/admin/${tab}/default`);
-      await expect(page.getByTestId("admin-screen")).toBeVisible();
-    }
-  });
-
   test("shows an imposter's stubs and opens the editor", async ({ page }) => {
     const { imposters } = fixture();
-    await signIn(page, "editor");
+    await signIn(page);
     await goToScreen(page, `/imposters/${imposters[0]}`);
     await page.getByRole("button", { name: /add stub/i }).click();
     // The editor's own surface: the form, the JSON document, and the summary that says what the
@@ -74,7 +66,7 @@ test.describe("the shipped console loads", () => {
      * the id field either way, so its presence alone would have passed on the broken build.
      */
     const { imposters } = fixture();
-    await signIn(page, "editor");
+    await signIn(page);
     await goToScreen(page, `/imposters/${imposters[0]}`);
 
     // `/^edit /` with the trailing space: the visible text is "Edit" but the accessible name is
@@ -88,43 +80,29 @@ test.describe("the shipped console loads", () => {
   });
 });
 
-test.describe("roles get the console their bindings allow", () => {
-  test("a viewer is offered no write control", async ({ page }) => {
-    await signIn(page, "viewer");
+test.describe("the whole console is offered, because there is one identity", () => {
+  /*
+   * #550 removed roles, so what these pin is the inverse of what they used to: every authoring
+   * control is drawn for whoever signed in. They still earn their place — an accidentally hidden
+   * control and a control that never rendered look identical from a bug report, and only a test
+   * that names each one tells them apart.
+   */
+  test("offers the imposter-list authoring controls", async ({ page }) => {
+    await signIn(page);
     await goToScreen(page, "/imposters");
-    await expect(page.getByTestId("new-imposter")).toHaveCount(0);
-    await expect(page.getByTestId("nav-administration")).toHaveCount(0);
-    // Presentation only — but the read it *can* do must still work.
-    await expect(page.getByRole("heading", { level: 1 })).toHaveText(/imposters/i);
-  });
-
-  test("an operator may disable but not create", async ({ page }) => {
-    await signIn(page, "operator");
-    await goToScreen(page, "/imposters");
-    await expect(page.getByTestId("new-imposter")).toHaveCount(0);
+    await expect(page.getByTestId("new-imposter")).toBeVisible();
+    await expect(page.getByTestId("open-import")).toBeVisible();
     await expect(page.getByRole("button", { name: /disable/i }).first()).toBeVisible();
   });
 
-  /*
-   * The imposter's own screen, which the cases above never reach: every other test that opens it
-   * signs in as `editor`, so `Add stub` and `Duplicate` have only ever been asserted PRESENT.
-   *
-   * Their absence is the whole of what a lesser role sees — there is no explanatory note, by
-   * design (RFC-006 §3 rule 3: hiding a control is presentation). That makes it worth pinning from
-   * both sides: an operator who cannot find the button and an operator for whom the button was
-   * wrongly hidden look identical from a bug report, and only a test tells them apart.
-   */
-  test("an operator gets no authoring controls on an imposter's own screen", async ({ page }) => {
+  test("offers the authoring controls on an imposter's own screen", async ({ page }) => {
     const { imposters } = fixture();
-    await signIn(page, "operator");
+    await signIn(page);
     await goToScreen(page, `/imposters/${imposters[0]}`);
 
-    // `imposter.lifecycle` yes, `imposter.write` no — so neither authoring control is drawn.
-    await expect(page.getByRole("button", { name: /add stub/i })).toHaveCount(0);
-    await expect(page.getByTestId("clone-imposter")).toHaveCount(0);
+    await expect(page.getByRole("button", { name: /add stub/i })).toBeVisible();
+    await expect(page.getByTestId("clone-imposter")).toBeVisible();
     /*
-     * The read it may do still works, so this is gating rather than a screen that failed to load.
-     *
      * Asserted on the heading rather than the `detail-port` field: the fields moved onto the
      * Settings tab, and the heading carries the port on every tab. That makes it the better probe
      * for "the screen loaded" anyway — it cannot pass merely because one panel happened to render.
@@ -132,83 +110,33 @@ test.describe("roles get the console their bindings allow", () => {
     await expect(page.getByRole("heading", { level: 1 })).toContainText(String(imposters[0]));
   });
 
-  test("an editor gets those same controls", async ({ page }) => {
-    // The other half of the pair. Without it the assertions above would still pass if the controls
-    // stopped rendering for everybody.
+  test("offers no administration entry, because there is nothing left to administer", async ({
+    page,
+  }) => {
+    // Tenancy and principals were that screen's whole subject, and #550 removed both. The nav must
+    // not keep an entry whose route no longer parses — it would land on the imposters fallback and
+    // read as a broken link.
+    await signIn(page);
+    await expect(page.getByTestId("nav-administration")).toHaveCount(0);
+  });
+
+  test("offers every scenario and space control", async ({ page }) => {
     const { imposters } = fixture();
-    await signIn(page, "editor");
-    await goToScreen(page, `/imposters/${imposters[0]}`);
-
-    await expect(page.getByRole("button", { name: /add stub/i })).toBeVisible();
-    await expect(page.getByTestId("clone-imposter")).toBeVisible();
-  });
-
-  test("a tenant-admin reaches principals without a fleet-scoped tenant list", async ({ page }) => {
-    /*
-     * The lockout that shipped: the nav links to the admin screen with no tenant, and the only
-     * control that set one lived in a `ClusterAdmin` tenant list. A TenantAdmin could never reach
-     * the surface its role exists for.
-     */
-    await signIn(page, "tenant-admin");
-    await page.getByTestId("nav-administration").click();
-    await page.getByRole("link", { name: /^principals$/i }).click();
-    await expect(page.getByText(/choose a tenant/i)).toHaveCount(0);
-    await expect(page.getByTestId("admin-screen")).toBeVisible();
-  });
-
-  test("the tenant in view is named even with nothing to switch to", async ({ page }) => {
-    await signIn(page, "tenant-admin");
-    await expect(page.getByTestId("tenant-current")).toContainText("default");
-  });
-
-  test("a viewer reads scenarios and is offered no control that disturbs them", async ({ page }) => {
-    const { imposters } = fixture();
-    await signIn(page, "viewer");
-    // The entry must be *offered* — `scenario.read` is a Viewer grant, so hiding the screen would
-    // withhold a surface the role is entitled to.
+    await signIn(page);
     await expect(page.getByTestId("nav-scenarios")).toBeVisible();
-    await goToScreen(page, `/scenarios/${imposters[0]}`);
-    await expect(page.getByTestId("reset-scenarios")).toHaveCount(0);
-    await expect(page.getByTestId("space-teardown")).toHaveCount(0);
-    await expect(page.getByTestId("flow-state-clear-all")).toHaveCount(0);
-  });
-
-  test("an operator may reset and tear down but not redefine", async ({ page }) => {
-    /*
-     * The disturb/redefine split, in the shipped artifact. `ScenarioReset` and `SpaceTeardown` are
-     * Operator; `ScenarioWrite` and `SpaceStubWrite` are Editor. The flow-state panel is the
-     * counter-intuitive one — an operator may clear an entry but not set one, because the server
-     * classifies the `PUT` as `SpaceStubWrite`.
-     */
-    const { imposters } = fixture();
-    await signIn(page, "operator");
     await goToScreen(page, `/scenarios/${imposters[0]}`);
     await expect(page.getByTestId("reset-scenarios")).toBeVisible();
     await expect(page.getByTestId("flow-state-clear-all")).toBeVisible();
 
-    /*
-     * The space control is asserted absent ON THE TAB IT LIVES ON.
-     *
-     * Spaces became their own tab, and asserting `toHaveCount(0)` from the scenarios tab would pass
-     * for the wrong reason — the control is not rendered there for anybody, so the assertion would
-     * hold even if an operator were wrongly offered it. An absence is only evidence where the thing
-     * would otherwise be.
-     */
+    // The space controls are asserted ON THE TAB THEY LIVE ON: neither renders on the scenarios
+    // tab for anybody, so asserting there would pass for the wrong reason.
     await goToScreen(page, `/scenarios/${imposters[0]}?tab=spaces`);
     await expect(page.getByTestId("space-teardown")).toBeVisible();
-    await expect(page.getByTestId("space-add-stub")).toHaveCount(0);
-  });
-
-  test("an editor may scope a stub into a space", async ({ page }) => {
-    const { imposters } = fixture();
-    await signIn(page, "editor");
-    // Spaces are their own tab now; the tab lives in the hash, so this arrives on it directly.
-    await goToScreen(page, `/scenarios/${imposters[0]}?tab=spaces`);
     await expect(page.getByTestId("space-add-stub")).toBeVisible();
   });
 
-  test("a fleet-admin sees the fleet screen a viewer is refused", async ({ page }) => {
-    await signIn(page, "fleet-admin");
+  test("reaches the fleet screen from the nav", async ({ page }) => {
+    await signIn(page);
     await expect(page.getByTestId("nav-cluster")).toBeVisible();
     await goToScreen(page, "/cluster");
     await expect(page.getByTestId("fleet-node")).toBeVisible();
@@ -226,7 +154,7 @@ test.describe("the destructive-confirm dialog is a modal (#236)", () => {
    * it was taken, and the confirm baseline had already recorded the broken rendering as correct.
    */
   async function openTheDialog(page: import("@playwright/test").Page) {
-    await signIn(page, "editor");
+    await signIn(page);
     await goToScreen(page, "/imposters");
     await page.getByTestId("delete-imposter-4645").click();
     await expect(page.getByTestId("confirm-delete-imposter")).toBeVisible();
@@ -337,18 +265,18 @@ test.describe("the destructive-confirm dialog is a modal (#236)", () => {
 test.describe("session lifecycle", () => {
   test("signing out returns to the login form", async ({ page }) => {
     // The bug this pins was invisible to the cache-level unit test that preceded it.
-    await signIn(page, "editor");
+    await signIn(page);
     await page.getByTestId("sign-out").click();
     await expect(page.getByLabel(/api key/i)).toBeVisible();
     await expect(page.getByTestId("sign-out")).toHaveCount(0);
   });
 
   test("a signed-out session cannot be resumed by navigating back", async ({ page }) => {
-    await signIn(page, "editor");
+    await signIn(page);
     await page.getByTestId("sign-out").click();
     await expect(page.getByLabel(/api key/i)).toBeVisible();
     // Straight to `goto`, not `goToScreen`: that helper waits for the shell, which is precisely
-    // what must NOT appear here. The cookie is gone, so whoami 401s and login is what renders.
+    // what must NOT appear here. The cookie is gone, so the session probe 401s and login renders.
     await page.goto("/console/#/imposters");
     await expect(page.getByLabel(/api key/i)).toBeVisible();
     await expect(page.getByTestId("identity")).toHaveCount(0);

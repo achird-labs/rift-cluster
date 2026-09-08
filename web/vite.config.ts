@@ -84,8 +84,8 @@ export default defineConfig({
     include: ["src/**/*.test.ts", "src/**/*.test.tsx"],
     environmentOptions: {
       // An explicit, non-opaque origin. jsdom's default document is `about:blank`, whose origin is
-      // opaque — and `localStorage` is unavailable on an opaque origin, so without this the tenant
-      // selection cannot be exercised at all.
+      // opaque — and both `localStorage` and same-origin `fetch` behave differently there, so the
+      // tests would exercise a document the browser never serves.
       jsdom: { url: "http://localhost/console/" },
     },
   },

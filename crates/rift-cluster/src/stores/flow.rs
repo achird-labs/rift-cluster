@@ -67,12 +67,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::bridge::{Bridge, BridgeConfig, CallerClass};
-use crate::control::TenantId;
 use crate::metrics;
 use crate::raft::ring::{KeyClass, OwnedKey};
 use crate::raft::{NodeId, RaftNode, Ring};
 use crate::rpc::{HandlerFuture, Router, RpcError};
-use crate::stores::flow_config::{ContextScope, FlowConfig, ReadConsistency};
+use crate::stores::flow_config::{FlowConfig, ReadConsistency};
 use crate::stores::shard::{Durability, FlowShard, Versioned};
 use rift_cluster_base::seams::BackendUnavailable;
 
@@ -346,17 +345,10 @@ struct SyncReply {
 }
 
 /// `POST /_cluster/flow/counts` — this node's OWNED entry count per port
-/// (#372), the flow-state half of a tenant's `numberOfFlowEntries` usage.
+/// (#372), the flow-state half of an imposter's `numberOfFlowEntries`.
 #[derive(Debug, Serialize, Deserialize)]
 struct CountsReq {
     ports: Vec<u16>,
-    /// The tenants whose tenant-scoped (`t<tenant>:`, #288) flows the caller
-    /// wants counted (#413). `default` so a peer still on a build before this
-    /// field decodes the request; it then answers with no tenant slots, and the
-    /// tenant half of the fleet-wide sum is a floor for the length of that
-    /// rolling upgrade — the same shape any additive wire field has here.
-    #[serde(default)]
-    tenants: Vec<String>,
     /// The caller's own ring index, checked against the serving node's
     /// (RFC-001 §7.6's fencing token, reused here rather than invented
     /// afresh). A membership change can leave two nodes' rings disagreeing
@@ -374,22 +366,6 @@ struct CountsReply {
     /// reasoning: a JSON object's keys are strings, and a `u16` round-tripping
     /// through one is a decode failure waiting to happen.
     slots: Vec<(u16, u64)>,
-    /// `(tenant, this node's owned live-entry count under `t<tenant>:`)` (#413).
-    /// `default` for the same rolling-upgrade reason as [`CountsReq::tenants`]:
-    /// an older peer's reply has no such field and decodes as "no tenant
-    /// slots".
-    #[serde(default)]
-    tenant_slots: Vec<(String, u64)>,
-}
-
-/// What [`FlowNet::fleet_usage_counts`] answers: live entries charged per port
-/// (imposter-scoped flows, `i<port>:`) and per tenant (tenant-scoped flows,
-/// `t<tenant>:`, #288/#413). Fleet-scoped `f:` flows are in neither — shared by
-/// construction, so charging them anywhere would be arbitrary.
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
-pub struct FlowCounts {
-    pub by_port: HashMap<u16, u64>,
-    pub by_tenant: HashMap<String, u64>,
 }
 
 /// `POST /_cluster/flow/spaces` — this node's OWNED spaces under `prefix` (#374): the per-row
@@ -591,16 +567,15 @@ impl FlowNet {
     /// entry, and the ordinary write path never pushes for a port no engine
     /// serves.
     ///
-    /// Only `i<port>:`. A `fleet`- or `tenant`-scoped flow is not this
-    /// imposter's to drop, and ports are fleet-unique across tenants (RFC-002
-    /// §3.2), so `i<port>:` can never be another tenant's namespace.
+    /// Only `i<port>:`. A `fleet`-scoped flow is not this imposter's to drop,
+    /// and ports are fleet-unique, so `i<port>:` names exactly one imposter.
     ///
     /// `Async` durability: the imposter whose knob would have chosen is gone,
     /// and this is a rare admin-path write. A crash inside the fsync interval
     /// is covered by the reconcile-time sweep on restart, which finds the
     /// namespace orphaned and drops it again.
     pub async fn clear_imposter_scope(&self, port: u16) -> usize {
-        let prefix = ContextScope::Imposter.prefix_for(Some(port), None);
+        let prefix = crate::stores::flow_config::ContextScope::Imposter.prefix_for(Some(port));
         let mut dropped = 0;
         for flow_id in self.shard.flow_ids() {
             if !flow_id.starts_with(&prefix) {
@@ -1311,58 +1286,36 @@ impl FlowNet {
 
     /// This node's OWNED share of `numberOfFlowEntries` (#372): the live entry
     /// count of every flow this node currently owns, charged per port for the
-    /// imposter-scoped ones (`i<port>:`) whose port is in `ports` and per tenant
-    /// for the tenant-scoped ones (`t<tenant>:`, #288/#413) whose tenant is in
-    /// `tenants` — one pass over the shard for both, because a tenant listing
-    /// asks for both at once and `entries_by_flow` is the whole shard.
+    /// imposter-scoped ones (`i<port>:`) whose port is in `ports`.
     ///
     /// Filtered to the **owner** only, never every holder of a copy: a flow keeps
     /// [`REPLICAS`] copies for durability, so a raw per-node sum (this node's plus
     /// every peer's) would count each entry up to [`REPLICAS`] times. Restricting
-    /// to the owner makes the fleet-wide sum in [`Self::fleet_usage_counts`]
+    /// to the owner makes the fleet-wide sum in [`Self::fleet_entry_counts`]
     /// exactly the union of live entries, with no coordination beyond the ring
     /// every node already agrees on.
     ///
-    /// Fleet-scoped (`f:`) flows match neither [`imposter_port`] nor [`tenant_of`],
-    /// so they contribute to nothing — they are shared by construction, and
-    /// charging them to any one imposter or tenant would be arbitrary. The
-    /// unresolved placeholders (`i?:`, `t??:`) name nothing to charge either.
-    fn owned_counts(
-        &self,
-        node: &RaftNode,
-        ring: &Ring,
-        ports: &[u16],
-        tenants: &[String],
-    ) -> FlowCounts {
+    /// Fleet-scoped (`f:`) flows do not match [`imposter_port`], so they
+    /// contribute to nothing — they are shared by construction, and charging them
+    /// to any one imposter would be arbitrary. The unresolved placeholder (`i?:`)
+    /// names nothing to charge either.
+    fn owned_counts(&self, node: &RaftNode, ring: &Ring, ports: &[u16]) -> HashMap<u16, u64> {
         let wanted_ports: HashSet<u16> = ports.iter().copied().collect();
-        let wanted_tenants: HashSet<&str> = tenants.iter().map(String::as_str).collect();
         // Seeded with every requested key at `0`, not only the ones this node
-        // happens to own something for: `fleet_usage_counts` folds a peer's
-        // reply into these maps by key, and a key absent here would silently
+        // happens to own something for: `fleet_entry_counts` folds a peer's
+        // reply into this map by key, and a key absent here would silently
         // drop that peer's count instead of adding to zero.
-        let mut counts = FlowCounts {
-            by_port: ports.iter().map(|&port| (port, 0)).collect(),
-            by_tenant: tenants.iter().map(|t| (t.clone(), 0)).collect(),
-        };
+        let mut counts: HashMap<u16, u64> = ports.iter().map(|&port| (port, 0)).collect();
         for (flow_id, count) in self.shard.entries_by_flow() {
-            let charge_port = imposter_port(&flow_id).filter(|port| wanted_ports.contains(port));
-            let charge_tenant = if charge_port.is_none() {
-                tenant_of(&flow_id).filter(|tenant| wanted_tenants.contains(tenant))
-            } else {
-                None
-            };
-            if charge_port.is_none() && charge_tenant.is_none() {
+            let Some(port) = imposter_port(&flow_id).filter(|port| wanted_ports.contains(port))
+            else {
                 continue;
-            }
+            };
             let owned = OwnedKey::new(KeyClass::FlowKv, &flow_id);
             if ring.owner(owned) != Some(node.id()) {
                 continue;
             }
-            if let Some(port) = charge_port {
-                *counts.by_port.entry(port).or_insert(0) += count as u64;
-            } else if let Some(tenant) = charge_tenant {
-                *counts.by_tenant.entry(tenant.to_owned()).or_insert(0) += count as u64;
-            }
+            *counts.entry(port).or_insert(0) += count as u64;
         }
         counts
     }
@@ -1391,40 +1344,21 @@ impl FlowNet {
         ports: &[u16],
         budget: Duration,
     ) -> (HashMap<u16, u64>, bool) {
-        let (counts, partial) = self.fleet_usage_counts(ports, &[], budget).await;
-        (counts.by_port, partial)
-    }
-
-    /// [`Self::fleet_entry_counts`], plus the tenant-scoped flows of `tenants`
-    /// charged per tenant (#413) — one fan-out for both, because a tenant listing
-    /// needs both and every peer's answer is one shard scan either way. Same
-    /// `partial` contract. A peer still on a build before the tenant half
-    /// answers only the port half; the tenant sum is then a floor for the length
-    /// of that rolling upgrade, which is the shape any additive wire field has.
-    #[must_use]
-    pub async fn fleet_usage_counts(
-        self: &Arc<Self>,
-        ports: &[u16],
-        tenants: &[String],
-        budget: Duration,
-    ) -> (FlowCounts, bool) {
-        // Nothing to fan out for: a tenant with no imposters and no
-        // tenant-scoped flows to ask about has a locally computable (empty)
-        // answer, and asking every peer anyway would stamp `partial: true` on
-        // a `0/0/0` body the instant any one of them failed to answer in time
-        // — for no reason, since there is nothing for their answers to add.
-        if ports.is_empty() && tenants.is_empty() {
-            return (FlowCounts::default(), false);
+        // Nothing to fan out for: no ports means a locally computable (empty)
+        // answer, and asking every peer anyway would stamp `partial: true` on an
+        // empty body the instant any one of them failed to answer in time.
+        if ports.is_empty() {
+            return (HashMap::new(), false);
         }
 
         let (node, ring) = match self.view() {
             Ok(view) => view,
             Err(reason) => {
                 tracing::warn!(error = %reason, "flow entry counts: cluster view unavailable");
-                return (FlowCounts::default(), true);
+                return (HashMap::new(), true);
             }
         };
-        let mut totals = self.owned_counts(&node, &ring, ports, tenants);
+        let mut totals = self.owned_counts(&node, &ring, ports);
 
         let peers: Vec<NodeId> = ring
             .members()
@@ -1441,12 +1375,10 @@ impl FlowNet {
         for peer in peers.iter().copied() {
             let node = Arc::clone(&node);
             let req_ports = ports.to_vec();
-            let req_tenants = tenants.to_vec();
             set.spawn(async move {
                 let outcome = async {
                     let body = serde_json::to_vec(&CountsReq {
                         ports: req_ports,
-                        tenants: req_tenants,
                         m_idx: caller_m_idx,
                     })
                     .map_err(|e| e.to_string())?;
@@ -1468,8 +1400,7 @@ impl FlowNet {
                 match joined {
                     Ok((peer, Ok(reply))) => {
                         answered.insert(peer);
-                        merge_peer_counts(&mut totals.by_port, &reply.slots);
-                        merge_peer_counts(&mut totals.by_tenant, &reply.tenant_slots);
+                        merge_peer_counts(&mut totals, &reply.slots);
                     }
                     Ok((peer, Err(e))) => {
                         answered.insert(peer);
@@ -1629,26 +1560,12 @@ fn merge_peer_counts<K: std::hash::Hash + Eq>(
     }
 }
 
-/// The tenant a tenant-scoped flow id belongs to (`t<tenant>:` → `<tenant>`,
-/// #288), or `None` for every other namespace and for the unresolved `t??:`
-/// placeholder — which names no real tenant to charge, so its entries are
-/// charged to nobody, exactly like `i?:`'s (#413).
-fn tenant_of(scoped_flow_id: &str) -> Option<&str> {
-    scoped_flow_id
-        .strip_prefix('t')
-        .and_then(|rest| rest.split_once(':'))
-        .map(|(tenant, _)| tenant)
-        .filter(|tenant| !tenant.is_empty() && !tenant.starts_with('?'))
-}
-
 /// The imposter port a scoped flow id belongs to, or `None` for a fleet-scoped
-/// (`f:`) id, a tenant-scoped (`t<tenant>:`, #288) id, or the unreachable `i?:`
-/// placeholder namespace ([`ContextScope::prefix_for`]) — all deliberately
-/// excluded from any port's count: a fleet-scoped flow is shared by
-/// construction, so charging its entries to any one imposter's port would be
-/// arbitrary; a tenant-scoped flow is shared across its tenant's ports the same
-/// way (charging it to the *tenant* is issue #413); and the placeholder names
-/// no real port to charge at all.
+/// (`f:`) id or the unreachable `i?:` placeholder namespace
+/// ([`ContextScope::prefix_for`]) — both deliberately excluded from any port's
+/// count: a fleet-scoped flow is shared by construction, so charging its entries
+/// to any one imposter's port would be arbitrary, and the placeholder names no
+/// real port to charge at all.
 fn imposter_port(scoped_flow_id: &str) -> Option<u16> {
     scoped_flow_id
         .strip_prefix('i')
@@ -1868,27 +1785,14 @@ pub fn flow_routes(net: Arc<FlowNet>) -> Router {
                             ring.m_idx()
                         )));
                     }
-                    let totals = net.owned_counts(&node, &ring, &req.ports, &req.tenants);
+                    let totals = net.owned_counts(&node, &ring, &req.ports);
                     let slots = req
                         .ports
                         .iter()
-                        .map(|&port| (port, totals.by_port.get(&port).copied().unwrap_or(0)))
+                        .map(|&port| (port, totals.get(&port).copied().unwrap_or(0)))
                         .collect();
-                    let tenant_slots = req
-                        .tenants
-                        .iter()
-                        .map(|tenant| {
-                            (
-                                tenant.clone(),
-                                totals.by_tenant.get(tenant).copied().unwrap_or(0),
-                            )
-                        })
-                        .collect();
-                    serde_json::to_vec(&CountsReply {
-                        slots,
-                        tenant_slots,
-                    })
-                    .map_err(|e| RpcError::Handler(e.to_string()))
+                    serde_json::to_vec(&CountsReply { slots })
+                        .map_err(|e| RpcError::Handler(e.to_string()))
                 })
             }),
         )
@@ -1952,55 +1856,15 @@ pub struct ClusteredFlowStore {
     /// previously tell which imposter a `flow_id` belonged to; now the id itself
     /// says.
     port: Option<u16>,
-    /// The tenant that owns this imposter's port (#288), consulted only when
-    /// [`FlowConfig::scope`] is [`ContextScope::Tenant`] — every other scope
-    /// ignores it, the same way `port` is unused by `Fleet`.
-    ///
-    /// Filled on the first *successful* lookup and never on a failed one:
-    /// `provide` tries eagerly, so the ordinary store resolves exactly once,
-    /// but a lookup that fails there (the node handle not yet installed, a
-    /// storage error, the config row not yet visible) is retried on the next
-    /// op instead of being cached — a store that remembered a transient
-    /// failure would render its defensive `t??:` namespace for its whole
-    /// lifetime, silently, and that is a wrong namespace, not a degraded one.
-    tenant: OnceLock<TenantId>,
-    /// Whether an unresolved-tenant failure has been logged at error level for
-    /// this store already. The retry is per op (see `tenant`), but the log
-    /// must not be: a store whose tenant never resolves — a node handle that
-    /// was never bound, a persistent storage error — would otherwise emit one
-    /// error line per flow read and write on the request path. First failure
-    /// at error, the rest at debug, until a lookup succeeds.
-    tenant_failure_logged: std::sync::atomic::AtomicBool,
 }
 
 impl ClusteredFlowStore {
-    /// Held as scope+port+tenant rather than a rendered prefix so this shares
+    /// Held as scope+port rather than a rendered prefix so this shares
     /// [`ContextScope::scoped_flow_id`] with the admin front's ownership lookup
     /// (#359). Two renderings of this key would be two answers to "who owns this
     /// flow", and the wrong one sends an operator to the wrong node.
     fn scoped(&self, flow_id: &str) -> String {
-        let tenant = if self.config.scope == ContextScope::Tenant {
-            self.tenant()
-        } else {
-            None
-        };
-        self.config
-            .scope
-            .scoped_flow_id(self.port, tenant.map(TenantId::as_str), flow_id)
-    }
-
-    /// The owning tenant, resolved on first use and cached on success only (see
-    /// the field's doc). `None` when it cannot be resolved *right now*; the
-    /// caller renders the defensive prefix and the next op tries again.
-    fn tenant(&self) -> Option<&TenantId> {
-        if let Some(tenant) = self.tenant.get() {
-            return Some(tenant);
-        }
-        let loudly = !self
-            .tenant_failure_logged
-            .swap(true, std::sync::atomic::Ordering::Relaxed);
-        let resolved = resolve_owning_tenant(&self.net, self.port, loudly)?;
-        Some(self.tenant.get_or_init(|| resolved))
+        self.config.scope.scoped_flow_id(self.port, flow_id)
     }
 
     fn write(&self, flow_id: &str, key: &str, op: WriteOp) -> anyhow::Result<WriteReply> {
@@ -2176,70 +2040,6 @@ impl ClusteredFlowStoreProvider {
     }
 }
 
-/// The tenant that owns `port`, read from this node's applied state (#288).
-///
-/// Ports are fleet-unique across tenants (RFC-002 §3.2), so port → tenant is a
-/// function; and by the time the engine drives `provide` the config row exists
-/// (apply commits `sm_configs` before the sync action that reaches the provider,
-/// and again on `reconcile_engine`), so for a tenant-scoped config this should
-/// always resolve. The tenant is deliberately **not** in `ImposterConfig` — the
-/// core schema carries no tenancy (open-core rule) — which is why it has to be
-/// looked up here rather than read off the config.
-///
-/// `None` is not an error path in itself — the store still functions, rendering
-/// its defensive `t??:` prefix ([`ContextScope::prefix_for`]) — but a
-/// tenant-scoped imposter losing its namespace to that placeholder is exactly
-/// the cross-tenant bleed the scope exists to prevent, so every distinct cause
-/// is logged by name: an operator has to be able to tell "the node handle is
-/// not installed" (a wiring bug) from "no owner row yet" (a race, or a port
-/// nobody configured) from "the read itself failed" (storage). `loudly` picks
-/// the level — error for a store's first failure, debug for the retries after
-/// it (see `ClusteredFlowStore::tenant_failure_logged`).
-fn resolve_owning_tenant(net: &FlowNet, port: Option<u16>, loudly: bool) -> Option<TenantId> {
-    macro_rules! report {
-        ($($arg:tt)*) => {
-            if loudly {
-                tracing::error!($($arg)*);
-            } else {
-                tracing::debug!($($arg)*);
-            }
-        };
-    }
-    let Some(port) = port else {
-        report!("tenant-scoped flow store built without a port; cannot resolve its tenant");
-        return None;
-    };
-    let Some(node) = net.node.get().and_then(Weak::upgrade) else {
-        report!(
-            port,
-            "tenant-scoped flow store: no cluster node bound to the flow net (not yet bound, or \
-             shut down); the owning tenant cannot be resolved and the store renders its \
-             defensive t??: prefix until it can"
-        );
-        return None;
-    };
-    match node.owning_tenant(port) {
-        Ok(Some(tenant)) => Some(tenant),
-        Ok(None) => {
-            report!(
-                port,
-                "tenant-scoped flow store: no applied config row owns this port yet; the store \
-                 renders its defensive t??: prefix until one does"
-            );
-            None
-        }
-        Err(e) => {
-            report!(
-                port,
-                error = %e,
-                "tenant-scoped flow store: owning-tenant lookup failed; the store renders its \
-                 defensive t??: prefix until a lookup succeeds"
-            );
-            None
-        }
-    }
-}
-
 impl rift_cluster_base::seams::FlowStoreProvider for ClusteredFlowStoreProvider {
     fn provide(
         &self,
@@ -2262,17 +2062,7 @@ impl rift_cluster_base::seams::FlowStoreProvider for ClusteredFlowStoreProvider 
             net: Arc::clone(&self.net),
             config: flow_config,
             port: config.port,
-            tenant: OnceLock::new(),
-            tenant_failure_logged: std::sync::atomic::AtomicBool::new(false),
         };
-        // Resolve the tenant now rather than on the first op, so the ordinary
-        // tenant-scoped store pays the lookup once, here, and a failure is
-        // logged at provide time — where an operator reading the log can
-        // still connect it to the imposter that just started. A failure here
-        // is not cached (see the field's doc); the store retries per op.
-        if store.config.scope == ContextScope::Tenant {
-            let _ = store.tenant();
-        }
         Some(Arc::new(store))
     }
 }
@@ -2281,10 +2071,9 @@ impl rift_cluster_base::seams::FlowStoreProvider for ClusteredFlowStoreProvider 
 mod tests {
     use super::*;
 
-    /// `imposter_port` charges only `i<port>:` ids: the fleet (`f:`), tenant (`t<tenant>:`,
-    /// #288) and placeholder namespaces are excluded by construction — pinned so a future
-    /// prefix cannot start being charged to a port by accident (a tenant id spelled like a port
-    /// is the tempting mistake).
+    /// `imposter_port` charges only `i<port>:` ids: the fleet (`f:`) and placeholder
+    /// namespaces are excluded by construction — pinned so a future prefix cannot start
+    /// being charged to a port by accident.
     #[test]
     fn imposter_port_charges_only_the_imposter_namespace() {
         assert_eq!(imposter_port("i6400:cart"), Some(6400));
@@ -2293,39 +2082,6 @@ mod tests {
         assert_eq!(imposter_port("t6400:cart"), None);
         assert_eq!(imposter_port("t??:cart"), None);
         assert_eq!(imposter_port("i?:cart"), None);
-    }
-
-    /// `tenant_of` charges only `t<tenant>:` ids, and never the unresolved placeholder (#413).
-    #[test]
-    fn tenant_of_charges_only_the_tenant_namespace() {
-        assert_eq!(tenant_of("tacme:cart"), Some("acme"));
-        assert_eq!(tenant_of("tdefault:x"), Some("default"));
-        assert_eq!(
-            tenant_of("t??:cart"),
-            None,
-            "the placeholder names no tenant"
-        );
-        assert_eq!(tenant_of("t?:cart"), None);
-        assert_eq!(tenant_of("t:cart"), None, "an empty tenant is not a tenant");
-        assert_eq!(tenant_of("i6400:cart"), None);
-        assert_eq!(tenant_of("f:cart"), None);
-        assert_eq!(tenant_of("tacme"), None, "no `:` — not a scoped id at all");
-    }
-
-    /// The peer fold works for the tenant half exactly as for ports (#413): a mentioned tenant is
-    /// added to, an unmentioned one is left alone, an unrequested one is ignored.
-    #[test]
-    fn a_peers_tenant_counts_fold_like_its_port_counts() {
-        let mut totals: HashMap<String, u64> =
-            HashMap::from([("acme".to_owned(), 5), ("beta".to_owned(), 0)]);
-        merge_peer_counts(
-            &mut totals,
-            &[("acme".to_owned(), 3), ("gamma".to_owned(), 9)],
-        );
-        assert_eq!(
-            totals,
-            HashMap::from([("acme".to_owned(), 8), ("beta".to_owned(), 0)])
-        );
     }
 
     // -- issue #401: `merge_peer_counts` (the `fleet_entry_counts` peer fold) -

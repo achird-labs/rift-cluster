@@ -2,38 +2,20 @@ import { type FormEvent, type ReactNode, useEffect, useState } from "react";
 
 import { ApiError } from "../api/client.ts";
 import { RouteTableConflict, useDeleteRoute, usePutRoutes, useRouteTable } from "../app/queries.ts";
-import { useSession } from "../app/session.tsx";
 import { Card, Empty, ErrorNote, Ident, Status, UnconfirmedNote } from "../components/primitives.tsx";
 import type { Route } from "../features/routes/order.ts";
 import { effectiveOrder, orderReason, validateTable } from "../features/routes/order.ts";
 import { probeRoutes } from "../features/routes/probe.ts";
 import { useToast } from "../components/toast.tsx";
 
-/**
- * Is this tenant's table *known* to be uninstalled?
- *
- * `installed` is published beside the table on `GET` and `PUT /front-door/routes` and nowhere else
- * (D-68, amended by #545), so this is a read of one field — but a strict one. The `undefined` case,
- * a body that did not carry the flag, is deliberately not `true`: everything this predicate gates
- * is a confident structural claim ("these routes can never take a request"), and putting that
- * behind a read that merely failed to say would be the same bound-versus-unknown error #369 exists
- * to prevent, one level up. One definition, used by every call site, so the rule cannot drift.
- */
-function isNotInstalled(fromTable: boolean | undefined): boolean {
-  return fromTable === false;
-}
-
 export function RouteTableScreen(): ReactNode {
-  const { can } = useSession();
   const table = useRouteTable();
-  const notInstalled = isNotInstalled(table.data?.installed);
-  const mayWrite = can("imposter.write");
 
   if (table.isError) {
     return (
       <section className="screen">
         <h1>Front-door routes</h1>
-        <ErrorNote error={table.error} context="Could not read this tenant's route table" />
+        <ErrorNote error={table.error} context="Could not read the fleet's route table" />
       </section>
     );
   }
@@ -43,35 +25,25 @@ export function RouteTableScreen(): ReactNode {
       <header className="screen-head">
         <h1>Front-door routes</h1>
         <p className="scope-label">
-          {notInstalled
-            ? "Listed in stored order. This tenant's table is not evaluated by the front door — see below."
-            : "Listed in the order the front door evaluates them, which is computed from the routes themselves — not the order they were authored in."}
+          Listed in the order the front door evaluates them, which is computed from the routes
+          themselves — not the order they were authored in.
         </p>
       </header>
       {table.isPending ? <p className="muted">Reading…</p> : null}
       {table.isSuccess ? (
         <div className="screen-split">
           <div className="screen-main">
-            <Editor loaded={table.data.routes} mayWrite={mayWrite} notInstalled={notInstalled} />
+            <Editor loaded={table.data} />
             <FrontDoorNotes />
           </div>
-          <RouteTester routes={table.data.routes} notInstalled={notInstalled} />
+          <RouteTester routes={table.data} />
         </div>
       ) : null}
     </section>
   );
 }
 
-function Editor({
-  loaded,
-  mayWrite,
-  notInstalled,
-}: {
-  loaded: Route[];
-  mayWrite: boolean;
-  /** Resolved once by the screen and passed down, so no component re-derives the rule. */
-  notInstalled: boolean;
-}): ReactNode {
+function Editor({ loaded }: { loaded: Route[] }): ReactNode {
   const [draft, setDraft] = useState<Route[]>(loaded);
   const [adding, setAdding] = useState(false);
   const [base, setBase] = useState<Route[]>(loaded);
@@ -121,12 +93,8 @@ function Editor({
    * appended after it rather than dropped: an operator still has to be able to see and re-enable
    * them.
    *
-   * Except when the table is never installed, where `effectiveOrder` is computing a chain that does
-   * not exist — sorting by it would present a fabricated order under a header that says these are
-   * listed as stored. Stored order is the only true ordering available for that tenant, and it is
-   * what the muted rank and "why" columns are consistent with.
    */
-  const rows = notInstalled ? draft : [...ordered, ...draft.filter((route) => !route.enabled)];
+  const rows = [...ordered, ...draft.filter((route) => !route.enabled)];
 
   const save = (): void => {
     if (errors.length > 0) return;
@@ -250,34 +218,6 @@ function Editor({
         </p>
       ) : null}
 
-      {/*
-       * `role="status"`, and the accent family rather than warn/crit: nothing here is broken or
-       * needs attention, and a tenant cannot act on it at all. It is a standing structural fact
-       * about where this table lives, so it is stated once above the rows instead of repeated as
-       * an alarm on each of them.
-       */}
-      {notInstalled ? (
-        <div className="banner info" data-testid="routes-not-installed" role="status">
-          <span className="b-glyph" aria-hidden="true">
-            &#x25c8;
-          </span>
-          <div>
-            <strong>These routes are stored, but not compiled into the front door.</strong>
-            <p>
-              The front door is a single shared listener with no tenant discriminator, so only the
-              default tenant&rsquo;s table is installed. This table is replicated and readable —
-              editing it here is real — but no request can ever be dispatched through it.
-            </p>
-            <p>
-              The reasoning is recorded in <Ident>docs/architecture/08-tenancy-security.md</Ident>,
-              under &ldquo;<code>desired_routes</code> is deliberately NOT unioned&rdquo;: an
-              arriving data-plane request carries no tenant identity, so a shared table would let
-              any tenant&rsquo;s catch-all capture front-door traffic fleet-wide.
-            </p>
-          </div>
-        </div>
-      ) : null}
-
       <section className="card">
         <div className="scroll-x">
       <table className="dense">
@@ -288,27 +228,19 @@ function Editor({
             <th>Match</th>
             <th>Target</th>
             <th>Why this order</th>
-            {mayWrite ? <th>Actions</th> : null}
+            <th>Actions</th>
           </tr>
         </thead>
         <tbody>
           {rows.map((route) => (
             <tr key={route.id} data-testid="route-row">
               {/*
-               * A disabled route is excluded from dispatch, so it has no place in the chain — and
-               * when the whole table is uninstalled there is no chain for any row to have a place
-               * in, so a rank number would be a claim about an order that does not exist.
+               * A disabled route is excluded from dispatch, so it has no place in the chain and
+               * gets no rank number — a claim about an order it is not in.
                */}
-              <td
-                data-testid="route-rank"
-                title={
-                  notInstalled
-                    ? "Not in any dispatch chain — this tenant's table is never installed."
-                    : undefined
-                }
-              >
-                <span className={route.enabled && !notInstalled ? "order-rank" : "order-rank off"}>
-                  {notInstalled ? "—" : (rank.get(route.id) ?? "—")}
+              <td data-testid="route-rank">
+                <span className={route.enabled ? "order-rank" : "order-rank off"}>
+                  {rank.get(route.id) ?? "—"}
                 </span>
               </td>
               <td data-testid="route-id">
@@ -324,34 +256,32 @@ function Editor({
                 {route.target.strip_prefix ? " · strips prefix" : ""}
               </td>
               <td className="muted" data-testid="route-why">
-                {routeWhy(route, notInstalled)}
+                {routeWhy(route)}
               </td>
-              {mayWrite ? (
-                <td>
-                  <button
-                    className="btn sm"
-                    type="button"
-                    onClick={() =>
-                      setDraft(
-                        draft.map((r) => (r.id === route.id ? { ...r, enabled: !r.enabled } : r)),
-                      )
-                    }
-                  >
-                    {route.enabled ? `Disable ${route.id}` : `Enable ${route.id}`}
-                  </button>
-                  {/*
-                   * A single removal goes through DELETE rather than a whole-table PUT: it cannot
-                   * take an unrelated concurrent edit down with it.
-                   */}
-                  <button
-                    className="btn sm danger"
-                    type="button"
-                    onClick={() => remove.mutate({ routeId: route.id })}
-                  >
-                    Delete {route.id}
-                  </button>
-                </td>
-              ) : null}
+              <td>
+                <button
+                  className="btn sm"
+                  type="button"
+                  onClick={() =>
+                    setDraft(
+                      draft.map((r) => (r.id === route.id ? { ...r, enabled: !r.enabled } : r)),
+                    )
+                  }
+                >
+                  {route.enabled ? `Disable ${route.id}` : `Enable ${route.id}`}
+                </button>
+                {/*
+                 * A single removal goes through DELETE rather than a whole-table PUT: it cannot
+                 * take an unrelated concurrent edit down with it.
+                 */}
+                <button
+                  className="btn sm danger"
+                  type="button"
+                  onClick={() => remove.mutate({ routeId: route.id })}
+                >
+                  Delete {route.id}
+                </button>
+              </td>
             </tr>
           ))}
         </tbody>
@@ -361,12 +291,12 @@ function Editor({
 
       {draft.length === 0 ? (
         <Empty
-          title="This tenant has no front-door routes"
+          title="This fleet has no front-door routes"
           body="Every request reaches its imposter by port until a route is added here."
         />
       ) : null}
 
-      {mayWrite && adding ? (
+      {adding ? (
         <NewRoute
           existingIds={draft.map((route) => route.id)}
           onCancel={() => setAdding(false)}
@@ -380,47 +310,37 @@ function Editor({
         />
       ) : null}
 
-      {mayWrite ? (
-        <nav className="pager">
-          <button
-            className="btn"
-            type="button"
-            data-testid="add-route"
-            onClick={() => setAdding(true)}
-            disabled={adding}
-          >
-            Add route
-          </button>
-          {/* Disabled rather than silently no-op: `save()` returns early on a validation error, and
-              a button that looks live but does nothing reads as a broken console. */}
-          <button
-            className="btn primary"
-            type="button"
-            onClick={save}
-            disabled={put.isPending || errors.length > 0}
-          >
-            Save table
-          </button>
-          <button className="btn" type="button" onClick={() => setDraft(base)} disabled={!dirty}>
-            Revert
-          </button>
-          {dirty ? <Status tone="warn" label="unsaved changes" /> : null}
-        </nav>
-      ) : null}
+      <nav className="pager">
+        <button
+          className="btn"
+          type="button"
+          data-testid="add-route"
+          onClick={() => setAdding(true)}
+          disabled={adding}
+        >
+          Add route
+        </button>
+        {/* Disabled rather than silently no-op: `save()` returns early on a validation error, and
+            a button that looks live but does nothing reads as a broken console. */}
+        <button
+          className="btn primary"
+          type="button"
+          onClick={save}
+          disabled={put.isPending || errors.length > 0}
+        >
+          Save table
+        </button>
+        <button className="btn" type="button" onClick={() => setDraft(base)} disabled={!dirty}>
+          Revert
+        </button>
+        {dirty ? <Status tone="warn" label="unsaved changes" /> : null}
+      </nav>
     </>
   );
 }
 
-/**
- * What the "why this order" column says about one route.
- *
- * `orderReason` prose ("wins on priority", "more specific host") describes a place in a live chain,
- * so on an uninstalled table it is not merely overridden but never computed. Not-installed outranks
- * "disabled" because it is the stronger fact: switching a route off explains its absence from a
- * chain that, for this tenant, does not exist either way.
- */
-function routeWhy(route: Route, notInstalled: boolean): string {
-  if (notInstalled) return "not installed";
+/** What the "why this order" column says about one route. */
+function routeWhy(route: Route): string {
   return route.enabled ? orderReason(route) : "disabled";
 }
 
@@ -600,13 +520,7 @@ function FrontDoorNotes(): ReactNode {
  * clauses the same way. That is said on the panel rather than left implied — a tester quietly
  * disagreeing with the real dispatcher would be worse than no tester, because it would be trusted.
  */
-function RouteTester({
-  routes,
-  notInstalled,
-}: {
-  routes: readonly Route[];
-  notInstalled: boolean;
-}): ReactNode {
+function RouteTester({ routes }: { routes: readonly Route[] }): ReactNode {
   const [host, setHost] = useState("");
   const [path, setPath] = useState("/");
   const [header, setHeader] = useState("");
@@ -691,17 +605,9 @@ function RouteTester({
             ))}
           </ol>
         )}
-        {/*
-         * Without this the panel contradicts the banner: it would name a winning route on a table
-         * the screen has just said can never take a request. The verdict stays — it is a true
-         * reading of the rules, and it is what the table would do once installed — but it stops
-         * being presented as something that could happen to this tenant today.
-         */}
         <p className="hint" data-testid="probe-hint">
           Evaluated by this console against the table above — the front door has no probe endpoint
           to ask, so this is a reading of the same rules rather than its verdict.
-          {notInstalled &&
-            " This tenant's table is never installed, so no request would reach any of these routes in the first place — this is what it would do if it were."}
         </p>
       </section>
     </aside>

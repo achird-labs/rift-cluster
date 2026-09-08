@@ -1,15 +1,27 @@
 # Console design prototype — RFC-006 scope A
 
 `console-prototype.html` is a **self-contained, zero-dependency** prototype of every RFC-006 §4 screen
-whose backend has shipped or is sliced:
+whose backend has shipped or is sliced.
+
+> **Amended by D-73** (RFC-007 §3.2, #550): the **Administration** screen is gone, along with the
+> tenant switcher, the identity block, the role matrix and the key-shown-once panel — tenants,
+> principals, roles, bindings and quotas were removed from the fleet. The `admin` / `adminTab` /
+> `role` query parameters below and the *Administration* section further down describe a screen
+> that no longer exists and are kept as history; the prototype HTML still renders them, because it
+> is a design artifact rather than a client. The shipped console has no permission gates at all:
+> whoever logged in holds the fleet's one credential, so every control is offered.
+>
+> The **not-installed treatment** for route tables is gone too, and for a reason worth reading
+> where the treatment is described (below): with one fleet-wide table every stored route is
+> installed, so the flag would be a constant.
 
 | Screen | Slice | Issue |
 |---|---|---|
 | Sign in — API key exchanged for a session cookie | C2 | [#185](https://github.com/achird-labs/rift-cluster/issues/185) |
-| App shell, tenant switcher, imposters, cluster/fleet | C4 | [#187](https://github.com/achird-labs/rift-cluster/issues/187) |
+| App shell, imposters, cluster/fleet (the tenant switcher went with D-73) | C4 | [#187](https://github.com/achird-labs/rift-cluster/issues/187) |
 | Stub editor — form ⟷ JSON, lint, 409 rebase | C5 | [#188](https://github.com/achird-labs/rift-cluster/issues/188) |
 | Request log (per-node) and front-door route editor | C6 | [#189](https://github.com/achird-labs/rift-cluster/issues/189) |
-| Tenants, principals, roles | C7 | [#190](https://github.com/achird-labs/rift-cluster/issues/190) |
+| ~~Tenants, principals, roles~~ | ~~C7~~ | removed by D-73 (#550) |
 
 Scenarios and flow state (#149), sources (#20) and specs (#148) appear as greyed nav entries carrying
 their issue number — a visible roadmap rather than a 404, which is what §4 asks for.
@@ -52,7 +64,7 @@ These are the ones that separate an honest operator console from a plausible-loo
 
 1. **`?screen=imposters&data=empty&fleet=degraded`** — a naive console says "no imposters" here and is
    *wrong*. An imposter configured on the node that did not answer would not appear. This prototype
-   says "cannot confirm this tenant is empty" and names the coverage.
+   says "cannot confirm this fleet is empty" and names the coverage.
 2. **`?screen=requests&fleet=degraded&scopeNode=rift-3`** — the scoped node is unreachable. Its log is
    **unknown**, not empty, and the screen says so in those words.
 3. **`?screen=requests&data=empty`** — the reachable-and-genuinely-empty case, for contrast with (2).
@@ -87,22 +99,19 @@ are excluded from dispatch and shown with `—`.
 > `PUT /front-door/routes` (D-68, amended) — and nothing to prefer between. A body that omits the
 > flag is still unknown, never `false`.
 
-**A non-default tenant's table is never in any order at all.** `desired_routes` compiles only the
-default tenant's routes into the shared front door (`08-tenancy-security.md`), so for every other
-tenant the screen is showing stored state that cannot take a request. The server says so with
-`installed: false` beside the table on `GET` and `PUT /front-door/routes` (D-68), and nowhere else.
-The write carries the flag deliberately: an operator saving a table under a non-default tenant
-learns from the answer to their own `PUT` that it will never dispatch, rather than waiting on the
-next poll.
+**The not-installed treatment is gone (D-73, #550).** It existed because `desired_routes` compiled
+only the default tenant's routes into the shared front door, so a non-default tenant's table was
+stored state that could never take a request, and `installed: false` beside the table on `GET` and
+`PUT /front-door/routes` was how the server said so (D-68). With one fleet-wide table every stored
+route is installed: the flag would be a constant `true`, so it is removed from the contract and the
+banner, the muted rank cells, the `not installed` tie-break text and the stored-order fallback are
+all removed from the screen.
 
-The screen then spends the fact four ways (#400): a `role="status"` banner naming it and its
-reason, `—` in every rank cell, `not installed` in place of the tie-break prose, and the rows listed
-in **stored** order rather than `effective_order()` — sorting by a chain that is never evaluated
-would be the same fabrication the rank column is being muted to avoid. Editing stays enabled — the
-table is real replicated state — and all of it keys on a positive `installed: false`, never on a
-body that merely did not say. That last point is the rule, not an implementation detail: rendering
-"cannot take a request" off the back of a read the console could not complete would be a confident
-claim sourced from an unknown.
+The rule the treatment embodied is worth keeping in view even though its subject is gone: the
+screen keyed all of it on a *positive* `installed: false`, never on a body that merely did not say,
+because rendering "cannot take a request" off the back of a read the console could not complete
+would be a confident claim sourced from an unknown. Every remaining unknown on this screen is held
+to the same standard.
 
 The editor validates before the write, mirroring `RouteTable::validate` / `Route::validate`:
 
@@ -125,7 +134,12 @@ one. A whole-table write from a long-open editor is a lost update waiting to hap
 loads a revision, sends it back, and on a mismatch offers refresh-and-reapply instead of overwriting.
 Deleting a single route is the safe operation and should be preferred where that is what was meant.
 
-## Administration: the two behaviours not to soften
+## ~~Administration: the two behaviours not to soften~~ — removed by D-73 (#550)
+
+*History. There is no Administration screen: no tenants, no principals, no roles, no minted keys.
+The fleet has one credential, set by `--api-key`, and it is never shown by the console because the
+console never holds it — `POST /session` exchanges it for a cookie at login. The paragraphs below
+described the screen that was.*
 
 **A key is shown once.** The fleet stores an argon2id hash, so there is nothing to reveal later and no
 reveal action is offered — one would teach operators to expect a feature that cannot exist.
@@ -133,7 +147,7 @@ reveal action is offered — one would teach operators to expect a feature that 
 The role matrix is rendered as a matrix on purpose. `authz.rs::role_allows` is written as explicit
 per-role arms precisely so a security reviewer can read the table, and the UI should have the same
 property. Note `FleetAdmin` binds only on the fleet scope `*` — so it is never offered as an
-in-tenant role.
+in-tenant role. *(`authz.rs` no longer exists.)*
 
 ## Design decisions, and why
 

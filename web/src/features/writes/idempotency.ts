@@ -40,10 +40,10 @@ import { ApiError } from "../../api/client.ts";
  *
  * ## Send it exactly where the contract declares it (#389)
  *
- * `openapi-ee.yaml` declares `Idempotency-Key` on fifteen routes — the ones reaching the admin
- * front's `build_and_run` (imposters, stubs, lifecycle, front-door routes, scenarios, flow state)
- * and its tenancy surface (tenants, principals, bindings). Those derive their op id from the header
- * via `base_op_id`, and those are the ones {@link keyedAttempt} is for.
+ * `openapi-ee.yaml` declares `Idempotency-Key` on the routes reaching the admin front's
+ * `build_and_run` — imposters, stubs, lifecycle, front-door routes, scenarios and flow state.
+ * Those derive their op id from the header via `base_op_id`, and those are the ones
+ * {@link keyedAttempt} is for.
  *
  * The routes in {@link UNDECLARED} do **not** declare the parameter, and the fleet does not read it
  * on them — `try` returns from `terminate` before the header is parsed, and space teardown mints
@@ -106,7 +106,7 @@ function outcomeIsUnknown(error: unknown): boolean {
  * ```ts
  * const keyed = keyedAttempt();
  * // inside mutationFn:
- * await keyed((idempotencyKey) => apiSend("PUT", path, body, { tenant, idempotencyKey }));
+ * await keyed((idempotencyKey) => apiSend("PUT", path, body, { idempotencyKey }));
  * ```
  */
 export function keyedAttempt(): <T>(attempt: (key: string) => Promise<T>) => Promise<T> {

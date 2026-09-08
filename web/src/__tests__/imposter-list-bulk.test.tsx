@@ -5,7 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { Imposters } from "../screens/Imposters.tsx";
 import { createQueryClient } from "../app/query.ts";
-import { renderInApp, stubFetch, whoamiWith } from "./harness.tsx";
+import { renderInApp, stubFetch } from "./harness.tsx";
 
 /**
  * The list screen's search, sort and bulk behaviour.
@@ -44,8 +44,8 @@ afterEach(() => {
   window.location.hash = "";
 });
 
-async function rendered(role: "editor" | "viewer" | "fleet-admin" = "fleet-admin"): Promise<void> {
-  renderInApp(<Imposters />, { whoami: whoamiWith(role) });
+async function rendered(): Promise<void> {
+  renderInApp(<Imposters />);
   await screen.findByTestId("imposter-row-4545");
 }
 
@@ -71,7 +71,7 @@ describe("filtering", () => {
     // The half that a state-only filter fails: reload the page and the view comes back.
     window.location.hash = "#/imposters?q=checkout";
     stubFetch(base());
-    renderInApp(<Imposters />, { whoami: whoamiWith("fleet-admin") });
+    renderInApp(<Imposters />);
 
     await waitFor(() => expect(visiblePorts()).toEqual([4546]));
     expect((screen.getByTestId("imposter-filter-text") as HTMLInputElement).value).toBe("checkout");
@@ -80,7 +80,7 @@ describe("filtering", () => {
   it("clears back to a URL with no query string at all", async () => {
     window.location.hash = "#/imposters?q=bill&sort=name";
     stubFetch(base());
-    renderInApp(<Imposters />, { whoami: whoamiWith("fleet-admin") });
+    renderInApp(<Imposters />);
     await screen.findByTestId("imposter-row-4545");
 
     await userEvent.click(screen.getByTestId("imposter-filter-reset"));
@@ -92,7 +92,7 @@ describe("filtering", () => {
   it("renders rather than throwing for a hand-edited filter", async () => {
     window.location.hash = "#/imposters?sort=colour&dir=widdershins&rec=maybe";
     stubFetch(base());
-    renderInApp(<Imposters />, { whoami: whoamiWith("fleet-admin") });
+    renderInApp(<Imposters />);
 
     await waitFor(() => expect(visiblePorts()).toHaveLength(3));
   });
@@ -219,7 +219,7 @@ describe("selection", () => {
   });
 
   it("shows no bulk bar until something is actually ticked", async () => {
-    // A principal who HOLDS the actions but has selected nothing. Distinct from the viewer case
+    // The bar exists but nothing is selected. Distinct from the empty-table case
     // below, which short-circuits earlier — nothing was asserting the zero-count guard itself.
     stubFetch(base());
     await rendered();
@@ -291,7 +291,7 @@ describe("selection", () => {
     // suite by an order of magnitude. Invalidating drives the same refetch immediately — what is
     // under test is the reconciliation, not the cadence.
     const client = createQueryClient();
-    renderInApp(<Imposters />, { whoami: whoamiWith("fleet-admin"), client });
+    renderInApp(<Imposters />, { client });
     await screen.findByTestId("imposter-row-4545");
 
     await userEvent.click(screen.getByTestId("imposter-select-4545"));
@@ -316,14 +316,6 @@ describe("selection", () => {
     expect(screen.queryByTestId("imposter-bulk-bar")).toBeNull();
   });
 
-  it("offers no bulk bar to a principal who holds none of the actions", async () => {
-    // Hidden, not disabled — the same rule the single-row actions already follow.
-    stubFetch(base());
-    await rendered("viewer");
-
-    expect(screen.queryByTestId("imposter-select-all")).toBeNull();
-    expect(screen.queryByTestId("imposter-bulk-bar")).toBeNull();
-  });
 });
 
 describe("bulk actions", () => {

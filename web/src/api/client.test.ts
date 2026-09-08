@@ -6,7 +6,6 @@ import {
   IDEMPOTENCY_HEADER,
   REVISION_HEADER,
   RawJsonBody,
-  TENANT_HEADER,
   apiGet,
   apiGetWithRevision,
   apiSend,
@@ -31,41 +30,9 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
-describe("tenant selection", () => {
-  it("sends X-Rift-Tenant with the tenant in view", () => {
-    const fetchMock = mockFetch(json({ imposters: [] }));
-    void apiGet("/imposters", { tenant: "acme" });
-    expect(headersOf(fetchMock)[TENANT_HEADER]).toBe("acme");
-  });
-
-  it("omits the header entirely when no tenant is selected", () => {
-    // RFC-002 §8.1: absent means the principal's default tenant. Sending an empty string instead
-    // would be a *claim* of a tenant named "", which resolves to a tenant the caller is not bound
-    // to and 404s.
-    const fetchMock = mockFetch(json({ imposters: [] }));
-    void apiGet("/imposters");
-    expect(TENANT_HEADER in headersOf(fetchMock)).toBe(false);
-  });
-
-  it("carries the tenant on mutations too", () => {
-    const fetchMock = mockFetch(json({ message: "ok" }));
-    void apiSend("POST", "/imposters/4545/disable", undefined, { tenant: "globex" });
-    const headers = headersOf(fetchMock);
-    expect(headers[TENANT_HEADER]).toBe("globex");
-    expect(headers[CSRF_HEADER]).toBe("1");
-  });
-
-  it("uses the exact header name the admin front reads", () => {
-    // `admin_front.rs::requested_tenant` matches `x-rift-tenant`; HTTP header names are
-    // case-insensitive, but the contract declares this casing and the proxy path forwards it
-    // verbatim, so pinning it keeps the two documents honest with each other.
-    expect(TENANT_HEADER).toBe("X-Rift-Tenant");
-  });
-});
-
 describe("error surfacing", () => {
   it("throws with the status so a screen can tell 404 from 503", () => {
-    // The fleet projection answers 404 for a role that lacks it and 503 when the node is not
+    // The fleet projection answers 404 on an unclustered node and 503 when the node is not
     // ready. Those are different sentences on screen, so the status has to survive the client.
     const fetchMock = mockFetch(json({ message: "nope" }, 404));
     expect(fetchMock).toBeDefined();
@@ -80,7 +47,7 @@ describe("error surfacing", () => {
 
   it("still sends no CSRF header on a read", () => {
     const fetchMock = mockFetch(json({}));
-    void apiGet("/admin/whoami");
+    void apiGet("/_fleet/health");
     expect(CSRF_HEADER in headersOf(fetchMock)).toBe(false);
   });
 });
@@ -151,7 +118,7 @@ describe("a parked write is not an applied write (#211)", () => {
   it("treats an empty 204 as applied, not as parked", async () => {
     // `null`, not `""` — the Response constructor rejects any body on a 204.
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(null, { status: 204 })));
-    const result = await apiSend("DELETE", "/admin/tenants/acme");
+    const result = await apiSend("DELETE", "/front-door/routes/edge");
     expect(result).toEqual({ kind: "applied", data: null });
   });
 });
@@ -176,12 +143,12 @@ describe("reading the revision the write will be conditioned on", () => {
       vi.fn().mockResolvedValue(
         new Response(JSON.stringify({ port: 4545 }), {
           status: 200,
-          headers: { [REVISION_HEADER]: "default:4545@17" },
+          headers: { [REVISION_HEADER]: "4545@17" },
         }),
       ),
     );
     const read = await apiGetWithRevision<{ port: number }>("/imposters/4545");
-    expect(read).toEqual({ data: { port: 4545 }, revision: "default:4545@17" });
+    expect(read).toEqual({ data: { port: 4545 }, revision: "4545@17" });
   });
 
   it("reports a missing header as null rather than inventing a token", async () => {
@@ -200,8 +167,8 @@ describe("reading the revision the write will be conditioned on", () => {
 describe("conditioning a write on a revision", () => {
   it("sends If-Match when the caller supplies a token", () => {
     const fetchMock = mockFetch(json({ port: 4545 }));
-    void apiSend("PUT", "/imposters/4545/stubs/by-id/s-1", {}, { ifMatch: "default:4545@17" });
-    expect(headersOf(fetchMock)["If-Match"]).toBe("default:4545@17");
+    void apiSend("PUT", "/imposters/4545/stubs/by-id/s-1", {}, { ifMatch: "4545@17" });
+    expect(headersOf(fetchMock)["If-Match"]).toBe("4545@17");
   });
 
   it("omits If-Match entirely when there is no token", () => {
@@ -247,7 +214,7 @@ describe("idempotency key (#371)", () => {
   });
 
   // A read cannot double-apply, and one admin route refuses the header outright (minting a
-  // principal), so sending it where it has no meaning would invite a 400 for nothing.
+  // so sending it where it has no meaning would invite a 400 for nothing.
   it("never sends it on a GET", () => {
     const fetchMock = mockFetch(json({ imposters: [] }));
     void apiGet("/imposters", { idempotencyKey: "op-1" });

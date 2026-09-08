@@ -228,7 +228,7 @@ const WORDING: Record<Degradation, string> = {
 
 /**
  * Why the fleet reading is absent, when it is. The two are different sentences on screen and must
- * not collapse into one: not asking is a settled fact about the principal, whereas asking and
+ * not collapse into one: not asking is a settled decision by the screen, whereas asking and
  * failing means the qualification this screen would have applied is simply missing.
  */
 export type FleetReadState =
@@ -247,16 +247,14 @@ export type ViewConfidence = {
 /**
  * How much a read served by *this* node is worth right now.
  *
- * `not-asked` is the common case, not an edge one: the fleet projection is `ClusterAdmin`-gated, so
- * every role below FleetAdmin is refused it and the imposter list does not even try. Calling that
- * "partial" would put a permanent warning on a healthy console until operators stopped reading it;
- * calling it "complete" would assert something nothing supports. It says neither, and the screens
- * still label every reading as this node's own.
+ * `not-asked` covers a screen that has not obtained the reading yet, or has chosen not to ask.
+ * Calling that "partial" would put a warning on a healthy console until operators stopped reading
+ * it; calling it "complete" would assert something nothing supports. It says neither, and the
+ * screens still label every reading as this node's own.
  *
- * `unavailable` is the case that must not be folded into it. A FleetAdmin whose `/_fleet/*` read
- * failed is not a principal without the scope — the screen has lost the very signal that would
- * have told it whether to trust an empty list, and saying nothing would present that as a clean
- * reading.
+ * `unavailable` is the case that must not be folded into it. A `/_fleet/*` read that was asked and
+ * failed has lost the very signal that would have told the screen whether to trust an empty list,
+ * and saying nothing would present that as a clean reading.
  */
 export function viewConfidence(state: FleetReadState): ViewConfidence {
   if (state.kind === "unavailable") {

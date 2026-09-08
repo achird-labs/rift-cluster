@@ -101,14 +101,20 @@ describe("readSpaceList", () => {
     });
   });
 
-  it("reads the two unavailable reasons, both forcing spaces empty and partial true in practice", () => {
-    for (const reason of ["fleet-scope", "scope-unresolved"] as const) {
-      const state = readSpaceList({ spaces: [], partial: true, unavailable: reason });
-      expect(state).toEqual({
-        kind: "list",
-        list: { durability: null, spaces: [], partial: true, unavailable: reason },
-      });
-    }
+  it("reads the unavailable reason, which forces spaces empty and partial true in practice", () => {
+    const state = readSpaceList({ spaces: [], partial: true, unavailable: "scope-unresolved" });
+    expect(state).toEqual({
+      kind: "list",
+      list: { durability: null, spaces: [], partial: true, unavailable: "scope-unresolved" },
+    });
+  });
+
+  it("refuses the withdrawn fleet-scope reason rather than reading it as no reason at all", () => {
+    // #550 dropped the variant from the contract. A body still carrying it is a server this
+    // console does not understand, and folding it to `null` would render the generic partial
+    // banner — a confident, wrong sentence about a listing that was never attempted.
+    const state = readSpaceList({ spaces: [], partial: true, unavailable: "fleet-scope" });
+    expect(state.kind).toBe("unknown");
   });
 
   it("reads an absent unavailable field as null, not as a reason the server never gave", () => {

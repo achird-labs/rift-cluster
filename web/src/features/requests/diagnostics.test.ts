@@ -76,11 +76,11 @@ describe("describeOutcome on a request that matched nothing", () => {
   // this panel makes — so the unrecognised reason is shown exactly as the engine spelled it.
   it("shows an unrecognised reason as the engine spelled it rather than dropping the candidate", () => {
     const view = describeOutcome(
-      wire({ matched: false, tried: [{ stubIndex: 0, why: { reason: "skippedTenant" } }] }),
+      wire({ matched: false, tried: [{ stubIndex: 0, why: { reason: "skippedByANewerGate" } }] }),
     );
     expect(view).toEqual({
       kind: "unmatched",
-      tried: [{ label: "stub #0", why: "skippedTenant" }],
+      tried: [{ label: "stub #0", why: "skippedByANewerGate" }],
       omitted: 0,
     });
   });

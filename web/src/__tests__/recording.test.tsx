@@ -12,7 +12,7 @@ import {
   recordingState,
 } from "../features/recording/state.ts";
 import { ImposterDetail } from "../screens/ImposterDetail.tsx";
-import { onDetailTab, renderInApp, stubFetch, whoamiWith } from "./harness.tsx";
+import { onDetailTab, renderInApp, stubFetch } from "./harness.tsx";
 
 type Stub = components["schemas"]["Stub"];
 
@@ -49,7 +49,7 @@ function routes(stubs: Stub[], opts: { recorded?: Stub[]; voters?: number[] } = 
     // on, and the controls correctly refuse to send without one.
     "/imposters/4545": {
       json: imposterBody(stubs),
-      headers: { "Rift-Cluster-Revision": "default:4545@7" },
+      headers: { "Rift-Cluster-Revision": "4545@7" },
     },
     "/imposters/4545?replayable=true&removeProxies=true": {
       json: imposterBody(opts.recorded ?? []),
@@ -150,7 +150,7 @@ describe("the proxy stub a recording writes", () => {
 describe("the start-recording form", () => {
   it("offers every proxy mode with what it does and what it costs", async () => {
     stubFetch(routes([]));
-    renderInApp(<ImposterDetail port={4545} />, { whoami: whoamiWith("editor") });
+    renderInApp(<ImposterDetail port={4545} />);
 
     await userEvent.click(await screen.findByRole("button", { name: /start recording/i }));
 
@@ -170,7 +170,7 @@ describe("the start-recording form", () => {
 
   it("states the predicate-generator defaults as defaults rather than hiding them", async () => {
     stubFetch(routes([]));
-    renderInApp(<ImposterDetail port={4545} />, { whoami: whoamiWith("editor") });
+    renderInApp(<ImposterDetail port={4545} />);
     await userEvent.click(await screen.findByRole("button", { name: /start recording/i }));
 
     expect(DEFAULT_GENERATOR_FIELDS).toEqual(["method", "path", "query"]);
@@ -186,7 +186,7 @@ describe("the start-recording form", () => {
     // Promoting blind is how people end up with 400 stubs keyed on a Date header; sending blind is
     // the same mistake one step earlier.
     stubFetch(routes([]));
-    renderInApp(<ImposterDetail port={4545} />, { whoami: whoamiWith("editor") });
+    renderInApp(<ImposterDetail port={4545} />);
     await userEvent.click(await screen.findByRole("button", { name: /start recording/i }));
 
     const preview = await screen.findByTestId("recording-json-preview");
@@ -204,7 +204,7 @@ describe("the review table", () => {
      * prevent.
      */
     stubFetch(routes([PROXY_STUB], { recorded: [RECORDED_FLAT] }));
-    renderInApp(<ImposterDetail port={4545} />, { whoami: whoamiWith("editor") });
+    renderInApp(<ImposterDetail port={4545} />);
 
     const row = await screen.findByTestId("recorded-row-0");
     expect(row.textContent).toContain("201");
@@ -234,7 +234,7 @@ describe("the review table", () => {
       ...routes([PROXY_STUB], { recorded: [wrapped] }),
       "/imposters/4545/stubs": { json: imposterBody([wrapped]) },
     });
-    renderInApp(<ImposterDetail port={4545} />, { whoami: whoamiWith("editor") });
+    renderInApp(<ImposterDetail port={4545} />);
 
     const row = await screen.findByTestId("recorded-row-0");
     expect(row.textContent).toContain("200");
@@ -254,7 +254,7 @@ describe("the review table", () => {
 
   it("says so when a recording has captured nothing yet", async () => {
     stubFetch(routes([PROXY_STUB], { recorded: [] }));
-    renderInApp(<ImposterDetail port={4545} />, { whoami: whoamiWith("editor") });
+    renderInApp(<ImposterDetail port={4545} />);
 
     expect((await screen.findByTestId("recorded-none")).textContent).toMatch(/no.*record/i);
   });
@@ -266,7 +266,7 @@ describe("promote", () => {
       ...routes([PROXY_STUB], { recorded: [RECORDED_FLAT] }),
       "/imposters/4545/stubs": { json: imposterBody([RECORDED_FLAT]) },
     });
-    renderInApp(<ImposterDetail port={4545} />, { whoami: whoamiWith("editor") });
+    renderInApp(<ImposterDetail port={4545} />);
 
     await userEvent.click(await screen.findByRole("button", { name: /stop & promote/i }));
     await userEvent.click(await screen.findByTestId("confirm-destructive"));
@@ -276,7 +276,7 @@ describe("promote", () => {
     expect(put?.method).toBe("PUT");
     // Conditioned on the revision the review was read at — an unconditioned promote is
     // last-writer-wins against whatever changed while the operator was reading the table.
-    expect(put?.headers["if-match"]).toBe("default:4545@7");
+    expect(put?.headers["if-match"]).toBe("4545@7");
     // The recorded document goes back verbatim — including the flat response form.
     expect(JSON.parse(String(put?.body)).stubs[0].responses[0]).toEqual(
       RECORDED_FLAT.responses?.[0],
@@ -292,7 +292,7 @@ describe("the start-recording form writes what it previewed", () => {
       ...routes([]),
       "/imposters/4545/stubs": { json: imposterBody([]) },
     });
-    renderInApp(<ImposterDetail port={4545} />, { whoami: whoamiWith("editor") });
+    renderInApp(<ImposterDetail port={4545} />);
 
     await userEvent.click(await screen.findByRole("button", { name: /start recording/i }));
     await userEvent.type(screen.getByLabelText(/proxy target/i), "https://api.example.com");
@@ -315,7 +315,7 @@ describe("the start-recording form writes what it previewed", () => {
   it("re-previews when a generator field is toggled off", async () => {
     // "Selectable" means the selection reaches the document, not merely that a box moves.
     stubFetch(routes([]));
-    renderInApp(<ImposterDetail port={4545} />, { whoami: whoamiWith("editor") });
+    renderInApp(<ImposterDetail port={4545} />);
     await userEvent.click(await screen.findByRole("button", { name: /start recording/i }));
 
     await userEvent.click(screen.getByTestId("generator-query"));
@@ -337,7 +337,7 @@ describe("promote is refused when there is nothing to promote", () => {
      * list — proxy stub included — with nothing, which no confirm dialog makes acceptable.
      */
     stubFetch(routes([PROXY_STUB], { recorded: [] }));
-    renderInApp(<ImposterDetail port={4545} />, { whoami: whoamiWith("editor") });
+    renderInApp(<ImposterDetail port={4545} />);
 
     await screen.findByTestId("recorded-none");
     expect(screen.queryByRole("button", { name: /stop & promote/i })).toBeNull();
@@ -345,7 +345,7 @@ describe("promote is refused when there is nothing to promote", () => {
 
   it("names the count on the confirm, so the operator sees what is being promoted", async () => {
     stubFetch(routes([PROXY_STUB], { recorded: [RECORDED_FLAT] }));
-    renderInApp(<ImposterDetail port={4545} />, { whoami: whoamiWith("editor") });
+    renderInApp(<ImposterDetail port={4545} />);
 
     await userEvent.click(await screen.findByRole("button", { name: /stop & promote/i }));
     expect(screen.getByTestId("confirm-destructive").textContent).toMatch(/1 recorded stub/);
@@ -358,7 +358,7 @@ describe("the review table belongs to a recording, not to every imposter", () =>
     // "Recording" heading above the stub table that already shows them would present ordinary
     // configuration as something waiting to be promoted.
     stubFetch(routes([STATIC_STUB]));
-    renderInApp(<ImposterDetail port={4545} />, { whoami: whoamiWith("editor") });
+    renderInApp(<ImposterDetail port={4545} />);
 
     await screen.findByTestId("detail-port");
     expect(screen.queryByTestId("recorded-row-0")).toBeNull();
@@ -378,7 +378,7 @@ describe("a promote that races another change", () => {
       ...routes([PROXY_STUB], { recorded: [RECORDED_FLAT] }),
       "/imposters/4545/stubs": { status: 409, json: { message: "revision conflict" } },
     });
-    renderInApp(<ImposterDetail port={4545} />, { whoami: whoamiWith("editor") });
+    renderInApp(<ImposterDetail port={4545} />);
 
     await userEvent.click(await screen.findByRole("button", { name: /stop & promote/i }));
     await userEvent.click(await screen.findByTestId("confirm-destructive"));
@@ -400,7 +400,7 @@ describe("discard", () => {
       ...routes([PROXY_STUB], { recorded: [RECORDED_FLAT] }),
       "/imposters/4545/savedProxyResponses": { json: imposterBody([PROXY_STUB]) },
     });
-    renderInApp(<ImposterDetail port={4545} />, { whoami: whoamiWith("editor") });
+    renderInApp(<ImposterDetail port={4545} />);
 
     await userEvent.click(await screen.findByRole("button", { name: /discard recordings/i }));
     expect(calls).not.toContain("/imposters/4545/savedProxyResponses");
@@ -410,36 +410,10 @@ describe("discard", () => {
   });
 });
 
-describe("the controls gate on the actions the server actually checks", () => {
-  it("offers a viewer none of them", async () => {
-    stubFetch(routes([PROXY_STUB], { recorded: [RECORDED_FLAT] }));
-    renderInApp(<ImposterDetail port={4545} />, { whoami: whoamiWith("viewer") });
-
-    await screen.findByTestId("detail-port");
-    expect(screen.queryByRole("button", { name: /stop & promote/i })).toBeNull();
-    expect(screen.queryByRole("button", { name: /discard recordings/i })).toBeNull();
-  });
-
-  it("offers an operator discard but not promote", async () => {
-    /*
-     * Not a stylistic split. `DELETE .../savedProxyResponses` is not terminated by the admin front
-     * — it proxies upstream, and `principal.rs::map_action` folds it onto
-     * `Action::SavedRequestsClear` along with `savedRequests` and `requests` (RFC-002 §4.1). That
-     * is `requests.clear`, which Operator holds. Promote is a `ReplaceStubs` write, which is not.
-     * Transcribing the action that actually authorizes the call is `rbac.ts`'s stated rule.
-     */
-    stubFetch(routes([PROXY_STUB], { recorded: [RECORDED_FLAT] }));
-    renderInApp(<ImposterDetail port={4545} />, { whoami: whoamiWith("operator") });
-
-    expect(await screen.findByRole("button", { name: /discard recordings/i })).toBeTruthy();
-    expect(screen.queryByRole("button", { name: /stop & promote/i })).toBeNull();
-  });
-});
-
 describe("fleet honesty about where a recording lives", () => {
   it("warns a multi-node fleet that recording is per node, naming the issue that fixes it", async () => {
     stubFetch(routes([], { voters: [1, 2, 3] }));
-    renderInApp(<ImposterDetail port={4545} />, { whoami: whoamiWith("editor") });
+    renderInApp(<ImposterDetail port={4545} />);
 
     const caveat = await screen.findByTestId("recording-fleet-caveat");
     expect(caveat.textContent).toMatch(/per[- ]node|each node/i);
@@ -450,7 +424,7 @@ describe("fleet honesty about where a recording lives", () => {
     // An operator who learns about duplicate recordings after driving traffic has already paid for
     // it. The state here is Empty — nothing recorded yet — and the warning is already on screen.
     stubFetch(routes([], { voters: [1, 2, 3] }));
-    renderInApp(<ImposterDetail port={4545} />, { whoami: whoamiWith("editor") });
+    renderInApp(<ImposterDetail port={4545} />);
 
     expect(await screen.findByTestId("recording-fleet-caveat")).toBeTruthy();
     expect(screen.queryByTestId("recorded-row-0")).toBeNull();
@@ -459,7 +433,7 @@ describe("fleet honesty about where a recording lives", () => {
   it("still warns when the fleet size could not be read at all", async () => {
     /*
      * The case that matters most, and the one a naive implementation gets backwards: `/_fleet/*`
-     * authorizes `Action::ClusterAdmin`, so for every role below fleet-admin — including the
+     * is served only by a clustered node, so on an unclustered one — including the
      * editors who do most of the recording — the read answers 403. Folding that into "single node"
      * would hide the warning from exactly the people it is for. An unread fleet is not a
      * one-node fleet.
@@ -470,7 +444,7 @@ describe("fleet honesty about where a recording lives", () => {
       "/_fleet/members": { status: 403, json: { message: "forbidden" } },
       "/_fleet/health": { status: 403, json: { message: "forbidden" } },
     });
-    renderInApp(<ImposterDetail port={4545} />, { whoami: whoamiWith("editor") });
+    renderInApp(<ImposterDetail port={4545} />);
 
     const caveat = await screen.findByTestId("recording-fleet-caveat");
     expect(caveat.textContent).toMatch(/per[- ]node|each node/i);
@@ -484,7 +458,7 @@ describe("fleet honesty about where a recording lives", () => {
     // One voter is this deployment's membership, not a shortfall — the same discipline the fleet
     // screen holds to. A banner here would be a warning about a problem that cannot occur.
     stubFetch(routes([PROXY_STUB], { recorded: [], voters: [1] }));
-    renderInApp(<ImposterDetail port={4545} />, { whoami: whoamiWith("editor") });
+    renderInApp(<ImposterDetail port={4545} />);
 
     // Waited for, not sampled: until the fleet read resolves the size is genuinely unknown, and an
     // unknown fleet warns (see the test above). The claim here is the narrower one — once the read

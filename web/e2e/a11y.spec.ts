@@ -57,17 +57,8 @@ test.describe("accessibility", () => {
 
   for (const hash of ["/imposters", "/cluster", "/requests", "/routes", "/scenarios"]) {
     test(`the ${hash} screen`, async ({ page }) => {
-      await signIn(page, "fleet-admin");
+      await signIn(page);
       await goToScreen(page, hash);
-      const found = await violations(page);
-      expect(found, describeViolations(found)).toEqual([]);
-    });
-  }
-
-  for (const tab of ["tenants", "principals", "bindings"]) {
-    test(`the ${tab} admin tab`, async ({ page }) => {
-      await signIn(page, "fleet-admin");
-      await goToScreen(page, `/admin/${tab}/default`);
       const found = await violations(page);
       expect(found, describeViolations(found)).toEqual([]);
     });
@@ -76,7 +67,7 @@ test.describe("accessibility", () => {
   test("the new-imposter form", async ({ page }) => {
     // Every field must reach a label. The checkbox especially: its sentence lives in a sibling
     // span, which is exactly the arrangement that loses its association when markup is refactored.
-    await signIn(page, "editor");
+    await signIn(page);
     await goToScreen(page, "/imposters");
     await page.getByTestId("new-imposter").click();
     const found = await violations(page);
@@ -96,7 +87,7 @@ test.describe("accessibility", () => {
      * a click test and fail this one.
      */
     const { imposters } = fixture();
-    await signIn(page, "fleet-admin");
+    await signIn(page);
     await goToScreen(page, "/imposters");
 
     const first = page.getByTestId(`imposter-select-${imposters[0]}`);
@@ -116,7 +107,7 @@ test.describe("accessibility", () => {
     // A `<th>` with an onClick would sort on click and be invisible to keyboard and screen-reader
     // users entirely. `aria-sort` is the other half: without it the current order is conveyed by
     // an arrow glyph and nothing else.
-    await signIn(page, "fleet-admin");
+    await signIn(page);
     await goToScreen(page, "/imposters");
 
     const header = page.getByTestId("imposter-sort-name");
@@ -133,7 +124,7 @@ test.describe("accessibility", () => {
     // form — a scenario state input, a stub textarea, a flow-state key and value — and a field that
     // loses its label association is invisible to a screen reader and to `getByLabel`.
     const { imposters } = fixture();
-    await signIn(page, "editor");
+    await signIn(page);
     await goToScreen(page, `/scenarios/${imposters[0]}`);
     const found = await violations(page);
     expect(found, describeViolations(found)).toEqual([]);
@@ -141,7 +132,7 @@ test.describe("accessibility", () => {
 
   test("the stub editor", async ({ page }) => {
     const { imposters } = fixture();
-    await signIn(page, "editor");
+    await signIn(page);
     await goToScreen(page, `/imposters/${imposters[0]}`);
     await page.getByRole("button", { name: /add stub/i }).click();
     await expect(page.getByTestId("stub-form")).toBeVisible();
@@ -162,7 +153,7 @@ test.describe("accessibility", () => {
   });
 
   test("the confirm dialog traps its own labelling", async ({ page }) => {
-    await signIn(page, "editor");
+    await signIn(page);
     await goToScreen(page, "/imposters");
     await page.getByTestId("delete-imposter-4645").click();
     const found = await violations(page);

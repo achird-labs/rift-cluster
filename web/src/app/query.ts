@@ -39,9 +39,9 @@ export const POLLED_REQUESTS = {
  * Retry a flaky hop; never re-ask a question the fleet has already answered.
  *
  * A 4xx from the admin front is a decision, not a hiccup — 401 means the session lapsed, 403 that
- * the role refuses it, and 404 on a fleet-scoped route that the principal lacks the scope (RFC-002
- * §8.4). Retrying those only repeats the denial and delays the honest message on screen by a
- * backoff interval, for an outcome that cannot change.
+ * the front refused the request, and 404 that the resource is not there. Retrying those only
+ * repeats the answer and delays the honest message on screen by a backoff interval, for an outcome
+ * that cannot change.
  */
 export function retryTransportFailures(failureCount: number, error: Error): boolean {
   if (error instanceof ApiError && error.status >= 400 && error.status < 500) return false;

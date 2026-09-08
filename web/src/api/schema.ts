@@ -12,14 +12,14 @@ export interface paths {
             cookie?: never;
         };
         /**
-         * List imposters (upstream, filtered to the caller's owned ports)
-         * @description Proxied to the embedded engine's own admin API, which now binds every tenant's imposters in-process — this front filters the response body down to ports the caller's tenant owns before returning it, since the engine has no tenant concept of its own. Runs the same tenant-binding gate as every other route, so an unbound `X-Rift-Tenant` claim answers `404` (RFC-002 §8.4).
+         * List imposters (upstream)
+         * @description Proxied to the embedded engine's own admin API, which binds every replicated imposter in-process.
          *     Each entry's `numberOfRequests` is then rewritten to the fleet sum (issue #223), the same decoration `getImposter` documents in full, fetched for every listed port in one round trip per peer. `Rift-Cluster-Partial` marks the rare case where a peer could not be reached in time.
          */
         get: operations["listImposters"];
         /**
-         * Replace the caller's tenant's whole imposter set
-         * @description Terminates: reconciles the tenant's configured imposters toward the given set — upserts every listed imposter, then prunes whatever this tenant owns that was left out (`{"imposters":[]}` deletes everything). Destructive regardless of method, so this requires `ImposterDelete`, not merely `ImposterWrite` — an Editor who may write but not delete cannot reach it through this route. Cannot carry `If-Match` (no single record to condition a whole-set replace on); sending one answers `400`.
+         * Replace the fleet's whole imposter set
+         * @description Terminates: reconciles the fleet's configured imposters toward the given set — upserts every listed imposter, then prunes every applied port left out (`{"imposters":[]}` deletes everything). Cannot carry `If-Match` (no single record to condition a whole-set replace on); sending one answers `400`.
          */
         put: operations["replaceAllImposters"];
         /**
@@ -28,8 +28,8 @@ export interface paths {
          */
         post: operations["createImposter"];
         /**
-         * Delete the caller's tenant's whole imposter set
-         * @description Terminates: commits a `DeleteAll` op for the authorized tenant and answers with what was removed, captured before the delete commits.
+         * Delete the fleet's whole imposter set
+         * @description Terminates: commits a `DeleteAll` op and answers with what was removed, captured before the delete commits.
          */
         delete: operations["deleteAllImposters"];
         options?: never;
@@ -57,7 +57,7 @@ export interface paths {
         post?: never;
         /**
          * Delete one imposter
-         * @description Terminates: mirrors upstream's own semantics — deleting an absent imposter answers `404` and commits nothing (keeps the log free of no-ops). A cross-tenant port answers the same indistinguishable `404` (RFC-002 §8.4), not `403`, so a probe sweeping port numbers cannot tell "someone else's" from "nobody's".
+         * @description Terminates: mirrors upstream's own semantics — deleting an absent imposter answers `404` and commits nothing (keeps the log free of no-ops).
          */
         delete: operations["deleteImposter"];
         options?: never;
@@ -253,7 +253,7 @@ export interface paths {
          *     **Events.** `hello` first, carrying `engineVersion`, `types` (always `["requests"]`), `port`, `clusterTailLatencyMs`, and `cursor` — the position the stream starts from, so a client can bootstrap a poll from it. Then `request` events, whose `data` is `{port, flowId, request}`, plus `index` **only** for entries this node wrote (a peer's seq is a position in another shard and must never be presented back as a scalar `since`). `lagged` when retention evicted entries this reader had not reached — same meaning as upstream's: reconcile by polling, this stream does not replay. `partial` on every transition of the merged read's degraded state, `true` and back to `false`, so a peer going unreachable mid-stream is visible rather than silent. `: ping` every 15 s.
          *     **Divergences from the engine's own stream**, all additive: `hello` gains `clusterTailLatencyMs` and `cursor` and omits the engine's scalar `seq` (a merged stream has no single bus position); `id:` is the vector cursor token rather than a bus sequence number; `index` is withheld for peer entries; and `partial` is new.
          *     With `match` present this proxies to the local engine unchanged, for the reason `GET .../savedRequests` documents: the merge path evaluates no predicates, so terminating a predicate-scoped tail would answer with the whole fleet's requests instead of the caller's subset.
-         *     Unlike this route, `GET /events` stays proxied per-node and FleetAdmin-gated: its payload spans every tenant and is not yet filtered server-side (issue #163 owns that). This per-port tail carries one imposter's requests and is authorized as the ordinary port-scoped `imposter.read` it always was.
+         *     Unlike this route, `GET /events` stays proxied per-node: it is upstream's own firehose, answered by the node it reaches. This per-port tail carries one imposter's requests and is authorized as the ordinary port-scoped `imposter.read` it always was.
          */
         get: operations["streamSavedRequests"];
         put?: never;
@@ -421,10 +421,8 @@ export interface paths {
         /**
          * List an imposter's correlated-isolation spaces (issue #374)
          * @description Every space (flow) this imposter currently exists under, fleet-wide — not just the ones this node happens to hold a replica of. A row means the space exists, and `entryCount` is its live key count, which may be `0`: the in-memory shard never runs a background sweep of expired keys, so a space every key of which has expired is still a space, reachable and listed, with `entryCount: 0`. A flow keeps several replicated copies for durability, but each flow has exactly one **owner** (the ring member Raft assigns it), and this listing is the union of every ring member's own owned share: by construction duplicate-free, and complete regardless which node answers the request.
-         *
          *     There is no upstream route for this shape at all — only the single-space read and the per-space stubs write exist there — so unlike `GET /imposters/{port}/spaces/{flowId}`, which proxies to the core engine, this is EE-only and answered entirely from this node's applied cluster state.
-         *
-         *     A fleet-scoped imposter (`flowState.contextScope: "fleet"`) shares its flow-id namespace with every other fleet-scoped imposter, so its spaces are not necessarily private to the one imposter named in the path — and its listing is served to a `FleetAdmin` only (see `unavailable`). A tenant-scoped imposter (`"tenant"`, #288) shares its namespace with the owning tenant's other imposters and no one else's, so its listing is served to that tenant. Imposter-scoped spaces (the default) are private to this port. `owner` is reported per space, never once for the whole list, because a flow — not a port — is the only thing the ring assigns an owner to: one imposter's spaces can legitimately have different owners.
+         *     A fleet-scoped imposter (`flowState.contextScope: "fleet"`) shares its flow-id namespace with every other fleet-scoped imposter, so its spaces are not necessarily private to the one imposter named in the path. Imposter-scoped spaces (the default) are private to this port. `owner` is reported per space, never once for the whole list, because a flow — not a port — is the only thing the ring assigns an owner to: one imposter's spaces can legitimately have different owners.
          */
         get: operations["listSpaces"];
         put?: never;
@@ -485,9 +483,7 @@ export interface paths {
         /**
          * Add a stub scoped to a space
          * @description Terminates (issue #537): committed as an ordinary stub edit on the imposter's replicated config, so the stub **replicates to every node and survives a config reconcile**.
-         *
          *     Before this it was proxied to the receiving node's engine and never reached replicated state, so it existed on that node alone and the next reconcile — triggered by any committed write, on any imposter — deleted it as a stub the replicated layer had never heard of. Both behind a `201`. A space stub is an ordinary imposter-config stub distinguished only by `space`, so it needed no new replicated shape.
-         *
          *     The path's `flowId` is the source of truth for the scope: a `space` in the body is ignored, exactly as the upstream handler did it. The body is the **bare stub**, not the `{"stub": …}` envelope that `POST /imposters/{port}/stubs` takes — sending that envelope here is a `400` naming the mistake, because every field it carries would otherwise be discarded and leave a stub that matches everything in the space.
          */
         post: operations["addSpaceStub"];
@@ -512,15 +508,12 @@ export interface paths {
         /**
          * Send a sample request to this imposter and return what it answered
          * @description Terminates. The console's **Send** button: it lets an operator find out whether a stub matches without leaving the admin origin, which a browser cannot do on its own — the console is served from the admin port, an imposter answers on its own, and a mock sends no CORS headers, so an in-page `fetch` is blocked for essentially every stub.
-         *
          *     The server **opens no socket** to answer it (issue #344): the sample request is dispatched in-process to the imposter this node's engine holds, over an in-memory HTTP/1 connection, so what answers is that imposter by construction — never whatever else happens to hold the port. Its containment is structural rather than configurable:
-         *
          *     * It names a **port, never a URL or host** — there is no address in
          *       the exchange at all.
          *
-         *     * The port must be an imposter in the caller's own tenant. An
-         *       unknown port and another tenant's port answer the identical
-         *       RFC-002 §8.4 `404`, so this cannot be used to map which ports
+         *     * The port must name an imposter this fleet has applied. An unknown
+         *       port answers `404`, so this cannot be used to map which ports
          *       exist. A port this node's engine does not actually hold (a
          *       committed config whose bind failed) answers `502`.
          *
@@ -542,9 +535,7 @@ export interface paths {
          *       than on a response header (achird-labs/rift#965). The fault is named
          *       canonically for its kind, whichever alias the stub spelled it with.
          *
-         *
          *     Requires `imposter.try` (Operator and up). A try is not read-only in effect — it advances scenario state, appends to the request log and can trigger proxy recording — which is why it sits with the other Operator "disturb" actions rather than with `imposter.read`. A Viewer diagnosing a stub uses the console's `Copy curl` button instead, which needs no server surface.
-         *
          *     The exchange is bounded: **10 seconds** total, and at most **1 MiB** of the imposter's response body is read back, after which `truncated` is `true`. This is a diagnosis surface, not a transfer surface.
          */
         post: operations["tryImposter"];
@@ -613,17 +604,15 @@ export interface paths {
             cookie?: never;
         };
         /**
-         * Read the caller's tenant's front-door route table
+         * Read the fleet's front-door route table
          * @description Terminates: this front door's only read path — a state-machine read, not a mutation, so it never reaches the write classifier or the proxy. There is no upstream `/front-door/routes` to fall back on. The table and its `Rift-Cluster-Revision` are read in one state-machine transaction, so the revision always describes exactly the body returned with it.
-         *
-         *     The body is a config document a client `PUT`s back verbatim, and stays one: `installed` is a read-only decoration ignored on parse, so round-tripping this response through `putFrontDoorRoutes` stores an identical table.
+         *     The body is a config document a client `PUT`s back verbatim: round-tripping this response through `putFrontDoorRoutes` stores an identical table.
          */
         get: operations["getFrontDoorRoutes"];
         /**
-         * Replace the caller's tenant's front-door route table
+         * Replace the fleet's front-door route table
          * @description Terminates: whole-table replace, deterministic and pre-validated before commit, so the parsed table itself is what gets stored (no post-commit re-read — there is no upstream `/front-door/routes` to read from). Because it replaces the table wholesale, an unconditional `PUT` silently discards any edit committed since the caller read — send `If-Match` with the revision `getFrontDoorRoutes` answered to make the replace conditional.
-         *
-         *     **Only the default tenant's routes are compiled into the shared front door.** A non-default tenant's table is validated, committed and read back intact — the tenant sees what it wrote, and the data survives whenever the front door grows a tenant dimension — but it is never compiled in, so none of its routes can take a dispatch. The `200` here means the table was stored, not that it will dispatch; the `installed` field in the response body is the one place the write says which.
+         *     **Every stored route is compiled into the front door.** The `installed` field this response carried before #550 is gone: it existed because only the default tenant's routes were ever compiled in, and with one fleet-wide table it would be a constant `true`.
          */
         put: operations["putFrontDoorRoutes"];
         post?: never;
@@ -645,143 +634,9 @@ export interface paths {
         post?: never;
         /**
          * Delete one front-door route by id
-         * @description Terminates: idempotent at the state-machine level, but the admin surface still answers `404` for a route id that was never in the caller's own tenant's table (captured before the delete commits, the same shape as `deleteImposter`). A delete mutates the table, so it advances the table's revision and invalidates any outstanding `If-Match` against it.
+         * @description Terminates: idempotent at the state-machine level, but the admin surface still answers `404` for a route id that was never in the table (captured before the delete commits, the same shape as `deleteImposter`). A delete mutates the table, so it advances the table's revision and invalidates any outstanding `If-Match` against it.
          */
         delete: operations["deleteFrontDoorRoute"];
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/admin/tenants": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /**
-         * List tenants
-         * @description Terminates. Fleet-scoped (`ClusterAdmin` / FleetAdmin only).
-         */
-        get: operations["listTenants"];
-        put?: never;
-        /**
-         * Create a tenant
-         * @description Terminates. Fleet-scoped (`ClusterAdmin` / FleetAdmin only) — a caller unbound at the fleet scope gets the RFC-002 §8.4 `404`, not a `403`, so they cannot learn this route exists for them at all. The one `403` this route does answer is the CSRF check (see `CsrfHeader`): a cookie-authenticated request missing `X-Rift-CSRF` is refused before authorization is ever evaluated, so it is unrelated to the fleet-scope `404` above.
-         */
-        post: operations["createTenant"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/admin/tenants/{tenantId}": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                /** @description The tenant record's id. */
-                tenantId: components["parameters"]["TenantId"];
-            };
-            cookie?: never;
-        };
-        /**
-         * Read one tenant
-         * @description Scoped to the path tenant and requires `ClusterAdmin`, so a `TenantAdmin` of the named tenant is bound but insufficient — `403`, not `404`.
-         */
-        get: operations["getTenant"];
-        /**
-         * Create-or-replace a tenant by id
-         * @description Terminates. The path id wins over any body id — the authorization decision was made against the path, so honouring a disagreeing body id would authorize one record and write another; a body `id` that disagrees with the path answers `400`, it is not silently ignored. Scoped to the path tenant and requires `ClusterAdmin`, so a `TenantAdmin` of the named tenant is bound but insufficient — `403`, not `404`.
-         */
-        put: operations["putTenant"];
-        post?: never;
-        /** Delete a tenant */
-        delete: operations["deleteTenant"];
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/admin/tenants/{tenantId}/principals": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                /** @description The tenant record's id. */
-                tenantId: components["parameters"]["TenantId"];
-            };
-            cookie?: never;
-        };
-        /** List principals bound to this tenant */
-        get: operations["listPrincipals"];
-        put?: never;
-        /**
-         * Mint a principal and bind it to this tenant
-         * @description Terminates: mints an API key, hashes it, and returns the raw value in this one response — the control plane stores only the argon2id hash and a SHA-256-derived id, neither of which can reproduce it, so there is nothing for a later `GET` to leak. `Idempotency-Key` is refused (`400`) on this route: a retried request cannot recover the original response's key, so pretending the retry is safe would be dishonest.
-         */
-        post: operations["createPrincipal"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/admin/tenants/{tenantId}/principals/{principalId}": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                /** @description The tenant record's id. */
-                tenantId: components["parameters"]["TenantId"];
-                /** @description A principal's id (derived from its credential, e.g. key:<sha256-prefix>). */
-                principalId: components["parameters"]["PrincipalId"];
-            };
-            cookie?: never;
-        };
-        get?: never;
-        /**
-         * Update a principal's display name and disabled state
-         * @description Terminates. Fleet-scoped (`ClusterAdmin` / FleetAdmin only) — principals are a fleet-global namespace, so a tenant admin deleting or editing one could destroy a credential another tenant relies on. Does not rotate the credential: a principal's id is derived from its key, so a new key is a new principal, not an update. `disabled` is required, not defaulted — an operator renaming a principal must not accidentally un-revoke it.
-         */
-        put: operations["putPrincipal"];
-        post?: never;
-        /**
-         * Delete a principal
-         * @description Terminates. Fleet-scoped (`ClusterAdmin` / FleetAdmin only) — see `putPrincipal`.
-         */
-        delete: operations["deletePrincipal"];
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/admin/tenants/{tenantId}/bindings/{principalId}": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                /** @description The tenant record's id. */
-                tenantId: components["parameters"]["TenantId"];
-                /** @description A principal's id (derived from its credential, e.g. key:<sha256-prefix>). */
-                principalId: components["parameters"]["PrincipalId"];
-            };
-            cookie?: never;
-        };
-        get?: never;
-        /**
-         * Bind a principal to a role in this tenant
-         * @description Terminates. Tenant-scoped (`TenantManage` / TenantAdmin+) inside an ordinary tenant, but `ClusterAdmin` / FleetAdmin-only when the path names the fleet scope (`*`) — a binding there is a grant of fleet privilege, and granting fleet privilege requires fleet privilege regardless of the route shape.
-         */
-        put: operations["putBinding"];
-        post?: never;
-        /**
-         * Remove a principal's binding to this tenant
-         * @description Terminates. Same tenant-vs-fleet authorization split as `putBinding`.
-         */
-        delete: operations["deleteBinding"];
         options?: never;
         head?: never;
         patch?: never;
@@ -795,14 +650,13 @@ export interface paths {
             cookie?: never;
         };
         /**
-         * The tenant's recorded requests across every imposter, merged and resumable
-         * @description Terminates. `GET /imposters/{port}/savedRequests` across every imposter the caller's tenant owns, merged server-side into one ordered, resumable answer.
+         * The fleet's recorded requests across every imposter, merged and resumable
+         * @description Terminates. `GET /imposters/{port}/savedRequests` across every imposter the fleet has applied, merged server-side into one ordered, resumable answer.
          *     **Ordering is the journal's, not the network's.** Rows are ordered by each request's own recorded timestamp. That timestamp is stamped by whichever node served the request, so entries recorded within milliseconds of each other on clock-skewed nodes can still transpose — there is no fleet-wide sequence and this endpoint does not invent one. What it removes is the *other* source of disorder: assembling this view client-side ordered rows by which of N responses arrived first.
          *     **One cursor, not N.** `cursor` in the response is a single opaque token covering every port this answer covers; pass it back as `since` for the next page. Within the covered set the walk is gapless and duplicate-free per shard, exactly as the per-imposter cursor is. A per-imposter token presented here is refused with a `400` that says so, rather than misread as a fleet position.
-         *     **The cap is stated.** A tenant may own more imposters than one answer covers. Coverage ranks ports by most recent activity and keeps `--cluster-fleet-journal-port-cap` of them (default 100); `coverage.omitted` names every port left out and `coverage.capped` says whether the cap bit at all. Nothing is dropped silently.
+         *     **The cap is stated.** A fleet may hold more imposters than one answer covers. Coverage ranks ports by most recent activity and keeps `--cluster-fleet-journal-port-cap` of them (default 100); `coverage.omitted` names every port left out and `coverage.capped` says whether the cap bit at all. Nothing is dropped silently.
          *     **`joined`** names covered ports that had no position in the presented cursor and whose history was therefore replayed — the ports a resuming client may see duplicates from. On a baseline read (no `since`) that is every covered port, by definition.
-         *     No `match` parameter: the merge path evaluates no predicates, so a predicate-scoped fleet read would answer with the whole tenant's requests instead of the caller's subset. Predicate-scoped reads stay per-imposter.
-         *     Authorized as the ordinary `imposter.read` under `X-Rift-Tenant`. It needs no FleetAdmin gate — unlike `GET /events`, whose payload spans every tenant — because its port set is the caller's tenant's own imposters and nothing else can enter the walk.
+         *     No `match` parameter: the merge path evaluates no predicates, so a predicate-scoped fleet read would answer with everything instead of the caller's scoped subset. Predicate-scoped reads stay per-imposter.
          */
         get: operations["readFleetRequests"];
         put?: never;
@@ -821,7 +675,7 @@ export interface paths {
             cookie?: never;
         };
         /**
-         * Live tail of the tenant's recorded requests across every imposter (SSE)
+         * Live tail of the fleet's recorded requests across every imposter (SSE)
          * @description The live sibling of `GET /admin/requests`, and the fleet-wide counterpart of `GET /imposters/{port}/savedRequests/stream`. Answers `text/event-stream`.
          *     Every property that route documents holds here, for the same reasons and with the same token vocabulary: one contract shared with the cursor read, `Last-Event-ID` resuming gaplessly and without duplicates per shard, and a declared `clusterTailLatencyMs` bounding how late a peer's entry can arrive.
          *     **Events.** `hello` first, carrying `engineVersion`, `types` (always `["requests"]`), `scope` (always `"fleet"`), `clusterTailLatencyMs`, `cursor`, and `coverage`. Then `request` events whose `data` is `{port, flowId, request}`, plus `index` **only** for entries this node wrote. `coverage` whenever the covered set changes — the cap is dynamic, so a client whose view narrowed or widened is told rather than left to guess. `lagged` when retention evicted entries this reader had not reached. `partial` on every transition of the degraded state. `: ping` every 15 s.
@@ -848,36 +702,12 @@ export interface paths {
         /**
          * Compile an OpenAPI document into an imposter config, storing nothing
          * @description Terminates, and **stores nothing** (D-72, issue #549). The body is an OpenAPI 3.0 document — JSON or YAML, sniffed rather than declared — and the answer is the compiled imposter JSON, byte for byte what the caller then sends as `PUT /imposters`, plus the operation index the compiler built it from so a client can show what it is about to deploy.
-         *
          *     **Stateless, and that is the whole point.** No record is kept, no `ControlOp` is minted and no applied state is read: the cluster retains nothing about the document, and the compiled imposter reaches the log through the one path every other config takes — the caller's own `PUT /imposters`. This replaced the stored `/specs` surface (import, drift, deploy), which no longer exists.
-         *
          *     **`port` is required.** There is no stored record to infer a binding from, and a compiled imposter with no port cannot be replicated at all, so answering with a portless document would hand the caller something the very next `PUT /imposters` would refuse.
-         *
          *     The compiler's refusals — an unsupported version, an external `$ref`, a parse failure, its own self-check — are this route's `400` verbatim. There is no separate warning channel: a document the compiler would warn about is one it refuses, so a `200` here means the output passed the contract it just emitted.
-         *
          *     Authorized as `imposter.write` (Editor and up): the caller is being handed a config to deploy, and the compile is the first half of that write.
          */
         post: operations["compileSpec"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/admin/whoami": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /**
-         * The caller's own resolved identity and tenant bindings
-         * @description Terminates. The one admin route with no action to authorize — it reports the caller's own identity and nothing else, so there is nothing beyond authentication to check. `authorizationDisabled: true` with a `null` principal means the fleet defines no principals and no API key (the open-admin-plane bypass), reported honestly rather than made to look like a normal identity.
-         */
-        get: operations["getWhoAmI"];
-        put?: never;
-        post?: never;
         delete?: never;
         options?: never;
         head?: never;
@@ -893,7 +723,7 @@ export interface paths {
         };
         /**
          * This hand-authored OpenAPI contract, served as JSON
-         * @description Terminates. Authenticated but actionless, the same posture as `getWhoAmI` — the document describes the shape of the whole admin surface, so serving it unauthenticated would hand a scanner a map of every tenancy and fleet route for free. Carries no tenant data, so any authenticated principal reads the same bytes.
+         * @description Terminates. Authenticated: the document describes the shape of the whole admin surface, so serving it unauthenticated on a keyed fleet would hand a scanner a map of every route for free.
          */
         get: operations["getOpenApiContract"];
         put?: never;
@@ -914,7 +744,7 @@ export interface paths {
         get?: never;
         /**
          * Set or rename the fleet's operator-set name
-         * @description Terminates. Fleet-scoped (`ClusterAdmin` / FleetAdmin only), because this is a fleet-wide rename, not a tenant-scoped one. Replicated via a new `ControlOp` rather than a per-node command-line flag, so every node — and every console session, regardless of which node it happens to be talking to — agrees on one name. Setting the first name and renaming are the same write: the new value replaces whatever was there.
+         * @description Terminates. Replicated via a `ControlOp` rather than a per-node command-line flag, so every node — and every console session, regardless of which node it happens to be talking to — agrees on one name. Setting the first name and renaming are the same write: the new value replaces whatever was there.
          */
         put: operations["putFleetName"];
         post?: never;
@@ -933,7 +763,7 @@ export interface paths {
         };
         /**
          * This node's view of raft membership (fleet projection)
-         * @description Terminates. Read-only admin-port projection of the operator surface that otherwise rides the cluster port behind the HMAC secret a browser can never hold (RFC-006 §5.2) — same JSON shape as `/_cluster/members`, rendered by the same builder (`cluster_api.rs`'s `members_body`) so the two ports cannot drift. Fleet-scoped: `ClusterAdmin`, FleetAdmin only — settled in RFC-006 §12 Q3 (`docs/architecture/08-tenancy-security.md`), because this is the same infrastructure-inventory category `principal::map_action` already routes to `Action::ClusterAdmin` (`/config`, `/metrics`, `/logs`), and projecting cluster-port data onto the admin port at a lower tier would be a privilege reduction, not a convenience.
+         * @description Terminates. Read-only admin-port projection of the operator surface that otherwise rides the cluster port behind the HMAC secret a browser can never hold (RFC-006 §5.2) — same JSON shape as `/_cluster/members`, rendered by the same builder (`cluster_api.rs`'s `members_body`) so the two ports cannot drift. Requires the fleet's API key — or a session cookie minted from it — whenever one is configured.
          */
         get: operations["getFleetMembers"];
         put?: never;
@@ -953,7 +783,7 @@ export interface paths {
         };
         /**
          * This node's readiness and ring view (fleet projection)
-         * @description Terminates. Same projection as `getFleetMembers`, rendering `cluster_api.rs`'s `health_body` — byte-identical to `/_cluster/health` on the cluster port. Fleet-scoped (`ClusterAdmin`, FleetAdmin only); see `getFleetMembers` for the settled RFC-006 §12 Q3 reasoning.
+         * @description Terminates. Same projection as `getFleetMembers`, rendering `cluster_api.rs`'s `health_body` — byte-identical to `/_cluster/health` on the cluster port. Authenticated like every other admin route.
          */
         get: operations["getFleetHealth"];
         put?: never;
@@ -976,7 +806,7 @@ export interface paths {
         };
         /**
          * An op's commit status (fleet projection)
-         * @description Terminates. Same projection as `getFleetMembers`, rendering `cluster_api.rs`'s `op_body` — the poll target for a `202`-parked or async-committed write's op id, on the admin port instead of the cluster port. Fleet-scoped (`ClusterAdmin`, FleetAdmin only); see `getFleetMembers` for the settled RFC-006 §12 Q3 reasoning.
+         * @description Terminates. Same projection as `getFleetMembers`, rendering `cluster_api.rs`'s `op_body` — the poll target for a `202`-parked or async-committed write's op id, on the admin port instead of the cluster port. Authenticated like every other admin route.
          */
         get: operations["getFleetOp"];
         put?: never;
@@ -998,8 +828,10 @@ export interface paths {
         put?: never;
         /**
          * Exchange an API key for a session cookie
-         * @description Terminates. Not a Raft write: the server verifies the key, then mints an HMAC-signed `{principal_id, issued_at, expiry}` token under the fleet's session-signing key (a control-plane record every node verifies from its own applied state) and returns it as an `HttpOnly` cookie — this is the one moment the long-lived API key transits the page (RFC-006 §9.3), so it belongs in component state only, never `localStorage` and never a URL, and should be dropped as soon as this call returns.
-         *     The cookie proves authentication only. Every later request still resolves the principal's bindings from applied state, so disabling the principal or deleting a binding cuts a live session immediately, with the same committed-or-not semantics a bearer gets. There is no server-side session table and, deliberately, **no per-session revocation in v1** — the documented bounds are the 8-hour `Max-Age`, session-signing-key rotation (invalidates every outstanding session at once), and disabling the principal. This is a stated limit, not a gap.
+         * @description Terminates. Not a Raft write: the server compares the submitted key against the fleet's `--api-key` in constant time, then mints an HMAC-signed `{subject, issued_at, expiry, key_revision}` token under the fleet's session-signing key (a control-plane record every node verifies from its own applied state) and returns it as an `HttpOnly` cookie — this is the one moment the long-lived API key transits the page (RFC-006 §9.3), so it belongs in component state only, never `localStorage` and never a URL, and should be dropped as soon as this call returns.
+         *     The cookie is accepted by **every node**, because the signing key is replicated: a session minted on one node verifies on the next with no second login.
+         *     The cookie proves authentication only — with one credential there is no identity for it to resolve to. There is no server-side session table and, deliberately, **no per-session revocation**: the documented bounds are the 8-hour `Max-Age` and session-signing-key rotation, which invalidates every outstanding session at once. This is a stated limit, not a gap.
+         *     A fleet running with **no** `--api-key` has an open admin plane and nothing to exchange; this answers `400` rather than handing out a cookie that proves nothing.
          */
         post: operations["createSession"];
         /**
@@ -1021,7 +853,7 @@ export interface paths {
         };
         /**
          * Core admin root (upstream)
-         * @description Upstream classifies this as `SYSTEM_READ`, which this front maps to `Action::ClusterAdmin` — **FleetAdmin only**, on a clustered node. Unauthenticated answers `401`; a caller bound to some tenant but not FleetAdmin answers `403`; a caller with no fleet-scope binding at all answers `404` (RFC-002 §8.4) — operators used to this route being open on a standalone node should expect all three on a `--cluster` node.
+         * @description Proxied to the embedded engine. Requires the fleet's API key — or a session cookie minted from it — whenever one is configured; unauthenticated answers `401`. operators used to this route being open on a standalone node should expect all three on a `--cluster` node.
          */
         get: operations["getRoot"];
         put?: never;
@@ -1041,7 +873,7 @@ export interface paths {
         };
         /**
          * Process health (upstream)
-         * @description Upstream classifies this as `SYSTEM_READ`, which this front maps to `Action::ClusterAdmin` — **FleetAdmin only**, on a clustered node. Unauthenticated answers `401`; a caller bound to some tenant but not FleetAdmin answers `403`; a caller with no fleet-scope binding at all answers `404` (RFC-002 §8.4).
+         * @description Proxied to the embedded engine. Requires the fleet's API key — or a session cookie minted from it — whenever one is configured; unauthenticated answers `401`.
          */
         get: operations["getHealth"];
         put?: never;
@@ -1061,7 +893,7 @@ export interface paths {
         };
         /**
          * The engine's effective startup configuration (upstream)
-         * @description Upstream classifies this as `SYSTEM_READ`, which this front maps to `Action::ClusterAdmin` — **FleetAdmin only**, on a clustered node. A caller bound to some tenant but not FleetAdmin answers `403`; a caller with no fleet-scope binding at all answers `404` (RFC-002 §8.4).
+         * @description Proxied to the embedded engine. Requires the fleet's API key — or a session cookie minted from it — whenever one is configured.
          */
         get: operations["getConfig"];
         put?: never;
@@ -1081,7 +913,7 @@ export interface paths {
         };
         /**
          * In-process log buffer (upstream)
-         * @description Upstream classifies this as `SYSTEM_READ`, which this front maps to `Action::ClusterAdmin` — **FleetAdmin only**, on a clustered node. A caller bound to some tenant but not FleetAdmin answers `403`; a caller with no fleet-scope binding at all answers `404` (RFC-002 §8.4).
+         * @description Proxied to the embedded engine. Requires the fleet's API key — or a session cookie minted from it — whenever one is configured.
          */
         get: operations["getLogs"];
         put?: never;
@@ -1101,7 +933,7 @@ export interface paths {
         };
         /**
          * Prometheus-format process metrics (upstream)
-         * @description Upstream classifies this as `SYSTEM_READ`, which this front maps to `Action::ClusterAdmin` — **FleetAdmin only**, on a clustered node. A caller bound to some tenant but not FleetAdmin answers `403`; a caller with no fleet-scope binding at all answers `404` (RFC-002 §8.4).
+         * @description Proxied to the embedded engine. Requires the fleet's API key — or a session cookie minted from it — whenever one is configured.
          */
         get: operations["getMetrics"];
         put?: never;
@@ -1123,7 +955,7 @@ export interface paths {
         put?: never;
         /**
          * Reload configuration from disk (upstream)
-         * @description Upstream classifies this as `SYSTEM_WRITE`, which this front maps to `Action::ClusterAdmin` — **FleetAdmin only**, on a clustered node. A caller bound to some tenant but not FleetAdmin answers `403`; a caller with no fleet-scope binding at all answers `404` (RFC-002 §8.4).
+         * @description Proxied to the embedded engine. Requires the fleet's API key — or a session cookie minted from it — whenever one is configured.
          */
         post: operations["reloadConfig"];
         delete?: never;
@@ -1162,9 +994,7 @@ export interface components {
             stubCount?: number;
             /**
              * @description How many requests this imposter has served, **fleet-wide** (issue #363). Present on both the list projection and the single-imposter read.
-             *
              *     Declared rather than left to this schema's `additionalProperties`, which is what previously kept it off the console: a field reaching the body only through the index signature is one no typed client can render without asserting a shape the contract never promised.
-             *
              *     The value is not this node's own tally. Upstream answers its local G-counter slot, and the front rewrites it to the sum across every node's slot for this port (issue #223) — so it is the figure the design's `REQUESTS · FLEET SUM` tile claims to be. When a peer could not be reached inside the fan-out budget the response carries `Rift-Cluster-Partial`, and the sum is of the nodes that answered: a floor, not a total.
              */
             numberOfRequests?: number;
@@ -1176,10 +1006,8 @@ export interface components {
         RiftExtensions: {
             /**
              * @description Upstream's flow-state block, **proxied verbatim**. Upstream emits an allowlist of it — `backend`, `ttlSeconds`, and `flowIdSource` only when set — because `flowState.redis` can carry a credentialed connection URL, and anything added later is therefore excluded by default rather than leaked.
-             *
              *     The EE front does not rewrite this block. `flowIdSource` in particular stays the flat string upstream renders, because rift-verify reads it there to drive correlated isolation; the resolved view with provenance is the sibling `flowStateResolved` (issue #370), which is additive precisely so this contract holds.
-             *
-             *     On write, `contextScope` (`"imposter"` default, `"tenant"`, `"fleet"`) chooses the flow-id namespace; it is never echoed back here. `"fleet"` is admitted only from a `FleetAdmin` (RFC-005 S1, issue #288): any other principal's `POST`/`PUT` carrying it answers `400` — a **role refusal wearing the `BadData` status the issue prescribes**, not a malformed payload; retrying with the same body cannot succeed, escalating the caller can. The whole `PUT /imposters` batch is refused when one config carries it. Not gated: the no-principal open admin plane, and stub edits on an already-admitted fleet-scoped imposter (their bodies carry no `flowState`).
+             *     On write, `contextScope` (`"imposter"` default, `"fleet"`) chooses the flow-id namespace; it is never echoed back here. The third value, `"tenant"`, was removed with tenancy (#550) and is now **refused by name** with a `400` rather than aliased to either survivor: silently folding it into one of them would change which imposters share flow state, which is the one thing this key decides.
              */
             flowState?: {
                 [key: string]: unknown;
@@ -1190,9 +1018,7 @@ export interface components {
         };
         /**
          * @description The per-imposter flow-state knobs with their **provenance** (issue #370), added by the EE front to the single-imposter read. Absent from the list projection, which has no knobs panel.
-         *
          *     Two of the three cannot reach a client any other way: `durability` and `readConsistency` are parsed by the cluster but are not on upstream's allowlist, so they are published here or nowhere. `flowIdSource` is repeated from `flowState` deliberately, so the console reads one block with one shape rather than two knobs from here and a third from upstream's, inferring provenance for that one from absence.
-         *
          *     `contextScope` is deliberately **not** here: it is not a knob with a fleet default to resolve but a namespace choice fixed at admission (see the `flowState` docs), and upstream's own `flowState` echo does not carry it either.
          */
         FlowStateResolved: {
@@ -1209,7 +1035,6 @@ export interface components {
             value: string;
             /**
              * @description `set` when the imposter's document carries the key, `default` when it does not and the built-in applies.
-             *
              *     This is **presence of the key, not equality with the default value**: an imposter that explicitly pins `durability: "async"` reads as `set`, because the operator made a choice. Rendering that as inherited would invite the next operator to change a fleet default instead — and there is no fleet-level override for these knobs, so "inherited" means the compiled-in default and nothing else.
              * @enum {string}
              */
@@ -1235,7 +1060,7 @@ export interface components {
         } & {
             [key: string]: unknown;
         };
-        /** @description One page of the tenant's fleet-wide request journal (issue #362) — the rows, the cursor that fetches the next page, and an explicit statement of which imposters the answer actually speaks for. */
+        /** @description One page of the fleet-wide request journal (issue #362) — the rows, the cursor that fetches the next page, and an explicit statement of which imposters the answer actually speaks for. */
         FleetRequestPage: {
             /** @description Recorded requests across the covered imposters, ordered by each request's own recorded timestamp. Each row names the imposter it came from — without that a merged answer is a pile of requests with no way to tell which mock served them. */
             requests: {
@@ -1255,7 +1080,7 @@ export interface components {
         FleetJournalCoverage: {
             /** @description The imposters this answer walked, ascending. */
             covered: number[];
-            /** @description Every imposter the tenant owns that was considered, covered or not. */
+            /** @description Every imposter the fleet holds that was considered, covered or not. */
             total: number;
             /** @description The imposters the cap excluded, ascending — named rather than counted, so an operator can tell whose traffic they are not looking at. Ports rank by most recent activity, so these are the least recently active. */
             omitted: number[];
@@ -1299,19 +1124,16 @@ export interface components {
             matchOutcome?: components["schemas"]["MatchOutcome"];
             /**
              * @description The response status that went back (issue #364, upstream rift#940).
-             *
              *     Attached after the response exists, like `matchOutcome` is attached after the match — the entry is journalled before either is knowable. **Absent means not recorded**, never `0`: the `X-Rift-Debug` path returns early and a request journalled before an error never reaches the attach, so absence is a real state and distinct from any status.
              */
             status?: number;
             /**
              * @description How long the imposter took to answer, in milliseconds (issue #364). Attached with `status`; the two are present or absent together.
-             *
              *     A present `0` is an ordinary reading, not a missing one — a stub answered from memory is well under a millisecond. The resolution suits the question the column exists to answer, *is this mock the slow thing?*, where the interesting values are `behaviors.wait` delays and proxied upstreams. Measured before this node's own CORS header injection, which happens after the imposter has finished.
              */
             latencyMs?: number;
             /**
              * @description The node that served this request (issue #364), stamped by the clustered journal at record time — it is the same identity the entry is keyed by, so a merged read cannot show a row whose `node` disagrees with the shard it came from.
-             *
              *     A string, not a number: node ids are identifiers rather than magnitudes, and an id above 2^53 would be silently rounded by any JavaScript reading it. Absent from a recording made before this shipped, and from a single-node engine, which has no name for itself.
              */
             node?: string;
@@ -1396,11 +1218,6 @@ export interface components {
         RouteTable: {
             routes?: components["schemas"]["Route"][];
         };
-        /** @description A route table as answered, which is the stored table plus whether this tenant's routes are compiled into the shared front door. Request bodies take a plain `RouteTable` — `installed` is derived server-side and any value sent for it is ignored, so a client cannot declare its own table installed. */
-        RouteTableView: components["schemas"]["RouteTable"] & {
-            /** @description Whether this tenant's routes are compiled into the shared front door. **Only the default tenant's are.** A non-default tenant's table is validated, stored, replicated and served back unchanged, but is never compiled in and can therefore never take a dispatch — `false` here is the difference between "these routes took no traffic" and "these routes cannot take any". Published here, on the write and the read, and nowhere else (D-68). */
-            installed: boolean;
-        };
         Route: {
             /** @description Unique and stable; how the admin API addresses one route. */
             id: string;
@@ -1433,101 +1250,6 @@ export interface components {
             /** @default true */
             enabled: boolean;
         };
-        /** @description `id` is required by this schema because `POST /admin/tenants` requires it (`400` otherwise). On `PUT /admin/tenants/{tenantId}` the path segment is authoritative, but a body `id` that disagrees with it is NOT silently ignored — it answers `400`, since the authorization decision was made against the path and honouring a disagreeing body id would authorize one record and write another. */
-        TenantWrite: {
-            /** @description Required on create (`POST`). On `PUT`, must either be omitted or match the path `tenantId` exactly — a mismatch is a `400`, not a silent override. */
-            id: string;
-            displayName: string;
-            quotas?: components["schemas"]["Quotas"];
-            /**
-             * Format: int64
-             * @description Seconds the request-journal shards keep this tenant's data; 0 = unlimited.
-             * @default 0
-             */
-            journalRetentionSecs: number;
-        };
-        Tenant: components["schemas"]["TenantWrite"] & {
-            /** Format: int64 */
-            createdAtSecs?: number;
-            deleted?: boolean;
-            usage?: components["schemas"]["QuotaUsage"];
-        };
-        /**
-         * @description What this tenant is currently using against each of its `quotas` (issue #372). A limit is a fact about configuration; usage is a fact about the fleet, and only the second one changes.
-         *
-         *     **A point-in-time reading, not a guarantee.** Quota enforcement happens at *apply*, not at submit, so a parked write is judged against the quota as it stands on replay. These figures say what was true when the read was served, and nothing about whether the next write will be admitted.
-         *
-         *     Every field is present and zero for a tenant holding nothing — absent would mean "not reported", which is a different fact.
-         */
-        QuotaUsage: {
-            /** @description How many imposters this tenant holds, counted from the replicated config set. Exact: it is the same set `maxImposters` is enforced against at apply. */
-            imposters: number;
-            /**
-             * @description The stub count of this tenant's **largest single imposter** — not the sum across its imposters.
-             *
-             *     `maxStubsPerImposter` is a per-imposter limit, so the worst single imposter is the only reading against which `used / limit` means anything. A tenant-wide sum would render `5000 / 1000` while nothing was over quota at all.
-             */
-            stubsPerImposter: number;
-            /**
-             * Format: int64
-             * @description Live flow-state entries held on this tenant's imposter ports, summed across the fleet. Unlike the two above this is **not** read from the replicated config set: flow state is sharded per node and volatile (TTL and whole-flow LRU shedding), so it is gathered by a fan-out to every node. `Rift-Cluster-Partial` marks a response where a peer could not be reached inside the budget — the sum is then of the nodes that answered: a floor, not a total.
-             *
-             *     **Fleet-scoped flows are counted against no tenant.** A flow under `contextScope: "fleet"` is shared by construction, so charging it to every tenant would double-count it and charging it to one would be arbitrary. Counted here: imposter-scoped flows, on ports this tenant owns, plus tenant-scoped flows (`contextScope: "tenant"`, #288) charged to this tenant by their key (#413) — the latter even for a tenant that currently holds no imposter, since a flow can outlive the imposter that wrote it and is still that tenant's state. During a rolling upgrade a peer on a build before #413 answers only the per-port half, so the tenant-scoped share is a floor until every node is upgraded.
-             *
-             *     ⚠️ **`maxFlowEntries` currently enforces nothing.** Unlike the other two quotas it is checked on no write path, so this figure is reported against a ceiling that refuses nothing today. It is a observability reading, not a budget.
-             */
-            flowEntries: number;
-        };
-        /** @description Every field is required when `quotas` is present — none carries `serde(default)`, so a present-but-partial object fails deserialization with `missing field` and answers `400`; only an entirely absent `quotas` is defaulted (`TenantBody.quotas` is `serde(default)`). */
-        Quotas: {
-            /** @default 1000 */
-            maxImposters: number;
-            /** @default 1000 */
-            maxStubsPerImposter: number;
-            /**
-             * Format: int64
-             * @default 100000
-             */
-            maxFlowEntries: number;
-        };
-        /**
-         * @description A strict superset ladder: viewer subset of operator subset of editor subset of tenant-admin subset of fleet-admin. Only fleet-admin may hold a binding on the fleet scope (*).
-         * @enum {string}
-         */
-        Role: "viewer" | "operator" | "editor" | "tenant-admin" | "fleet-admin";
-        PrincipalCreate: {
-            displayName: string;
-            role: components["schemas"]["Role"];
-        };
-        PrincipalUpdate: {
-            displayName: string;
-            /** @description Required, not defaulted — an omitted field must not silently un-revoke a principal. */
-            disabled: boolean;
-        };
-        /** @description A principal as read back. Never carries credential material. */
-        Principal: {
-            id: string;
-            displayName: string;
-            /**
-             * @description The kind of credential; never any part of its value.
-             * @enum {string}
-             */
-            auth: "apiKey" | "oidc" | "mtlsSan";
-            disabled: boolean;
-            role?: components["schemas"]["Role"];
-        };
-        /** @description The one-time response to principal creation. apiKey appears nowhere else. */
-        IssuedPrincipal: {
-            id: string;
-            displayName: string;
-            role: components["schemas"]["Role"];
-            tenant: string;
-            /** @description Shown once. Not stored anywhere in recoverable form. */
-            apiKey: string;
-        };
-        Binding: {
-            role: components["schemas"]["Role"];
-        };
         FleetNameWrite: {
             /** @description Required — an omitted field is refused, not defaulted to an empty name. Trimmed non-empty, at most 128 characters, and free of control characters; otherwise unconstrained, since this is chrome text a human reads rather than an id anything parses back. */
             name: string;
@@ -1548,23 +1270,9 @@ export interface components {
                 stubIds: string[];
             }[];
         };
-        WhoAmI: {
-            /** @description Null under the open-admin-plane bypass (no principals configured, no API key). */
-            principalId?: string | null;
-            /** @description The principal's own display name, for a client to render instead of `principalId`. Null for the two identities with no stored row to read it from: the open-admin-plane bypass, and the legacy `--api-key`'s synthetic principal (minted in code, never committed) — whose `principalId` is the already-readable `legacy:api-key`. A client falls back to `principalId` when this is null. It exists because `principalId` for a minted key is `key:<sha256-hex>`: not a credential, since the raw key cannot be recovered from it and argon2id is the actual boundary, but indistinguishable from one on screen. */
-            displayName?: string | null;
-            bindings: {
-                tenant?: string;
-                role?: components["schemas"]["Role"];
-            }[];
-            /** @description True when the fleet enforces nothing at all (distinct from an authenticated principal with zero bindings). */
-            authorizationDisabled: boolean;
-        };
         /**
          * @description Raft membership as this node sees it, plus one row per voter carrying that voter's own applied index (issue #361).
-         *
          *     The top-level fields are `cluster_api.rs`'s `members_body`, the same builder `/_cluster/members` serves on the cluster port. `members` is added on top and is the one difference between the two ports: this projection folds that builder across every voter, asking each peer the question the cluster port already answers, while `/_cluster/members` stays node-local — it is the target of that fan-out, and it is also how an operator asks *one* node what it thinks when isolating a node that is behind.
-         *
          *     So there is still exactly one implementation of "a node's own applied index", read once here and once per peer. What the two ports must not do is answer the same question differently; a fold over one builder is not that.
          */
         FleetMembers: {
@@ -1583,29 +1291,23 @@ export interface components {
             voters: string[];
             /**
              * @description The fleet's operator-set name (issue #373), or `null` when nobody has named it yet. A label, not an identity — node ids remain what every endpoint on this document addresses; this exists only so a console user, or an operator with several fleets open, can tell them apart at a glance.
-             *
              *     Deliberately **not** in `required`, unlike `current_leader` and `last_applied` which share its always-present-but-nullable shape. Those predate every node in any live fleet; this field does not. During a rolling upgrade the node answering this request may be a pre-#373 build that omits the key altogether, and `/_fleet/members` is answered by whichever node the caller reached — so absent is a genuinely reachable state, not a hypothetical one. Requiring it would make the shape an older node really sends unrepresentable in every generated client.
-             *
              *     Consumers therefore fold absent into `null`: both mean "no name to show". What neither means is "the name could not be read" — that is `fleet_name_unavailable` below, and keeping the two apart is the whole point of there being two fields.
              */
             fleet_name?: string | null;
             /**
              * @description Whether the answering node could not *read* the name, as distinct from there being none to read. Both arrive as `fleet_name: null`, and without this flag they are the same byte on the wire — so a storage fault on the answering node would render exactly like a fleet nobody has named, which is the wrong-but-quiet failure the error rules exist to prevent.
-             *
              *     The read deliberately still answers `200` when this is `true`: everything else in this body comes from in-memory raft metrics and is still trustworthy, and an operator diagnosing that fault wants the membership view rather than a `500`. Absent is equivalent to `false`.
              */
             fleet_name_unavailable?: boolean;
             /**
              * @description Ports this node's engine actually holds the socket for (issue #369), fleet-wide and deduplicated. A **positive** list, not just "every configured port minus `bind_failures`": a port this node has never applied config for also has no recorded failure, so a failures-only projection would have the console infer "absent ⇒ bound" and render a confident green row for a node that never received the imposter. This is the field that makes the panel a claim about what is actually listening rather than an inference from what has not (yet) failed.
-             *
              *     A **failed** bind is not a failed imposter: the node still serves that port's imposter in-process through the front door and the `/__rift/:port` gateway route (RFC-001 §7.4.6) — it just is not the process holding the socket. `bound_ports` says which case applies; it is not a health signal on its own.
-             *
              *     Deliberately **not** in `required`, for the same rolling-upgrade reason as `fleet_name`: a pre-#369 peer's reply omits this key entirely, and `/_fleet/members` may be answered by whichever node the caller reached. Absent means "unknown", exactly like `null` — never "nothing bound". See `bind_status_unavailable` for why a present-but-empty answer is not interchangeable with either.
              */
             bound_ports?: number[] | null;
             /**
              * @description Why each port in this map failed to bind, keyed by port number as a string (issue #369) — e.g. `{"9090": "Address already in use"}`. A port is never a key here **and** a member of `bound_ports`; see that field for what a failed bind does and does not mean for the imposter it names.
-             *
              *     An empty object is the healthy answer once this node has actually read its own state: it means "checked every configured port, nothing failed" — a different claim from `null`, which means "this node could not check". Not in `required`, for the same rolling-upgrade reason as `bound_ports`.
              */
             bind_failures?: {
@@ -1613,15 +1315,12 @@ export interface components {
             } | null;
             /**
              * @description Whether the answering node has no local engine to observe binds with at all, as distinct from having an engine and finding nothing bound or nothing failed. The same `fleet_name`/`fleet_name_unavailable` split (#373), applied here: `bound_ports` and `bind_failures` both arrive `null` whether the cause is "no local engine" or "peer is unreachable and said nothing", and without this flag those two are the same byte on the wire.
-             *
              *     `false` once a node has an engine and has checked its ports, whether or not anything is bound. `null` (or the key absent) only for a peer this node could not reach or that predates this field — the same "unknown, not unhealthy" rule `bound_ports` documents. A reachable voter reporting `true` here is enough on its own to mark `/_fleet/members`'s response `Rift-Cluster-Partial`, the same as an unreachable one.
              */
             bind_status_unavailable?: boolean | null;
             /**
              * @description One row per voter, in `voters` order (issue #361). Present on `/_fleet/members` only — `/_cluster/members` is node-local.
-             *
              *     The console is served under `default-src 'self'`, so the page can only ever dial the node that served it: a peer's applied index is unreachable from the browser by construction, and can only arrive through an aggregate the serving node assembles. This is it.
-             *
              *     When a voter does not answer inside the fan-out budget its row is still present with `reachable: false` and a `null` index, and the response carries `Rift-Cluster-Partial`. The row is not omitted — a missing voter would read as a fleet that shrank.
              */
             members?: {
@@ -1630,7 +1329,6 @@ export interface components {
                 /**
                  * Format: int64
                  * @description What that node reports about itself, read back from its own body rather than recomputed here.
-                 *
                  *     `null`, never `0`, when the node did not answer: an unknown index rendered as zero reads as "this node has applied nothing", which is an alarm raised by the fan-out rather than by the fleet.
                  */
                 last_applied?: number | null;
@@ -1662,16 +1360,13 @@ export interface components {
             /**
              * Format: int64
              * @description Writes **this node** accepted under `--cluster-admin-async` and has not replayed yet (issue #360). A magnitude, so a number.
-             *
              *     `null`, never `0`, when the depth could not be read: zero is the reassuring answer — "nothing outstanding" — and it is the one an operator acts on by not acting. Reporting it because storage could not be read is the wrong-but-quiet failure this API avoids everywhere else.
              */
             parked_intents?: number | null;
             /**
              * Format: int64
              * @description The same depth summed across every voter (issue #360). Present on `/_fleet/health` only — `/_cluster/health` is node-local, because it is the target of this fan-out and is also how an operator asks one node how far behind its own replay is.
-             *
              *     The tile this feeds sits beside fleet-wide counts and means "the fleet has taken work it has not finished", so a single node's figure under that label would understate it.
-             *
              *     **Absent** when this node could not read its own depth — a sum missing an unknown addend is not a sum. When a *peer* fails to answer, the field is present but is a **floor**, and the response carries `Rift-Cluster-Partial` to say so.
              */
             parked_intents_fleet?: number;
@@ -1701,7 +1396,7 @@ export interface components {
         };
         /** @description The `POST /session` request body. */
         SessionCreate: {
-            /** @description The admin API key, or a minted principal's API key — the same credential `apiKeyAuth` accepts as a bearer, exchanged here once for a session cookie instead of sent on every request. */
+            /** @description The fleet's admin API key — the same credential `apiKeyAuth` accepts as a bearer, exchanged here once for a session cookie instead of sent on every request. A fleet running with no `--api-key` has nothing to exchange and answers `400`. */
             apiKey: string;
         };
         /** @description A Mountebank-shaped hypermedia link: an object carrying `href` and nothing else. Named as a component because the upstream system routes (`getRoot`, `getLogs`) emit the same one-key object in several places and a client should get one type for all of them. */
@@ -1846,7 +1541,7 @@ export interface components {
                 "application/json": components["schemas"]["Error"];
             };
         };
-        /** @description Authenticated, but denied for one of two reasons that share this status: (1) the caller's role does not grant the action within a tenant they ARE bound to (distinct from the RFC-002 §8.4 404 used for cross-tenant/unbound-tenant probes), or (2) a cookie-authenticated mutation omitted the required `X-Rift-CSRF` header (see `CsrfHeader`) — checked before authorization runs, so it can fire even on a route whose role-insufficient case answers 404 instead of 403 (e.g. `createTenant`). */
+        /** @description Authenticated, but refused: a cookie-authenticated mutation omitted the required `X-Rift-CSRF` header (see `CsrfHeader`). This is the only `403` this front produces — with one credential there is no per-resource authorization to fail. */
         Forbidden: {
             headers: {
                 [name: string]: unknown;
@@ -1864,7 +1559,7 @@ export interface components {
                 "application/json": components["schemas"]["Error"];
             };
         };
-        /** @description If-Match named a revision that no longer matches the stored record — a single imposter's, or a tenant's whole front-door route table. The write committed nothing. */
+        /** @description If-Match named a revision that no longer matches the stored record — a single imposter's, or the whole front-door route table. The write committed nothing. */
         RevisionConflict: {
             headers: {
                 [name: string]: unknown;
@@ -1917,20 +1612,14 @@ export interface components {
         };
     };
     parameters: {
-        /** @description Optimistic-concurrency precondition for a single-imposter write: either the exact token from a prior response's Rift-Cluster-Revision header (default:<port>@<revision>) or a bare revision integer. Absent, the write is last-writer-wins. A stale or mismatched value answers 409; sending it on a collection-wide mutation (which has no single record to condition on) answers 400. The route-table form is a separate parameter (IfMatchRouteTable) because its grammar is portless — the two are not interchangeable, and sending one where the other is expected answers 400. */
+        /** @description Optimistic-concurrency precondition for a single-imposter write: either the exact token from a prior response's Rift-Cluster-Revision header (<port>@<revision>) or a bare revision integer. Absent, the write is last-writer-wins. A stale or mismatched value answers 409; sending it on a collection-wide mutation (which has no single record to condition on) answers 400. The route-table form is a separate parameter (IfMatchRouteTable) because its grammar is portless — the two are not interchangeable, and sending one where the other is expected answers 400. */
         IfMatch: string;
-        /** @description Optimistic-concurrency precondition for a front-door route-table write: the portless token default@<revision>, exactly as getFrontDoorRoutes answers it in its Rift-Cluster-Revision header, or a bare revision integer. Portless because the precondition is against the tenant's route table as a whole, not any one route — there is no port to name. A tenant whose table has never been written is at revision 0, so conditioning on 0 is how a first writer claims one. Both a whole-table PUT and a single-route DELETE advance the revision, so either invalidates an outstanding token. Absent, a PUT is a last-writer-wins whole-table replace and will silently discard a concurrent edit. A stale value answers 409; a value this front cannot evaluate — a wildcard, a weak validator, a comma list, the ported default:<port>@<revision> form — answers 400. */
+        /** @description Optimistic-concurrency precondition for a front-door route-table write: the portless token routes@<revision>, exactly as getFrontDoorRoutes answers it in its Rift-Cluster-Revision header, or a bare revision integer. Portless because the precondition is against the route table as a whole, not any one route — there is no port to name. A table that has never been written is at revision 0, so conditioning on 0 is how a first writer claims one. Both a whole-table PUT and a single-route DELETE advance the revision, so either invalidates an outstanding token. Absent, a PUT is a last-writer-wins whole-table replace and will silently discard a concurrent edit. A stale value answers 409; a value this front cannot evaluate — a wildcard, a weak validator, a comma list, the ported <port>@<revision> form — answers 400. */
         IfMatchRouteTable: string;
-        /** @description Client-chosen retry key for a mutating request. Mints a deterministic op id (a v5 derivation when the value is not itself a UUID) so a retried request with the same key dedups to the original committed response instead of re-applying. Explicitly refused with 400 on principal creation — not silently ignored: the key and principal id are minted per request before any op id exists, so a replayed request would commit nothing yet still answer 201 with a freshly minted key that was never stored. A client that sent the header believes its retry is safe, so the request is rejected rather than left to go on believing it. A keyed retry against an op that committed a `409` (revision conflict) dedups to that same `409` — the key does not make the conflict retryable. A client that wants to proceed after a `409` must rebase against the current state and retry with a *fresh* Idempotency-Key, not the one that produced the conflict. */
+        /** @description Client-chosen retry key for a mutating request. Mints a deterministic op id (a v5 derivation when the value is not itself a UUID) so a retried request with the same key dedups to the original committed response instead of re-applying. exists. A keyed retry against an op that committed a `409` (revision conflict) dedups to that same `409` — the key does not make the conflict retryable. A client that wants to proceed after a `409` must rebase against the current state and retry with a *fresh* Idempotency-Key, not the one that produced the conflict. */
         IdempotencyKey: string;
-        /** @description Selects which of the caller's existing tenant bindings this request acts under; it never grants a binding the caller does not already hold. Absent, requests act as the default tenant. Ignored on tenancy routes, where the path segment names the tenant being administered instead. */
-        TenantHeader: string;
         /** @description The imposter's port number. */
         Port: number;
-        /** @description The tenant record's id. */
-        TenantId: string;
-        /** @description A principal's id (derived from its credential, e.g. key:<sha256-prefix>). */
-        PrincipalId: string;
         /** @description A correlated-isolation space's flow id. */
         FlowId: string;
         /** @description A correlated-isolation space's flow id, selected by query string rather than path. Absent, the imposter resolves its own default flow and the response says which one it used. A separate component from `FlowId` on purpose: that one is `in: path` and required, and the two locations are not interchangeable. */
@@ -1956,7 +1645,7 @@ export interface components {
     };
     requestBodies: never;
     headers: {
-        /** @description The committed log revision this response reflects. For a tenancy write it is <tenant>@<revision>, using the real tenant id. For an imposter/stub write the tenant segment is NOT the caller's real tenant — the code hardcodes the literal string `default`, so a write authorized as tenant `acme` still emits `default:<port>@<revision>`. A front-door route-table read or write emits the portless `default@<revision>` (same hardcoded tenant segment); on a read it is the revision of the table in that same response's body. Treat the whole token as opaque: feed it back verbatim as If-Match on a later write to the same record rather than constructing one from this template — a constructed value that gets the tenant segment wrong answers `400`. */
+        /** @description The committed log revision this response reflects, as `<subject>@<revision>`. For an imposter or stub write the subject is the imposter's port (`4545@17`). For a front-door route-table read or write it is the literal `routes` (`routes@17`); on a read it is the revision of the table in that same response's body. Treat the whole token as opaque: feed it back verbatim as If-Match on a later write to the same record rather than constructing one from this template — a constructed value naming the wrong subject answers `400`. */
         RiftClusterRevision: string;
         /** @description The op id a write committed (or parked) under. Present only on a terminated write's SUCCESS response (`200`/`201`/`202`/`204`) — a refusal (`refusal_response`, e.g. `400`/`404`/`409`) sets no headers at all, so those responses carry no op id. For a single-op mutation this is the same id the client's Idempotency-Key deterministically derives; a multi-op mutation (e.g. a batch `PUT /imposters`) instead carries a per-index derived id on each success, while its `202` parked path carries the base id — the "same id Idempotency-Key derives" equivalence holds only for single-op writes. */
         RiftClusterOpId: string;
@@ -1982,16 +1671,13 @@ export interface operations {
     listImposters: {
         parameters: {
             query?: never;
-            header?: {
-                /** @description Selects which of the caller's existing tenant bindings this request acts under; it never grants a binding the caller does not already hold. Absent, requests act as the default tenant. Ignored on tenancy routes, where the path segment names the tenant being administered instead. */
-                "X-Rift-Tenant"?: components["parameters"]["TenantHeader"];
-            };
+            header?: never;
             path?: never;
             cookie?: never;
         };
         requestBody?: never;
         responses: {
-            /** @description The caller's tenant's imposters. */
+            /** @description The fleet's imposters. */
             200: {
                 headers: {
                     "Rift-Cluster-Partial": components["headers"]["RiftClusterPartial"];
@@ -2005,24 +1691,13 @@ export interface operations {
             };
             401: components["responses"]["Unauthorized"];
             403: components["responses"]["Forbidden"];
-            /** @description Caller is not bound to the tenant named — indistinguishable from that tenant not existing (RFC-002 §8.4). */
-            404: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Error"];
-                };
-            };
         };
     };
     replaceAllImposters: {
         parameters: {
             query?: never;
             header?: {
-                /** @description Selects which of the caller's existing tenant bindings this request acts under; it never grants a binding the caller does not already hold. Absent, requests act as the default tenant. Ignored on tenancy routes, where the path segment names the tenant being administered instead. */
-                "X-Rift-Tenant"?: components["parameters"]["TenantHeader"];
-                /** @description Client-chosen retry key for a mutating request. Mints a deterministic op id (a v5 derivation when the value is not itself a UUID) so a retried request with the same key dedups to the original committed response instead of re-applying. Explicitly refused with 400 on principal creation — not silently ignored: the key and principal id are minted per request before any op id exists, so a replayed request would commit nothing yet still answer 201 with a freshly minted key that was never stored. A client that sent the header believes its retry is safe, so the request is rejected rather than left to go on believing it. A keyed retry against an op that committed a `409` (revision conflict) dedups to that same `409` — the key does not make the conflict retryable. A client that wants to proceed after a `409` must rebase against the current state and retry with a *fresh* Idempotency-Key, not the one that produced the conflict. */
+                /** @description Client-chosen retry key for a mutating request. Mints a deterministic op id (a v5 derivation when the value is not itself a UUID) so a retried request with the same key dedups to the original committed response instead of re-applying. exists. A keyed retry against an op that committed a `409` (revision conflict) dedups to that same `409` — the key does not make the conflict retryable. A client that wants to proceed after a `409` must rebase against the current state and retry with a *fresh* Idempotency-Key, not the one that produced the conflict. */
                 "Idempotency-Key"?: components["parameters"]["IdempotencyKey"];
                 /** @description RFC-006 §5.3/§9.2 CSRF defense: a cookie-authenticated state-changing request (anything that would mutate state, sent with the `rift_session` cookie rather than an `Authorization` bearer) that omits this header is refused with `403`, checked before authorization runs. Send any non-empty value — `SameSite=Strict` already stops the cookie riding cross-site, so this header exists only to defeat the narrower case (a same-site-adjacent or misconfigured-CORS request) by requiring a custom header cross-origin HTML cannot attach without a preflight. Bearer-authenticated requests are exempt: a bearer cannot be attached to a request by a victim's browser in the first place, which is the entire attack this header defends against — so requiring it there would add friction without closing a real hole. */
                 "X-Rift-CSRF"?: components["parameters"]["CsrfHeader"];
@@ -2055,15 +1730,6 @@ export interface operations {
             400: components["responses"]["BadData"];
             401: components["responses"]["Unauthorized"];
             403: components["responses"]["Forbidden"];
-            /** @description Caller is not bound to the tenant named (`X-Rift-Tenant` or default) — indistinguishable from that tenant not existing (RFC-002 §8.4). */
-            404: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Error"];
-                };
-            };
             413: components["responses"]["PayloadTooLarge"];
             500: components["responses"]["InternalError"];
             503: components["responses"]["Unavailable"];
@@ -2074,11 +1740,9 @@ export interface operations {
         parameters: {
             query?: never;
             header?: {
-                /** @description Selects which of the caller's existing tenant bindings this request acts under; it never grants a binding the caller does not already hold. Absent, requests act as the default tenant. Ignored on tenancy routes, where the path segment names the tenant being administered instead. */
-                "X-Rift-Tenant"?: components["parameters"]["TenantHeader"];
-                /** @description Optimistic-concurrency precondition for a single-imposter write: either the exact token from a prior response's Rift-Cluster-Revision header (default:<port>@<revision>) or a bare revision integer. Absent, the write is last-writer-wins. A stale or mismatched value answers 409; sending it on a collection-wide mutation (which has no single record to condition on) answers 400. The route-table form is a separate parameter (IfMatchRouteTable) because its grammar is portless — the two are not interchangeable, and sending one where the other is expected answers 400. */
+                /** @description Optimistic-concurrency precondition for a single-imposter write: either the exact token from a prior response's Rift-Cluster-Revision header (<port>@<revision>) or a bare revision integer. Absent, the write is last-writer-wins. A stale or mismatched value answers 409; sending it on a collection-wide mutation (which has no single record to condition on) answers 400. The route-table form is a separate parameter (IfMatchRouteTable) because its grammar is portless — the two are not interchangeable, and sending one where the other is expected answers 400. */
                 "If-Match"?: components["parameters"]["IfMatch"];
-                /** @description Client-chosen retry key for a mutating request. Mints a deterministic op id (a v5 derivation when the value is not itself a UUID) so a retried request with the same key dedups to the original committed response instead of re-applying. Explicitly refused with 400 on principal creation — not silently ignored: the key and principal id are minted per request before any op id exists, so a replayed request would commit nothing yet still answer 201 with a freshly minted key that was never stored. A client that sent the header believes its retry is safe, so the request is rejected rather than left to go on believing it. A keyed retry against an op that committed a `409` (revision conflict) dedups to that same `409` — the key does not make the conflict retryable. A client that wants to proceed after a `409` must rebase against the current state and retry with a *fresh* Idempotency-Key, not the one that produced the conflict. */
+                /** @description Client-chosen retry key for a mutating request. Mints a deterministic op id (a v5 derivation when the value is not itself a UUID) so a retried request with the same key dedups to the original committed response instead of re-applying. exists. A keyed retry against an op that committed a `409` (revision conflict) dedups to that same `409` — the key does not make the conflict retryable. A client that wants to proceed after a `409` must rebase against the current state and retry with a *fresh* Idempotency-Key, not the one that produced the conflict. */
                 "Idempotency-Key"?: components["parameters"]["IdempotencyKey"];
                 /** @description RFC-006 §5.3/§9.2 CSRF defense: a cookie-authenticated state-changing request (anything that would mutate state, sent with the `rift_session` cookie rather than an `Authorization` bearer) that omits this header is refused with `403`, checked before authorization runs. Send any non-empty value — `SameSite=Strict` already stops the cookie riding cross-site, so this header exists only to defeat the narrower case (a same-site-adjacent or misconfigured-CORS request) by requiring a custom header cross-origin HTML cannot attach without a preflight. Bearer-authenticated requests are exempt: a bearer cannot be attached to a request by a victim's browser in the first place, which is the entire attack this header defends against — so requiring it there would add friction without closing a real hole. */
                 "X-Rift-CSRF"?: components["parameters"]["CsrfHeader"];
@@ -2107,15 +1771,6 @@ export interface operations {
             400: components["responses"]["BadData"];
             401: components["responses"]["Unauthorized"];
             403: components["responses"]["Forbidden"];
-            /** @description Caller is not bound to the tenant named (`X-Rift-Tenant` or default) — indistinguishable from that tenant not existing (RFC-002 §8.4). */
-            404: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Error"];
-                };
-            };
             409: components["responses"]["RevisionConflict"];
             413: components["responses"]["PayloadTooLarge"];
             500: components["responses"]["InternalError"];
@@ -2127,9 +1782,7 @@ export interface operations {
         parameters: {
             query?: never;
             header?: {
-                /** @description Selects which of the caller's existing tenant bindings this request acts under; it never grants a binding the caller does not already hold. Absent, requests act as the default tenant. Ignored on tenancy routes, where the path segment names the tenant being administered instead. */
-                "X-Rift-Tenant"?: components["parameters"]["TenantHeader"];
-                /** @description Client-chosen retry key for a mutating request. Mints a deterministic op id (a v5 derivation when the value is not itself a UUID) so a retried request with the same key dedups to the original committed response instead of re-applying. Explicitly refused with 400 on principal creation — not silently ignored: the key and principal id are minted per request before any op id exists, so a replayed request would commit nothing yet still answer 201 with a freshly minted key that was never stored. A client that sent the header believes its retry is safe, so the request is rejected rather than left to go on believing it. A keyed retry against an op that committed a `409` (revision conflict) dedups to that same `409` — the key does not make the conflict retryable. A client that wants to proceed after a `409` must rebase against the current state and retry with a *fresh* Idempotency-Key, not the one that produced the conflict. */
+                /** @description Client-chosen retry key for a mutating request. Mints a deterministic op id (a v5 derivation when the value is not itself a UUID) so a retried request with the same key dedups to the original committed response instead of re-applying. exists. A keyed retry against an op that committed a `409` (revision conflict) dedups to that same `409` — the key does not make the conflict retryable. A client that wants to proceed after a `409` must rebase against the current state and retry with a *fresh* Idempotency-Key, not the one that produced the conflict. */
                 "Idempotency-Key"?: components["parameters"]["IdempotencyKey"];
                 /** @description RFC-006 §5.3/§9.2 CSRF defense: a cookie-authenticated state-changing request (anything that would mutate state, sent with the `rift_session` cookie rather than an `Authorization` bearer) that omits this header is refused with `403`, checked before authorization runs. Send any non-empty value — `SameSite=Strict` already stops the cookie riding cross-site, so this header exists only to defeat the narrower case (a same-site-adjacent or misconfigured-CORS request) by requiring a custom header cross-origin HTML cannot attach without a preflight. Bearer-authenticated requests are exempt: a bearer cannot be attached to a request by a victim's browser in the first place, which is the entire attack this header defends against — so requiring it there would add friction without closing a real hole. */
                 "X-Rift-CSRF"?: components["parameters"]["CsrfHeader"];
@@ -2155,15 +1808,6 @@ export interface operations {
             202: components["responses"]["AcceptedParked"];
             401: components["responses"]["Unauthorized"];
             403: components["responses"]["Forbidden"];
-            /** @description Caller is not bound to the tenant named (`X-Rift-Tenant` or default) — indistinguishable from that tenant not existing (RFC-002 §8.4). */
-            404: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Error"];
-                };
-            };
             500: components["responses"]["InternalError"];
             503: components["responses"]["Unavailable"];
             504: components["responses"]["WriteTimeout"];
@@ -2172,10 +1816,7 @@ export interface operations {
     getImposter: {
         parameters: {
             query?: never;
-            header?: {
-                /** @description Selects which of the caller's existing tenant bindings this request acts under; it never grants a binding the caller does not already hold. Absent, requests act as the default tenant. Ignored on tenancy routes, where the path segment names the tenant being administered instead. */
-                "X-Rift-Tenant"?: components["parameters"]["TenantHeader"];
-            };
+            header?: never;
             path: {
                 /** @description The imposter's port number. */
                 port: components["parameters"]["Port"];
@@ -2197,7 +1838,7 @@ export interface operations {
             };
             401: components["responses"]["Unauthorized"];
             403: components["responses"]["Forbidden"];
-            /** @description No such imposter for this tenant — genuinely absent, or owned by another tenant (RFC-002 §8.4's indistinguishable 404). */
+            /** @description No such imposter on this port. */
             404: {
                 headers: {
                     [name: string]: unknown;
@@ -2212,11 +1853,9 @@ export interface operations {
         parameters: {
             query?: never;
             header?: {
-                /** @description Selects which of the caller's existing tenant bindings this request acts under; it never grants a binding the caller does not already hold. Absent, requests act as the default tenant. Ignored on tenancy routes, where the path segment names the tenant being administered instead. */
-                "X-Rift-Tenant"?: components["parameters"]["TenantHeader"];
-                /** @description Optimistic-concurrency precondition for a single-imposter write: either the exact token from a prior response's Rift-Cluster-Revision header (default:<port>@<revision>) or a bare revision integer. Absent, the write is last-writer-wins. A stale or mismatched value answers 409; sending it on a collection-wide mutation (which has no single record to condition on) answers 400. The route-table form is a separate parameter (IfMatchRouteTable) because its grammar is portless — the two are not interchangeable, and sending one where the other is expected answers 400. */
+                /** @description Optimistic-concurrency precondition for a single-imposter write: either the exact token from a prior response's Rift-Cluster-Revision header (<port>@<revision>) or a bare revision integer. Absent, the write is last-writer-wins. A stale or mismatched value answers 409; sending it on a collection-wide mutation (which has no single record to condition on) answers 400. The route-table form is a separate parameter (IfMatchRouteTable) because its grammar is portless — the two are not interchangeable, and sending one where the other is expected answers 400. */
                 "If-Match"?: components["parameters"]["IfMatch"];
-                /** @description Client-chosen retry key for a mutating request. Mints a deterministic op id (a v5 derivation when the value is not itself a UUID) so a retried request with the same key dedups to the original committed response instead of re-applying. Explicitly refused with 400 on principal creation — not silently ignored: the key and principal id are minted per request before any op id exists, so a replayed request would commit nothing yet still answer 201 with a freshly minted key that was never stored. A client that sent the header believes its retry is safe, so the request is rejected rather than left to go on believing it. A keyed retry against an op that committed a `409` (revision conflict) dedups to that same `409` — the key does not make the conflict retryable. A client that wants to proceed after a `409` must rebase against the current state and retry with a *fresh* Idempotency-Key, not the one that produced the conflict. */
+                /** @description Client-chosen retry key for a mutating request. Mints a deterministic op id (a v5 derivation when the value is not itself a UUID) so a retried request with the same key dedups to the original committed response instead of re-applying. exists. A keyed retry against an op that committed a `409` (revision conflict) dedups to that same `409` — the key does not make the conflict retryable. A client that wants to proceed after a `409` must rebase against the current state and retry with a *fresh* Idempotency-Key, not the one that produced the conflict. */
                 "Idempotency-Key"?: components["parameters"]["IdempotencyKey"];
                 /** @description RFC-006 §5.3/§9.2 CSRF defense: a cookie-authenticated state-changing request (anything that would mutate state, sent with the `rift_session` cookie rather than an `Authorization` bearer) that omits this header is refused with `403`, checked before authorization runs. Send any non-empty value — `SameSite=Strict` already stops the cookie riding cross-site, so this header exists only to defeat the narrower case (a same-site-adjacent or misconfigured-CORS request) by requiring a custom header cross-origin HTML cannot attach without a preflight. Bearer-authenticated requests are exempt: a bearer cannot be attached to a request by a victim's browser in the first place, which is the entire attack this header defends against — so requiring it there would add friction without closing a real hole. */
                 "X-Rift-CSRF"?: components["parameters"]["CsrfHeader"];
@@ -2243,7 +1882,7 @@ export interface operations {
             202: components["responses"]["AcceptedParked"];
             401: components["responses"]["Unauthorized"];
             403: components["responses"]["Forbidden"];
-            /** @description No such imposter on this port for the caller's tenant — either it genuinely does not exist, or it belongs to a different tenant. The two are byte-identical by design (RFC-002 §8.4). */
+            /** @description No such imposter on this port. */
             404: {
                 headers: {
                     [name: string]: unknown;
@@ -2262,11 +1901,9 @@ export interface operations {
         parameters: {
             query?: never;
             header?: {
-                /** @description Selects which of the caller's existing tenant bindings this request acts under; it never grants a binding the caller does not already hold. Absent, requests act as the default tenant. Ignored on tenancy routes, where the path segment names the tenant being administered instead. */
-                "X-Rift-Tenant"?: components["parameters"]["TenantHeader"];
-                /** @description Optimistic-concurrency precondition for a single-imposter write: either the exact token from a prior response's Rift-Cluster-Revision header (default:<port>@<revision>) or a bare revision integer. Absent, the write is last-writer-wins. A stale or mismatched value answers 409; sending it on a collection-wide mutation (which has no single record to condition on) answers 400. The route-table form is a separate parameter (IfMatchRouteTable) because its grammar is portless — the two are not interchangeable, and sending one where the other is expected answers 400. */
+                /** @description Optimistic-concurrency precondition for a single-imposter write: either the exact token from a prior response's Rift-Cluster-Revision header (<port>@<revision>) or a bare revision integer. Absent, the write is last-writer-wins. A stale or mismatched value answers 409; sending it on a collection-wide mutation (which has no single record to condition on) answers 400. The route-table form is a separate parameter (IfMatchRouteTable) because its grammar is portless — the two are not interchangeable, and sending one where the other is expected answers 400. */
                 "If-Match"?: components["parameters"]["IfMatch"];
-                /** @description Client-chosen retry key for a mutating request. Mints a deterministic op id (a v5 derivation when the value is not itself a UUID) so a retried request with the same key dedups to the original committed response instead of re-applying. Explicitly refused with 400 on principal creation — not silently ignored: the key and principal id are minted per request before any op id exists, so a replayed request would commit nothing yet still answer 201 with a freshly minted key that was never stored. A client that sent the header believes its retry is safe, so the request is rejected rather than left to go on believing it. A keyed retry against an op that committed a `409` (revision conflict) dedups to that same `409` — the key does not make the conflict retryable. A client that wants to proceed after a `409` must rebase against the current state and retry with a *fresh* Idempotency-Key, not the one that produced the conflict. */
+                /** @description Client-chosen retry key for a mutating request. Mints a deterministic op id (a v5 derivation when the value is not itself a UUID) so a retried request with the same key dedups to the original committed response instead of re-applying. exists. A keyed retry against an op that committed a `409` (revision conflict) dedups to that same `409` — the key does not make the conflict retryable. A client that wants to proceed after a `409` must rebase against the current state and retry with a *fresh* Idempotency-Key, not the one that produced the conflict. */
                 "Idempotency-Key"?: components["parameters"]["IdempotencyKey"];
                 /** @description RFC-006 §5.3/§9.2 CSRF defense: a cookie-authenticated state-changing request (anything that would mutate state, sent with the `rift_session` cookie rather than an `Authorization` bearer) that omits this header is refused with `403`, checked before authorization runs. Send any non-empty value — `SameSite=Strict` already stops the cookie riding cross-site, so this header exists only to defeat the narrower case (a same-site-adjacent or misconfigured-CORS request) by requiring a custom header cross-origin HTML cannot attach without a preflight. Bearer-authenticated requests are exempt: a bearer cannot be attached to a request by a victim's browser in the first place, which is the entire attack this header defends against — so requiring it there would add friction without closing a real hole. */
                 "X-Rift-CSRF"?: components["parameters"]["CsrfHeader"];
@@ -2296,7 +1933,7 @@ export interface operations {
             202: components["responses"]["AcceptedParked"];
             401: components["responses"]["Unauthorized"];
             403: components["responses"]["Forbidden"];
-            /** @description No such imposter for this tenant, or owned by another tenant. */
+            /** @description No such imposter on this port. */
             404: {
                 headers: {
                     [name: string]: unknown;
@@ -2315,11 +1952,9 @@ export interface operations {
         parameters: {
             query?: never;
             header?: {
-                /** @description Selects which of the caller's existing tenant bindings this request acts under; it never grants a binding the caller does not already hold. Absent, requests act as the default tenant. Ignored on tenancy routes, where the path segment names the tenant being administered instead. */
-                "X-Rift-Tenant"?: components["parameters"]["TenantHeader"];
-                /** @description Optimistic-concurrency precondition for a single-imposter write: either the exact token from a prior response's Rift-Cluster-Revision header (default:<port>@<revision>) or a bare revision integer. Absent, the write is last-writer-wins. A stale or mismatched value answers 409; sending it on a collection-wide mutation (which has no single record to condition on) answers 400. The route-table form is a separate parameter (IfMatchRouteTable) because its grammar is portless — the two are not interchangeable, and sending one where the other is expected answers 400. */
+                /** @description Optimistic-concurrency precondition for a single-imposter write: either the exact token from a prior response's Rift-Cluster-Revision header (<port>@<revision>) or a bare revision integer. Absent, the write is last-writer-wins. A stale or mismatched value answers 409; sending it on a collection-wide mutation (which has no single record to condition on) answers 400. The route-table form is a separate parameter (IfMatchRouteTable) because its grammar is portless — the two are not interchangeable, and sending one where the other is expected answers 400. */
                 "If-Match"?: components["parameters"]["IfMatch"];
-                /** @description Client-chosen retry key for a mutating request. Mints a deterministic op id (a v5 derivation when the value is not itself a UUID) so a retried request with the same key dedups to the original committed response instead of re-applying. Explicitly refused with 400 on principal creation — not silently ignored: the key and principal id are minted per request before any op id exists, so a replayed request would commit nothing yet still answer 201 with a freshly minted key that was never stored. A client that sent the header believes its retry is safe, so the request is rejected rather than left to go on believing it. A keyed retry against an op that committed a `409` (revision conflict) dedups to that same `409` — the key does not make the conflict retryable. A client that wants to proceed after a `409` must rebase against the current state and retry with a *fresh* Idempotency-Key, not the one that produced the conflict. */
+                /** @description Client-chosen retry key for a mutating request. Mints a deterministic op id (a v5 derivation when the value is not itself a UUID) so a retried request with the same key dedups to the original committed response instead of re-applying. exists. A keyed retry against an op that committed a `409` (revision conflict) dedups to that same `409` — the key does not make the conflict retryable. A client that wants to proceed after a `409` must rebase against the current state and retry with a *fresh* Idempotency-Key, not the one that produced the conflict. */
                 "Idempotency-Key"?: components["parameters"]["IdempotencyKey"];
                 /** @description RFC-006 §5.3/§9.2 CSRF defense: a cookie-authenticated state-changing request (anything that would mutate state, sent with the `rift_session` cookie rather than an `Authorization` bearer) that omits this header is refused with `403`, checked before authorization runs. Send any non-empty value — `SameSite=Strict` already stops the cookie riding cross-site, so this header exists only to defeat the narrower case (a same-site-adjacent or misconfigured-CORS request) by requiring a custom header cross-origin HTML cannot attach without a preflight. Bearer-authenticated requests are exempt: a bearer cannot be attached to a request by a victim's browser in the first place, which is the entire attack this header defends against — so requiring it there would add friction without closing a real hole. */
                 "X-Rift-CSRF"?: components["parameters"]["CsrfHeader"];
@@ -2349,7 +1984,7 @@ export interface operations {
             202: components["responses"]["AcceptedParked"];
             401: components["responses"]["Unauthorized"];
             403: components["responses"]["Forbidden"];
-            /** @description No such imposter for this tenant, or owned by another tenant. */
+            /** @description No such imposter on this port. */
             404: {
                 headers: {
                     [name: string]: unknown;
@@ -2367,10 +2002,7 @@ export interface operations {
     listStubs: {
         parameters: {
             query?: never;
-            header?: {
-                /** @description Selects which of the caller's existing tenant bindings this request acts under; it never grants a binding the caller does not already hold. Absent, requests act as the default tenant. Ignored on tenancy routes, where the path segment names the tenant being administered instead. */
-                "X-Rift-Tenant"?: components["parameters"]["TenantHeader"];
-            };
+            header?: never;
             path: {
                 /** @description The imposter's port number. */
                 port: components["parameters"]["Port"];
@@ -2392,7 +2024,7 @@ export interface operations {
             };
             401: components["responses"]["Unauthorized"];
             403: components["responses"]["Forbidden"];
-            /** @description No such imposter for this tenant, or owned by another tenant. */
+            /** @description No such imposter on this port. */
             404: {
                 headers: {
                     [name: string]: unknown;
@@ -2407,11 +2039,9 @@ export interface operations {
         parameters: {
             query?: never;
             header?: {
-                /** @description Selects which of the caller's existing tenant bindings this request acts under; it never grants a binding the caller does not already hold. Absent, requests act as the default tenant. Ignored on tenancy routes, where the path segment names the tenant being administered instead. */
-                "X-Rift-Tenant"?: components["parameters"]["TenantHeader"];
-                /** @description Optimistic-concurrency precondition for a single-imposter write: either the exact token from a prior response's Rift-Cluster-Revision header (default:<port>@<revision>) or a bare revision integer. Absent, the write is last-writer-wins. A stale or mismatched value answers 409; sending it on a collection-wide mutation (which has no single record to condition on) answers 400. The route-table form is a separate parameter (IfMatchRouteTable) because its grammar is portless — the two are not interchangeable, and sending one where the other is expected answers 400. */
+                /** @description Optimistic-concurrency precondition for a single-imposter write: either the exact token from a prior response's Rift-Cluster-Revision header (<port>@<revision>) or a bare revision integer. Absent, the write is last-writer-wins. A stale or mismatched value answers 409; sending it on a collection-wide mutation (which has no single record to condition on) answers 400. The route-table form is a separate parameter (IfMatchRouteTable) because its grammar is portless — the two are not interchangeable, and sending one where the other is expected answers 400. */
                 "If-Match"?: components["parameters"]["IfMatch"];
-                /** @description Client-chosen retry key for a mutating request. Mints a deterministic op id (a v5 derivation when the value is not itself a UUID) so a retried request with the same key dedups to the original committed response instead of re-applying. Explicitly refused with 400 on principal creation — not silently ignored: the key and principal id are minted per request before any op id exists, so a replayed request would commit nothing yet still answer 201 with a freshly minted key that was never stored. A client that sent the header believes its retry is safe, so the request is rejected rather than left to go on believing it. A keyed retry against an op that committed a `409` (revision conflict) dedups to that same `409` — the key does not make the conflict retryable. A client that wants to proceed after a `409` must rebase against the current state and retry with a *fresh* Idempotency-Key, not the one that produced the conflict. */
+                /** @description Client-chosen retry key for a mutating request. Mints a deterministic op id (a v5 derivation when the value is not itself a UUID) so a retried request with the same key dedups to the original committed response instead of re-applying. exists. A keyed retry against an op that committed a `409` (revision conflict) dedups to that same `409` — the key does not make the conflict retryable. A client that wants to proceed after a `409` must rebase against the current state and retry with a *fresh* Idempotency-Key, not the one that produced the conflict. */
                 "Idempotency-Key"?: components["parameters"]["IdempotencyKey"];
                 /** @description RFC-006 §5.3/§9.2 CSRF defense: a cookie-authenticated state-changing request (anything that would mutate state, sent with the `rift_session` cookie rather than an `Authorization` bearer) that omits this header is refused with `403`, checked before authorization runs. Send any non-empty value — `SameSite=Strict` already stops the cookie riding cross-site, so this header exists only to defeat the narrower case (a same-site-adjacent or misconfigured-CORS request) by requiring a custom header cross-origin HTML cannot attach without a preflight. Bearer-authenticated requests are exempt: a bearer cannot be attached to a request by a victim's browser in the first place, which is the entire attack this header defends against — so requiring it there would add friction without closing a real hole. */
                 "X-Rift-CSRF"?: components["parameters"]["CsrfHeader"];
@@ -2445,7 +2075,7 @@ export interface operations {
             400: components["responses"]["BadData"];
             401: components["responses"]["Unauthorized"];
             403: components["responses"]["Forbidden"];
-            /** @description No such imposter for this tenant, or owned by another tenant. */
+            /** @description No such imposter on this port. */
             404: {
                 headers: {
                     [name: string]: unknown;
@@ -2465,11 +2095,9 @@ export interface operations {
         parameters: {
             query?: never;
             header?: {
-                /** @description Selects which of the caller's existing tenant bindings this request acts under; it never grants a binding the caller does not already hold. Absent, requests act as the default tenant. Ignored on tenancy routes, where the path segment names the tenant being administered instead. */
-                "X-Rift-Tenant"?: components["parameters"]["TenantHeader"];
-                /** @description Optimistic-concurrency precondition for a single-imposter write: either the exact token from a prior response's Rift-Cluster-Revision header (default:<port>@<revision>) or a bare revision integer. Absent, the write is last-writer-wins. A stale or mismatched value answers 409; sending it on a collection-wide mutation (which has no single record to condition on) answers 400. The route-table form is a separate parameter (IfMatchRouteTable) because its grammar is portless — the two are not interchangeable, and sending one where the other is expected answers 400. */
+                /** @description Optimistic-concurrency precondition for a single-imposter write: either the exact token from a prior response's Rift-Cluster-Revision header (<port>@<revision>) or a bare revision integer. Absent, the write is last-writer-wins. A stale or mismatched value answers 409; sending it on a collection-wide mutation (which has no single record to condition on) answers 400. The route-table form is a separate parameter (IfMatchRouteTable) because its grammar is portless — the two are not interchangeable, and sending one where the other is expected answers 400. */
                 "If-Match"?: components["parameters"]["IfMatch"];
-                /** @description Client-chosen retry key for a mutating request. Mints a deterministic op id (a v5 derivation when the value is not itself a UUID) so a retried request with the same key dedups to the original committed response instead of re-applying. Explicitly refused with 400 on principal creation — not silently ignored: the key and principal id are minted per request before any op id exists, so a replayed request would commit nothing yet still answer 201 with a freshly minted key that was never stored. A client that sent the header believes its retry is safe, so the request is rejected rather than left to go on believing it. A keyed retry against an op that committed a `409` (revision conflict) dedups to that same `409` — the key does not make the conflict retryable. A client that wants to proceed after a `409` must rebase against the current state and retry with a *fresh* Idempotency-Key, not the one that produced the conflict. */
+                /** @description Client-chosen retry key for a mutating request. Mints a deterministic op id (a v5 derivation when the value is not itself a UUID) so a retried request with the same key dedups to the original committed response instead of re-applying. exists. A keyed retry against an op that committed a `409` (revision conflict) dedups to that same `409` — the key does not make the conflict retryable. A client that wants to proceed after a `409` must rebase against the current state and retry with a *fresh* Idempotency-Key, not the one that produced the conflict. */
                 "Idempotency-Key"?: components["parameters"]["IdempotencyKey"];
                 /** @description RFC-006 §5.3/§9.2 CSRF defense: a cookie-authenticated state-changing request (anything that would mutate state, sent with the `rift_session` cookie rather than an `Authorization` bearer) that omits this header is refused with `403`, checked before authorization runs. Send any non-empty value — `SameSite=Strict` already stops the cookie riding cross-site, so this header exists only to defeat the narrower case (a same-site-adjacent or misconfigured-CORS request) by requiring a custom header cross-origin HTML cannot attach without a preflight. Bearer-authenticated requests are exempt: a bearer cannot be attached to a request by a victim's browser in the first place, which is the entire attack this header defends against — so requiring it there would add friction without closing a real hole. */
                 "X-Rift-CSRF"?: components["parameters"]["CsrfHeader"];
@@ -2505,7 +2133,7 @@ export interface operations {
             400: components["responses"]["BadData"];
             401: components["responses"]["Unauthorized"];
             403: components["responses"]["Forbidden"];
-            /** @description No such imposter for this tenant, or owned by another tenant. */
+            /** @description No such imposter on this port. */
             404: {
                 headers: {
                     [name: string]: unknown;
@@ -2524,10 +2152,7 @@ export interface operations {
     getStubAt: {
         parameters: {
             query?: never;
-            header?: {
-                /** @description Selects which of the caller's existing tenant bindings this request acts under; it never grants a binding the caller does not already hold. Absent, requests act as the default tenant. Ignored on tenancy routes, where the path segment names the tenant being administered instead. */
-                "X-Rift-Tenant"?: components["parameters"]["TenantHeader"];
-            };
+            header?: never;
             path: {
                 /** @description The imposter's port number. */
                 port: components["parameters"]["Port"];
@@ -2549,7 +2174,7 @@ export interface operations {
             };
             401: components["responses"]["Unauthorized"];
             403: components["responses"]["Forbidden"];
-            /** @description No such imposter, no such stub index, or owned by another tenant. */
+            /** @description No such imposter on this port, or no such stub index. */
             404: {
                 headers: {
                     [name: string]: unknown;
@@ -2564,11 +2189,9 @@ export interface operations {
         parameters: {
             query?: never;
             header?: {
-                /** @description Selects which of the caller's existing tenant bindings this request acts under; it never grants a binding the caller does not already hold. Absent, requests act as the default tenant. Ignored on tenancy routes, where the path segment names the tenant being administered instead. */
-                "X-Rift-Tenant"?: components["parameters"]["TenantHeader"];
-                /** @description Optimistic-concurrency precondition for a single-imposter write: either the exact token from a prior response's Rift-Cluster-Revision header (default:<port>@<revision>) or a bare revision integer. Absent, the write is last-writer-wins. A stale or mismatched value answers 409; sending it on a collection-wide mutation (which has no single record to condition on) answers 400. The route-table form is a separate parameter (IfMatchRouteTable) because its grammar is portless — the two are not interchangeable, and sending one where the other is expected answers 400. */
+                /** @description Optimistic-concurrency precondition for a single-imposter write: either the exact token from a prior response's Rift-Cluster-Revision header (<port>@<revision>) or a bare revision integer. Absent, the write is last-writer-wins. A stale or mismatched value answers 409; sending it on a collection-wide mutation (which has no single record to condition on) answers 400. The route-table form is a separate parameter (IfMatchRouteTable) because its grammar is portless — the two are not interchangeable, and sending one where the other is expected answers 400. */
                 "If-Match"?: components["parameters"]["IfMatch"];
-                /** @description Client-chosen retry key for a mutating request. Mints a deterministic op id (a v5 derivation when the value is not itself a UUID) so a retried request with the same key dedups to the original committed response instead of re-applying. Explicitly refused with 400 on principal creation — not silently ignored: the key and principal id are minted per request before any op id exists, so a replayed request would commit nothing yet still answer 201 with a freshly minted key that was never stored. A client that sent the header believes its retry is safe, so the request is rejected rather than left to go on believing it. A keyed retry against an op that committed a `409` (revision conflict) dedups to that same `409` — the key does not make the conflict retryable. A client that wants to proceed after a `409` must rebase against the current state and retry with a *fresh* Idempotency-Key, not the one that produced the conflict. */
+                /** @description Client-chosen retry key for a mutating request. Mints a deterministic op id (a v5 derivation when the value is not itself a UUID) so a retried request with the same key dedups to the original committed response instead of re-applying. exists. A keyed retry against an op that committed a `409` (revision conflict) dedups to that same `409` — the key does not make the conflict retryable. A client that wants to proceed after a `409` must rebase against the current state and retry with a *fresh* Idempotency-Key, not the one that produced the conflict. */
                 "Idempotency-Key"?: components["parameters"]["IdempotencyKey"];
                 /** @description RFC-006 §5.3/§9.2 CSRF defense: a cookie-authenticated state-changing request (anything that would mutate state, sent with the `rift_session` cookie rather than an `Authorization` bearer) that omits this header is refused with `403`, checked before authorization runs. Send any non-empty value — `SameSite=Strict` already stops the cookie riding cross-site, so this header exists only to defeat the narrower case (a same-site-adjacent or misconfigured-CORS request) by requiring a custom header cross-origin HTML cannot attach without a preflight. Bearer-authenticated requests are exempt: a bearer cannot be attached to a request by a victim's browser in the first place, which is the entire attack this header defends against — so requiring it there would add friction without closing a real hole. */
                 "X-Rift-CSRF"?: components["parameters"]["CsrfHeader"];
@@ -2602,7 +2225,7 @@ export interface operations {
             400: components["responses"]["BadData"];
             401: components["responses"]["Unauthorized"];
             403: components["responses"]["Forbidden"];
-            /** @description No such imposter, no such stub index, or owned by another tenant. */
+            /** @description No such imposter on this port, or no such stub index. */
             404: {
                 headers: {
                     [name: string]: unknown;
@@ -2622,11 +2245,9 @@ export interface operations {
         parameters: {
             query?: never;
             header?: {
-                /** @description Selects which of the caller's existing tenant bindings this request acts under; it never grants a binding the caller does not already hold. Absent, requests act as the default tenant. Ignored on tenancy routes, where the path segment names the tenant being administered instead. */
-                "X-Rift-Tenant"?: components["parameters"]["TenantHeader"];
-                /** @description Optimistic-concurrency precondition for a single-imposter write: either the exact token from a prior response's Rift-Cluster-Revision header (default:<port>@<revision>) or a bare revision integer. Absent, the write is last-writer-wins. A stale or mismatched value answers 409; sending it on a collection-wide mutation (which has no single record to condition on) answers 400. The route-table form is a separate parameter (IfMatchRouteTable) because its grammar is portless — the two are not interchangeable, and sending one where the other is expected answers 400. */
+                /** @description Optimistic-concurrency precondition for a single-imposter write: either the exact token from a prior response's Rift-Cluster-Revision header (<port>@<revision>) or a bare revision integer. Absent, the write is last-writer-wins. A stale or mismatched value answers 409; sending it on a collection-wide mutation (which has no single record to condition on) answers 400. The route-table form is a separate parameter (IfMatchRouteTable) because its grammar is portless — the two are not interchangeable, and sending one where the other is expected answers 400. */
                 "If-Match"?: components["parameters"]["IfMatch"];
-                /** @description Client-chosen retry key for a mutating request. Mints a deterministic op id (a v5 derivation when the value is not itself a UUID) so a retried request with the same key dedups to the original committed response instead of re-applying. Explicitly refused with 400 on principal creation — not silently ignored: the key and principal id are minted per request before any op id exists, so a replayed request would commit nothing yet still answer 201 with a freshly minted key that was never stored. A client that sent the header believes its retry is safe, so the request is rejected rather than left to go on believing it. A keyed retry against an op that committed a `409` (revision conflict) dedups to that same `409` — the key does not make the conflict retryable. A client that wants to proceed after a `409` must rebase against the current state and retry with a *fresh* Idempotency-Key, not the one that produced the conflict. */
+                /** @description Client-chosen retry key for a mutating request. Mints a deterministic op id (a v5 derivation when the value is not itself a UUID) so a retried request with the same key dedups to the original committed response instead of re-applying. exists. A keyed retry against an op that committed a `409` (revision conflict) dedups to that same `409` — the key does not make the conflict retryable. A client that wants to proceed after a `409` must rebase against the current state and retry with a *fresh* Idempotency-Key, not the one that produced the conflict. */
                 "Idempotency-Key"?: components["parameters"]["IdempotencyKey"];
                 /** @description RFC-006 §5.3/§9.2 CSRF defense: a cookie-authenticated state-changing request (anything that would mutate state, sent with the `rift_session` cookie rather than an `Authorization` bearer) that omits this header is refused with `403`, checked before authorization runs. Send any non-empty value — `SameSite=Strict` already stops the cookie riding cross-site, so this header exists only to defeat the narrower case (a same-site-adjacent or misconfigured-CORS request) by requiring a custom header cross-origin HTML cannot attach without a preflight. Bearer-authenticated requests are exempt: a bearer cannot be attached to a request by a victim's browser in the first place, which is the entire attack this header defends against — so requiring it there would add friction without closing a real hole. */
                 "X-Rift-CSRF"?: components["parameters"]["CsrfHeader"];
@@ -2655,7 +2276,7 @@ export interface operations {
             202: components["responses"]["AcceptedParked"];
             401: components["responses"]["Unauthorized"];
             403: components["responses"]["Forbidden"];
-            /** @description No such imposter, no such stub index, or owned by another tenant. */
+            /** @description No such imposter on this port, or no such stub index. */
             404: {
                 headers: {
                     [name: string]: unknown;
@@ -2673,10 +2294,7 @@ export interface operations {
     getStubById: {
         parameters: {
             query?: never;
-            header?: {
-                /** @description Selects which of the caller's existing tenant bindings this request acts under; it never grants a binding the caller does not already hold. Absent, requests act as the default tenant. Ignored on tenancy routes, where the path segment names the tenant being administered instead. */
-                "X-Rift-Tenant"?: components["parameters"]["TenantHeader"];
-            };
+            header?: never;
             path: {
                 /** @description The imposter's port number. */
                 port: components["parameters"]["Port"];
@@ -2698,7 +2316,7 @@ export interface operations {
             };
             401: components["responses"]["Unauthorized"];
             403: components["responses"]["Forbidden"];
-            /** @description No such imposter, no such stub id, or owned by another tenant. */
+            /** @description No such imposter on this port, or no such stub id. */
             404: {
                 headers: {
                     [name: string]: unknown;
@@ -2713,11 +2331,9 @@ export interface operations {
         parameters: {
             query?: never;
             header?: {
-                /** @description Selects which of the caller's existing tenant bindings this request acts under; it never grants a binding the caller does not already hold. Absent, requests act as the default tenant. Ignored on tenancy routes, where the path segment names the tenant being administered instead. */
-                "X-Rift-Tenant"?: components["parameters"]["TenantHeader"];
-                /** @description Optimistic-concurrency precondition for a single-imposter write: either the exact token from a prior response's Rift-Cluster-Revision header (default:<port>@<revision>) or a bare revision integer. Absent, the write is last-writer-wins. A stale or mismatched value answers 409; sending it on a collection-wide mutation (which has no single record to condition on) answers 400. The route-table form is a separate parameter (IfMatchRouteTable) because its grammar is portless — the two are not interchangeable, and sending one where the other is expected answers 400. */
+                /** @description Optimistic-concurrency precondition for a single-imposter write: either the exact token from a prior response's Rift-Cluster-Revision header (<port>@<revision>) or a bare revision integer. Absent, the write is last-writer-wins. A stale or mismatched value answers 409; sending it on a collection-wide mutation (which has no single record to condition on) answers 400. The route-table form is a separate parameter (IfMatchRouteTable) because its grammar is portless — the two are not interchangeable, and sending one where the other is expected answers 400. */
                 "If-Match"?: components["parameters"]["IfMatch"];
-                /** @description Client-chosen retry key for a mutating request. Mints a deterministic op id (a v5 derivation when the value is not itself a UUID) so a retried request with the same key dedups to the original committed response instead of re-applying. Explicitly refused with 400 on principal creation — not silently ignored: the key and principal id are minted per request before any op id exists, so a replayed request would commit nothing yet still answer 201 with a freshly minted key that was never stored. A client that sent the header believes its retry is safe, so the request is rejected rather than left to go on believing it. A keyed retry against an op that committed a `409` (revision conflict) dedups to that same `409` — the key does not make the conflict retryable. A client that wants to proceed after a `409` must rebase against the current state and retry with a *fresh* Idempotency-Key, not the one that produced the conflict. */
+                /** @description Client-chosen retry key for a mutating request. Mints a deterministic op id (a v5 derivation when the value is not itself a UUID) so a retried request with the same key dedups to the original committed response instead of re-applying. exists. A keyed retry against an op that committed a `409` (revision conflict) dedups to that same `409` — the key does not make the conflict retryable. A client that wants to proceed after a `409` must rebase against the current state and retry with a *fresh* Idempotency-Key, not the one that produced the conflict. */
                 "Idempotency-Key"?: components["parameters"]["IdempotencyKey"];
                 /** @description RFC-006 §5.3/§9.2 CSRF defense: a cookie-authenticated state-changing request (anything that would mutate state, sent with the `rift_session` cookie rather than an `Authorization` bearer) that omits this header is refused with `403`, checked before authorization runs. Send any non-empty value — `SameSite=Strict` already stops the cookie riding cross-site, so this header exists only to defeat the narrower case (a same-site-adjacent or misconfigured-CORS request) by requiring a custom header cross-origin HTML cannot attach without a preflight. Bearer-authenticated requests are exempt: a bearer cannot be attached to a request by a victim's browser in the first place, which is the entire attack this header defends against — so requiring it there would add friction without closing a real hole. */
                 "X-Rift-CSRF"?: components["parameters"]["CsrfHeader"];
@@ -2751,7 +2367,7 @@ export interface operations {
             400: components["responses"]["BadData"];
             401: components["responses"]["Unauthorized"];
             403: components["responses"]["Forbidden"];
-            /** @description No such imposter, no such stub id, or owned by another tenant. */
+            /** @description No such imposter on this port, or no such stub id. */
             404: {
                 headers: {
                     [name: string]: unknown;
@@ -2771,11 +2387,9 @@ export interface operations {
         parameters: {
             query?: never;
             header?: {
-                /** @description Selects which of the caller's existing tenant bindings this request acts under; it never grants a binding the caller does not already hold. Absent, requests act as the default tenant. Ignored on tenancy routes, where the path segment names the tenant being administered instead. */
-                "X-Rift-Tenant"?: components["parameters"]["TenantHeader"];
-                /** @description Optimistic-concurrency precondition for a single-imposter write: either the exact token from a prior response's Rift-Cluster-Revision header (default:<port>@<revision>) or a bare revision integer. Absent, the write is last-writer-wins. A stale or mismatched value answers 409; sending it on a collection-wide mutation (which has no single record to condition on) answers 400. The route-table form is a separate parameter (IfMatchRouteTable) because its grammar is portless — the two are not interchangeable, and sending one where the other is expected answers 400. */
+                /** @description Optimistic-concurrency precondition for a single-imposter write: either the exact token from a prior response's Rift-Cluster-Revision header (<port>@<revision>) or a bare revision integer. Absent, the write is last-writer-wins. A stale or mismatched value answers 409; sending it on a collection-wide mutation (which has no single record to condition on) answers 400. The route-table form is a separate parameter (IfMatchRouteTable) because its grammar is portless — the two are not interchangeable, and sending one where the other is expected answers 400. */
                 "If-Match"?: components["parameters"]["IfMatch"];
-                /** @description Client-chosen retry key for a mutating request. Mints a deterministic op id (a v5 derivation when the value is not itself a UUID) so a retried request with the same key dedups to the original committed response instead of re-applying. Explicitly refused with 400 on principal creation — not silently ignored: the key and principal id are minted per request before any op id exists, so a replayed request would commit nothing yet still answer 201 with a freshly minted key that was never stored. A client that sent the header believes its retry is safe, so the request is rejected rather than left to go on believing it. A keyed retry against an op that committed a `409` (revision conflict) dedups to that same `409` — the key does not make the conflict retryable. A client that wants to proceed after a `409` must rebase against the current state and retry with a *fresh* Idempotency-Key, not the one that produced the conflict. */
+                /** @description Client-chosen retry key for a mutating request. Mints a deterministic op id (a v5 derivation when the value is not itself a UUID) so a retried request with the same key dedups to the original committed response instead of re-applying. exists. A keyed retry against an op that committed a `409` (revision conflict) dedups to that same `409` — the key does not make the conflict retryable. A client that wants to proceed after a `409` must rebase against the current state and retry with a *fresh* Idempotency-Key, not the one that produced the conflict. */
                 "Idempotency-Key"?: components["parameters"]["IdempotencyKey"];
                 /** @description RFC-006 §5.3/§9.2 CSRF defense: a cookie-authenticated state-changing request (anything that would mutate state, sent with the `rift_session` cookie rather than an `Authorization` bearer) that omits this header is refused with `403`, checked before authorization runs. Send any non-empty value — `SameSite=Strict` already stops the cookie riding cross-site, so this header exists only to defeat the narrower case (a same-site-adjacent or misconfigured-CORS request) by requiring a custom header cross-origin HTML cannot attach without a preflight. Bearer-authenticated requests are exempt: a bearer cannot be attached to a request by a victim's browser in the first place, which is the entire attack this header defends against — so requiring it there would add friction without closing a real hole. */
                 "X-Rift-CSRF"?: components["parameters"]["CsrfHeader"];
@@ -2804,7 +2418,7 @@ export interface operations {
             202: components["responses"]["AcceptedParked"];
             401: components["responses"]["Unauthorized"];
             403: components["responses"]["Forbidden"];
-            /** @description No such imposter, no such stub id, or owned by another tenant. */
+            /** @description No such imposter on this port, or no such stub id. */
             404: {
                 headers: {
                     [name: string]: unknown;
@@ -2861,7 +2475,7 @@ export interface operations {
             400: components["responses"]["BadData"];
             401: components["responses"]["Unauthorized"];
             403: components["responses"]["Forbidden"];
-            /** @description No such imposter for this tenant, or owned by another tenant. */
+            /** @description No such imposter on this port. */
             404: {
                 headers: {
                     [name: string]: unknown;
@@ -2906,7 +2520,7 @@ export interface operations {
             400: components["responses"]["BadData"];
             401: components["responses"]["Unauthorized"];
             403: components["responses"]["Forbidden"];
-            /** @description No such imposter for this tenant, or owned by another tenant. */
+            /** @description No such imposter on this port. */
             404: {
                 headers: {
                     [name: string]: unknown;
@@ -2950,7 +2564,7 @@ export interface operations {
             400: components["responses"]["BadData"];
             401: components["responses"]["Unauthorized"];
             403: components["responses"]["Forbidden"];
-            /** @description No such imposter for this tenant, or owned by another tenant. */
+            /** @description No such imposter on this port. */
             404: {
                 headers: {
                     [name: string]: unknown;
@@ -3003,7 +2617,7 @@ export interface operations {
             400: components["responses"]["BadData"];
             401: components["responses"]["Unauthorized"];
             403: components["responses"]["Forbidden"];
-            /** @description No such imposter for this tenant, or owned by another tenant. */
+            /** @description No such imposter on this port. */
             404: {
                 headers: {
                     [name: string]: unknown;
@@ -3048,7 +2662,7 @@ export interface operations {
             400: components["responses"]["BadData"];
             401: components["responses"]["Unauthorized"];
             403: components["responses"]["Forbidden"];
-            /** @description No such imposter for this tenant, or owned by another tenant. */
+            /** @description No such imposter on this port. */
             404: {
                 headers: {
                     [name: string]: unknown;
@@ -3095,7 +2709,7 @@ export interface operations {
             };
             401: components["responses"]["Unauthorized"];
             403: components["responses"]["Forbidden"];
-            /** @description No such imposter for this tenant, or owned by another tenant. */
+            /** @description No such imposter on this port. */
             404: {
                 headers: {
                     [name: string]: unknown;
@@ -3129,7 +2743,7 @@ export interface operations {
             };
             401: components["responses"]["Unauthorized"];
             403: components["responses"]["Forbidden"];
-            /** @description No such imposter for this tenant, or owned by another tenant. */
+            /** @description No such imposter on this port. */
             404: {
                 headers: {
                     [name: string]: unknown;
@@ -3170,7 +2784,7 @@ export interface operations {
             };
             401: components["responses"]["Unauthorized"];
             403: components["responses"]["Forbidden"];
-            /** @description No such imposter for this tenant, or owned by another tenant. */
+            /** @description No such imposter on this port. */
             404: {
                 headers: {
                     [name: string]: unknown;
@@ -3220,7 +2834,7 @@ export interface operations {
             };
             401: components["responses"]["Unauthorized"];
             403: components["responses"]["Forbidden"];
-            /** @description No such imposter for this tenant, or owned by another tenant. */
+            /** @description No such imposter on this port. */
             404: {
                 headers: {
                     [name: string]: unknown;
@@ -3271,7 +2885,7 @@ export interface operations {
             };
             401: components["responses"]["Unauthorized"];
             403: components["responses"]["Forbidden"];
-            /** @description No such imposter for this tenant, or owned by another tenant. */
+            /** @description No such imposter on this port. */
             404: {
                 headers: {
                     [name: string]: unknown;
@@ -3320,19 +2934,16 @@ export interface operations {
                         partial: boolean;
                         /**
                          * @description Present only when the listing was refused outright rather than merely incomplete — `spaces` is then always `[]` and `partial` is always `true`. Absent on an ordinary read, whether or not that read is itself partial.
-                         *
-                         *     `fleet-scope` is a **policy refusal, not a transient failure**: the imposter is `flowState.contextScope: "fleet"`, whose `f:` key prefix carries no tenant component, so scanning it would either match nothing (wrong prefix) or return another tenant's fleet-scoped flows alongside this one's (right prefix, no way to filter by tenant). It is answered to every caller who does not hold `FleetAdmin` (#288) — a `FleetAdmin` binding, whose role is to cross every tenant's boundary, is served the real fleet-wide list instead. It will not resolve on a retry for the same principal; the caller's own single-space read (`GET /imposters/{port}/spaces/{flowId}`) is unaffected and still answers by id.
-                         *
-                         *     `scope-unresolved` means this imposter's own config could not be read or parsed, so its `contextScope` — and therefore which flow-id namespace to enumerate — is unknown. Guessing would risk scanning the wrong namespace and reporting it complete, so this refuses instead. Unlike `fleet-scope`, this may clear on a retry (a node still catching up, or the config being fixed).
+                         *     `scope-unresolved` means this imposter's own config could not be read or parsed, so its `contextScope` — and therefore which flow-id namespace to enumerate — is unknown. Guessing would risk scanning the wrong namespace and reporting it complete, so this refuses instead. It may clear on a retry (a node still catching up, or the config being fixed).
                          * @enum {string}
                          */
-                        unavailable?: "fleet-scope" | "scope-unresolved";
+                        unavailable?: "scope-unresolved";
                     };
                 };
             };
             401: components["responses"]["Unauthorized"];
             403: components["responses"]["Forbidden"];
-            /** @description No such imposter for this tenant, or owned by another tenant. */
+            /** @description No such imposter on this port. */
             404: {
                 headers: {
                     [name: string]: unknown;
@@ -3373,13 +2984,9 @@ export interface operations {
                         numberOfRequests: number;
                         /**
                          * @description The node id holding this flow's state (issue #359). A **string**, not an integer, for the same reason as `FleetMembers.node_id`: a raft id is a `u64`, and JavaScript reads a JSON number back as an IEEE-754 double, so every id above 2^53 - 1 would round silently and name a neighbouring node. Corrected in issue #374, which publishes the same field on the listing and would otherwise have given one field two types on adjacent routes.
-                         *
                          *     A space *is* a flow, and a flow is the only thing the ring assigns an owner to: imposters, stubs and config are replicated to every node, so any node serves them and none owns them. One port with several flows therefore has several owners, one per flow.
-                         *
                          *     A node that receives a request for a flow it does not own talks to the owner rather than answering from its own copy, so this names where that flow's state actually lives.
-                         *
                          *     Decided by the flow id under this imposter's `flowState.contextScope`, not by the id alone — under `fleet` scope two imposters' same-named spaces are one flow with one owner.
-                         *
                          *     **Absent, never guessed**, when no membership has been applied or the imposter's scope could not be read: the field is omitted rather than defaulted, because a wrong owner sends an operator to the wrong node.
                          */
                         owner?: string;
@@ -3388,7 +2995,7 @@ export interface operations {
             };
             401: components["responses"]["Unauthorized"];
             403: components["responses"]["Forbidden"];
-            /** @description No such imposter for this tenant, or owned by another tenant. */
+            /** @description No such imposter on this port. */
             404: {
                 headers: {
                     [name: string]: unknown;
@@ -3432,7 +3039,7 @@ export interface operations {
             };
             401: components["responses"]["Unauthorized"];
             403: components["responses"]["Forbidden"];
-            /** @description No such imposter for this tenant, or owned by another tenant. */
+            /** @description No such imposter on this port. */
             404: {
                 headers: {
                     [name: string]: unknown;
@@ -3468,7 +3075,7 @@ export interface operations {
             };
             401: components["responses"]["Unauthorized"];
             403: components["responses"]["Forbidden"];
-            /** @description No such imposter for this tenant, or owned by another tenant. */
+            /** @description No such imposter on this port. */
             404: {
                 headers: {
                     [name: string]: unknown;
@@ -3511,7 +3118,7 @@ export interface operations {
             400: components["responses"]["BadData"];
             401: components["responses"]["Unauthorized"];
             403: components["responses"]["Forbidden"];
-            /** @description No such imposter for this tenant, or owned by another tenant. */
+            /** @description No such imposter on this port. */
             404: {
                 headers: {
                     [name: string]: unknown;
@@ -3530,8 +3137,6 @@ export interface operations {
         parameters: {
             query?: never;
             header?: {
-                /** @description Selects which of the caller's existing tenant bindings this request acts under; it never grants a binding the caller does not already hold. Absent, requests act as the default tenant. Ignored on tenancy routes, where the path segment names the tenant being administered instead. */
-                "X-Rift-Tenant"?: components["parameters"]["TenantHeader"];
                 /** @description RFC-006 §5.3/§9.2 CSRF defense: a cookie-authenticated state-changing request (anything that would mutate state, sent with the `rift_session` cookie rather than an `Authorization` bearer) that omits this header is refused with `403`, checked before authorization runs. Send any non-empty value — `SameSite=Strict` already stops the cookie riding cross-site, so this header exists only to defeat the narrower case (a same-site-adjacent or misconfigured-CORS request) by requiring a custom header cross-origin HTML cannot attach without a preflight. Bearer-authenticated requests are exempt: a bearer cannot be attached to a request by a victim's browser in the first place, which is the entire attack this header defends against — so requiring it there would add friction without closing a real hole. */
                 "X-Rift-CSRF"?: components["parameters"]["CsrfHeader"];
             };
@@ -3559,7 +3164,7 @@ export interface operations {
             400: components["responses"]["BadData"];
             401: components["responses"]["Unauthorized"];
             403: components["responses"]["Forbidden"];
-            /** @description No such imposter for this tenant, or owned by another tenant — byte-identical either way (RFC-002 §8.4). */
+            /** @description No such imposter on this port. */
             404: {
                 headers: {
                     [name: string]: unknown;
@@ -3635,7 +3240,7 @@ export interface operations {
             };
             401: components["responses"]["Unauthorized"];
             403: components["responses"]["Forbidden"];
-            /** @description No such imposter for this tenant, or owned by another tenant. */
+            /** @description No such imposter on this port. */
             404: {
                 headers: {
                     [name: string]: unknown;
@@ -3718,7 +3323,7 @@ export interface operations {
             };
             401: components["responses"]["Unauthorized"];
             403: components["responses"]["Forbidden"];
-            /** @description No such imposter for this tenant, or owned by another tenant. */
+            /** @description No such imposter on this port. */
             404: {
                 headers: {
                     [name: string]: unknown;
@@ -3779,36 +3384,24 @@ export interface operations {
     getFrontDoorRoutes: {
         parameters: {
             query?: never;
-            header?: {
-                /** @description Selects which of the caller's existing tenant bindings this request acts under; it never grants a binding the caller does not already hold. Absent, requests act as the default tenant. Ignored on tenancy routes, where the path segment names the tenant being administered instead. */
-                "X-Rift-Tenant"?: components["parameters"]["TenantHeader"];
-            };
+            header?: never;
             path?: never;
             cookie?: never;
         };
         requestBody?: never;
         responses: {
-            /** @description The tenant's route table, and whether it is compiled into the shared front door — `false` for every non-default tenant, whose routes are stored and served back but never dispatch. */
+            /** @description The fleet's route table. */
             200: {
                 headers: {
                     "Rift-Cluster-Revision": components["headers"]["RiftClusterRevision"];
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["RouteTableView"];
+                    "application/json": components["schemas"]["RouteTable"];
                 };
             };
             401: components["responses"]["Unauthorized"];
             403: components["responses"]["Forbidden"];
-            /** @description Caller is not bound to the tenant named (`X-Rift-Tenant` or default) — indistinguishable from that tenant not existing (RFC-002 §8.4). */
-            404: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Error"];
-                };
-            };
             500: components["responses"]["InternalError"];
         };
     };
@@ -3816,13 +3409,11 @@ export interface operations {
         parameters: {
             query?: never;
             header?: {
-                /** @description Selects which of the caller's existing tenant bindings this request acts under; it never grants a binding the caller does not already hold. Absent, requests act as the default tenant. Ignored on tenancy routes, where the path segment names the tenant being administered instead. */
-                "X-Rift-Tenant"?: components["parameters"]["TenantHeader"];
-                /** @description Client-chosen retry key for a mutating request. Mints a deterministic op id (a v5 derivation when the value is not itself a UUID) so a retried request with the same key dedups to the original committed response instead of re-applying. Explicitly refused with 400 on principal creation — not silently ignored: the key and principal id are minted per request before any op id exists, so a replayed request would commit nothing yet still answer 201 with a freshly minted key that was never stored. A client that sent the header believes its retry is safe, so the request is rejected rather than left to go on believing it. A keyed retry against an op that committed a `409` (revision conflict) dedups to that same `409` — the key does not make the conflict retryable. A client that wants to proceed after a `409` must rebase against the current state and retry with a *fresh* Idempotency-Key, not the one that produced the conflict. */
+                /** @description Client-chosen retry key for a mutating request. Mints a deterministic op id (a v5 derivation when the value is not itself a UUID) so a retried request with the same key dedups to the original committed response instead of re-applying. exists. A keyed retry against an op that committed a `409` (revision conflict) dedups to that same `409` — the key does not make the conflict retryable. A client that wants to proceed after a `409` must rebase against the current state and retry with a *fresh* Idempotency-Key, not the one that produced the conflict. */
                 "Idempotency-Key"?: components["parameters"]["IdempotencyKey"];
                 /** @description RFC-006 §5.3/§9.2 CSRF defense: a cookie-authenticated state-changing request (anything that would mutate state, sent with the `rift_session` cookie rather than an `Authorization` bearer) that omits this header is refused with `403`, checked before authorization runs. Send any non-empty value — `SameSite=Strict` already stops the cookie riding cross-site, so this header exists only to defeat the narrower case (a same-site-adjacent or misconfigured-CORS request) by requiring a custom header cross-origin HTML cannot attach without a preflight. Bearer-authenticated requests are exempt: a bearer cannot be attached to a request by a victim's browser in the first place, which is the entire attack this header defends against — so requiring it there would add friction without closing a real hole. */
                 "X-Rift-CSRF"?: components["parameters"]["CsrfHeader"];
-                /** @description Optimistic-concurrency precondition for a front-door route-table write: the portless token default@<revision>, exactly as getFrontDoorRoutes answers it in its Rift-Cluster-Revision header, or a bare revision integer. Portless because the precondition is against the tenant's route table as a whole, not any one route — there is no port to name. A tenant whose table has never been written is at revision 0, so conditioning on 0 is how a first writer claims one. Both a whole-table PUT and a single-route DELETE advance the revision, so either invalidates an outstanding token. Absent, a PUT is a last-writer-wins whole-table replace and will silently discard a concurrent edit. A stale value answers 409; a value this front cannot evaluate — a wildcard, a weak validator, a comma list, the ported default:<port>@<revision> form — answers 400. */
+                /** @description Optimistic-concurrency precondition for a front-door route-table write: the portless token routes@<revision>, exactly as getFrontDoorRoutes answers it in its Rift-Cluster-Revision header, or a bare revision integer. Portless because the precondition is against the route table as a whole, not any one route — there is no port to name. A table that has never been written is at revision 0, so conditioning on 0 is how a first writer claims one. Both a whole-table PUT and a single-route DELETE advance the revision, so either invalidates an outstanding token. Absent, a PUT is a last-writer-wins whole-table replace and will silently discard a concurrent edit. A stale value answers 409; a value this front cannot evaluate — a wildcard, a weak validator, a comma list, the ported <port>@<revision> form — answers 400. */
                 "If-Match"?: components["parameters"]["IfMatchRouteTable"];
             };
             path?: never;
@@ -3834,7 +3425,7 @@ export interface operations {
             };
         };
         responses: {
-            /** @description The stored table, and whether it is compiled into the shared front door. */
+            /** @description The stored table. */
             200: {
                 headers: {
                     "Rift-Cluster-Revision": components["headers"]["RiftClusterRevision"];
@@ -3842,22 +3433,13 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["RouteTableView"];
+                    "application/json": components["schemas"]["RouteTable"];
                 };
             };
             202: components["responses"]["AcceptedParked"];
             400: components["responses"]["BadData"];
             401: components["responses"]["Unauthorized"];
             403: components["responses"]["Forbidden"];
-            /** @description Caller is not bound to the tenant named (`X-Rift-Tenant` or default) — indistinguishable from that tenant not existing (RFC-002 §8.4). */
-            404: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Error"];
-                };
-            };
             409: components["responses"]["RevisionConflict"];
             413: components["responses"]["PayloadTooLarge"];
             500: components["responses"]["InternalError"];
@@ -3871,11 +3453,9 @@ export interface operations {
             header?: {
                 /** @description RFC-006 §5.3/§9.2 CSRF defense: a cookie-authenticated state-changing request (anything that would mutate state, sent with the `rift_session` cookie rather than an `Authorization` bearer) that omits this header is refused with `403`, checked before authorization runs. Send any non-empty value — `SameSite=Strict` already stops the cookie riding cross-site, so this header exists only to defeat the narrower case (a same-site-adjacent or misconfigured-CORS request) by requiring a custom header cross-origin HTML cannot attach without a preflight. Bearer-authenticated requests are exempt: a bearer cannot be attached to a request by a victim's browser in the first place, which is the entire attack this header defends against — so requiring it there would add friction without closing a real hole. */
                 "X-Rift-CSRF"?: components["parameters"]["CsrfHeader"];
-                /** @description Selects which of the caller's existing tenant bindings this request acts under; it never grants a binding the caller does not already hold. Absent, requests act as the default tenant. Ignored on tenancy routes, where the path segment names the tenant being administered instead. */
-                "X-Rift-Tenant"?: components["parameters"]["TenantHeader"];
-                /** @description Client-chosen retry key for a mutating request. Mints a deterministic op id (a v5 derivation when the value is not itself a UUID) so a retried request with the same key dedups to the original committed response instead of re-applying. Explicitly refused with 400 on principal creation — not silently ignored: the key and principal id are minted per request before any op id exists, so a replayed request would commit nothing yet still answer 201 with a freshly minted key that was never stored. A client that sent the header believes its retry is safe, so the request is rejected rather than left to go on believing it. A keyed retry against an op that committed a `409` (revision conflict) dedups to that same `409` — the key does not make the conflict retryable. A client that wants to proceed after a `409` must rebase against the current state and retry with a *fresh* Idempotency-Key, not the one that produced the conflict. */
+                /** @description Client-chosen retry key for a mutating request. Mints a deterministic op id (a v5 derivation when the value is not itself a UUID) so a retried request with the same key dedups to the original committed response instead of re-applying. exists. A keyed retry against an op that committed a `409` (revision conflict) dedups to that same `409` — the key does not make the conflict retryable. A client that wants to proceed after a `409` must rebase against the current state and retry with a *fresh* Idempotency-Key, not the one that produced the conflict. */
                 "Idempotency-Key"?: components["parameters"]["IdempotencyKey"];
-                /** @description Optimistic-concurrency precondition for a front-door route-table write: the portless token default@<revision>, exactly as getFrontDoorRoutes answers it in its Rift-Cluster-Revision header, or a bare revision integer. Portless because the precondition is against the tenant's route table as a whole, not any one route — there is no port to name. A tenant whose table has never been written is at revision 0, so conditioning on 0 is how a first writer claims one. Both a whole-table PUT and a single-route DELETE advance the revision, so either invalidates an outstanding token. Absent, a PUT is a last-writer-wins whole-table replace and will silently discard a concurrent edit. A stale value answers 409; a value this front cannot evaluate — a wildcard, a weak validator, a comma list, the ported default:<port>@<revision> form — answers 400. */
+                /** @description Optimistic-concurrency precondition for a front-door route-table write: the portless token routes@<revision>, exactly as getFrontDoorRoutes answers it in its Rift-Cluster-Revision header, or a bare revision integer. Portless because the precondition is against the route table as a whole, not any one route — there is no port to name. A table that has never been written is at revision 0, so conditioning on 0 is how a first writer claims one. Both a whole-table PUT and a single-route DELETE advance the revision, so either invalidates an outstanding token. Absent, a PUT is a last-writer-wins whole-table replace and will silently discard a concurrent edit. A stale value answers 409; a value this front cannot evaluate — a wildcard, a weak validator, a comma list, the ported <port>@<revision> form — answers 400. */
                 "If-Match"?: components["parameters"]["IfMatchRouteTable"];
             };
             path: {
@@ -3899,7 +3479,7 @@ export interface operations {
             202: components["responses"]["AcceptedParked"];
             401: components["responses"]["Unauthorized"];
             403: components["responses"]["Forbidden"];
-            /** @description No route with that id in the caller's tenant's table. */
+            /** @description No route with that id in the table. */
             404: {
                 headers: {
                     [name: string]: unknown;
@@ -3909,485 +3489,6 @@ export interface operations {
                 };
             };
             409: components["responses"]["RevisionConflict"];
-            500: components["responses"]["InternalError"];
-            503: components["responses"]["Unavailable"];
-            504: components["responses"]["WriteTimeout"];
-        };
-    };
-    listTenants: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Every tenant. */
-            200: {
-                headers: {
-                    "Rift-Cluster-Partial": components["headers"]["RiftClusterPartial"];
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Tenant"][];
-                };
-            };
-            401: components["responses"]["Unauthorized"];
-            /** @description Caller holds no fleet-scoped binding (RFC-002 §8.4 — not a 403). */
-            404: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Error"];
-                };
-            };
-        };
-    };
-    createTenant: {
-        parameters: {
-            query?: never;
-            header?: {
-                /** @description Client-chosen retry key for a mutating request. Mints a deterministic op id (a v5 derivation when the value is not itself a UUID) so a retried request with the same key dedups to the original committed response instead of re-applying. Explicitly refused with 400 on principal creation — not silently ignored: the key and principal id are minted per request before any op id exists, so a replayed request would commit nothing yet still answer 201 with a freshly minted key that was never stored. A client that sent the header believes its retry is safe, so the request is rejected rather than left to go on believing it. A keyed retry against an op that committed a `409` (revision conflict) dedups to that same `409` — the key does not make the conflict retryable. A client that wants to proceed after a `409` must rebase against the current state and retry with a *fresh* Idempotency-Key, not the one that produced the conflict. */
-                "Idempotency-Key"?: components["parameters"]["IdempotencyKey"];
-                /** @description RFC-006 §5.3/§9.2 CSRF defense: a cookie-authenticated state-changing request (anything that would mutate state, sent with the `rift_session` cookie rather than an `Authorization` bearer) that omits this header is refused with `403`, checked before authorization runs. Send any non-empty value — `SameSite=Strict` already stops the cookie riding cross-site, so this header exists only to defeat the narrower case (a same-site-adjacent or misconfigured-CORS request) by requiring a custom header cross-origin HTML cannot attach without a preflight. Bearer-authenticated requests are exempt: a bearer cannot be attached to a request by a victim's browser in the first place, which is the entire attack this header defends against — so requiring it there would add friction without closing a real hole. */
-                "X-Rift-CSRF"?: components["parameters"]["CsrfHeader"];
-            };
-            path?: never;
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["TenantWrite"];
-            };
-        };
-        responses: {
-            /** @description Tenant created; body is empty (`terminate_tenancy` renders no body and omits `content-type` here — only principal creation returns a body). */
-            201: {
-                headers: {
-                    "Rift-Cluster-Revision": components["headers"]["RiftClusterRevision"];
-                    "Rift-Cluster-Op-Id": components["headers"]["RiftClusterOpId"];
-                    [name: string]: unknown;
-                };
-                content?: never;
-            };
-            400: components["responses"]["BadData"];
-            401: components["responses"]["Unauthorized"];
-            /** @description Cookie-authenticated request missing the required `X-Rift-CSRF` header (see `CsrfHeader`) — the only `403` this fleet-scoped route answers; role-insufficient access is the `404` above, not this. */
-            403: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Error"];
-                };
-            };
-            /** @description Caller is not bound to the fleet scope — indistinguishable from a route that does not exist for this caller (RFC-002 §8.4). */
-            404: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Error"];
-                };
-            };
-            413: components["responses"]["PayloadTooLarge"];
-            500: components["responses"]["InternalError"];
-            503: components["responses"]["Unavailable"];
-            504: components["responses"]["WriteTimeout"];
-        };
-    };
-    getTenant: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                /** @description The tenant record's id. */
-                tenantId: components["parameters"]["TenantId"];
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description The tenant. */
-            200: {
-                headers: {
-                    "Rift-Cluster-Partial": components["headers"]["RiftClusterPartial"];
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Tenant"];
-                };
-            };
-            401: components["responses"]["Unauthorized"];
-            403: components["responses"]["Forbidden"];
-            /** @description Caller is not bound to the named tenant — indistinguishable from the tenant not existing at all (RFC-002 §8.4). A `403` means the caller IS bound but its role is insufficient. */
-            404: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Error"];
-                };
-            };
-        };
-    };
-    putTenant: {
-        parameters: {
-            query?: never;
-            header?: {
-                /** @description Client-chosen retry key for a mutating request. Mints a deterministic op id (a v5 derivation when the value is not itself a UUID) so a retried request with the same key dedups to the original committed response instead of re-applying. Explicitly refused with 400 on principal creation — not silently ignored: the key and principal id are minted per request before any op id exists, so a replayed request would commit nothing yet still answer 201 with a freshly minted key that was never stored. A client that sent the header believes its retry is safe, so the request is rejected rather than left to go on believing it. A keyed retry against an op that committed a `409` (revision conflict) dedups to that same `409` — the key does not make the conflict retryable. A client that wants to proceed after a `409` must rebase against the current state and retry with a *fresh* Idempotency-Key, not the one that produced the conflict. */
-                "Idempotency-Key"?: components["parameters"]["IdempotencyKey"];
-                /** @description RFC-006 §5.3/§9.2 CSRF defense: a cookie-authenticated state-changing request (anything that would mutate state, sent with the `rift_session` cookie rather than an `Authorization` bearer) that omits this header is refused with `403`, checked before authorization runs. Send any non-empty value — `SameSite=Strict` already stops the cookie riding cross-site, so this header exists only to defeat the narrower case (a same-site-adjacent or misconfigured-CORS request) by requiring a custom header cross-origin HTML cannot attach without a preflight. Bearer-authenticated requests are exempt: a bearer cannot be attached to a request by a victim's browser in the first place, which is the entire attack this header defends against — so requiring it there would add friction without closing a real hole. */
-                "X-Rift-CSRF"?: components["parameters"]["CsrfHeader"];
-            };
-            path: {
-                /** @description The tenant record's id. */
-                tenantId: components["parameters"]["TenantId"];
-            };
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["TenantWrite"];
-            };
-        };
-        responses: {
-            /** @description Tenant updated; body is empty (`terminate_tenancy` renders no body — only principal creation returns one). */
-            200: {
-                headers: {
-                    "Rift-Cluster-Revision": components["headers"]["RiftClusterRevision"];
-                    "Rift-Cluster-Op-Id": components["headers"]["RiftClusterOpId"];
-                    [name: string]: unknown;
-                };
-                content?: never;
-            };
-            400: components["responses"]["BadData"];
-            401: components["responses"]["Unauthorized"];
-            403: components["responses"]["Forbidden"];
-            /** @description Caller is not bound to the named tenant — indistinguishable from the tenant not existing at all (RFC-002 §8.4). A `403` means the caller IS bound but its role is insufficient. */
-            404: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Error"];
-                };
-            };
-            413: components["responses"]["PayloadTooLarge"];
-            500: components["responses"]["InternalError"];
-            503: components["responses"]["Unavailable"];
-            504: components["responses"]["WriteTimeout"];
-        };
-    };
-    deleteTenant: {
-        parameters: {
-            query?: never;
-            header?: {
-                /** @description Client-chosen retry key for a mutating request. Mints a deterministic op id (a v5 derivation when the value is not itself a UUID) so a retried request with the same key dedups to the original committed response instead of re-applying. Explicitly refused with 400 on principal creation — not silently ignored: the key and principal id are minted per request before any op id exists, so a replayed request would commit nothing yet still answer 201 with a freshly minted key that was never stored. A client that sent the header believes its retry is safe, so the request is rejected rather than left to go on believing it. A keyed retry against an op that committed a `409` (revision conflict) dedups to that same `409` — the key does not make the conflict retryable. A client that wants to proceed after a `409` must rebase against the current state and retry with a *fresh* Idempotency-Key, not the one that produced the conflict. */
-                "Idempotency-Key"?: components["parameters"]["IdempotencyKey"];
-                /** @description RFC-006 §5.3/§9.2 CSRF defense: a cookie-authenticated state-changing request (anything that would mutate state, sent with the `rift_session` cookie rather than an `Authorization` bearer) that omits this header is refused with `403`, checked before authorization runs. Send any non-empty value — `SameSite=Strict` already stops the cookie riding cross-site, so this header exists only to defeat the narrower case (a same-site-adjacent or misconfigured-CORS request) by requiring a custom header cross-origin HTML cannot attach without a preflight. Bearer-authenticated requests are exempt: a bearer cannot be attached to a request by a victim's browser in the first place, which is the entire attack this header defends against — so requiring it there would add friction without closing a real hole. */
-                "X-Rift-CSRF"?: components["parameters"]["CsrfHeader"];
-            };
-            path: {
-                /** @description The tenant record's id. */
-                tenantId: components["parameters"]["TenantId"];
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Deleted; no body. */
-            204: {
-                headers: {
-                    "Rift-Cluster-Revision": components["headers"]["RiftClusterRevision"];
-                    "Rift-Cluster-Op-Id": components["headers"]["RiftClusterOpId"];
-                    [name: string]: unknown;
-                };
-                content?: never;
-            };
-            401: components["responses"]["Unauthorized"];
-            403: components["responses"]["Forbidden"];
-            /** @description Caller is not bound to the named tenant — indistinguishable from the tenant not existing at all (RFC-002 §8.4). A `403` means the caller IS bound but its role is insufficient. */
-            404: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Error"];
-                };
-            };
-            500: components["responses"]["InternalError"];
-            503: components["responses"]["Unavailable"];
-            504: components["responses"]["WriteTimeout"];
-        };
-    };
-    listPrincipals: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                /** @description The tenant record's id. */
-                tenantId: components["parameters"]["TenantId"];
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Principals bound to the tenant, with their role. */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Principal"][];
-                };
-            };
-            401: components["responses"]["Unauthorized"];
-            403: components["responses"]["Forbidden"];
-            /** @description Caller is not bound to the named tenant — indistinguishable from the tenant not existing at all (RFC-002 §8.4). */
-            404: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Error"];
-                };
-            };
-        };
-    };
-    createPrincipal: {
-        parameters: {
-            query?: never;
-            header?: {
-                /** @description RFC-006 §5.3/§9.2 CSRF defense: a cookie-authenticated state-changing request (anything that would mutate state, sent with the `rift_session` cookie rather than an `Authorization` bearer) that omits this header is refused with `403`, checked before authorization runs. Send any non-empty value — `SameSite=Strict` already stops the cookie riding cross-site, so this header exists only to defeat the narrower case (a same-site-adjacent or misconfigured-CORS request) by requiring a custom header cross-origin HTML cannot attach without a preflight. Bearer-authenticated requests are exempt: a bearer cannot be attached to a request by a victim's browser in the first place, which is the entire attack this header defends against — so requiring it there would add friction without closing a real hole. */
-                "X-Rift-CSRF"?: components["parameters"]["CsrfHeader"];
-            };
-            path: {
-                /** @description The tenant record's id. */
-                tenantId: components["parameters"]["TenantId"];
-            };
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["PrincipalCreate"];
-            };
-        };
-        responses: {
-            /** @description The minted principal, including its raw API key (shown once). */
-            201: {
-                headers: {
-                    "Rift-Cluster-Revision": components["headers"]["RiftClusterRevision"];
-                    "Rift-Cluster-Op-Id": components["headers"]["RiftClusterOpId"];
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["IssuedPrincipal"];
-                };
-            };
-            400: components["responses"]["BadData"];
-            401: components["responses"]["Unauthorized"];
-            403: components["responses"]["Forbidden"];
-            /** @description Caller is not bound to the named tenant — indistinguishable from the tenant not existing at all (RFC-002 §8.4). */
-            404: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Error"];
-                };
-            };
-            413: components["responses"]["PayloadTooLarge"];
-            500: components["responses"]["InternalError"];
-            503: components["responses"]["Unavailable"];
-            504: components["responses"]["WriteTimeout"];
-        };
-    };
-    putPrincipal: {
-        parameters: {
-            query?: never;
-            header?: {
-                /** @description Client-chosen retry key for a mutating request. Mints a deterministic op id (a v5 derivation when the value is not itself a UUID) so a retried request with the same key dedups to the original committed response instead of re-applying. Explicitly refused with 400 on principal creation — not silently ignored: the key and principal id are minted per request before any op id exists, so a replayed request would commit nothing yet still answer 201 with a freshly minted key that was never stored. A client that sent the header believes its retry is safe, so the request is rejected rather than left to go on believing it. A keyed retry against an op that committed a `409` (revision conflict) dedups to that same `409` — the key does not make the conflict retryable. A client that wants to proceed after a `409` must rebase against the current state and retry with a *fresh* Idempotency-Key, not the one that produced the conflict. */
-                "Idempotency-Key"?: components["parameters"]["IdempotencyKey"];
-                /** @description RFC-006 §5.3/§9.2 CSRF defense: a cookie-authenticated state-changing request (anything that would mutate state, sent with the `rift_session` cookie rather than an `Authorization` bearer) that omits this header is refused with `403`, checked before authorization runs. Send any non-empty value — `SameSite=Strict` already stops the cookie riding cross-site, so this header exists only to defeat the narrower case (a same-site-adjacent or misconfigured-CORS request) by requiring a custom header cross-origin HTML cannot attach without a preflight. Bearer-authenticated requests are exempt: a bearer cannot be attached to a request by a victim's browser in the first place, which is the entire attack this header defends against — so requiring it there would add friction without closing a real hole. */
-                "X-Rift-CSRF"?: components["parameters"]["CsrfHeader"];
-            };
-            path: {
-                /** @description The tenant record's id. */
-                tenantId: components["parameters"]["TenantId"];
-                /** @description A principal's id (derived from its credential, e.g. key:<sha256-prefix>). */
-                principalId: components["parameters"]["PrincipalId"];
-            };
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["PrincipalUpdate"];
-            };
-        };
-        responses: {
-            /** @description Principal updated; body is empty (`terminate_tenancy` renders no body — only principal creation returns one). */
-            200: {
-                headers: {
-                    "Rift-Cluster-Revision": components["headers"]["RiftClusterRevision"];
-                    "Rift-Cluster-Op-Id": components["headers"]["RiftClusterOpId"];
-                    [name: string]: unknown;
-                };
-                content?: never;
-            };
-            400: components["responses"]["BadData"];
-            401: components["responses"]["Unauthorized"];
-            403: components["responses"]["Forbidden"];
-            /** @description No such principal, or caller lacks fleet-scoped access (RFC-002 §8.4). */
-            404: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Error"];
-                };
-            };
-            413: components["responses"]["PayloadTooLarge"];
-            500: components["responses"]["InternalError"];
-            503: components["responses"]["Unavailable"];
-            504: components["responses"]["WriteTimeout"];
-        };
-    };
-    deletePrincipal: {
-        parameters: {
-            query?: never;
-            header?: {
-                /** @description Client-chosen retry key for a mutating request. Mints a deterministic op id (a v5 derivation when the value is not itself a UUID) so a retried request with the same key dedups to the original committed response instead of re-applying. Explicitly refused with 400 on principal creation — not silently ignored: the key and principal id are minted per request before any op id exists, so a replayed request would commit nothing yet still answer 201 with a freshly minted key that was never stored. A client that sent the header believes its retry is safe, so the request is rejected rather than left to go on believing it. A keyed retry against an op that committed a `409` (revision conflict) dedups to that same `409` — the key does not make the conflict retryable. A client that wants to proceed after a `409` must rebase against the current state and retry with a *fresh* Idempotency-Key, not the one that produced the conflict. */
-                "Idempotency-Key"?: components["parameters"]["IdempotencyKey"];
-                /** @description RFC-006 §5.3/§9.2 CSRF defense: a cookie-authenticated state-changing request (anything that would mutate state, sent with the `rift_session` cookie rather than an `Authorization` bearer) that omits this header is refused with `403`, checked before authorization runs. Send any non-empty value — `SameSite=Strict` already stops the cookie riding cross-site, so this header exists only to defeat the narrower case (a same-site-adjacent or misconfigured-CORS request) by requiring a custom header cross-origin HTML cannot attach without a preflight. Bearer-authenticated requests are exempt: a bearer cannot be attached to a request by a victim's browser in the first place, which is the entire attack this header defends against — so requiring it there would add friction without closing a real hole. */
-                "X-Rift-CSRF"?: components["parameters"]["CsrfHeader"];
-            };
-            path: {
-                /** @description The tenant record's id. */
-                tenantId: components["parameters"]["TenantId"];
-                /** @description A principal's id (derived from its credential, e.g. key:<sha256-prefix>). */
-                principalId: components["parameters"]["PrincipalId"];
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Deleted; no body. */
-            204: {
-                headers: {
-                    "Rift-Cluster-Revision": components["headers"]["RiftClusterRevision"];
-                    "Rift-Cluster-Op-Id": components["headers"]["RiftClusterOpId"];
-                    [name: string]: unknown;
-                };
-                content?: never;
-            };
-            401: components["responses"]["Unauthorized"];
-            403: components["responses"]["Forbidden"];
-            /** @description No such principal, or caller lacks fleet-scoped access (RFC-002 §8.4). */
-            404: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Error"];
-                };
-            };
-            500: components["responses"]["InternalError"];
-            503: components["responses"]["Unavailable"];
-            504: components["responses"]["WriteTimeout"];
-        };
-    };
-    putBinding: {
-        parameters: {
-            query?: never;
-            header?: {
-                /** @description Client-chosen retry key for a mutating request. Mints a deterministic op id (a v5 derivation when the value is not itself a UUID) so a retried request with the same key dedups to the original committed response instead of re-applying. Explicitly refused with 400 on principal creation — not silently ignored: the key and principal id are minted per request before any op id exists, so a replayed request would commit nothing yet still answer 201 with a freshly minted key that was never stored. A client that sent the header believes its retry is safe, so the request is rejected rather than left to go on believing it. A keyed retry against an op that committed a `409` (revision conflict) dedups to that same `409` — the key does not make the conflict retryable. A client that wants to proceed after a `409` must rebase against the current state and retry with a *fresh* Idempotency-Key, not the one that produced the conflict. */
-                "Idempotency-Key"?: components["parameters"]["IdempotencyKey"];
-                /** @description RFC-006 §5.3/§9.2 CSRF defense: a cookie-authenticated state-changing request (anything that would mutate state, sent with the `rift_session` cookie rather than an `Authorization` bearer) that omits this header is refused with `403`, checked before authorization runs. Send any non-empty value — `SameSite=Strict` already stops the cookie riding cross-site, so this header exists only to defeat the narrower case (a same-site-adjacent or misconfigured-CORS request) by requiring a custom header cross-origin HTML cannot attach without a preflight. Bearer-authenticated requests are exempt: a bearer cannot be attached to a request by a victim's browser in the first place, which is the entire attack this header defends against — so requiring it there would add friction without closing a real hole. */
-                "X-Rift-CSRF"?: components["parameters"]["CsrfHeader"];
-            };
-            path: {
-                /** @description The tenant record's id. */
-                tenantId: components["parameters"]["TenantId"];
-                /** @description A principal's id (derived from its credential, e.g. key:<sha256-prefix>). */
-                principalId: components["parameters"]["PrincipalId"];
-            };
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["Binding"];
-            };
-        };
-        responses: {
-            /** @description Binding stored; body is empty (`terminate_tenancy` renders no body — only principal creation returns one). */
-            200: {
-                headers: {
-                    "Rift-Cluster-Revision": components["headers"]["RiftClusterRevision"];
-                    "Rift-Cluster-Op-Id": components["headers"]["RiftClusterOpId"];
-                    [name: string]: unknown;
-                };
-                content?: never;
-            };
-            400: components["responses"]["BadData"];
-            401: components["responses"]["Unauthorized"];
-            403: components["responses"]["Forbidden"];
-            /** @description No such tenant/principal, or caller lacks the required binding (RFC-002 §8.4). */
-            404: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Error"];
-                };
-            };
-            413: components["responses"]["PayloadTooLarge"];
-            500: components["responses"]["InternalError"];
-            503: components["responses"]["Unavailable"];
-            504: components["responses"]["WriteTimeout"];
-        };
-    };
-    deleteBinding: {
-        parameters: {
-            query?: never;
-            header?: {
-                /** @description Client-chosen retry key for a mutating request. Mints a deterministic op id (a v5 derivation when the value is not itself a UUID) so a retried request with the same key dedups to the original committed response instead of re-applying. Explicitly refused with 400 on principal creation — not silently ignored: the key and principal id are minted per request before any op id exists, so a replayed request would commit nothing yet still answer 201 with a freshly minted key that was never stored. A client that sent the header believes its retry is safe, so the request is rejected rather than left to go on believing it. A keyed retry against an op that committed a `409` (revision conflict) dedups to that same `409` — the key does not make the conflict retryable. A client that wants to proceed after a `409` must rebase against the current state and retry with a *fresh* Idempotency-Key, not the one that produced the conflict. */
-                "Idempotency-Key"?: components["parameters"]["IdempotencyKey"];
-                /** @description RFC-006 §5.3/§9.2 CSRF defense: a cookie-authenticated state-changing request (anything that would mutate state, sent with the `rift_session` cookie rather than an `Authorization` bearer) that omits this header is refused with `403`, checked before authorization runs. Send any non-empty value — `SameSite=Strict` already stops the cookie riding cross-site, so this header exists only to defeat the narrower case (a same-site-adjacent or misconfigured-CORS request) by requiring a custom header cross-origin HTML cannot attach without a preflight. Bearer-authenticated requests are exempt: a bearer cannot be attached to a request by a victim's browser in the first place, which is the entire attack this header defends against — so requiring it there would add friction without closing a real hole. */
-                "X-Rift-CSRF"?: components["parameters"]["CsrfHeader"];
-            };
-            path: {
-                /** @description The tenant record's id. */
-                tenantId: components["parameters"]["TenantId"];
-                /** @description A principal's id (derived from its credential, e.g. key:<sha256-prefix>). */
-                principalId: components["parameters"]["PrincipalId"];
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Removed; no body. */
-            204: {
-                headers: {
-                    "Rift-Cluster-Revision": components["headers"]["RiftClusterRevision"];
-                    "Rift-Cluster-Op-Id": components["headers"]["RiftClusterOpId"];
-                    [name: string]: unknown;
-                };
-                content?: never;
-            };
-            401: components["responses"]["Unauthorized"];
-            403: components["responses"]["Forbidden"];
-            /** @description No such tenant/principal, or caller lacks the required binding (RFC-002 §8.4). */
-            404: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Error"];
-                };
-            };
             500: components["responses"]["InternalError"];
             503: components["responses"]["Unavailable"];
             504: components["responses"]["WriteTimeout"];
@@ -4457,8 +3558,6 @@ export interface operations {
                 name?: string;
             };
             header?: {
-                /** @description Selects which of the caller's existing tenant bindings this request acts under; it never grants a binding the caller does not already hold. Absent, requests act as the default tenant. Ignored on tenancy routes, where the path segment names the tenant being administered instead. */
-                "X-Rift-Tenant"?: components["parameters"]["TenantHeader"];
                 /** @description RFC-006 §5.3/§9.2 CSRF defense: a cookie-authenticated state-changing request (anything that would mutate state, sent with the `rift_session` cookie rather than an `Authorization` bearer) that omits this header is refused with `403`, checked before authorization runs. Send any non-empty value — `SameSite=Strict` already stops the cookie riding cross-site, so this header exists only to defeat the narrower case (a same-site-adjacent or misconfigured-CORS request) by requiring a custom header cross-origin HTML cannot attach without a preflight. Bearer-authenticated requests are exempt: a bearer cannot be attached to a request by a victim's browser in the first place, which is the entire attack this header defends against — so requiring it there would add friction without closing a real hole. */
                 "X-Rift-CSRF"?: components["parameters"]["CsrfHeader"];
             };
@@ -4487,28 +3586,6 @@ export interface operations {
             403: components["responses"]["Forbidden"];
             413: components["responses"]["PayloadTooLarge"];
             500: components["responses"]["InternalError"];
-            503: components["responses"]["Unavailable"];
-        };
-    };
-    getWhoAmI: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description The caller's identity. */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["WhoAmI"];
-                };
-            };
-            401: components["responses"]["Unauthorized"];
             503: components["responses"]["Unavailable"];
         };
     };
@@ -4541,7 +3618,7 @@ export interface operations {
         parameters: {
             query?: never;
             header?: {
-                /** @description Client-chosen retry key for a mutating request. Mints a deterministic op id (a v5 derivation when the value is not itself a UUID) so a retried request with the same key dedups to the original committed response instead of re-applying. Explicitly refused with 400 on principal creation — not silently ignored: the key and principal id are minted per request before any op id exists, so a replayed request would commit nothing yet still answer 201 with a freshly minted key that was never stored. A client that sent the header believes its retry is safe, so the request is rejected rather than left to go on believing it. A keyed retry against an op that committed a `409` (revision conflict) dedups to that same `409` — the key does not make the conflict retryable. A client that wants to proceed after a `409` must rebase against the current state and retry with a *fresh* Idempotency-Key, not the one that produced the conflict. */
+                /** @description Client-chosen retry key for a mutating request. Mints a deterministic op id (a v5 derivation when the value is not itself a UUID) so a retried request with the same key dedups to the original committed response instead of re-applying. exists. A keyed retry against an op that committed a `409` (revision conflict) dedups to that same `409` — the key does not make the conflict retryable. A client that wants to proceed after a `409` must rebase against the current state and retry with a *fresh* Idempotency-Key, not the one that produced the conflict. */
                 "Idempotency-Key"?: components["parameters"]["IdempotencyKey"];
             };
             path?: never;
@@ -4553,7 +3630,7 @@ export interface operations {
             };
         };
         responses: {
-            /** @description Name stored; body is empty (`terminate_tenancy` renders no body — only principal creation returns one). */
+            /** @description Name stored; body is empty. */
             200: {
                 headers: {
                     "Rift-Cluster-Revision": components["headers"]["RiftClusterRevision"];
@@ -4564,15 +3641,6 @@ export interface operations {
             };
             400: components["responses"]["BadData"];
             401: components["responses"]["Unauthorized"];
-            /** @description Caller lacks fleet-scoped access (RFC-002 §8.4 — not a 403). */
-            404: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Error"];
-                };
-            };
             413: components["responses"]["PayloadTooLarge"];
             500: components["responses"]["InternalError"];
             503: components["responses"]["Unavailable"];
@@ -4598,15 +3666,6 @@ export interface operations {
                 };
             };
             401: components["responses"]["Unauthorized"];
-            /** @description Caller lacks fleet-scoped (`ClusterAdmin`) access — indistinguishable from a route that does not exist for this caller (RFC-002 §8.4), the same posture `listTenants` already uses for fleet-scoped denial. */
-            404: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Error"];
-                };
-            };
             503: components["responses"]["Unavailable"];
         };
     };
@@ -4629,15 +3688,6 @@ export interface operations {
                 };
             };
             401: components["responses"]["Unauthorized"];
-            /** @description Caller lacks fleet-scoped (`ClusterAdmin`) access — indistinguishable from a route that does not exist for this caller (RFC-002 §8.4). */
-            404: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Error"];
-                };
-            };
             503: components["responses"]["Unavailable"];
         };
     };
@@ -4663,7 +3713,7 @@ export interface operations {
                 };
             };
             401: components["responses"]["Unauthorized"];
-            /** @description Either of two indistinguishable cases: the op id names no op (unknown, or its dedup window lapsed — same as `/_cluster/ops/:id`) — a malformed id names no op the same way, so it 404s too, never `400` — or the caller lacks fleet-scoped (`ClusterAdmin`) access (RFC-002 §8.4). */
+            /** @description The op id names no op: unknown, or its dedup window lapsed (same as `/_cluster/ops/:id`). A malformed id names no op the same way, so it 404s too, never `400`. */
             404: {
                 headers: {
                     [name: string]: unknown;
@@ -4758,15 +3808,6 @@ export interface operations {
             };
             401: components["responses"]["Unauthorized"];
             403: components["responses"]["Forbidden"];
-            /** @description Caller holds no fleet-scoped binding — indistinguishable from the route not existing for them (RFC-002 §8.4). */
-            404: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Error"];
-                };
-            };
         };
     };
     getHealth: {
@@ -4795,15 +3836,6 @@ export interface operations {
             };
             401: components["responses"]["Unauthorized"];
             403: components["responses"]["Forbidden"];
-            /** @description Caller holds no fleet-scoped binding — indistinguishable from the route not existing for them (RFC-002 §8.4). */
-            404: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Error"];
-                };
-            };
         };
     };
     getConfig: {
@@ -4826,15 +3858,6 @@ export interface operations {
             };
             401: components["responses"]["Unauthorized"];
             403: components["responses"]["Forbidden"];
-            /** @description Caller holds no fleet-scoped binding — indistinguishable from the route not existing for them (RFC-002 §8.4). */
-            404: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Error"];
-                };
-            };
         };
     };
     getLogs: {
@@ -4869,15 +3892,6 @@ export interface operations {
             };
             401: components["responses"]["Unauthorized"];
             403: components["responses"]["Forbidden"];
-            /** @description Caller holds no fleet-scoped binding — indistinguishable from the route not existing for them (RFC-002 §8.4). */
-            404: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Error"];
-                };
-            };
         };
     };
     getMetrics: {
@@ -4900,15 +3914,6 @@ export interface operations {
             };
             401: components["responses"]["Unauthorized"];
             403: components["responses"]["Forbidden"];
-            /** @description Caller holds no fleet-scoped binding — indistinguishable from the route not existing for them (RFC-002 §8.4). */
-            404: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Error"];
-                };
-            };
         };
     };
     reloadConfig: {
@@ -4931,15 +3936,6 @@ export interface operations {
             };
             401: components["responses"]["Unauthorized"];
             403: components["responses"]["Forbidden"];
-            /** @description Caller holds no fleet-scoped binding — indistinguishable from the route not existing for them (RFC-002 §8.4). */
-            404: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Error"];
-                };
-            };
         };
     };
 }

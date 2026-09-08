@@ -141,7 +141,7 @@ export function Tile({
 /**
  * Nothing to show — and *why* there is nothing, which is the half that matters.
  *
- * "No imposters" and "cannot confirm this tenant is empty" are different facts, and the screens
+ * "No imposters" and "cannot confirm the fleet is empty" are different facts, and the screens
  * that can tell them apart pass different `body` text here rather than sharing one message.
  */
 export function Empty({
@@ -178,7 +178,7 @@ export function Ident({ children }: { children: ReactNode }): ReactNode {
  * An error an operator can act on.
  *
  * `ApiError` carries the status, and the status is the diagnosis: 401 means the session lapsed,
- * 403 means the role refused it, 404 on a fleet-scoped route means the principal lacks the scope
+ * 403 means the front refused it, 404 means the resource is not there
  * (RFC-002 §8.4 renders that as "no such route", which must not become "no such cluster" on screen).
  */
 export function ErrorNote({ error, context }: { error: unknown; context?: string }): ReactNode {
@@ -194,10 +194,9 @@ export function ErrorNote({ error, context }: { error: unknown; context?: string
  * A write the fleet accepted but this session could not watch land.
  *
  * Deliberately `role="status"` and not `role="alert"`: nothing is wrong. The write was durably
- * parked and is committing; following it to completion needs fleet-admin scope, and `403`/`404` from
- * the op-status projection is what most principals get whatever the write did. Saying "saved" here
- * would be the bug this note exists to replace, and saying "failed" would be the same overclaim
- * pointing the other way.
+ * parked and is committing; a node that cannot resolve the op id answers `403`/`404` whatever the
+ * write did. Saying "saved" here would be the bug this note exists to replace, and saying "failed"
+ * would be the same overclaim pointing the other way.
  */
 export function UnconfirmedNote({ reason }: { reason: string }): ReactNode {
   return (
@@ -303,7 +302,7 @@ export function describe(error: unknown): string {
       case 401:
         return "401 — the session is not valid. Sign in again.";
       case 403:
-        return "403 — this principal's role does not permit that.";
+        return "403 — the admin front refused that request.";
       case 503:
         return "503 — this node is not ready to answer.";
       default:

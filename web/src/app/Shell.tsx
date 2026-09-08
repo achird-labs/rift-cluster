@@ -1,6 +1,5 @@
 import type { ReactNode } from "react";
 
-import { Admin } from "../screens/Admin.tsx";
 import { Fleet } from "../screens/Fleet.tsx";
 import { ImposterDetail } from "../screens/ImposterDetail.tsx";
 import { Imposters } from "../screens/Imposters.tsx";
@@ -11,7 +10,6 @@ import { GROUP_LABEL, ISSUE_URL, NAV, NAV_GROUPS, type NavGroup, groupOf } from 
 import { ToastHost } from "../components/toast.tsx";
 import { SignOut } from "./SignOut.tsx";
 import { useFleetView } from "./queries.ts";
-import { useSession } from "./session.tsx";
 import { type Route, toHash, useRoute } from "./routing.ts";
 
 export function Shell(): ReactNode {
@@ -28,8 +26,6 @@ export function Shell(): ReactNode {
         <Nav current={route} />
         <div className="who">
           <FleetName />
-          <TenantSwitcher />
-          <Identity />
           <SignOut />
         </div>
       </header>
@@ -55,8 +51,6 @@ function Screen({ route }: { route: Route }): ReactNode {
       return <RouteTableScreen />;
     case "scenarios":
       return <Scenarios port={route.port} flow={route.flow} />;
-    case "admin":
-      return <Admin tab={route.tab} tenant={route.tenant} />;
   }
 }
 
@@ -67,23 +61,18 @@ function Screen({ route }: { route: Route }): ReactNode {
  *
  * Horizontal since the warm-paper redesign, which changes what a group can be: there is no line to
  * spend on a heading, so a group is a run of entries between two hairlines and carries its name to
- * assistive tech through `role="group"` instead. The order, the RBAC filtering and the roadmap
- * entries are all unchanged — only the axis is.
+ * assistive tech through `role="group"` instead.
+ *
+ * Every entry is drawn. Since #550 there is one credential and one identity, so there is no role
+ * for which a screen could be unreachable and nothing left to filter on.
  */
 function Nav({ current }: { current: Route }): ReactNode {
-  const { can } = useSession();
-
-  // Hiding a screen the principal's role cannot read is UX only — the API refuses the same
-  // principal either way (RFC-006 §3 rule 3) — but offering one that can only ever render an
-  // authorization error is worse than not offering it.
-  const visible = NAV.filter((entry) => entry.kind === "planned" || can(entry.requires));
-
   return (
     <nav className="nav" aria-label="Console sections">
       {NAV_GROUPS.map((group: NavGroup) => {
-        const entries = visible.filter((entry) => groupOf(entry) === group);
-        // A group whose every entry the role cannot read draws nothing — not even its separator.
-        // An empty labelled run would advertise a category the principal can never open.
+        const entries = NAV.filter((entry) => groupOf(entry) === group);
+        // An empty group draws nothing — not even its separator. Today that is only the roadmap
+        // run, which is empty whenever every promised screen has shipped.
         if (entries.length === 0) return null;
         return (
           <div className="nav-group" key={group} role="group" aria-label={GROUP_LABEL[group]}>
@@ -148,25 +137,17 @@ function Nav({ current }: { current: Route }): ReactNode {
 }
 
 /**
- * The fleet's operator-set name (#373), beside the tenant it is a rename for — the sharper use
- * the issue calls out: an operator with staging and production open in two tabs can otherwise
- * tell them apart only by port, while every destructive act this console offers is fleet-wide.
+ * The fleet's operator-set name (#373) — the sharper use the issue calls out: an operator with
+ * staging and production open in two tabs can otherwise tell them apart only by port, while every
+ * destructive act this console offers is fleet-wide.
  *
  * Renders nothing rather than "Unnamed" here, unlike the Fleet screen's Ring card. That card is
  * the one place this fact has a card to itself and can afford to state absence as a fact; on
  * every other screen a global "Unnamed" fleet label would be noise before an operator has ever
- * named anything, and the read is `ClusterAdmin`-scoped, so it is also unavailable to most
- * principals most of the time. Genuinely nothing to report either way, same as `TenantSwitcher`
- * below when no tenant is selected.
+ * named anything.
  */
 function FleetName(): ReactNode {
-  const { can } = useSession();
-  // Gated, for the reason `useFleetView`'s own doc gives: a principal without the fleet scope gets
-  // no label rather than a 404. Ungated this would be the *worst* case of the two the doc weighs —
-  // the imposter list's two guaranteed 404s happen once per list load, whereas this component is
-  // mounted on every screen, so it would put them behind every page a tenant-scoped principal ever
-  // opens, to render nothing either way.
-  const fleet = useFleetView({ enabled: can("fleet.read"), polled: false });
+  const fleet = useFleetView({ polled: false });
 
   if (!fleet.isSuccess || fleet.data.fleetName === null) return null;
 
@@ -175,110 +156,5 @@ function FleetName(): ReactNode {
       <span className="eyebrow">Fleet</span>
       <span className="ident">{fleet.data.fleetName}</span>
     </div>
-  );
-}
-
-/**
- * One tenant in view at a time (RFC-002 §8.1). The switcher only *selects* among bindings the
- * principal already holds — it grants nothing, and the console adds no header logic beyond sending
- * the selection.
- */
-function TenantSwitcher(): ReactNode {
-  const { tenant, tenants, setTenant } = useSession();
-
-  // Genuinely nothing to report: no selection means requests carry no `X-Rift-Tenant` and there is
-  // no tenant name that would be true of them.
-  if (tenant === null) return null;
-
-  /*
-   * One tenant still gets a label, just not a control.
-   *
-   * This used to render nothing at all below two tenants — "an inert control would imply there is
-   * something to switch to", which is right about the *control* and wrong about the *fact*. Every
-   * read on every screen is scoped to a tenant, and a single-tenant principal (the common case for
-   * a TenantAdmin) could not see which one anywhere in the console. A static value states the
-   * scope without pretending to offer a choice.
-   */
-  if (tenants.length < 2) {
-    return (
-      <div className="tenant-switch" data-testid="tenant-current">
-        <span className="eyebrow">Tenant</span>
-        <span className="ident">{tenant}</span>
-      </div>
-    );
-  }
-
-  return (
-    <label className="tenant-switch">
-      <span className="eyebrow">Tenant</span>
-      {/* `value={tenant}` with no fallback, deliberately: the control must display the tenant the
-          requests actually carry. Substituting `tenants[0]` for an unset selection would label
-          every read with a tenant the header never named. */}
-      <select
-        data-testid="tenant-switcher"
-        value={tenant}
-        onChange={(event) => setTenant(event.target.value)}
-      >
-        {tenants.map((name) => (
-          <option key={name} value={name}>
-            {name}
-          </option>
-        ))}
-      </select>
-    </label>
-  );
-}
-
-/**
- * Up to two letters for the avatar mark, from the principal's name.
- *
- * Decorative — the name is rendered in full beside it — so it is `aria-hidden` at the render site
- * and needs no fallback beyond an empty string.
- */
-export function initials(name: string): string {
-  return name
-    .split(/\s+/)
-    .filter((word) => word.length > 0)
-    .slice(0, 2)
-    .map((word) => word[0]?.toUpperCase() ?? "")
-    .join("");
-}
-
-/**
- * Who is signed in.
- *
- * Renders `displayName` and falls back to `principalId` only when the fleet has no row to carry a
- * name — the legacy `--api-key` identity, whose id is the readable `legacy:api-key`. It is
- * deliberately not the other way round: for a minted key `principalId` is `key:<sha256-hex>`,
- * which is not a credential (the raw key cannot be recovered from it, and argon2id is the real
- * boundary) but is indistinguishable from one on screen — and a console that displays
- * key-shaped strings teaches operators the wrong instinct about what is safe to share.
- */
-function Identity(): ReactNode {
-  const { whoami, role } = useSession();
-
-  if (whoami.authorizationDisabled) {
-    // Distinct from "an authenticated principal with zero bindings": the fleet defines no
-    // principals and no API key, so the admin plane is open. Rendering that as an ordinary
-    // identity would hide it.
-    return (
-      <span className="identity unenforced" data-testid="identity">
-        Authorization disabled — this fleet enforces no principals
-      </span>
-    );
-  }
-
-  const name = whoami.displayName ?? whoami.principalId ?? "unidentified principal";
-
-  return (
-    <>
-      <div className="identity" data-testid="identity">
-        <div className="id">{name}</div>
-        <div className="role">{role === null ? "no binding here" : role}</div>
-      </div>
-      <div className="avatar" aria-hidden="true">
-        {initials(name)}
-      </div>
-    </>
   );
 }

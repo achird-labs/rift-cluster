@@ -102,12 +102,14 @@ Three rules, in priority order:
 
 > **Amended by D-71** (RFC-007 §3.2, #546): the audit projection, its export sink and the
 > console's `Audit` and `Audit sink` tabs were removed. Rows below that name them stay as
-> history; the admin screen ships tenants, principals and bindings.
-
-Tenant-scoped, one tenant in view at a time. A tenant switcher (top-level,
-persisted per browser) sets the `X-Rift-Tenant` header on every API call for
-multi-tenant principals — RFC-002 §8.1's rules apply unchanged; the console
-adds no header logic of its own beyond sending the selection.
+> history.
+>
+> **Amended by D-73** (RFC-007 §3.2, #550): the console is **not tenant-scoped**. There is no
+> tenant switcher, no `X-Rift-Tenant` header, and no Admin screen — tenants, principals, roles,
+> bindings and quotas are gone from the fleet, so the row naming them below is history. Every
+> screen shows the one fleet, and every control is offered unconditionally: whoever logged in
+> holds the fleet's one credential and can do everything with it. The `Sources` and `Specs` rows
+> are likewise history (D-72, #549).
 
 | Screen | Backend | Availability |
 |---|---|---|
@@ -116,7 +118,7 @@ adds no header logic of its own beyond sending the selection.
 | **Request log** — recorded requests, match diagnostics | v1 read `GET /imposters/:port/requests` per node and labelled it **per-node view**. #147 H landed the promised convergence: the same route now answers the fleet's **merged** journal (doc-07), paged with the server's opaque `?since=` vector cursor, and the per-node label is deleted — a label renders only for an incomplete merge (`Rift-Cluster-Partial`). Same screen, no redesign, exactly as promised | v1 → merged (#147 H) |
 | **Cluster** — members, leader, ring epoch, readiness, pending ops | §5.2's admin-port fleet reads (projection of `cluster_api.rs:63-191`) | v1 |
 | **Front-door routes** — table editor | `GET/PUT /front-door/routes`, `DELETE /front-door/routes/:id` (`admin_front.rs`) | v1 |
-| **Tenants / principals / roles / tokens / audit** | RFC-002 §5 admin surface + `GET /admin/audit` | with RFC-002 T3/T4 |
+| ~~**Tenants / principals / roles / tokens / audit**~~ | ~~RFC-002 §5 admin surface + `GET /admin/audit`~~ | removed by D-71/D-73 |
 | **Scenarios & state** — scenario states per space, a space's scoped stubs, flow-state entries; set/reset/tear down/clear | `GET/POST/PUT /imposters/:port/scenarios*`, `GET/DELETE /imposters/:port/spaces/:flowId(/stubs)`, `GET/PUT/DELETE /admin/imposters/:port/flow-state/:flowId(/:key)` — all upstream routes that already ship and are contracted in `openapi-ee.yaml` | v1 (#232) |
 | **Sources** — declared sources, their drift policy, the ports they own, and drift state; declare, edit, delete and refresh-now | Reads: `GET /admin/sources` / `GET /admin/sources/{id}` (#239/#240), gated by `source.read` (Viewer+). Writes (#253): `POST /admin/sources`, `DELETE /admin/sources/{id}`, `POST /admin/sources/{id}/pull` — the verbs the cluster port already served, promoted to the RBAC'd front and tenant-resolved. Authorized as `imposter.write` / `imposter.delete`, matching the names the audit stream already emits for these ops rather than minting a `SourceWrite` the audit and the gate would disagree about | v1 (#233), writes #253 |
 | **Specs** — imported OpenAPI/proto specs | RFC-004 admin surface | with RFC-004 |
@@ -238,6 +240,19 @@ precise split is settled in the RFC-002 T2 review, noted in §12 Q3.
 (its stated purpose, `cluster_api.rs:5-8`) still requires asking each node.
 
 ### 5.3 Sessions — how a browser holds a credential
+
+> **Amended by D-73** (RFC-007 §3.2, #550): the exchange survives, simplified. There is exactly
+> one credential — the fleet's `--api-key` — so `POST /session` accepts *that* key (reversing
+> D-46, which refused it), the token's subject is the constant `"admin"` rather than a principal
+> id, and `session::verify` answers `Result<(), _>`: a cookie proves authentication and there is
+> no identity for it to resolve to. `GET /admin/whoami` is gone with the identities it reported.
+> Revocation is now bounded by the 8-hour `Max-Age` and signing-key rotation alone — disabling a
+> principal is no longer one of the bounds, because there are no principals. The token format,
+> the `kr` key-revision kill switch, the constant-time compare and the CSRF gate are unchanged.
+>
+> One mechanical consequence, recorded because it is not obvious: the loopback admin listener
+> now runs upstream's own key gate, so the front injects the configured key on its internal legs
+> — a cookie-authenticated request has no `Authorization` to forward.
 
 The API keeps accepting `Authorization` bearers unchanged (curl, SDKs, MCP).
 Browsers get a **session exchange**:
@@ -448,6 +463,11 @@ the fleet's durability model by using it.
 
 ### 8.3 Credential scope
 
+> **Amended by D-73** (RFC-007 §3.2, #550): there are no principals, roles or per-tenant
+> bindings, so a "dedicated `agent` principal bound `Editor`" is not a configuration this system
+> has. An MCP process holding the fleet's key holds the whole fleet. (§8 as a whole is retired by
+> D-71/#547 — the MCP server is not built.)
+
 The MCP process authenticates with **one API key = one RFC-002 principal**,
 and is nothing more than that principal. The recommended setup is a dedicated
 `agent` principal bound `Editor` in exactly the tenants the agent should
@@ -458,6 +478,10 @@ human's curl — which is the point: no special agent pathway to audit
 separately, and revoking the agent is deleting one binding.
 
 ### 8.4 Role-adaptive tool list
+
+> **Amended by D-73** (RFC-007 §3.2, #550): `GET /admin/whoami` does not exist and there are no
+> roles to adapt to. The full tool list is the only list — which is what this section already
+> says happens "pre-RFC-002 (single static key)", now permanently.
 
 On startup the server calls `GET /admin/whoami` and registers only the tools
 the principal's role can ever succeed at: a `Viewer` key yields the read and
@@ -492,6 +516,9 @@ life of the open tab — real, bounded, and audited as the victim principal.
 
 ### 9.2 CSRF and session theft
 
+> **Amended by D-73** (RFC-007 §3.2, #550): the residual-risk bound is `Max-Age` + signing-key
+> rotation. "Principal disable" is not one of them — there are no principals.
+
 Covered in §5.3: `SameSite=Strict` + custom-header double-submit for
 cookie-authenticated mutations; no permissive CORS; `Secure` cookie so the
 session never crosses plaintext HTTP. Session fixation is not applicable —
@@ -500,6 +527,12 @@ a client-presented one. Residual risk: no per-session revocation in v1
 (§10); the bound is `Max-Age` + signing-key rotation + principal disable.
 
 ### 9.3 The login form holds the real key, briefly
+
+> **Amended by D-73** (RFC-007 §3.2, #550): the mitigation named at the end of this section —
+> "mint a console-specific key, shown once, scoped, individually revocable" — is not available.
+> There is one key, and a keylogging XSS at login time takes the fleet's credential. The honest
+> statement of the residual risk is that rotating `--api-key` on every node is the response, and
+> that is a deployment action rather than an API one.
 
 `POST /session` is the one moment the long-lived API key transits the page.
 It is held in component state only (never localStorage, never a URL), sent

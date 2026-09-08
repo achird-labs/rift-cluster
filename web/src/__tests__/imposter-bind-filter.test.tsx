@@ -4,7 +4,7 @@ import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { Imposters } from "../screens/Imposters.tsx";
-import { renderInApp, stubFetch, whoamiWith } from "./harness.tsx";
+import { renderInApp, stubFetch } from "./harness.tsx";
 
 /**
  * The console filter half of issue #369 (bind status per node), AC4 and E9: "Bind failures" must
@@ -12,7 +12,7 @@ import { renderInApp, stubFetch, whoamiWith } from "./harness.tsx";
  * either "failing" or "healthy" — the defect class RFC-006 exists to prevent, reproduced at the
  * filter layer (blocker B3).
  *
- * Modelled on `imposters.test.tsx`'s harness conventions (`stubFetch`, `renderInApp`, `whoamiWith`).
+ * Modelled on `imposters.test.tsx`'s harness conventions (`stubFetch`, `renderInApp`).
  */
 
 afterEach(() => {
@@ -76,7 +76,7 @@ describe("the imposter list's bind-failures filter", () => {
         },
       },
     });
-    renderInApp(<Imposters />, { whoami: whoamiWith("fleet-admin") });
+    renderInApp(<Imposters />);
 
     expect(await screen.findByTestId("imposter-row-4545")).toBeTruthy();
     expect(await screen.findByTestId("imposter-row-4546")).toBeTruthy();
@@ -87,9 +87,9 @@ describe("the imposter list's bind-failures filter", () => {
     expect(screen.queryByTestId("imposter-row-4546")).toBeNull();
   });
 
-  it("does not offer the filter to a principal that cannot read the fleet", async () => {
+  it("does not offer the filter when the fleet projection is unreadable", async () => {
     stubFetch({ "/imposters": { json: TWO_IMPOSTERS } });
-    renderInApp(<Imposters />, { whoami: whoamiWith("editor") });
+    renderInApp(<Imposters />);
 
     await screen.findByTestId("imposter-row-4545");
 
@@ -102,7 +102,7 @@ describe("the imposter list's bind-failures filter", () => {
     // fleet (`fleet.read` withheld), so `fleetForBind` is `null` while the filter is already active.
     window.location.hash = "#/imposters?bind=failed";
     stubFetch({ "/imposters": { json: TWO_IMPOSTERS } });
-    renderInApp(<Imposters />, { whoami: whoamiWith("editor") });
+    renderInApp(<Imposters />);
 
     await screen.findByTestId("imposter-filters");
 
@@ -153,7 +153,7 @@ describe("the imposter list's bind-failures filter", () => {
         },
       },
     });
-    renderInApp(<Imposters />, { whoami: whoamiWith("fleet-admin") });
+    renderInApp(<Imposters />);
 
     await userEvent.setup().click(await screen.findByTestId("quick-bind-failures"));
 

@@ -454,7 +454,6 @@ code,
   text-align: right;
 }
 
-.tenant-switch,
 .fleet-name-badge {
   display: flex;
   align-items: center;
@@ -468,19 +467,6 @@ code,
 .fleet-name-badge .ident {
   font: 500 12.5px/1 var(--mono);
   color: var(--ink);
-}
-
-.tenant-switch .eyebrow {
-  font-size: 9.5px;
-}
-
-.tenant-switch select {
-  font: 500 12.5px/1 var(--mono);
-  border: 0;
-  background: transparent;
-  color: var(--ink);
-  cursor: pointer;
-  padding: 0;
 }
 
 .who .identity .id {
