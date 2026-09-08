@@ -5,7 +5,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { ImposterDetail } from "../screens/ImposterDetail.tsx";
 import { REVISION_HEADER } from "../api/client.ts";
-import { renderInApp, stubFetch, whoamiWith } from "./harness.tsx";
+import { renderInApp, stubFetch } from "./harness.tsx";
 
 /**
  * The lint pane renders the findings it is given (RFC-006 §12 Q1, and #248's AC8).
@@ -46,10 +46,10 @@ describe("AC8 — rift-lint findings render for the stub being edited", () => {
           enabled: true,
           stubs: [{ id: "s-1", responses: [{ is: { statusCode: 200 } }] }],
         },
-        headers: { [REVISION_HEADER]: "default:4545@7" },
+        headers: { [REVISION_HEADER]: "4545@7" },
       },
     });
-    renderInApp(<ImposterDetail port={PORT} />, { whoami: whoamiWith("editor") });
+    renderInApp(<ImposterDetail port={PORT} />);
 
     await userEvent.click(await screen.findByRole("button", { name: /edit/i }));
 

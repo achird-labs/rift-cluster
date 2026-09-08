@@ -22,9 +22,8 @@ use rift_cluster::stores::{
     seq_routes, spawn_anti_entropy,
 };
 use rift_cluster::{
-    Authority, ClusterDecorator, ControlOp, ControlOutcome, ControlRequest, DEFAULT_TENANT,
-    LeaveOutcome, NodeConfig, NodeError, NodeIdentity, PullOnMissInterceptor, RaftNode, TenantId,
-    metrics,
+    Authority, ClusterDecorator, ControlOp, ControlOutcome, ControlRequest, LeaveOutcome,
+    NodeConfig, NodeError, NodeIdentity, PullOnMissInterceptor, RaftNode, metrics,
 };
 use rift_cluster_base::seams::{
     CompiledRoutes, FileSource, HttpSource, ImposterConfig, ImposterManager, OutboundTls,
@@ -33,7 +32,6 @@ use rift_cluster_base::seams::{
 };
 
 use crate::admin_front::{self, AdminFront, FrontConfig};
-use crate::authorizer;
 use crate::cli::EeCli;
 use crate::cluster_api::{self, NodeSlot};
 use crate::probes::{self, ProbeListener};
@@ -46,11 +44,6 @@ use crate::readiness::{GATE_JOINED, GATE_RECONCILED, Readiness};
 /// enough to outlast a peer's own boot, short enough that a genuinely
 /// misconfigured seed list fails the deployment instead of hanging it.
 const SEED_JOIN_DEADLINE: Duration = Duration::from_secs(30);
-
-/// How often the fleet gauges are re-sampled from Raft metrics. Fast enough that
-/// a leadership change is visible within a scrape interval, slow enough to stay
-/// invisible next to the data plane.
-const METRICS_SAMPLE_INTERVAL: Duration = Duration::from_secs(5);
 
 /// How long startup waits for the durable membership to reach the node's
 /// metrics before deciding whether this node is still a member.
@@ -161,11 +154,8 @@ pub struct ComposedServer {
     /// inside `server`) and when clustering is on but `--front-door` was not
     /// given.
     front_door: Option<RunningFrontDoor>,
-    /// Samples the fleet gauges. Aborted on shutdown so it cannot outlive the
-    /// node it reads.
-    metrics_sampler: Option<tokio::task::JoinHandle<()>>,
     /// Reconciles the engine and satisfies [`GATE_RECONCILED`]; aborted on
-    /// shutdown for the same reason as the sampler.
+    /// shutdown so it cannot outlive the node it drives.
     reconciler: Option<tokio::task::JoinHandle<()>>,
     /// Replays parked intents on leader changes (issue #9 R4); same lifecycle
     /// rules as the reconciler.
@@ -268,9 +258,6 @@ impl ComposedServer {
 
     /// Stop every listener immediately, without a drain.
     pub async fn shutdown(self) {
-        if let Some(sampler) = self.metrics_sampler {
-            sampler.abort();
-        }
         if let Some(reconciler) = self.reconciler {
             reconciler.abort();
         }
@@ -444,7 +431,6 @@ pub async fn start_with_runtimes(
             node: None,
             front: None,
             front_door: None,
-            metrics_sampler: None,
             reconciler: None,
             intent_replayer: None,
             cluster_addr: None,
@@ -677,12 +663,6 @@ pub async fn start_with_runtimes(
         }
         return Err(anyhow::Error::new(e).context("binding the operator surface to the node"));
     }
-    // Sampled once here so the gauge is already correct on `/metrics` before
-    // the periodic sampler's first tick (issue #161): it reads the state
-    // machine, so it cannot run before the node exists. `spawn_metrics_sampler`
-    // keeps it current from here on, because whether the fleet has any
-    // principal can change at any moment a `PrincipalPut` commits.
-    sample_no_principals(&node);
     pull_on_miss.bind(&node);
     if let Err(e) = proxy_net.bind(&node, ProxyBindConfig::default()) {
         probes.shutdown().await;
@@ -745,7 +725,6 @@ pub async fn start_with_runtimes(
             probes: Some(probes),
             front: Some(front),
             front_door,
-            metrics_sampler: Some(spawn_metrics_sampler(Arc::clone(&node))),
             reconciler: Some(reconciler),
             intent_replayer: Some(spawn_intent_replayer(Arc::clone(&node))),
             node: Some(node),
@@ -799,27 +778,17 @@ async fn attach_data_plane(
     let fleet_journal_port_cap = cli.cluster.cluster_fleet_journal_port_cap;
     cli.oss.host = "127.0.0.1".to_owned();
     cli.oss.port = 0;
-    // Withheld from the loopback deliberately (issue #161, B4): upstream's own
-    // `ServerBuilder` gates the loopback admin on a raw compare of the
-    // `Authorization` header against `--api-key` (`rift-http-proxy`'s
-    // `admin_api::server`), unconditionally, *before* the `admin_authorizer`
-    // hook ever runs — see `attach_data_plane`'s `.admin_authorizer(...)` a
-    // few lines down. `admin_front` has already authenticated and authorized
-    // every request that reaches this loopback (terminated routes render
-    // straight from `admin_front`; proxied routes were authorized in
-    // `admin_front::handle` first), so leaving `cli.oss.api_key` set would
-    // install a *second*, independent api-key gate behind the first. With
-    // real principals also configured, a principal's own key almost never
-    // equals the legacy `--api-key` string, so upstream's raw compare would
-    // 401 every proxied and terminated-render request for every principal but
-    // the one holding the legacy key — the entire admin surface, for a fleet
-    // mid-migration off it. `api_key` (the local binding above, captured
-    // before this clears the copy `ServerBuilder` sees) still flows to
-    // `admin_front`'s own `FrontConfig` and to `EeAuthorizer` below, so the
-    // legacy key keeps resolving to its synthetic principal and the loopback
-    // stays gated — `EeAuthorizer` is its gate now, not upstream's raw
-    // compare.
-    cli.oss.api_key = None;
+    // **`cli.oss.api_key` is deliberately left in place** (#550, D-73). Before tenancy was
+    // removed this was cleared here: upstream's `ServerBuilder` gates the loopback admin on a raw
+    // compare of `Authorization` against `--api-key`, and with per-principal keys a principal's
+    // own key almost never equalled the legacy `--api-key` string, so upstream's compare would
+    // have 401'd every proxied request from every principal but one.
+    //
+    // With one credential that objection is gone, and keeping the gate is strictly better: the
+    // loopback listener is protected by upstream's own code rather than by a bespoke authorizer
+    // seam this project has to keep correct. `admin_front` authenticates first and then injects
+    // this same key onto the proxy leg (see `admin_front::proxy`), so a cookie-authenticated
+    // request — which carries no `Authorization` at all — still clears the loopback.
 
     // Taken, not read: when clustered, this node binds the front door itself
     // (below), against the table the state machine maintains rather than the
@@ -856,20 +825,13 @@ async fn attach_data_plane(
     let barrier_timeout = Duration::from_secs(cli.cluster.cluster_write_barrier_timeout);
     let admin_async = cli.cluster.cluster_admin_async;
     let seeds = cli.cluster.cluster_seeds.clone();
-    let legacy_key_is_fleet_admin = cli.cluster.cluster_legacy_key_is_fleet_admin;
 
+    // No `.admin_authorizer(...)`: the U-9 seam existed to give the loopback a second,
+    // tenant-aware gate behind the front's own. With one credential (#550, D-73) upstream's own
+    // `--api-key` compare — which `cli.oss.api_key` above leaves switched on — is that gate, and
+    // a bespoke authorizer would be a second implementation of one comparison.
     let server = ServerBuilder::from_cli(cli.oss)
         .manager(Arc::clone(&manager))
-        // Defence in depth (issue #161): `admin_front` decides first and is
-        // the only surface that can render RFC-002 §8.4's cross-tenant 404
-        // (this hook can only answer 403 — see `authorizer::EeAuthorizer`'s
-        // module doc), but the loopback core admin `admin_front` proxies to
-        // must not be an unguarded second door.
-        .admin_authorizer(Arc::new(authorizer::EeAuthorizer {
-            node: Arc::downgrade(node),
-            api_key: api_key.clone(),
-            legacy_key_is_fleet_admin,
-        }))
         .start()
         .await?;
 
@@ -914,7 +876,6 @@ async fn attach_data_plane(
             public_addr: public_admin.clone(),
             upstream_admin: server.admin_addr(),
             api_key,
-            legacy_key_is_fleet_admin,
             allow_injection,
             scripts_dir,
             barrier,
@@ -1078,7 +1039,6 @@ async fn bootstrap_imposters(
                     .unwrap_or(0),
                 expected_revision: None,
                 op: ControlOp::PutImposter {
-                    tenant: TenantId::new(DEFAULT_TENANT),
                     config: Box::new(config),
                 },
             };
@@ -1098,8 +1058,8 @@ async fn bootstrap_imposters(
                     %uri, port, revision = response.revision, %op_id,
                     "bootstrap imposter committed"
                 ),
-                // A committed refusal: the write succeeded, the state machine declined it (a port
-                // another tenant holds, a quota). The operator's to resolve, and loud, because a
+                // A committed refusal: the write succeeded, the state machine declined it (a
+                // config the admission rules reject). The operator's to resolve, and loud, because a
                 // node that boots without the imposters it was told to serve is the failure this
                 // whole path exists to prevent.
                 ControlOutcome::Failed { reason } => anyhow::bail!(
@@ -1317,35 +1277,6 @@ fn spawn_reconciler(
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
     })
-}
-
-/// Re-sample `rift_cluster_no_principals` on a timer (issue #161).
-///
-/// A `Weak` handle for the same reason the operator surface holds one: this task
-/// must never be what keeps the node alive, or shutdown would deadlock on a task
-/// that is itself waiting to read the node.
-fn spawn_metrics_sampler(node: Arc<RaftNode>) -> tokio::task::JoinHandle<()> {
-    let node = Arc::downgrade(&node);
-    tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(METRICS_SAMPLE_INTERVAL);
-        loop {
-            ticker.tick().await;
-            let Some(node) = node.upgrade() else { return };
-            sample_no_principals(&node);
-        }
-    })
-}
-
-/// Resample `rift_cluster_no_principals` (issue #161). A read error is logged
-/// rather than propagated: this is a reporting gauge, not a decision —
-/// the authorization path (`principal::should_bypass`) makes its own read and
-/// fails closed on the same error, so a sampler that skips a tick here costs
-/// a stale metric, never a wrong access decision.
-fn sample_no_principals(node: &RaftNode) {
-    match node.has_any_principals() {
-        Ok(has_any) => metrics::set_no_principals(!has_any),
-        Err(e) => tracing::warn!(error = %e, "could not sample rift_cluster_no_principals"),
-    }
 }
 
 /// The open-source manager the builder would have constructed, plus the cluster

@@ -33,9 +33,9 @@ pub mod stores;
 pub use bridge::{Bridge, BridgeConfig, CallerClass};
 pub use config::{ClusterConfig, ConfigError, RuntimeTopology};
 pub use control::{
-    ControlOp, ControlOutcome, ControlRequest, ControlResponse, DEFAULT_TENANT, FLEET_SCOPE,
-    PreconditionTarget, RecordedStub, RecordedStubPlacement, SESSION_KEY_BYTES, SessionKey,
-    StubEdit, StubEditScript, TenantId, precondition_target, routes_installed_for,
+    ControlOp, ControlOutcome, ControlRequest, ControlResponse, PreconditionTarget, RecordedStub,
+    RecordedStubPlacement, SESSION_KEY_BYTES, SessionKey, StubEdit, StubEditScript,
+    precondition_target,
 };
 pub use decorate::ClusterDecorator;
 pub use pull_on_miss::PullOnMissInterceptor;

@@ -15,7 +15,6 @@ import {
   useLifecycleToggle,
   useReplaceImposters,
 } from "../app/queries.ts";
-import { useSession } from "../app/session.tsx";
 import { toHash, useHashQuery } from "../app/routing.ts";
 import { ExportDialog } from "../components/exportDialog.tsx";
 import { FleetRail } from "../components/fleetRail.tsx";
@@ -53,7 +52,7 @@ import {
   type ImportEntry,
   type ImportPlan,
   exportOptionsQuery,
-  exportSetFilename,
+  EXPORT_SET_FILENAME,
   importPlan,
   parseImportDocument,
   renderSetDocument,
@@ -85,7 +84,7 @@ function ImposterTiles({
   imposters: readonly Imposter[];
   /** The fleet sum could not reach every node, so it is a floor rather than a total (#363). */
   countsArePartial: boolean;
-  /** `undefined` for a principal without `fleet.read` — refused, which is not the same as zero. */
+  /** `undefined` when this node served no fleet projection — unread, which is not the same as zero. */
   fleet: FleetView | undefined;
 }): ReactNode {
   /*
@@ -144,8 +143,8 @@ function ImposterTiles({
       </div>
 
       {/*
-        Absent entirely for a principal without `fleet.read`, rather than rendered as zero: "you may
-        not ask" and "the answer is none" are different facts, and a zero here is the reassuring one.
+        Absent entirely when the fleet read did not land, rather than rendered as zero: "not read"
+        and "the answer is none" are different facts, and a zero here is the reassuring one.
       */}
       {fleet === undefined ? null : (
         <div className={`tile${(fleet.parkedIntents ?? 0) > 0 ? " is-warn" : ""}`}>
@@ -203,7 +202,6 @@ function errorText(error: unknown): string {
 }
 
 export function Imposters(): ReactNode {
-  const { can, tenant } = useSession();
   const imposters = useImposters();
   /*
    * Unwrapped once. The read carries two facts with different scopes (#363) — the rows, and
@@ -217,31 +215,11 @@ export function Imposters(): ReactNode {
   const [importing, setImporting] = useState(false);
   const [exporting, setExporting] = useState(false);
   const [confirming, setConfirming] = useState<Imposter | null>(null);
-  // Only to qualify what the list shows. A principal without the fleet scope simply gets no
-  // qualification — never a 404 error on a screen whose own read succeeded.
-  const mayReadFleet = can("fleet.read");
-  const fleet = useFleetView({ enabled: mayReadFleet });
+  // Only to qualify what the list shows.
+  const fleet = useFleetView();
   const toggle = useLifecycleToggle();
 
-  const confidence = viewConfidence(fleetReadState(mayReadFleet, fleet));
-  const mayToggle = can("imposter.lifecycle");
-  const mayCreate = can("imposter.write");
-  // `imposter.delete`, not `imposter.write`: they are separate actions server-side and granted from
-  // separate arms, so gating on the wrong one is a drift waiting to happen (see `rbac.ts`).
-  const mayDelete = can("imposter.delete");
-  const mayExport = can("imposter.read");
-  // `rbac.ts` has no `imposter.exportSet`/`imposter.import` — export reads through the same read
-  // gate every other list on this screen uses, import-add writes through the same write gate
-  // `New imposter` does, and Replace all additionally needs delete because it is one.
-  /*
-   * `imposter.delete` ALONE, transcribed from the action that actually authorizes the call:
-   * `action_for(Terminated::ReplaceAllImposters) => Action::ImposterDelete` in `admin_front.rs`.
-   * Both capabilities start at Editor today so `&& mayCreate` would decide identically — which is
-   * exactly why it is wrong to write. `rbac.ts` makes the point: transcribing the real action is
-   * what stops the table going stale silently the day one of the grants moves.
-   */
-  const mayReplace = mayDelete;
-  const mayClear = can("requests.clear");
+  const confidence = viewConfidence(fleetReadState(fleet));
   const existingPorts = listed.flatMap((i) => (i.port === undefined ? [] : [i.port]));
 
   // ── Filter, sort, selection ───────────────────────────────────────────────
@@ -303,18 +281,10 @@ export function Imposters(): ReactNode {
   const allVisibleSelected = effective.length > 0 && effective.length === visiblePorts.size;
 
   const bulkActions: BulkAction[] = [
-    ...(mayDelete
-      ? [{ key: "delete" as const, label: "Delete", verb: "deleted", destructive: true }]
-      : []),
-    ...(mayToggle
-      ? [
-          { key: "enable" as const, label: "Enable", verb: "enabled", destructive: false },
-          { key: "disable" as const, label: "Disable", verb: "disabled", destructive: false },
-        ]
-      : []),
-    ...(mayClear
-      ? [{ key: "clear" as const, label: "Clear request log", verb: "cleared", destructive: true }]
-      : []),
+    { key: "delete", label: "Delete", verb: "deleted", destructive: true },
+    { key: "enable", label: "Enable", verb: "enabled", destructive: false },
+    { key: "disable", label: "Disable", verb: "disabled", destructive: false },
+    { key: "clear", label: "Clear request log", verb: "cleared", destructive: true },
   ];
 
   // Exhaustive over the narrowed `BulkActionKey`, with no `default`. A fifth action whose case is
@@ -374,36 +344,30 @@ export function Imposters(): ReactNode {
               an action on this screen's subject, and the header is where this screen's actions are.
               It opens a dialog because the choice it carries — what actually lands in the file —
               needs more than a button label to state. */}
-          {mayExport ? (
-            <button
-              className="btn"
-              type="button"
-              data-testid="export-imposters"
-              onClick={() => setExporting(true)}
-            >
-              Export
-            </button>
-          ) : null}
-          {mayCreate ? (
-            <button
-              className="btn"
-              type="button"
-              data-testid="open-import"
-              onClick={() => setImporting(true)}
-            >
-              Import
-            </button>
-          ) : null}
-          {mayCreate ? (
-            <button
-              className="btn primary"
-              type="button"
-              data-testid="new-imposter"
-              onClick={() => setCreating(true)}
-            >
-              New imposter
-            </button>
-          ) : null}
+          <button
+            className="btn"
+            type="button"
+            data-testid="export-imposters"
+            onClick={() => setExporting(true)}
+          >
+            Export
+          </button>
+          <button
+            className="btn"
+            type="button"
+            data-testid="open-import"
+            onClick={() => setImporting(true)}
+          >
+            Import
+          </button>
+          <button
+            className="btn primary"
+            type="button"
+            data-testid="new-imposter"
+            onClick={() => setCreating(true)}
+          >
+            New imposter
+          </button>
         </header>
 
         <ImposterTiles
@@ -412,16 +376,14 @@ export function Imposters(): ReactNode {
           fleet={fleet.data}
         />
 
-        {mayExport && exporting ? (
-        <ExportSetControl tenant={tenant} count={all.length} onClose={() => setExporting(false)} />
-      ) : null}
+        {exporting ? (
+          <ExportSetControl count={all.length} onClose={() => setExporting(false)} />
+        ) : null}
 
         {importing ? (
           <ImportPanel
             existingPorts={existingPorts}
             existingCount={listed.length}
-            mayWrite={mayCreate}
-            mayReplace={mayReplace}
             onClose={() => setImporting(false)}
           />
         ) : null}
@@ -528,7 +490,7 @@ export function Imposters(): ReactNode {
 
             {rows.length === 0 ? (
               <p className="muted" data-testid="imposters-no-matches">
-                No imposter in this tenant matches that filter.
+                No imposter matches that filter.
               </p>
             ) : (
               <div className="scroll-x">
@@ -589,7 +551,7 @@ export function Imposters(): ReactNode {
                           port has as many owners as it has flows (#359, D-20). The column is gone
                           rather than pending, because a column that can never be filled is a
                           promise, not a roadmap. */}
-                      {mayToggle || mayDelete ? <th aria-label="Actions" /> : null}
+                      <th aria-label="Actions" />
                     </tr>
                   </thead>
                   <tbody>
@@ -597,8 +559,6 @@ export function Imposters(): ReactNode {
                       <Row
                         key={imposter.port ?? `unnamed-${index}`}
                         imposter={imposter}
-                        mayToggle={mayToggle}
-                        mayDelete={mayDelete}
                         busy={toggle.isPending}
                         selectable={bulkActions.length > 0}
                         selected={imposter.port !== undefined && selected.has(imposter.port)}
@@ -665,14 +625,13 @@ export function Imposters(): ReactNode {
  * Three states, kept distinct on purpose: read it, never asked, asked and failed.
  *
  * Folding "asked and failed" into "never asked" is the tempting simplification and the wrong one —
- * it would let a FleetAdmin whose health read just 500'd see the same unqualified list as a viewer
- * who was never entitled to the reading in the first place.
+ * a health read that just 500'd has *lost* a signal, whereas one that was never made never had it,
+ * and only the first is a reason to qualify what the list is claiming.
  */
-function fleetReadState(
-  mayRead: boolean,
-  fleet: { data: FleetView | undefined; isError: boolean },
-): FleetReadState {
-  if (!mayRead) return { kind: "not-asked" };
+function fleetReadState(fleet: {
+  data: FleetView | undefined;
+  isError: boolean;
+}): FleetReadState {
   if (fleet.data !== undefined) return { kind: "read", view: fleet.data };
   return fleet.isError ? { kind: "unavailable" } : { kind: "not-asked" };
 }
@@ -680,7 +639,7 @@ function fleetReadState(
 /**
  * The first thing every new operator sees — and the state a naive console gets wrong.
  *
- * "No imposters" asserts a fact about the tenant from one node's answer. When that node is degraded
+ * "No imposters" asserts a fact about the fleet from one node's answer. When that node is degraded
  * an imposter it has not caught up on would not appear, so the honest sentence is that the list
  * cannot be confirmed, naming the coverage rather than implying a clean empty fleet.
  */
@@ -699,8 +658,8 @@ function EmptyState({
       mark={uncertain ? "▲" : "○"}
       title={
         uncertain
-          ? "Cannot confirm this tenant is empty"
-          : "No imposters in this tenant, in this node’s view"
+          ? "Cannot confirm the fleet is empty"
+          : "No imposters, in this node’s view"
       }
       body={
         uncertain ? (
@@ -732,8 +691,6 @@ function EmptyState({
 
 function Row({
   imposter,
-  mayToggle,
-  mayDelete,
   busy,
   selectable,
   selected,
@@ -743,8 +700,6 @@ function Row({
   onDelete,
 }: {
   imposter: Imposter;
-  mayToggle: boolean;
-  mayDelete: boolean;
   busy: boolean;
   selectable: boolean;
   selected: boolean;
@@ -786,38 +741,30 @@ function Row({
           <ImposterField imposter={imposter} field={column.key} renderName={nameLink(imposter)} />
         </td>
       ))}
-      {mayToggle || mayDelete ? (
-        <td>
-          {/* Rendered only for a role that holds the matching action. RFC-006 §3 rule 3: this is
-              presentation — the admin front re-checks the same action on the call itself. */}
-          {port === undefined ? null : (
-            <span className="row">
-              {mayToggle ? (
-                <button
-                  className="btn sm"
-                  type="button"
-                  disabled={busy}
-                  aria-label={`${imposter.enabled ? "Disable" : "Enable"} ${label}`}
-                  onClick={() => onToggle(port, !imposter.enabled)}
-                >
-                  {imposter.enabled ? "Disable" : "Enable"}
-                </button>
-              ) : null}
-              {mayDelete ? (
-                <button
-                  className="btn sm danger"
-                  type="button"
-                  data-testid={`delete-imposter-${port}`}
-                  aria-label={`Delete ${label}`}
-                  onClick={onDelete}
-                >
-                  Delete
-                </button>
-              ) : null}
-            </span>
-          )}
-        </td>
-      ) : null}
+      <td>
+        {port === undefined ? null : (
+          <span className="row">
+            <button
+              className="btn sm"
+              type="button"
+              disabled={busy}
+              aria-label={`${imposter.enabled ? "Disable" : "Enable"} ${label}`}
+              onClick={() => onToggle(port, !imposter.enabled)}
+            >
+              {imposter.enabled ? "Disable" : "Enable"}
+            </button>
+            <button
+              className="btn sm danger"
+              type="button"
+              data-testid={`delete-imposter-${port}`}
+              aria-label={`Delete ${label}`}
+              onClick={onDelete}
+            >
+              Delete
+            </button>
+          </span>
+        )}
+      </td>
     </tr>
   );
 }
@@ -1282,17 +1229,15 @@ function ReviewStep({ draft }: { draft: Imposter | null }): ReactNode {
 }
 
 /**
- * Export the whole tenant, in either projection (#251).
+ * Export every imposter, in either projection (#251).
  *
  * Two buttons, not a select-then-go: the projections carry a real semantic difference (whether the
  * import goes on recording), and naming both up front is worth more than one fewer click.
  */
 function ExportSetControl({
-  tenant,
   count,
   onClose,
 }: {
-  tenant: string | null;
   count: number;
   onClose: () => void;
 }): ReactNode {
@@ -1304,8 +1249,8 @@ function ExportSetControl({
     setError(null);
     setBusy(true);
     try {
-      const text = await apiGetText(`/imposters${exportOptionsQuery(options)}`, { tenant });
-      const filename = exportSetFilename(tenant);
+      const text = await apiGetText(`/imposters${exportOptionsQuery(options)}`);
+      const filename = EXPORT_SET_FILENAME;
       downloadText(filename, text);
       // A download is the one action with no on-screen consequence at all: the dialog closes and the
       // file lands somewhere the console cannot see. Saying so is the whole point of the toast.
@@ -1321,8 +1266,7 @@ function ExportSetControl({
   return (
     <>
       <ExportDialog
-        scope={{ kind: "tenant" }}
-        tenant={tenant}
+        scope={{ kind: "all" }}
         imposterCount={count}
         busy={busy}
         onExport={(options) => void run(options)}
@@ -1349,14 +1293,10 @@ type ImportResult = { port: number | null; ok: boolean; message?: string };
 function ImportPanel({
   existingPorts,
   existingCount,
-  mayWrite,
-  mayReplace,
   onClose,
 }: {
   existingPorts: readonly number[];
   existingCount: number;
-  mayWrite: boolean;
-  mayReplace: boolean;
   onClose: () => void;
 }): ReactNode {
   const [text, setText] = useState("");
@@ -1462,33 +1402,29 @@ function ImportPanel({
 
       <ImportLint findings={findings} />
 
-      {mayWrite ? (
-        <nav className="pager">
-          <button
-            className="btn primary"
-            type="button"
-            data-testid="import-add"
-            disabled={doc.kind !== "ok" || running}
-            onClick={() => void runAdd(doc.kind === "ok" ? doc.entries : [])}
-          >
-            {running ? "Adding…" : "Add"}
-          </button>
-          {mayReplace ? (
-            <button
-              className="btn danger"
-              type="button"
-              data-testid="import-replace"
-              disabled={doc.kind !== "ok" || running}
-              onClick={() => setConfirmingReplace(true)}
-            >
-              Replace all
-            </button>
-          ) : null}
-          <button className="btn" type="button" onClick={onClose} disabled={running}>
-            Close
-          </button>
-        </nav>
-      ) : null}
+      <nav className="pager">
+        <button
+          className="btn primary"
+          type="button"
+          data-testid="import-add"
+          disabled={doc.kind !== "ok" || running}
+          onClick={() => void runAdd(doc.kind === "ok" ? doc.entries : [])}
+        >
+          {running ? "Adding…" : "Add"}
+        </button>
+        <button
+          className="btn danger"
+          type="button"
+          data-testid="import-replace"
+          disabled={doc.kind !== "ok" || running}
+          onClick={() => setConfirmingReplace(true)}
+        >
+          Replace all
+        </button>
+        <button className="btn" type="button" onClick={onClose} disabled={running}>
+          Close
+        </button>
+      </nav>
 
       {replace.isError ? <ErrorNote error={replace.error} context="The set was not replaced" /> : null}
       {replace.isSuccess ? (
@@ -1502,7 +1438,7 @@ function ImportPanel({
       {confirmingReplace ? (
         <Confirm
           testId="confirm-replace-imposters"
-          title="Replace every imposter on this tenant?"
+          title="Replace every imposter on this fleet?"
           body={
             <>
               This destroys the {existingCount} imposter{existingCount === 1 ? "" : "s"} currently
@@ -1511,7 +1447,7 @@ function ImportPanel({
             </>
           }
           confirmLabel={`Replace ${existingCount} imposter${existingCount === 1 ? "" : "s"}`}
-          // The widest act the console offers: every imposter in the tenant goes, replaced by a
+          // The widest act the console offers: every imposter on the fleet goes, replaced by a
           // document. Typing the count is the difference between meaning it and having clicked
           // through this dialog before.
           requireTyped={String(existingCount)}

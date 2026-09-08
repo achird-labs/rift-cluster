@@ -91,8 +91,8 @@ pub struct ClusterArgs {
 
     /// How many imposters one fleet request-journal answer may cover (issue #362).
     ///
-    /// The fleet journal (`GET /admin/requests` and its stream) walks the caller's tenant's
-    /// imposters ranked by most recent activity and covers this many. What it leaves out is
+    /// The fleet journal (`GET /admin/requests` and its stream) walks the fleet's imposters
+    /// ranked by most recent activity and covers this many. What it leaves out is
     /// **named** in the answer's `coverage` block, so raising or lowering this changes how much one
     /// answer covers, never whether a short answer admits to being short.
     ///
@@ -179,19 +179,6 @@ pub struct ClusterArgs {
         env = "RIFT_CLUSTER_FLOW_FSYNC_INTERVAL_MS"
     )]
     pub cluster_flow_fsync_interval_ms: u64,
-
-    /// Also bind the legacy `--api-key`'s synthetic principal to `FleetAdmin`
-    /// on the fleet scope, on top of its `TenantAdmin` binding on `default`
-    /// (RFC-002 §3.4 migration). **Defaults to true for this release** so an
-    /// upgrade changes nothing observable; the schedule is default true, then
-    /// default false, then the flag is removed — see `docs/rift-cluster-server.md`.
-    #[arg(
-        long,
-        default_value_t = true,
-        action = clap::ArgAction::Set,
-        env = "RIFT_CLUSTER_LEGACY_KEY_IS_FLEET_ADMIN"
-    )]
-    pub cluster_legacy_key_is_fleet_admin: bool,
 }
 
 /// `--cluster-write-barrier` modes (issue #9 §4).
@@ -384,31 +371,6 @@ mod tests {
         let cli = EeCli::try_parse_from(["rift-cluster-server", "--runtime", "work-stealing"])
             .expect("parses");
         assert_eq!(cli.runtime_topology(), RuntimeTopology::WorkStealing);
-    }
-
-    /// RFC-002 §3.4: the staged default is the whole migration story, so the
-    /// flag's default must actually be `true` until this is explicitly
-    /// re-staged, and it must still be possible to turn off.
-    #[test]
-    fn legacy_key_is_fleet_admin_defaults_true_and_is_settable() {
-        let cli = EeCli::try_parse_from(["rift-cluster-server"]).expect("parses");
-        assert!(cli.cluster.cluster_legacy_key_is_fleet_admin);
-
-        let off = EeCli::try_parse_from([
-            "rift-cluster-server",
-            "--cluster-legacy-key-is-fleet-admin",
-            "false",
-        ])
-        .expect("parses");
-        assert!(!off.cluster.cluster_legacy_key_is_fleet_admin);
-
-        let on = EeCli::try_parse_from([
-            "rift-cluster-server",
-            "--cluster-legacy-key-is-fleet-admin",
-            "true",
-        ])
-        .expect("parses");
-        assert!(on.cluster.cluster_legacy_key_is_fleet_admin);
     }
 
     #[test]

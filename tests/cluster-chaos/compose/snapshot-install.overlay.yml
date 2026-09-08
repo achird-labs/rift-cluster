@@ -3,11 +3,10 @@
 #
 #     docker compose -f deploy/compose/docker-compose.yml \
 #                    -f tests/cluster-chaos/compose/chaos.overlay.yml \
-#                    -f tests/cluster-chaos/compose/tenancy.overlay.yml \
 #                    -f tests/cluster-chaos/compose/snapshot-install.overlay.yml up
 #
-# `Cluster::up_with_overlays(&["chaos.overlay.yml", "tenancy.overlay.yml",
-# "snapshot-install.overlay.yml"])` does this. Only C26 stacks it.
+# `Cluster::up_with_overlays(&["chaos.overlay.yml", "snapshot-install.overlay.yml"])` does this.
+# Only C26 stacks it.
 #
 # **Its own overlay, not a line in `chaos.overlay.yml`, and that is the whole point of this file.**
 # The issue's design said to set it in the shared chaos overlay. That was tried and CI proved it

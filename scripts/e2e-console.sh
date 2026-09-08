@@ -25,17 +25,15 @@ ADMIN_PORT=3525
 PROBE_PORT=3526
 METRICS_PORT=3591
 PEER_PORT=3790
-BOOTSTRAP_KEY="e2e-bootstrap-fleet-admin"
+# The fleet's one credential (#550, D-73). There are no tenants and no principals to mint from it:
+# whoever holds this key is the administrator, and `POST /session` exchanges it for the console's
+# cookie. `--api-key` is the only switch that closes the admin plane.
+API_KEY="e2e-fleet-admin-key"
 
 api() {
   method="$1"; path="$2"; shift 2
   curl -fsS -X "$method" "http://127.0.0.1:${ADMIN_PORT}${path}" \
-    -H "Authorization: ${BOOTSTRAP_KEY}" -H 'Content-Type: application/json' "$@"
-}
-
-mint() {
-  api POST "/admin/tenants/$1/principals" -d "{\"displayName\":\"$3\",\"role\":\"$2\"}" \
-    | python3 -c 'import sys,json;print(json.load(sys.stdin)["apiKey"])'
+    -H "Authorization: ${API_KEY}" -H 'Content-Type: application/json' "$@"
 }
 
 case "${1:-up}" in
@@ -60,7 +58,7 @@ case "${1:-up}" in
 
     "${BIN}" \
       --host 127.0.0.1 --port "${ADMIN_PORT}" --datadir "${RUN}/data" \
-      --api-key "${BOOTSTRAP_KEY}" --metrics-port "${METRICS_PORT}" \
+      --api-key "${API_KEY}" --metrics-port "${METRICS_PORT}" \
       --cluster --cluster-bind "127.0.0.1:${PEER_PORT}" \
       --cluster-advertise "127.0.0.1:${PEER_PORT}" \
       --cluster-secret e2e-cluster-secret \
@@ -79,24 +77,6 @@ case "${1:-up}" in
       sleep 0.5
     done
     [ -n "$ready" ] || { echo "FAIL: node never became ready"; tail -30 "${RUN}/node.log"; exit 1; }
-
-    # --- tenants and one principal per role ------------------------------------
-    api POST /admin/tenants -d '{"id":"acme","displayName":"Acme Corp"}' >/dev/null
-    VIEWER=$(mint default viewer "E2E Viewer")
-    OPERATOR=$(mint default operator "E2E Operator")
-    EDITOR=$(mint default editor "E2E Editor")
-    TENANT_ADMIN=$(mint default tenant-admin "E2E Tenant Admin")
-    ACME_EDITOR=$(mint acme editor "E2E Acme Editor")
-
-    # fleet-admin cannot be minted: `*` is not a valid tenant id for the principals route, and
-    # `fleet-admin` is refused inside an ordinary tenant. Mint at the floor, promote on the fleet
-    # scope, then drop the tenant binding so the principal holds `*` alone.
-    resp=$(api POST /admin/tenants/default/principals \
-      -d '{"displayName":"E2E Fleet Admin","role":"viewer"}')
-    pid=$(printf '%s' "$resp" | python3 -c 'import sys,json;print(json.load(sys.stdin)["id"])')
-    FLEET_ADMIN=$(printf '%s' "$resp" | python3 -c 'import sys,json;print(json.load(sys.stdin)["apiKey"])')
-    api PUT "/admin/tenants/*/bindings/${pid}" -d '{"role":"fleet-admin"}' >/dev/null
-    api DELETE "/admin/tenants/default/bindings/${pid}" >/dev/null
 
     # --- imposters, stubs, and traffic ------------------------------------------
     api POST /imposters -d '{
@@ -127,34 +107,31 @@ case "${1:-up}" in
     # --- the readiness sentinel, created LAST ------------------------------------
     #
     # `playwright.config.ts` waits on this imposter, not on `/console/`. The console is served the
-    # moment the node binds a socket — before a single tenant, principal or imposter exists — so
+    # moment the node binds a socket — before a single imposter exists — so
     # waiting on it starts the suite mid-seed. That is not theoretical: it raced in CI and failed
     # the first two visual specs while every later one passed, which reads like two flaky tests
     # rather than a fixture that had not finished.
     #
     # An imposter is the right sentinel because gateway traffic is auth-exempt (RFC-002 §7), so the
     # probe needs no key, and because it can only answer once every step above it has committed.
-    # Created in `acme`, not `default`, so it stays out of the imposter table the visual specs
-    # capture — a sentinel that changed the baseline would be a fixture detail leaking into the
-    # thing under test. Its port still serves traffic regardless of tenant.
-    api POST /imposters -H "X-Rift-Tenant: acme" -d '{
+    #
+    # It IS listed by `GET /imposters`. It used to be created in a second tenant so it stayed out of
+    # the table the visual specs capture; #550 left one fleet-wide set, so there is nowhere to hide
+    # it and the baselines include it.
+    api POST /imposters -d '{
       "port": 4699, "protocol": "http", "name": "e2e-ready", "recordRequests": false,
       "stubs": [{"responses":[{"is":{"statusCode":200,"body":"seeded"}}]}]}' >/dev/null
 
-    python3 - "$FIXTURE" "$ADMIN_PORT" "$BOOTSTRAP_KEY" \
-      "$VIEWER" "$OPERATOR" "$EDITOR" "$TENANT_ADMIN" "$FLEET_ADMIN" "$ACME_EDITOR" <<'PY'
+    python3 - "$FIXTURE" "$ADMIN_PORT" "$API_KEY" <<'PY'
 import json, sys
-out, port, bootstrap, viewer, operator, editor, tadmin, fadmin, acme = sys.argv[1:10]
+out, port, api_key = sys.argv[1:4]
 json.dump({
     "baseURL": f"http://127.0.0.1:{port}",
-    "keys": {
-        "bootstrap": bootstrap, "viewer": viewer, "operator": operator, "editor": editor,
-        "tenant-admin": tadmin, "fleet-admin": fadmin, "acme-editor": acme,
-    },
+    "apiKey": api_key,
     "imposters": [4645, 4646],
 }, open(out, "w"), indent=2)
 PY
-    echo "e2e fixture up on http://127.0.0.1:${ADMIN_PORT}/console/ (keys in ${FIXTURE})"
+    echo "e2e fixture up on http://127.0.0.1:${ADMIN_PORT}/console/ (key in ${FIXTURE})"
     ;;
 
   serve)

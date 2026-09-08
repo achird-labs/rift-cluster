@@ -193,7 +193,7 @@ async fn a_compile_retains_nothing_and_the_spec_store_is_gone() {
             .expect("clustered")
             .configured_ports()
             .expect("read configs"),
-        Vec::new(),
+        Vec::<u16>::new(),
         "a compile must not write config — only the PUT that follows it does"
     );
     assert_eq!(

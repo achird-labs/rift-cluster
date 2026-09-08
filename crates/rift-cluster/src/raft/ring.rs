@@ -95,7 +95,7 @@ impl<'a> OwnedKey<'a> {
     /// The owned key for a flow's state, keyed by its `flow_id`.
     ///
     /// The flow id is opaque and caller-supplied — it is not derived from a
-    /// tenant or a port, and nothing maps it back to an imposter. A port with
+    /// port, and nothing maps it back to an imposter. A port with
     /// several flows therefore has several owners, one per flow, and asking for
     /// "the owner of a port" has no answer.
     #[must_use]

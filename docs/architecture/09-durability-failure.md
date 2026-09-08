@@ -19,7 +19,8 @@ What state lives where, and what it survives:
 | Raft snapshot payload | file at `<cluster-state-dir>/snapshot/<id>` (temp → fsync → rename → dir fsync); `redb` holds only `{meta, file}` | ✅ | ✅ | Derived state — a missing payload is rebuilt, not mourned (#436) |
 | `departed` marker | file in the state dir, fsync'd before the drain | ✅ | ✅ | Steers the next start between *resume*, *rejoin* and *bootstrap* (D-26) |
 | Imposter configs + `enabled` + revisions | Raft state machine | ✅ | ✅ | Committed = fsync'd on majority |
-| Tenants, principals, bindings | Raft state machine | ✅ | ✅ | Authz survives anything the configs survive |
+| Front-door route table + its revision | Raft state machine | ✅ | ✅ | Committed with the configs it routes to |
+| Session-signing key, fleet name | Raft state machine | ✅ | ✅ | A console session survives any restart the fleet does |
 | Admin intents + op-dedup | Raft SM + accepting node's `pending_intents` | ✅ | ✅ | R4: parked before forwarded |
 | Flow state @ `sync` | FlowShard `redb`, fsync-per-ack | ✅ | ✅ **zero loss** | |
 | Flow state @ `async` (default) | FlowShard, group fsync per 50 ms | ✅ (replicas live) | ✅ minus ≤ 1 interval | Loss only if **all 3** holders die inside one interval |
@@ -161,8 +162,8 @@ bounds its *latency* is the link:
 
 Before #411 none of this was true: every attempt was cut at 50 ms and restarted,
 so a 512 KiB entry took 23–548 s and anything ≥ 1 MiB never committed at all —
-the effective ceiling was "whatever replicates in one heartbeat", far below both
-documented quotas.
+the effective ceiling was "whatever replicates in one heartbeat", far below the
+entry sizes the write path admits.
 
 **The silent window, and why it is closed.** A follower's election timer is
 refreshed only by an AppendEntries that reaches its engine, and openraft 0.9

@@ -17,21 +17,20 @@ export function Fleet(): ReactNode {
      * Both statuses mean the same thing here, and the console must say so rather than render one of
      * them as a broken page.
      *
-     * `/_fleet/*` authorizes `Action::ClusterAdmin` with no tenant scope, so `decide` splits: a
-     * principal bound to the requested tenant but lacking the role gets `InsufficientRole` → **403**,
-     * while an unbound one gets the RFC-002 §8.4 → **404**. The likelier visitor — a tenant-admin
-     * who bookmarked this screen — arrives on the 403 branch, so treating only 404 as "scope" would
-     * hand exactly that person a generic error.
+     * A node that is not clustered serves no `/_fleet/*` projection at all — there is nothing for it
+     * to answer about — so a bookmark to this screen lands on a `404` (or a `403` from a front that
+     * refuses the route outright). Neither is a fault in this session, and a generic error note
+     * would send the reader looking for one.
      */
     const status = fleet.error instanceof ApiError ? fleet.error.status : null;
-    const scoped = status === 404 || status === 403;
+    const unavailable = status === 404 || status === 403;
     return (
       <section className="screen">
         <h1>Cluster &amp; fleet</h1>
-        {scoped ? (
+        {unavailable ? (
           <p className="error" role="alert">
-            The fleet projection is fleet-scoped and is not available to this principal. A
-            FleetAdmin binding is required to read <Ident>/_fleet/*</Ident>.
+            This node serves no fleet projection. <Ident>/_fleet/*</Ident> exists only on a node
+            started with <Ident>--cluster</Ident>.
           </p>
         ) : (
           <ErrorNote error={fleet.error} context="Could not read this node's fleet view" />

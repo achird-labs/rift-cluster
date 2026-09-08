@@ -19,7 +19,7 @@ pnpm run e2e:update      # re-baseline the visual snapshots (read the diff first
 `playwright.config.ts` starts the fixture for you. To drive it by hand:
 
 ```sh
-scripts/e2e-console.sh up      # one seeded node on :3525, keys in web/e2e/.fixture.json
+scripts/e2e-console.sh up      # one seeded node on :3525, its key in web/e2e/.fixture.json
 scripts/e2e-console.sh down
 ```
 
@@ -27,7 +27,7 @@ scripts/e2e-console.sh down
 
 | Spec | What it is for |
 |---|---|
-| `smoke.spec.ts` | Every screen loads as every role, with a clean browser console. |
+| `smoke.spec.ts` | Every screen loads, with a clean browser console. |
 | `visual.spec.ts` | Component screenshots, both themes, diffed against committed baselines. |
 | `a11y.spec.ts` | axe over each screen; fails on `serious` and `critical` only. |
 
@@ -71,12 +71,12 @@ belongs to `crates/rift-cluster/tests/cluster.rs` and the container chaos tier, 
 it. `--cluster-allow-solo` keeps it a real one-voter cluster, so the fleet screen renders its
 single-node state rather than 404ing.
 
-Everything it seeds is fixed — ports, tenants, imposters, stubs, the number of requests — because a
+Everything it seeds is fixed — ports, the API key, imposters, stubs, the number of requests — because a
 visual baseline diffed against a fixture that varies is a test that fails for reasons nobody changed.
 
-`web/e2e/.fixture.json` holds the minted API keys and is **gitignored**, necessarily:
-`createPrincipal` returns the raw key once and the fleet stores only an argon2id hash, so every
-fixture run mints new ones. There is nothing stable to commit.
+`web/e2e/.fixture.json` holds the fleet's admin API key and the port it was started on, and is
+**gitignored**: it describes a fleet that only exists while the fixture is up, so a committed copy
+could only ever point a run at one that is not there.
 
 ## Baselines
 

@@ -3,27 +3,18 @@ import { fileURLToPath } from "node:url";
 import { expect, test as base } from "@playwright/test";
 import type { ConsoleMessage, Page } from "@playwright/test";
 
-/** Roles minted by `scripts/e2e-console.sh`. */
-export type RoleKey =
-  | "bootstrap"
-  | "viewer"
-  | "operator"
-  | "editor"
-  | "tenant-admin"
-  | "fleet-admin"
-  | "acme-editor";
-
 type Fixture = {
   baseURL: string;
-  keys: Record<RoleKey, string>;
+  /** The fleet's one credential (#550) — the value `scripts/e2e-console.sh` passed to `--api-key`. */
+  apiKey: string;
   imposters: number[];
 };
 
 /**
- * The keys the fixture minted, read at run time.
+ * What `scripts/e2e-console.sh` wrote about the fleet it started, read at run time.
  *
- * They cannot be committed: `createPrincipal` returns the raw key once and the fleet keeps only an
- * argon2id hash, so every fixture run mints new ones. The file is gitignored for the same reason.
+ * Not committed: the port and the key are the fixture's own, and the file is gitignored so a stale
+ * one cannot silently point a run at a fleet that is no longer there.
  */
 export function fixture(): Fixture {
   const path = fileURLToPath(new URL("./.fixture.json", import.meta.url));
@@ -49,9 +40,8 @@ export function fixture(): Fixture {
  * A 4xx the console asked for on purpose.
  *
  * Chrome logs every failed response as a console error, and this console provokes 4xx by design: an
- * unauthenticated visit probes `/admin/whoami` and renders the login screen from its `401`, and
- * RFC-002 §8.4 makes `404` the *correct* answer for a resource in another tenant. Failing on those
- * would fail every test for behaviour that is working.
+ * unauthenticated visit probes `/_fleet/health` and renders the login screen from its `401`.
+ * Failing on that would fail every test for behaviour that is working.
  *
  * 5xx is deliberately not excluded. Nothing in this console expects one, so a `500` reaching the
  * browser stays a failure.
@@ -78,22 +68,24 @@ export const test = base.extend<{ page: Page }>({
 export { expect };
 
 /**
- * Sign in as `role` and land on the imposters screen.
+ * Sign in and land on the imposters screen.
  *
- * Drives the real login form rather than injecting a cookie: the key-for-cookie exchange is the one
- * flow every session depends on, and a helper that bypassed it would leave it untested everywhere.
+ * No role: since #550 there is one credential and one identity, so every session is the same
+ * session. Drives the real login form rather than injecting a cookie — the key-for-cookie exchange
+ * is the one flow every session depends on, and a helper that bypassed it would leave it untested
+ * everywhere.
  */
-export async function signIn(page: Page, role: RoleKey): Promise<void> {
-  const { keys } = fixture();
+export async function signIn(page: Page): Promise<void> {
+  const { apiKey } = fixture();
   await page.goto("/console/");
-  await page.getByLabel(/api key/i).fill(keys[role]);
+  await page.getByLabel(/api key/i).fill(apiKey);
   await page.getByRole("button", { name: /^sign in$/i }).click();
-  // The shell is up once the identity is rendered; every screen assertion can rely on that.
-  await expect(page.getByTestId("identity")).toBeVisible();
+  // The shell is up once the nav is rendered; every screen assertion can rely on that.
+  await expect(page.getByTestId("nav-imposters")).toBeVisible();
 }
 
 /** Navigate within the SPA by hash, then wait for the shell to settle. */
 export async function goToScreen(page: Page, hash: string): Promise<void> {
   await page.goto(`/console/#${hash}`);
-  await expect(page.getByTestId("identity")).toBeVisible();
+  await expect(page.getByTestId("nav-imposters")).toBeVisible();
 }

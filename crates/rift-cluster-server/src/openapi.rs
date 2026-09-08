@@ -12,8 +12,8 @@
 //! the contract publishes, in both directions, and the tests in this module fail CI on any
 //! difference. The guard is layered, strongest first:
 //!
-//! 1. **Compile time, for the write surface.** `contract_route` and `tenancy_contract_route` are
-//!    exhaustive matches with no wildcard arm, so a new `Terminated` / `tenancy::Route` variant
+//! 1. **Compile time, for the write surface.** `contract_route` is an
+//!    exhaustive match with no wildcard arm, so a new `Terminated` variant
 //!    fails to *compile* until it is given a published path — the same tripwire `action_for`,
 //!    `addressed_port` and `scope_for` already use. On its own that only forces the variant to be
 //!    *named*, not to enter the set being compared, so `every_terminated_variant_has_a_representative`
@@ -105,9 +105,8 @@ pub(crate) fn contract_json() -> Result<Vec<u8>, &'static str> {
 ///
 /// Public so that integration test can reach it; a duplicated list is exactly how the two halves
 /// would drift.
-pub const HANDLE_DIRECT_ROUTES: [(&str, &str); 8] = [
+pub const HANDLE_DIRECT_ROUTES: [(&str, &str); 7] = [
     ("GET", "/front-door/routes"),
-    ("GET", "/admin/whoami"),
     ("GET", "/openapi.json"),
     // C2 (#185): the read-only fleet projection and the session exchange.
     ("GET", "/_fleet/members"),
@@ -128,10 +127,8 @@ mod parity {
     use std::collections::BTreeSet;
 
     use hyper::Method;
-    use rift_cluster::control::{PrincipalId, TenantId};
 
     use crate::admin_front::{Terminated, classify};
-    use crate::tenancy;
 
     /// One published operation: an OpenAPI path template plus its method.
     ///
@@ -333,44 +330,8 @@ mod parity {
             Terminated::DeleteRoute(_) => {
                 RouteKey::new(&Method::DELETE, "/front-door/routes/{routeId}")
             }
-            Terminated::Tenancy(route) => tenancy_contract_route(route),
+            Terminated::FleetNamePut => RouteKey::new(&Method::PUT, "/admin/fleet/name"),
             Terminated::SpecCompile => RouteKey::new(&Method::POST, "/specs/compile"),
-        }
-    }
-
-    /// The published operation for a tenancy route. Exhaustive for the same reason as
-    /// [`contract_route`].
-    pub(crate) fn tenancy_contract_route(route: &tenancy::Route) -> RouteKey {
-        use tenancy::Route;
-        match route {
-            Route::TenantCreate => RouteKey::new(&Method::POST, "/admin/tenants"),
-            Route::TenantList => RouteKey::new(&Method::GET, "/admin/tenants"),
-            Route::TenantRead(_) => RouteKey::new(&Method::GET, "/admin/tenants/{tenantId}"),
-            Route::TenantPut(_) => RouteKey::new(&Method::PUT, "/admin/tenants/{tenantId}"),
-            Route::TenantDelete(_) => RouteKey::new(&Method::DELETE, "/admin/tenants/{tenantId}"),
-            Route::PrincipalCreate(_) => {
-                RouteKey::new(&Method::POST, "/admin/tenants/{tenantId}/principals")
-            }
-            Route::PrincipalList(_) => {
-                RouteKey::new(&Method::GET, "/admin/tenants/{tenantId}/principals")
-            }
-            Route::PrincipalPut(_, _) => RouteKey::new(
-                &Method::PUT,
-                "/admin/tenants/{tenantId}/principals/{principalId}",
-            ),
-            Route::PrincipalDelete(_, _) => RouteKey::new(
-                &Method::DELETE,
-                "/admin/tenants/{tenantId}/principals/{principalId}",
-            ),
-            Route::BindingPut(_, _) => RouteKey::new(
-                &Method::PUT,
-                "/admin/tenants/{tenantId}/bindings/{principalId}",
-            ),
-            Route::BindingDelete(_, _) => RouteKey::new(
-                &Method::DELETE,
-                "/admin/tenants/{tenantId}/bindings/{principalId}",
-            ),
-            Route::FleetNamePut => RouteKey::new(&Method::PUT, "/admin/fleet/name"),
         }
     }
 
@@ -382,9 +343,6 @@ mod parity {
     /// error, and this list is what turns the variants into a set the parity test can compare. Add a
     /// variant, and the compiler stops you here first.
     pub(crate) fn terminated_representatives() -> Vec<Terminated> {
-        use tenancy::Route;
-        let tenant = TenantId::new("acme");
-        let principal = PrincipalId::new("p-1");
         vec![
             Terminated::Create,
             Terminated::ReplaceAllImposters,
@@ -410,18 +368,7 @@ mod parity {
             Terminated::TryImposter(4545),
             Terminated::PutRoutes,
             Terminated::DeleteRoute("svc".to_owned()),
-            Terminated::Tenancy(Route::TenantCreate),
-            Terminated::Tenancy(Route::TenantList),
-            Terminated::Tenancy(Route::TenantRead(tenant.clone())),
-            Terminated::Tenancy(Route::TenantPut(tenant.clone())),
-            Terminated::Tenancy(Route::TenantDelete(tenant.clone())),
-            Terminated::Tenancy(Route::PrincipalCreate(tenant.clone())),
-            Terminated::Tenancy(Route::PrincipalList(tenant.clone())),
-            Terminated::Tenancy(Route::PrincipalPut(tenant.clone(), principal.clone())),
-            Terminated::Tenancy(Route::PrincipalDelete(tenant.clone(), principal.clone())),
-            Terminated::Tenancy(Route::BindingPut(tenant.clone(), principal.clone())),
-            Terminated::Tenancy(Route::BindingDelete(tenant, principal)),
-            Terminated::Tenancy(Route::FleetNamePut),
+            Terminated::FleetNamePut,
             Terminated::SpecCompile,
         ]
     }
@@ -526,8 +473,6 @@ mod parity {
             .replace("{stubIndex}", "0")
             .replace("{stubId}", "s-1")
             .replace("{routeId}", "svc")
-            .replace("{tenantId}", "acme")
-            .replace("{principalId}", "p-1")
             .replace("{scenarioName}", "checkout")
             .replace("{flowId}", "flow-1")
             // A real UUID: `/_fleet/ops/{opId}` parses the segment, and a malformed id names no op at
@@ -567,8 +512,7 @@ mod tests {
 
     use super::parity::*;
     use super::*;
-    use crate::admin_front::{Terminated, TerminatedDiscriminants};
-    use crate::tenancy::RouteDiscriminants;
+    use crate::admin_front::TerminatedDiscriminants;
 
     fn parsed() -> &'static serde_json::Value {
         contract().expect("embedded openapi-ee.yaml must parse")
@@ -781,7 +725,6 @@ mod tests {
             "Idempotency-Key",
             "Rift-Cluster-Revision",
             "Rift-Cluster-Op-Id",
-            "X-Rift-Tenant",
             "Rift-Cluster-Partial",
         ] {
             assert!(
@@ -798,7 +741,7 @@ mod tests {
             .and_then(|c| c.get("parameters"))
             .and_then(serde_json::Value::as_object)
             .expect("components.parameters");
-        for component in ["IfMatch", "IdempotencyKey", "TenantHeader"] {
+        for component in ["IfMatch", "IdempotencyKey"] {
             let param = components
                 .get(component)
                 .unwrap_or_else(|| panic!("components.parameters.{component} is missing"));
@@ -1287,7 +1230,7 @@ mod tests {
     /// while the route shipped undocumented. That is the one hole a reviewer found in this design.
     ///
     /// `EnumDiscriminants` closes it: the discriminant enum gains a variant automatically, so this
-    /// assertion fails until a representative exists. Same for `tenancy::Route`.
+    /// assertion fails until a representative exists.
     #[test]
     fn every_terminated_variant_has_a_representative() {
         use strum::IntoEnumIterator;
@@ -1302,20 +1245,6 @@ mod tests {
             missing.is_empty(),
             "these Terminated variants have no representative, so their routes are invisible to \
              the parity comparison and could ship undocumented: {missing:?}"
-        );
-
-        let covered: BTreeSet<RouteDiscriminants> = terminated_representatives()
-            .iter()
-            .filter_map(|kind| match kind {
-                Terminated::Tenancy(route) => Some(RouteDiscriminants::from(route)),
-                _ => None,
-            })
-            .collect();
-        let all: BTreeSet<RouteDiscriminants> = RouteDiscriminants::iter().collect();
-        let missing: Vec<_> = all.difference(&covered).collect();
-        assert!(
-            missing.is_empty(),
-            "these tenancy::Route variants have no representative: {missing:?}"
         );
     }
 

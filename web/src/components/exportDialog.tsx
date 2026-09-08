@@ -5,8 +5,8 @@ import {
   exportOptionsQuery,
 } from "../features/imposters/portable.ts";
 
-/** What the export covers. The imposter list offers only the tenant; a detail screen offers both. */
-export type ExportScope = { kind: "tenant" } | { kind: "one"; port: number };
+/** What the export covers. The imposter list offers only the whole set; a detail screen offers both. */
+export type ExportScope = { kind: "all" } | { kind: "one"; port: number };
 
 /**
  * The export dialog.
@@ -22,7 +22,6 @@ export type ExportScope = { kind: "tenant" } | { kind: "one"; port: number };
 export function ExportDialog({
   scope,
   scopes,
-  tenant,
   imposterCount,
   busy,
   onScope,
@@ -32,7 +31,6 @@ export function ExportDialog({
   scope: ExportScope;
   /** Omitted when there is only one scope to offer, which is the imposter list's case. */
   scopes?: readonly ExportScope[];
-  tenant: string | null;
   imposterCount: number;
   busy: boolean;
   onScope?: (scope: ExportScope) => void;
@@ -47,10 +45,7 @@ export function ExportDialog({
 
   const holes = options.removeProxies && !options.replayable;
   const path = scope.kind === "one" ? `/imposters/${String(scope.port)}` : "/imposters";
-  const file =
-    scope.kind === "one"
-      ? `imposter-${String(scope.port)}.json`
-      : `imposters-${tenant ?? "all"}.json`;
+  const file = scope.kind === "one" ? `imposter-${String(scope.port)}.json` : "imposters.json";
 
   return (
     <div
@@ -77,7 +72,7 @@ export function ExportDialog({
             <div className="pill-filters export-scopes">
               {scopes.map((entry) => (
                 <button
-                  key={entry.kind === "one" ? `one-${String(entry.port)}` : "tenant"}
+                  key={entry.kind === "one" ? `one-${String(entry.port)}` : "all"}
                   type="button"
                   className="pill-filter"
                   aria-pressed={entry.kind === scope.kind}
@@ -85,7 +80,7 @@ export function ExportDialog({
                 >
                   {entry.kind === "one"
                     ? `This imposter · ${String(entry.port)}`
-                    : `Every imposter in ${tenant ?? "this tenant"} · ${String(imposterCount)}`}
+                    : `Every imposter · ${String(imposterCount)}`}
                 </button>
               ))}
             </div>
@@ -125,9 +120,7 @@ export function ExportDialog({
         <div className="field">
           <span className="eyebrow">Request</span>
           <pre className="payload" data-testid="export-curl">
-            {`curl -s '${path}${exportOptionsQuery(options)}' \\\n${
-              tenant === null ? "" : `  -H 'X-Rift-Tenant: ${tenant}' \\\n`
-            }  > ${file}`}
+            {`curl -s '${path}${exportOptionsQuery(options)}' > ${file}`}
           </pre>
         </div>
 

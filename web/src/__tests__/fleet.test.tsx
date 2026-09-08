@@ -3,7 +3,7 @@ import { screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { Fleet } from "../screens/Fleet.tsx";
-import { renderInApp, stubFetch, whoamiWith } from "./harness.tsx";
+import { renderInApp, stubFetch } from "./harness.tsx";
 
 const THREE_NODE = {
   "/_fleet/members": { json: { node_id: 2, is_leader: false, current_leader: 1, last_applied: 412, voters: [1, 2, 3] } },
@@ -35,7 +35,7 @@ describe("the fleet's name", () => {
 
   it("renders the name the fleet was given", async () => {
     stubFetch(withMembers({ fleet_name: "rift-prod-eu", fleet_name_unavailable: false }));
-    renderInApp(<Fleet />, { whoami: whoamiWith("fleet-admin") });
+    renderInApp(<Fleet />);
 
     expect((await screen.findByTestId("fleet-name")).textContent).toBe("rift-prod-eu");
   });
@@ -45,14 +45,14 @@ describe("the fleet's name", () => {
     // not an edge one. A blank here reads as "still loading" and invites a refresh that changes
     // nothing.
     stubFetch(withMembers({ fleet_name: null, fleet_name_unavailable: false }));
-    renderInApp(<Fleet />, { whoami: whoamiWith("fleet-admin") });
+    renderInApp(<Fleet />);
 
     expect((await screen.findByTestId("fleet-name")).textContent).toBe("Unnamed");
   });
 
   it("distinguishes a name it could not read from a fleet with no name", async () => {
     stubFetch(withMembers({ fleet_name: null, fleet_name_unavailable: true }));
-    renderInApp(<Fleet />, { whoami: whoamiWith("fleet-admin") });
+    renderInApp(<Fleet />);
 
     const name = await screen.findByTestId("fleet-name");
     expect(name.textContent).toBe("Unavailable");
@@ -63,7 +63,7 @@ describe("the fleet's name", () => {
     // Field-absent is the pre-#373 wire shape and must not read as "unavailable" — an older node
     // in a mixed-version fleet has not failed to read anything.
     stubFetch(withMembers({}));
-    renderInApp(<Fleet />, { whoami: whoamiWith("fleet-admin") });
+    renderInApp(<Fleet />);
 
     expect((await screen.findByTestId("fleet-name")).textContent).toBe("Unnamed");
   });
@@ -72,7 +72,7 @@ describe("the fleet's name", () => {
 describe("cluster screen against a 3-node fleet", () => {
   it("names this node, the leader, the ring epoch and the voters", async () => {
     stubFetch(THREE_NODE);
-    renderInApp(<Fleet />, { whoami: whoamiWith("fleet-admin") });
+    renderInApp(<Fleet />);
 
     expect((await screen.findByTestId("fleet-node")).textContent).toContain("2");
     expect(screen.getByTestId("fleet-leader").textContent).toContain("1");
@@ -114,7 +114,7 @@ describe("cluster screen against a 3-node fleet", () => {
 
     it("gives every voter its own unbreakable element", async () => {
       stubFetch(REALISTIC);
-      renderInApp(<Fleet />, { whoami: whoamiWith("fleet-admin") });
+      renderInApp(<Fleet />);
 
       const cell = await screen.findByTestId("fleet-voters");
       expect(cell.querySelectorAll(".nobreak")).toHaveLength(3);
@@ -122,7 +122,7 @@ describe("cluster screen against a 3-node fleet", () => {
 
     it("gives every ring member its own unbreakable element", async () => {
       stubFetch(REALISTIC);
-      renderInApp(<Fleet />, { whoami: whoamiWith("fleet-admin") });
+      renderInApp(<Fleet />);
 
       const cell = await screen.findByTestId("fleet-ring-epoch");
       expect(cell.querySelectorAll(".nobreak")).toHaveLength(3);
@@ -134,7 +134,7 @@ describe("cluster screen against a 3-node fleet", () => {
       // The separators stay OUTSIDE the unbreakable spans on purpose: a list that cannot break at
       // all overflows its tile instead, which trades one rendering bug for another.
       stubFetch(REALISTIC);
-      renderInApp(<Fleet />, { whoami: whoamiWith("fleet-admin") });
+      renderInApp(<Fleet />);
 
       const cell = await screen.findByTestId("fleet-voters");
       expect(cell.textContent).toContain("3342140982834931000, 3481475601826307600");
@@ -148,7 +148,7 @@ describe("cluster screen against a 3-node fleet", () => {
     // `/_fleet/*` is one node answering about itself; presenting it as the fleet's state is the
     // vacuous-test equivalent the issue calls out.
     stubFetch(THREE_NODE);
-    renderInApp(<Fleet />, { whoami: whoamiWith("fleet-admin") });
+    renderInApp(<Fleet />);
 
     expect((await screen.findByTestId("fleet-scope-label")).textContent).toMatch(/this node/i);
   });
@@ -157,7 +157,7 @@ describe("cluster screen against a 3-node fleet", () => {
 describe("cluster screen against a single node", () => {
   it("renders without implying two nodes are missing", async () => {
     stubFetch(SINGLE_NODE);
-    renderInApp(<Fleet />, { whoami: whoamiWith("fleet-admin") });
+    renderInApp(<Fleet />);
 
     expect((await screen.findByTestId("fleet-node")).textContent).toContain("1");
     expect(screen.queryByTestId("fleet-degraded")).toBeNull();
@@ -173,7 +173,7 @@ describe("degraded and unknown states", () => {
         json: { ready: false, state: "not-ready", pending_gates: ["cluster-joined"], isolated: true, ring: { m_idx: 7, members: [1, 2] } },
       },
     });
-    renderInApp(<Fleet />, { whoami: whoamiWith("fleet-admin") });
+    renderInApp(<Fleet />);
 
     const degraded = await screen.findByTestId("fleet-degraded");
     expect(degraded.textContent).toMatch(/isolated/i);
@@ -188,20 +188,21 @@ describe("degraded and unknown states", () => {
       "/_fleet/members": { json: { node_id: 3, is_leader: false, current_leader: null, last_applied: null, voters: [1, 2, 3] } },
       "/_fleet/health": { json: { ready: false, state: "not-ready", pending_gates: [], isolated: false, ring: { m_idx: 7, members: [1, 2, 3] } } },
     });
-    renderInApp(<Fleet />, { whoami: whoamiWith("fleet-admin") });
+    renderInApp(<Fleet />);
 
     expect((await screen.findByTestId("fleet-applied")).textContent).toContain("—");
     expect(screen.getByTestId("fleet-applied").textContent).not.toContain("0");
     expect(screen.getByTestId("fleet-leader").textContent).toContain("—");
   });
 
-  it("explains a 404 as insufficient scope rather than as a missing page", async () => {
-    // RFC-002 §8.4 makes "you may not" and "it is not there" indistinguishable on the wire. The
-    // console must not translate that into "the fleet has no cluster".
+  it("explains a 404 as a node with no fleet projection rather than as a missing page", async () => {
+    // A node started without `--cluster` serves no `/_fleet/*` at all, and a `404` is what a
+    // bookmark to this screen finds there. The console must say which node state that is rather
+    // than rendering a bare missing-page error the reader would take for a console fault.
     stubFetch({ "/_fleet/members": { status: 404, json: { message: "not found" } }, "/_fleet/health": { status: 404, json: { message: "not found" } } });
-    renderInApp(<Fleet />, { whoami: whoamiWith("viewer") });
+    renderInApp(<Fleet />);
 
     const error = await screen.findByRole("alert");
-    expect(error.textContent).toMatch(/fleet-scoped|not available to this principal/i);
+    expect(error.textContent).toMatch(/serves no fleet projection|--cluster/i);
   });
 });

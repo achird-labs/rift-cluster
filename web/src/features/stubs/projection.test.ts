@@ -47,7 +47,7 @@ describe("a stub the form does not model is raw-only, with every unmodelled key 
   it("names a top-level field outside the modelled set", () => {
     const projected = project({
       id: "s-1",
-      space: "tenant-a",
+      space: "flow-a",
       scenarioName: "checkout",
       behaviors: [{ wait: 50 }],
       predicates: [{ equals: { method: "GET", path: "/x" } }],

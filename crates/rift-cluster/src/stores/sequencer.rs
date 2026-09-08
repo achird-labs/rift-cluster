@@ -136,7 +136,7 @@ impl SequencingMode {
 /// funnel every config passes through to become real on a node, and which
 /// carries the *complete* desired set — so the map is exact by construction and
 /// a port that disappears drops out. The two alternatives were rejected:
-/// `RaftNode::imposter_config` needs a tenant the key does not carry and is a
+/// `RaftNode::imposter_config` is a
 /// storage read on a 20–40k RPS path, and `FlowStoreProvider::provide` is not
 /// re-called when an existing imposter's config changes in place, so a mode
 /// change would go unnoticed — silently stale, which is worse than absent.

@@ -4,7 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { POLL_INTERVAL_MS } from "../app/query.ts";
 import { Imposters } from "../screens/Imposters.tsx";
-import { renderInApp, setTabVisibility, stubFetch, whoamiWith } from "./harness.tsx";
+import { renderInApp, setTabVisibility, stubFetch } from "./harness.tsx";
 
 const IMPOSTERS = {
   "/imposters": { json: { imposters: [{ port: 4545, protocol: "http", recordRequests: false, enabled: true }] } },
@@ -31,7 +31,7 @@ describe("polling (RFC-006 §6 — polling, not realtime)", () => {
     // nothing.
     vi.useFakeTimers({ shouldAdvanceTime: true });
     const { calls } = stubFetch(IMPOSTERS);
-    renderInApp(<Imposters />, { whoami: whoamiWith("editor") });
+    renderInApp(<Imposters />);
     await screen.findByText("4545");
 
     const before = pollsSoFar(calls);
@@ -45,7 +45,7 @@ describe("polling (RFC-006 §6 — polling, not realtime)", () => {
     // per-query override; counting fetches across a real visibilitychange does.
     vi.useFakeTimers({ shouldAdvanceTime: true });
     const { calls } = stubFetch(IMPOSTERS);
-    renderInApp(<Imposters />, { whoami: whoamiWith("editor") });
+    renderInApp(<Imposters />);
     await screen.findByText("4545");
 
     setTabVisibility("hidden");

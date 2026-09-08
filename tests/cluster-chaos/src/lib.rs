@@ -196,27 +196,10 @@ pub struct Cluster {
     /// with only the base file leaves toxiproxy and Envoy running, and the next
     /// scenario inherits them.
     files: Vec<String>,
-    /// The admin credential this stack boots with, if any — see [`fleet_key_for`].
-    fleet_key: Option<&'static str>,
     _guard: MutexGuard<'static, ()>,
     /// When this stack was asked for, so `Drop` can report what the scenario
     /// cost end to end. See [`record`].
     created: Instant,
-}
-
-/// The admin credential a stack composed from `files` boots with, if any.
-///
-/// `/_fleet/members` is gated at `ClusterAdmin` through the same chokepoint as
-/// every other admin route, so on the closed plane `tenancy.overlay.yml` boots
-/// the harness has to present [`TENANCY_FLEET_KEY`] to read membership at all;
-/// on the open plane every other overlay leaves, an unauthenticated read is the
-/// right one. Derived from the compose file list rather than threaded through
-/// every constructor, because the overlay is the one place the key is set.
-fn fleet_key_for(files: &[String]) -> Option<&'static str> {
-    files
-        .iter()
-        .any(|file| file.ends_with("tenancy.overlay.yml"))
-        .then_some(TENANCY_FLEET_KEY)
 }
 
 impl Cluster {
@@ -269,7 +252,6 @@ impl Cluster {
         let guard = stack_lock().lock().unwrap_or_else(|e| e.into_inner());
         let cluster = Self {
             files: vec![base_file()],
-            fleet_key: None,
             _guard: guard,
             created: Instant::now(),
         };
@@ -291,10 +273,8 @@ impl Cluster {
         // Poisoning only means a previous scenario panicked; the stack is torn
         // down by `Drop` either way, so the lock still hands over a clean slate.
         let guard = stack_lock().lock().unwrap_or_else(|e| e.into_inner());
-        let fleet_key = fleet_key_for(&files);
         let cluster = Self {
             files,
-            fleet_key,
             _guard: guard,
             created: Instant::now(),
         };
@@ -379,7 +359,7 @@ impl Cluster {
             let mut voters_ok = 0;
             let mut leaders: Vec<Option<String>> = Vec::new();
             for node in &NODES {
-                if let Ok(body) = fleet_members(node.admin, self.fleet_key).await {
+                if let Ok(body) = fleet_members(node.admin).await {
                     if voter_count(&body) == Some(NODES.len()) {
                         voters_ok += 1;
                     }
@@ -699,8 +679,6 @@ pub fn published_host_ports() -> Vec<u16> {
     ports.extend(FLOW_STATE_HOST_PORTS);
     ports.extend(FRONT_DOOR_HOST_PORTS);
     ports.push(PROXY_ORIGIN_ADMIN_PORT);
-    ports.extend(TENANCY_A_HOST_PORTS);
-    ports.extend(TENANCY_B_HOST_PORTS);
     ports.extend(SEQUENCING_HOST_PORTS);
     ports
 }
@@ -856,28 +834,19 @@ pub async fn probe(port: u16, path: &str) -> anyhow::Result<u16> {
 }
 
 /// GET a JSON document from any published HTTP port.
+///
+/// No credential: every scenario in this tier runs against an open admin plane.
+/// The fleet is started without `MB_APIKEY`, which is what leaves it open (D-46).
 pub async fn get_json(port: u16, path: &str) -> anyhow::Result<(u16, serde_json::Value)> {
-    get_json_with_key(port, path, None).await
-}
-
-/// [`get_json`] carrying an `authorization` header, for the scenarios that run
-/// against a closed admin plane (C24-C27 under `tenancy.overlay.yml`).
-pub async fn get_json_with_key(
-    port: u16,
-    path: &str,
-    key: Option<&str>,
-) -> anyhow::Result<(u16, serde_json::Value)> {
-    let mut request = reqwest::Client::new()
+    let response = reqwest::Client::new()
         .get(format!("http://127.0.0.1:{port}{path}"))
-        .timeout(Duration::from_secs(10));
-    if let Some(key) = key {
-        request = request.header("authorization", key);
-    }
-    let response = request.send().await?;
+        .timeout(Duration::from_secs(10))
+        .send()
+        .await?;
     let status = response.status().as_u16();
     // The status is the subject here, so a body that is not JSON (or is empty)
     // must not mask it — callers assert on the status and use the body only as
-    // forensics. `imposter_ports_with_key` is where a non-2xx becomes an error.
+    // forensics. `imposter_ports` is where a non-2xx becomes an error.
     let body = response.json().await.unwrap_or(serde_json::Value::Null);
     Ok((status, body))
 }
@@ -892,23 +861,9 @@ pub async fn get_json_with_key(
 /// a second later -- which reads as "the mgmt network did not hold" and is
 /// wrong. A genuinely unreachable node still fails, just after the timeout.
 pub async fn wait_admin_reachable(admin: u16, timeout: Duration) -> anyhow::Result<()> {
-    wait_admin_reachable_with_key(admin, timeout, None).await
-}
-
-/// [`wait_admin_reachable`] carrying a credential — C25's closed admin plane.
-///
-/// Reachability and authorization are different questions, and on a closed plane
-/// the unauthenticated probe cannot tell them apart: it answers `401` from a node
-/// that is perfectly reachable, and the poll then burns its whole timeout before
-/// reporting what reads as a partition that did not hold.
-pub async fn wait_admin_reachable_with_key(
-    admin: u16,
-    timeout: Duration,
-    key: Option<&str>,
-) -> anyhow::Result<()> {
     let deadline = Instant::now() + timeout;
     loop {
-        let attempt = match get_json_with_key(admin, "/imposters", key).await {
+        let attempt = match get_json(admin, "/imposters").await {
             Ok((200, _)) => return Ok(()),
             Ok((status, _)) => format!("status {status}"),
             Err(e) => e.to_string(),
@@ -1028,130 +983,6 @@ pub async fn put_imposter_with_key(
     Ok((status, headers, envelope))
 }
 
-/// An admin-plane request carrying an API key, returning `(status, body)`.
-///
-/// Forensic body, not a bare status, for the same reason every other helper
-/// here returns one: C24 compares whole responses across three nodes, and a
-/// `403` that agrees on the status while disagreeing on the reason is exactly
-/// the divergence the scenario exists to catch.
-///
-/// `key: None` sends no credential at all — which is a distinct case from a
-/// wrong key, and the two must be distinguishable: an open plane answers the
-/// first and a closed one refuses it.
-pub async fn admin_with_key(
-    port: u16,
-    method: &str,
-    path: &str,
-    body: Option<&serde_json::Value>,
-    key: Option<&str>,
-) -> anyhow::Result<(u16, serde_json::Value)> {
-    admin_as(port, method, path, body, key, None).await
-}
-
-/// [`admin_with_key`] naming the tenant the caller is acting under.
-///
-/// `X-Rift-Tenant` **selects among the principal's existing bindings; it never
-/// grants one** (RFC-002 §8.1). Sent explicitly rather than left to default,
-/// because for a create it is the header that decides which tenant *acquires*
-/// the resource — so a scenario that omitted it would be asserting against
-/// whichever tenant the server picked, not the one it meant.
-pub async fn admin_as(
-    port: u16,
-    method: &str,
-    path: &str,
-    body: Option<&serde_json::Value>,
-    key: Option<&str>,
-    tenant: Option<&str>,
-) -> anyhow::Result<(u16, serde_json::Value)> {
-    let url = format!("http://127.0.0.1:{port}{path}");
-    let client = reqwest::Client::new();
-    let mut request = match method {
-        "GET" => client.get(url),
-        "POST" => client.post(url),
-        "PUT" => client.put(url),
-        "DELETE" => client.delete(url),
-        other => anyhow::bail!("unsupported method {other:?}"),
-    }
-    .timeout(Duration::from_secs(30));
-    if let Some(key) = key {
-        request = request.header("authorization", key);
-    }
-    if let Some(tenant) = tenant {
-        request = request.header("X-Rift-Tenant", tenant);
-    }
-    if let Some(body) = body {
-        request = request.json(body);
-    }
-    let response = request.send().await?;
-    let status = response.status().as_u16();
-    // A non-JSON body surfaces as null rather than as an error: the status is
-    // what the caller came for, and an unparseable body is itself a finding.
-    let parsed = response.json().await.unwrap_or(serde_json::Value::Null);
-    Ok((status, parsed))
-}
-
-/// Create a tenant as the fleet admin. Returns `(status, body)`.
-pub async fn create_tenant(
-    admin: u16,
-    tenant: &str,
-    key: &str,
-) -> anyhow::Result<(u16, serde_json::Value)> {
-    admin_with_key(
-        admin,
-        "POST",
-        "/admin/tenants",
-        Some(&serde_json::json!({ "id": tenant, "displayName": tenant })),
-        Some(key),
-    )
-    .await
-}
-
-/// Mint a principal bound to `tenant` with `role`, returning `(id, raw key)`.
-///
-/// `role` is the **kebab-case** wire form (`"viewer"`, `"operator"`, `"editor"`,
-/// `"tenant-admin"`) — `Role`'s serde representation, not its Rust spelling.
-///
-/// The id is returned alongside the key because revoking a binding addresses
-/// the principal by id (`DELETE /admin/tenants/:t/bindings/:pid`), and the id is
-/// derived from the key rather than chosen, so a caller cannot reconstruct it.
-///
-/// The key is returned in this one response and never again (RFC-002 §5 shows
-/// it once), so a scenario that drops it cannot recover it — hence returning it
-/// rather than the whole body.
-pub async fn mint_principal(
-    admin: u16,
-    tenant: &str,
-    role: &str,
-    key: &str,
-) -> anyhow::Result<(String, String)> {
-    let (status, body) = admin_with_key(
-        admin,
-        "POST",
-        &format!("/admin/tenants/{tenant}/principals"),
-        Some(&serde_json::json!({ "displayName": format!("{tenant}-{role}"), "role": role })),
-        Some(key),
-    )
-    .await?;
-    anyhow::ensure!(
-        status == 201,
-        "minting a {role} in {tenant} failed: {status} {body}"
-    );
-    // `apiKey`, not `key` — the field name is the contract `tenancy_api.rs`
-    // already asserts in process, and reading the wrong one here would fail as
-    // "no raw key" rather than as the typo it is.
-    let id = body
-        .get("id")
-        .and_then(serde_json::Value::as_str)
-        .map(str::to_owned)
-        .ok_or_else(|| anyhow::anyhow!("the mint response carried no id: {body}"))?;
-    let raw = body
-        .get("apiKey")
-        .and_then(serde_json::Value::as_str)
-        .map(str::to_owned)
-        .ok_or_else(|| anyhow::anyhow!("the mint response carried no raw key: {body}"))?;
-    Ok((id, raw))
-}
-
 /// The one imposter data port the `pull-on-miss` overlay publishes, and the
 /// host ports it appears on — indexed like [`NODES`]. C16 only.
 ///
@@ -1182,31 +1013,6 @@ pub const FLOW_STATE_HOST_PORTS: [u16; 3] = [16400, 26400, 36400];
 /// — see the overlay's header and #117.
 pub const SEQUENCING_IMPOSTER_PORT: u16 = 6700;
 pub const SEQUENCING_HOST_PORTS: [u16; 3] = [16700, 26700, 36700];
-
-/// C27's two imposter data ports — one per tenant — and the host ports
-/// `tenancy.overlay.yml` publishes them on, indexed like [`NODES`].
-///
-/// Two tenants, two ports, published on every node, because C27's claim is that
-/// tenancy isolates *ownership* and not the data plane: both imposters must
-/// answer unauthenticated traffic through any node. One port would prove only
-/// that one tenant's imposter serves; one node would prove nothing about the
-/// fleet.
-///
-/// Both sit below Linux's ephemeral range (32768-60999), so unlike
-/// [`FLOW_STATE_HOST_PORTS`]'s 36400 they need no `ip_local_reserved_ports`
-/// entry — see #117 and the overlay's header.
-pub const TENANCY_A_IMPOSTER_PORT: u16 = 6500;
-pub const TENANCY_A_HOST_PORTS: [u16; 3] = [16500, 26500, 36500];
-pub const TENANCY_B_IMPOSTER_PORT: u16 = 6501;
-pub const TENANCY_B_HOST_PORTS: [u16; 3] = [16501, 26501, 36501];
-
-/// The fleet-admin credential `tenancy.overlay.yml` boots the fleet with.
-///
-/// A constant rather than a generated value: it is set in the overlay, so the
-/// scenario and the compose file have to agree on it, and a literal that
-/// appears in both is easier to keep true than a value threaded through the
-/// environment.
-pub const TENANCY_FLEET_KEY: &str = "chaos-fleet-admin-key";
 
 /// The front door's host ports under `front-door.overlay.yml` — one per node,
 /// in `NODES` order. C17 and C18 only: no other scenario binds `--front-door`.
@@ -1386,27 +1192,19 @@ pub async fn clear_toxics(proxy: &str) -> anyhow::Result<()> {
 }
 
 /// The ports a node currently has configured, read from its admin API.
-pub async fn imposter_ports(admin: u16) -> anyhow::Result<Vec<u64>> {
-    imposter_ports_with_key(admin, None).await
-}
-
-/// [`imposter_ports`] carrying a credential, for the scenarios that run against
-/// a *closed* admin plane (C24-C27 under `tenancy.overlay.yml`).
 ///
 /// **Why the status is checked rather than the body simply parsed.** Without the
-/// check a `401` body has no `imposters` array, so it read as "this node has no
+/// check a refusal body has no `imposters` array, so it read as "this node has no
 /// imposters" — and `wait_converged` then reported `reached only 0/3 nodes`, a
-/// convergence failure, for what was actually a missing credential. That cost a
-/// full container run to diagnose. An unauthorized read is not an empty read,
-/// and the two must not be spelled the same way.
-pub async fn imposter_ports_with_key(admin: u16, key: Option<&str>) -> anyhow::Result<Vec<u64>> {
-    let mut request = reqwest::Client::new()
+/// convergence failure, for what was actually a refused read. That cost a full
+/// container run to diagnose. A refused read is not an empty read, and the two
+/// must not be spelled the same way.
+pub async fn imposter_ports(admin: u16) -> anyhow::Result<Vec<u64>> {
+    let response = reqwest::Client::new()
         .get(format!("http://127.0.0.1:{admin}/imposters"))
-        .timeout(Duration::from_secs(10));
-    if let Some(key) = key {
-        request = request.header("authorization", key);
-    }
-    let response = request.send().await?;
+        .timeout(Duration::from_secs(10))
+        .send()
+        .await?;
     let status = response.status();
     let body: serde_json::Value = response.json().await?;
     if !status.is_success() {
@@ -1429,49 +1227,24 @@ pub async fn wait_converged(port: u64, timeout: Duration) -> anyhow::Result<()> 
     wait_converged_on(&NODES.iter().collect::<Vec<_>>(), port, timeout).await
 }
 
-/// [`wait_converged`] carrying a credential — C24-C27's closed admin plane.
-///
-/// **Only observes the credential's own tenant.** These wrappers poll `GET /imposters`, and since
-/// issue #182 that listing is filtered to the caller's tenant — so waiting here for a port owned by
-/// a *different* tenant does not fail, it hangs until the timeout, which reads as "the fleet never
-/// converged" rather than "you asked the wrong tenant". A tenant-owned port wants a per-port poll
-/// with an explicit `X-Rift-Tenant` instead; see `wait_imposter_visible_as` in `scenarios.rs`.
-pub async fn wait_converged_with_key(
-    port: u64,
-    timeout: Duration,
-    key: &str,
-) -> anyhow::Result<()> {
-    wait_converged_on_with_key(&NODES.iter().collect::<Vec<_>>(), port, timeout, Some(key)).await
-}
-
 /// [`wait_converged`], restricted to a named subset — for scenarios where some
 /// node is deliberately down.
+///
+/// The last read error is carried into the timeout message. Polling must treat
+/// an error as "not yet" — a node that is still starting legitimately refuses —
+/// but discarding it entirely is what made a read failure present as a bare
+/// `0/3 nodes` with nothing to act on.
 pub async fn wait_converged_on(
     nodes: &[&Node],
     port: u64,
     timeout: Duration,
-) -> anyhow::Result<()> {
-    wait_converged_on_with_key(nodes, port, timeout, None).await
-}
-
-/// The one implementation behind the three wrappers above.
-///
-/// The last read error is carried into the timeout message. Polling must treat
-/// an error as "not yet" — a node that is still starting legitimately refuses —
-/// but discarding it entirely is what made the missing-credential failure above
-/// present as a bare `0/3 nodes` with nothing to act on.
-pub async fn wait_converged_on_with_key(
-    nodes: &[&Node],
-    port: u64,
-    timeout: Duration,
-    key: Option<&str>,
 ) -> anyhow::Result<()> {
     let deadline = Instant::now() + timeout;
     let mut last_error = None;
     loop {
         let mut seen = 0;
         for node in nodes {
-            match imposter_ports_with_key(node.admin, key).await {
+            match imposter_ports(node.admin).await {
                 Ok(ports) if ports.contains(&port) => seen += 1,
                 Ok(_) => {}
                 Err(e) => last_error = Some(format!("{}: {e}", node.name)),
@@ -1528,16 +1301,16 @@ pub async fn metric(port: u16, family: &str) -> anyhow::Result<f64> {
 ///
 /// The admin port, not `/_cluster/members`: that one rides the **cluster port**
 /// behind the HMAC credential the harness does not hold (see
-/// `FAILOVER_WRITE_BOUND` in the scenarios). `key` is the admin credential of a
-/// closed plane (`tenancy.overlay.yml`); `None` on the open plane every other
-/// overlay leaves.
+/// `FAILOVER_WRITE_BOUND` in the scenarios). Read without a credential, like
+/// every other admin read in this tier — the fleet boots with no `MB_APIKEY`,
+/// so the admin plane is open (D-46).
 ///
 /// Live, not sampled: the body is read off the node's Raft state at request
 /// time, so unlike the retired `rift_cluster_members` gauges (D-71, #548) there
 /// is no sampler to race. The waits below still poll, because forming, electing
 /// and promoting are asynchronous.
-pub async fn fleet_members(admin: u16, key: Option<&str>) -> anyhow::Result<serde_json::Value> {
-    let (status, body) = get_json_with_key(admin, "/_fleet/members", key).await?;
+pub async fn fleet_members(admin: u16) -> anyhow::Result<serde_json::Value> {
+    let (status, body) = get_json(admin, "/_fleet/members").await?;
     if status != 200 {
         bail!("/_fleet/members on :{admin} answered {status}");
     }
@@ -1563,20 +1336,11 @@ pub fn voter_count(body: &serde_json::Value) -> Option<usize> {
 /// asynchronous — asserting immediately after readiness fails a healthy cluster
 /// that is still electing.
 pub async fn wait_single_leader(timeout: Duration) -> anyhow::Result<usize> {
-    wait_single_leader_with_key(timeout, None).await
-}
-
-/// [`wait_single_leader`] on a closed admin plane (C24–C27 under
-/// `tenancy.overlay.yml`), where `/_fleet/members` answers only a fleet admin.
-pub async fn wait_single_leader_with_key(
-    timeout: Duration,
-    key: Option<&str>,
-) -> anyhow::Result<usize> {
     let deadline = Instant::now() + timeout;
     loop {
         let mut leaders = Vec::new();
         for (i, node) in NODES.iter().enumerate() {
-            if fleet_members(node.admin, key)
+            if fleet_members(node.admin)
                 .await
                 .is_ok_and(|body| claims_leadership(&body))
             {
@@ -1710,7 +1474,7 @@ pub async fn backend_failing_health_check(ip: &str) -> anyhow::Result<bool> {
 pub async fn wait_voters(node: &Node, expected: usize, timeout: Duration) -> anyhow::Result<()> {
     let deadline = Instant::now() + timeout;
     loop {
-        let seen = fleet_members(node.admin, None)
+        let seen = fleet_members(node.admin)
             .await
             .map(|body| voter_count(&body));
         if seen.as_ref().is_ok_and(|v| *v == Some(expected)) {

@@ -144,6 +144,16 @@ spec:
             # var is the wrong place for it.
             - name: RIFT_CLUSTER_SECRET_FILE
               value: "/etc/rift/cluster-secret"
+            # The ADMIN plane's credential — rendered only when one is configured. Unset, the admin
+            # API is open (see `adminApiKey` in values.yaml); set, the whole admin plane closes
+            # behind this one key. `/healthz`, `/readyz` and the imposter data plane are unaffected.
+            {{- with (include "rift-cluster.adminApiKeySecretName" .) }}
+            - name: MB_APIKEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ . }}
+                  key: {{ include "rift-cluster.adminApiKeySecretKey" $ }}
+            {{- end }}
             {{- with .Values.sources.imposters }}
             - name: RIFT_IMPOSTERS
               value: {{ . | quote }}

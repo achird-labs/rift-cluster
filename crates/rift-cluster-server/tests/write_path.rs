@@ -120,8 +120,8 @@ async fn post_imposter_commits_binds_and_carries_cluster_headers() {
         .expect("revision header present")
         .to_owned();
     assert!(
-        revision.starts_with(&format!("default:{port}@")),
-        "revision names the tenant, port and log index: {revision}"
+        revision.starts_with(&format!("{port}@")),
+        "revision names the port and the log index: {revision}"
     );
     let op_id = seen
         .header("rift-cluster-op-id")
@@ -552,14 +552,14 @@ async fn an_unknown_flow_state_knob_is_refused_before_commit() {
     server.shutdown().await;
 }
 
-/// RFC-005 S1 (#288): `contextScope: "tenant"` was reserved until RFC-002 shipped; it is a
-/// real scope now, admitted like the other two (this was a 400 naming RFC-002 before). Under the
-/// open-admin-plane bypass the imposter is owned by `default`, so its flows live under
-/// `tdefault:`; that the listing route resolves the applied scope and serves it is the closest
-/// external observation — `GET /imposters/{port}` echoes upstream's allowlisted `flowState`
-/// fields only, never `contextScope` (see `context_scope_is_not_in_the_resolved_block`).
+/// `contextScope: "tenant"` is **refused at admission, by name** (#550, D-73): the namespace it
+/// selected left with tenancy, and quietly aliasing it to `imposter` or `fleet` would change
+/// which imposters share flow state without telling anyone.
+///
+/// The refusal must name the issue, so an operator whose committed config stops being admitted
+/// can find out why rather than reading "unknown value".
 #[tokio::test]
-async fn the_tenant_context_scope_is_admitted_now_that_tenancy_exists() {
+async fn the_tenant_context_scope_is_refused_by_name() {
     let state = TempDir::new().expect("tempdir");
     let server = compose::start(cluster_cli(&state, &["--cluster-allow-solo"]))
         .await
@@ -577,34 +577,28 @@ async fn the_tenant_context_scope_is_admitted_now_that_tenancy_exists() {
         .await
         .expect("post imposter");
     let seen = Seen::of(response).await;
-    assert_eq!(seen.status, 201, "{seen}");
+    assert_eq!(seen.status, 400, "{seen}");
+    assert!(seen.body.contains("contextScope"), "{seen}");
+    assert!(
+        seen.body.contains("#550"),
+        "the refusal names the issue that removed the scope: {seen}"
+    );
 
+    // And nothing was committed.
     let read = reqwest::get(format!("http://{admin}/imposters/{port}"))
         .await
         .expect("get");
-    assert_eq!(read.status().as_u16(), 200, "an admitted config lands");
-
-    let spaces = reqwest::get(format!("http://{admin}/imposters/{port}/spaces"))
-        .await
-        .expect("get spaces");
     assert_eq!(
-        spaces.status().as_u16(),
-        200,
-        "the listing resolves the scope"
-    );
-    let body: serde_json::Value = spaces.json().await.expect("json");
-    assert!(
-        body.get("unavailable").is_none(),
-        "a tenant-scoped listing is bounded to the tenant, so it is served: {body}"
+        read.status().as_u16(),
+        404,
+        "a refused config must not land"
     );
 
     server.shutdown().await;
 }
 
-/// The accepted values do land. `fleet` is `FleetAdmin`-gated at admission as of #288, but this
-/// harness runs under the open-admin-plane bypass — no principal, so nothing to hold the role and
-/// nothing to gate: the write is admitted exactly as before. The gated path is proven in
-/// `tests/context_scope.rs`.
+/// The accepted values do land. `fleet` was `FleetAdmin`-gated at admission by #288; with one
+/// administrator (#550) there is no role to gate on and it is admitted like `imposter`.
 #[tokio::test]
 async fn an_explicit_fleet_context_scope_is_admitted() {
     let state = TempDir::new().expect("tempdir");
@@ -2517,7 +2511,7 @@ async fn if_match_preconditions_guard_single_imposter_writes() {
     let absent = reserve_port();
     let response = client
         .post(format!("http://{admin}/imposters"))
-        .header("if-match", format!("default:{absent}@5"))
+        .header("if-match", format!("{absent}@5"))
         .json(&minimal_imposter(absent))
         .send()
         .await
@@ -3147,7 +3141,7 @@ async fn index_addressed_edits_survive_valid_scripted_siblings() {
 /// submit fail.
 #[tokio::test]
 async fn a_parked_intent_replays_without_waiting_for_the_periodic_sweep() {
-    use rift_cluster::control::{ControlOp, ControlRequest, TenantId};
+    use rift_cluster::control::{ControlOp, ControlRequest};
 
     let state = TempDir::new().expect("tempdir");
     let server = compose::start(cluster_cli(&state, &["--cluster-allow-solo"]))
@@ -3163,7 +3157,6 @@ async fn a_parked_intent_replays_without_waiting_for_the_periodic_sweep() {
         issued_at_secs: 0,
         expected_revision: None,
         op: ControlOp::PutImposter {
-            tenant: TenantId::default(),
             config: serde_json::from_value(minimal_imposter(port)).expect("config parses"),
         },
     };
@@ -3347,7 +3340,7 @@ async fn the_imposter_read_hands_the_editor_its_if_match_token() {
         .expect("header is ascii")
         .to_owned();
     assert!(
-        token.starts_with(&format!("default:{port}@")),
+        token.starts_with(&format!("{port}@")),
         "ported token, same grammar as the write path emits: {token}"
     );
 
@@ -3427,7 +3420,7 @@ async fn the_imposter_read_hands_the_editor_its_if_match_token() {
 /// terminated here — which is exactly why it needs a test on this side. "The EE front inherits the
 /// upstream fix" is an assumption about the proxy path, not a fact the upstream suite can check:
 /// upstream tests the handler behind its own admin API, while a client of *this* binary reaches it
-/// through `admin_front`'s proxy, the RBAC gate and the tenancy resolution. A vendor bump that
+/// through `admin_front`'s proxy and its authentication gate. A vendor bump that
 /// silently stopped forwarding this route, or an EE-side interception that pre-empted it, would
 /// leave upstream green and this broken.
 ///

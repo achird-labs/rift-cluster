@@ -15,14 +15,14 @@ binds *every* imposter port — the fleet is a replica set, not a shard set.
 **Space-based isolation** (Rift's extension, upstream #223): many isolated
 environments multiplexed onto *one* port. A stub carries `space: "X"` and
 matches only when the request's resolved `flow_id` equals `X`, where the flow
-id comes from a header (`flowIdSource: "header:X-Flow-Id"`). Adding a tenant or
+id comes from a header (`flowIdSource: "header:X-Flow-Id"`). Adding a team or
 a parallel test run costs a header value, not a port.
 
 ## Why space-based is the clustering-native topology
 
 Port-based isolation fights managed load balancers: an ALB/NLB needs a listener
 and target group per port, cannot discover runtime-minted ports, and hits
-listener quotas around 50. Space-based isolation collapses the problem — one
+listener limits around 50. Space-based isolation collapses the problem — one
 front-end port, isolation scales with header cardinality:
 
 | Model | LB objects needed | Runtime-minted ports? | Header affinity possible? |
@@ -39,8 +39,8 @@ seam (#317, `gateway::dispatch_to_port`). Three addressing schemes were designed
 in order of transparency — but **only the path prefix is built**: upstream's
 `gateway.rs` parses `/__rift/:port/<path>`, and the front door (Chapter 13) uses
 that same form as its no-route fallback. The header and subdomain forms were
-withdrawn by D-54: a front-door route expresses either one, tenant-scoped and
-without a second implicit addressing path to account for.
+withdrawn by D-54: a front-door route expresses either one, without a second
+implicit addressing path to account for.
 
 | Scheme | Example | Status | Caveat |
 |---|---|---|---|

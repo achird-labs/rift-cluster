@@ -7,7 +7,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { REVISION_HEADER } from "../api/client.ts";
 import { ImposterDetail } from "../screens/ImposterDetail.tsx";
 import { StubEditor } from "../screens/StubEditor.tsx";
-import { renderInApp, whoamiWith } from "./harness.tsx";
+import { renderInApp } from "./harness.tsx";
 
 const PORT = 4545;
 const BY_ID = (id: string): string => `/imposters/${PORT}/stubs/by-id/${id}`;
@@ -22,7 +22,7 @@ const MODELLED = {
 /** A stub the form cannot hold: `space`, `scenarioName` and `behaviors` have no form controls. */
 const UNMODELLED = {
   id: "s-2",
-  space: "tenant-a",
+  space: "flow-a",
   scenarioName: "checkout",
   behaviors: [{ wait: 50 }],
   responses: [{ is: { statusCode: 204 } }],
@@ -114,8 +114,8 @@ afterEach(() => {
 
 describe("AC2 — a stub the form cannot hold is raw-only, and its bytes survive the round trip", () => {
   it("names every unmodelled key rather than showing a form with holes in it", async () => {
-    stubFleet({ read: () => ({ json: imposter([UNMODELLED]), revision: "default:4545@7" }) });
-    renderInApp(<ImposterDetail port={PORT} />, { whoami: whoamiWith("editor") });
+    stubFleet({ read: () => ({ json: imposter([UNMODELLED]), revision: "4545@7" }) });
+    renderInApp(<ImposterDetail port={PORT} />);
     await openEditor("s-2");
 
     const banner = await screen.findByTestId("stub-raw-banner");
@@ -127,12 +127,12 @@ describe("AC2 — a stub the form cannot hold is raw-only, and its bytes survive
   });
 
   it("sends the operator's own bytes, not a reserialization of them", async () => {
-    const calls = stubFleet({ read: () => ({ json: imposter([UNMODELLED]), revision: "default:4545@7" }) });
-    renderInApp(<ImposterDetail port={PORT} />, { whoami: whoamiWith("editor") });
+    const calls = stubFleet({ read: () => ({ json: imposter([UNMODELLED]), revision: "4545@7" }) });
+    renderInApp(<ImposterDetail port={PORT} />);
     const editor = await openEditor("s-2");
 
     // Key order and whitespace an operator chose, which a parse-and-restringify would destroy.
-    const authored = '{"id":"s-2","space":"tenant-a","responses":[{"is":{"statusCode":204}}]}';
+    const authored = '{"id":"s-2","space":"flow-a","responses":[{"is":{"statusCode":204}}]}';
     await retype(editor, authored);
     await userEvent.setup().click(screen.getByRole("button", { name: /save stub/i }));
 
@@ -143,8 +143,8 @@ describe("AC2 — a stub the form cannot hold is raw-only, and its bytes survive
 
 describe("AC4 — the editor's JSON view and form view stay one document", () => {
   it("shows the form and the JSON side by side for a stub the model covers", async () => {
-    stubFleet({ read: () => ({ json: imposter([MODELLED]), revision: "default:4545@7" }) });
-    renderInApp(<ImposterDetail port={PORT} />, { whoami: whoamiWith("editor") });
+    stubFleet({ read: () => ({ json: imposter([MODELLED]), revision: "4545@7" }) });
+    renderInApp(<ImposterDetail port={PORT} />);
     const editor = await openEditor("s-1");
 
     expect(screen.getByTestId("stub-form")).toBeTruthy();
@@ -172,8 +172,8 @@ describe("AC4 — the editor's JSON view and form view stay one document", () =>
       predicates: [{ soundsLike: { path: "/users" } }],
       responses: [{ is: { statusCode: 200 } }],
     };
-    stubFleet({ read: () => ({ json: imposter([unrepresentable]), revision: "default:4545@7" }) });
-    renderInApp(<ImposterDetail port={PORT} />, { whoami: whoamiWith("editor") });
+    stubFleet({ read: () => ({ json: imposter([unrepresentable]), revision: "4545@7" }) });
+    renderInApp(<ImposterDetail port={PORT} />);
     await openEditor("s-1");
 
     const banner = await screen.findByTestId("stub-raw-banner");
@@ -190,10 +190,10 @@ describe("AC4 — the editor's JSON view and form view stay one document", () =>
     stubFleet({
       read: () => ({
         json: imposter([{ id: "s-1", responses: [{ is: { statusCode: 200 } }] }]),
-        revision: "default:4545@7",
+        revision: "4545@7",
       }),
     });
-    renderInApp(<ImposterDetail port={PORT} />, { whoami: whoamiWith("editor") });
+    renderInApp(<ImposterDetail port={PORT} />);
     await openEditor("s-1");
 
     expect((await screen.findByTestId("stub-summary")).textContent).toMatch(
@@ -217,10 +217,10 @@ describe("AC4 — the editor's JSON view and form view stay one document", () =>
             responses: [{ is: { statusCode: 202 } }, { is: { statusCode: 200 } }],
           },
         ]),
-        revision: "default:4545@7",
+        revision: "4545@7",
       }),
     });
-    renderInApp(<ImposterDetail port={PORT} />, { whoami: whoamiWith("editor") });
+    renderInApp(<ImposterDetail port={PORT} />);
     await openEditor("s-1");
 
     expect((await screen.findByTestId("stub-summary")).textContent).toMatch(
@@ -237,10 +237,10 @@ describe("AC4 — the editor's JSON view and form view stay one document", () =>
         json: imposter([
           { id: "s-1", responses: [{ is: { statusCode: 200 } }, { proxy: { to: "http://api.example.com" } }] },
         ]),
-        revision: "default:4545@7",
+        revision: "4545@7",
       }),
     });
-    renderInApp(<ImposterDetail port={PORT} />, { whoami: whoamiWith("editor") });
+    renderInApp(<ImposterDetail port={PORT} />);
     await openEditor("s-1");
 
     expect((await screen.findByTestId("stub-raw-banner")).textContent).toContain("responses[1].proxy");
@@ -262,10 +262,10 @@ describe("AC4 — the editor's JSON view and form view stay one document", () =>
             responses: [{ is: { statusCode: 200, body: { ok: true } } }],
           },
         ]),
-        revision: "default:4545@7",
+        revision: "4545@7",
       }),
     });
-    renderInApp(<ImposterDetail port={PORT} />, { whoami: whoamiWith("editor") });
+    renderInApp(<ImposterDetail port={PORT} />);
     const editor = await openEditor("s-1");
 
     const user = userEvent.setup();
@@ -284,8 +284,8 @@ describe("AC4 — the editor's JSON view and form view stay one document", () =>
       predicates: [{ equals: { path: "/users" } }],
       responses: [{ is: { statusCode: 200, headers: { "Content-Type": "application/json" }, body: "[]" } }],
     };
-    stubFleet({ read: () => ({ json: imposter([singleEntry]), revision: "default:4545@7" }) });
-    renderInApp(<ImposterDetail port={PORT} />, { whoami: whoamiWith("editor") });
+    stubFleet({ read: () => ({ json: imposter([singleEntry]), revision: "4545@7" }) });
+    renderInApp(<ImposterDetail port={PORT} />);
     const editor = await openEditor("s-1");
 
     const user = userEvent.setup();
@@ -303,8 +303,8 @@ describe("AC4 — the editor's JSON view and form view stay one document", () =>
      * "also runs" labels read the array with a bare cast and threw during render, taking the whole
      * editor down. `send()` already guards its own read of `parsed.value` for exactly this reason.
      */
-    stubFleet({ read: () => ({ json: imposter([MODELLED]), revision: "default:4545@7" }) });
-    renderInApp(<ImposterDetail port={PORT} />, { whoami: whoamiWith("editor") });
+    stubFleet({ read: () => ({ json: imposter([MODELLED]), revision: "4545@7" }) });
+    renderInApp(<ImposterDetail port={PORT} />);
     const editor = await openEditor("s-1");
 
     for (const document of ['{"id":"s-1","responses":{}}', '{"id":"s-1","responses":"x"}', "null"]) {
@@ -315,8 +315,8 @@ describe("AC4 — the editor's JSON view and form view stay one document", () =>
   });
 
   it("drops to raw-only when a JSON edit introduces a key the form cannot hold", async () => {
-    stubFleet({ read: () => ({ json: imposter([MODELLED]), revision: "default:4545@7" }) });
-    renderInApp(<ImposterDetail port={PORT} />, { whoami: whoamiWith("editor") });
+    stubFleet({ read: () => ({ json: imposter([MODELLED]), revision: "4545@7" }) });
+    renderInApp(<ImposterDetail port={PORT} />);
     const editor = await openEditor("s-1");
 
     await retype(editor, '{"id":"s-1","behaviors":[{"wait":50}]}');
@@ -326,8 +326,8 @@ describe("AC4 — the editor's JSON view and form view stay one document", () =>
   });
 
   it("refuses to save text that is not JSON, saying so rather than sending it", async () => {
-    const calls = stubFleet({ read: () => ({ json: imposter([MODELLED]), revision: "default:4545@7" }) });
-    renderInApp(<ImposterDetail port={PORT} />, { whoami: whoamiWith("editor") });
+    const calls = stubFleet({ read: () => ({ json: imposter([MODELLED]), revision: "4545@7" }) });
+    renderInApp(<ImposterDetail port={PORT} />);
     const editor = await openEditor("s-1");
 
     await retype(editor, "{ not json");
@@ -342,8 +342,8 @@ describe("AC5 — the lint pane is advisory and the server's refusal is the auth
   it("says the linter is unavailable rather than showing an empty, reassuring finding list", async () => {
     // No wasm artifact on a dev/test build. "No findings" here would read as a clean bill from a
     // linter that never ran.
-    stubFleet({ read: () => ({ json: imposter([MODELLED]), revision: "default:4545@7" }) });
-    renderInApp(<ImposterDetail port={PORT} />, { whoami: whoamiWith("editor") });
+    stubFleet({ read: () => ({ json: imposter([MODELLED]), revision: "4545@7" }) });
+    renderInApp(<ImposterDetail port={PORT} />);
     await openEditor("s-1");
 
     expect((await screen.findByTestId("stub-lint")).textContent).toMatch(
@@ -353,10 +353,10 @@ describe("AC5 — the lint pane is advisory and the server's refusal is the auth
 
   it("surfaces a server rejection even when the local lint found nothing wrong", async () => {
     stubFleet({
-      read: () => ({ json: imposter([MODELLED]), revision: "default:4545@7" }),
+      read: () => ({ json: imposter([MODELLED]), revision: "4545@7" }),
       write: () => ({ status: 400, json: { message: "predicates[0].equals.method must be a string" } }),
     });
-    renderInApp(<ImposterDetail port={PORT} />, { whoami: whoamiWith("editor") });
+    renderInApp(<ImposterDetail port={PORT} />);
     await openEditor("s-1");
 
     await waitFor(() => expect(screen.getByTestId("stub-lint").textContent).toMatch(/unavailable/i));
@@ -377,10 +377,10 @@ describe("AC5 — the lint pane is advisory and the server's refusal is the auth
     const engineMessage =
       "_rift.fault.tcp object form requires a numeric 'probability' (use the bare fault-type string for an always-firing fault)";
     stubFleet({
-      read: () => ({ json: imposter([MODELLED]), revision: "default:4545@7" }),
+      read: () => ({ json: imposter([MODELLED]), revision: "4545@7" }),
       write: () => ({ status: 400, json: { message: engineMessage } }),
     });
-    renderInApp(<ImposterDetail port={PORT} />, { whoami: whoamiWith("editor") });
+    renderInApp(<ImposterDetail port={PORT} />);
     await openEditor("s-1");
 
     await userEvent.setup().click(screen.getByRole("button", { name: /save stub/i }));
@@ -411,10 +411,10 @@ describe("#257 — a stub as the API actually returns it", () => {
             ],
           },
         ]),
-        revision: "default:4545@7",
+        revision: "4545@7",
       }),
     });
-    renderInApp(<ImposterDetail port={PORT} />, { whoami: whoamiWith("editor") });
+    renderInApp(<ImposterDetail port={PORT} />);
     await openEditor("s-1");
 
     expect(screen.queryByTestId("stub-raw-banner")).toBeNull();
@@ -450,10 +450,10 @@ describe("#257 — a stub as the API actually returns it", () => {
             _links: { self: { href: "http://node-1:2525/imposters/4545/stubs/0" } },
           },
         ]),
-        revision: "default:4545@7",
+        revision: "4545@7",
       }),
     });
-    renderInApp(<ImposterDetail port={PORT} />, { whoami: whoamiWith("editor") });
+    renderInApp(<ImposterDetail port={PORT} />);
     await openEditor("get-order");
 
     expect(screen.queryByTestId("stub-raw-banner")).toBeNull();
@@ -474,10 +474,10 @@ describe("#257 — a stub as the API actually returns it", () => {
         json: imposter([
           { id: "s-1", predicates: [{ equals: { path: "/x" } }], responses: [{ is: { statusCode: "200" } }] },
         ]),
-        revision: "default:4545@7",
+        revision: "4545@7",
       }),
     });
-    renderInApp(<ImposterDetail port={PORT} />, { whoami: whoamiWith("editor") });
+    renderInApp(<ImposterDetail port={PORT} />);
     const editor = await openEditor("s-1");
 
     const user = userEvent.setup();
@@ -499,8 +499,8 @@ describe("#257 — a stub as the API actually returns it", () => {
       predicates: [{ equals: { path: "/users" } }],
       responses: [{ is: { statusCode: "204" } }],
     };
-    stubFleet({ read: () => ({ json: imposter([original]), revision: "default:4545@7" }) });
-    renderInApp(<ImposterDetail port={PORT} />, { whoami: whoamiWith("editor") });
+    stubFleet({ read: () => ({ json: imposter([original]), revision: "4545@7" }) });
+    renderInApp(<ImposterDetail port={PORT} />);
     const editor = await openEditor("s-1");
 
     /*
@@ -524,14 +524,13 @@ describe("#250 — a stub seeded from a recorded request", () => {
      * console. Letting an operator assume it was replayed from the journal would be the console
      * lying about what it knows — hence the line, and hence a test for the line.
      */
-    stubFleet({ read: () => ({ json: imposter([MODELLED]), revision: "default:4545@7" }) });
+    stubFleet({ read: () => ({ json: imposter([MODELLED]), revision: "4545@7" }) });
     const seed = {
       predicates: [{ equals: { method: "POST", path: "/orders" } }],
       responses: [{ is: { statusCode: 200, headers: { "Content-Type": "application/json" }, body: "{}" } }],
     };
     renderInApp(
-      <StubEditor port={PORT} target={{ kind: "new", seed }} original={null} revision="default:4545@7" onDone={() => {}} />,
-      { whoami: whoamiWith("editor") },
+      <StubEditor port={PORT} target={{ kind: "new", seed }} original={null} revision="4545@7" onDone={() => {}} />,
     );
 
     const editor = (await screen.findByTestId("code-editor-fallback")) as HTMLTextAreaElement;
@@ -549,16 +548,15 @@ describe("#250 — a stub seeded from a recorded request", () => {
   });
 
   it("offers no presets for a seeded stub — the seed IS the starting point", async () => {
-    stubFleet({ read: () => ({ json: imposter([MODELLED]), revision: "default:4545@7" }) });
+    stubFleet({ read: () => ({ json: imposter([MODELLED]), revision: "4545@7" }) });
     renderInApp(
       <StubEditor
         port={PORT}
         target={{ kind: "new", seed: { responses: [{ is: { statusCode: 200 } }] } }}
         original={null}
-        revision="default:4545@7"
+        revision="4545@7"
         onDone={() => {}}
       />,
-      { whoami: whoamiWith("editor") },
     );
 
     await screen.findByTestId("code-editor-fallback");
@@ -566,10 +564,9 @@ describe("#250 — a stub seeded from a recorded request", () => {
   });
 
   it("still offers presets for an unseeded new stub", async () => {
-    stubFleet({ read: () => ({ json: imposter([MODELLED]), revision: "default:4545@7" }) });
+    stubFleet({ read: () => ({ json: imposter([MODELLED]), revision: "4545@7" }) });
     renderInApp(
-      <StubEditor port={PORT} target={{ kind: "new" }} original={null} revision="default:4545@7" onDone={() => {}} />,
-      { whoami: whoamiWith("editor") },
+      <StubEditor port={PORT} target={{ kind: "new" }} original={null} revision="4545@7" onDone={() => {}} />,
     );
 
     expect(await screen.findByTestId("stub-presets")).toBeTruthy();
@@ -583,10 +580,10 @@ describe("AC7 — a stub body is rendered as text, never as markup", () => {
     stubFleet({
       read: () => ({
         json: imposter([{ id: "s-1", responses: [{ is: { statusCode: 200, body: payload } }] }]),
-        revision: "default:4545@7",
+        revision: "4545@7",
       }),
     });
-    renderInApp(<ImposterDetail port={PORT} />, { whoami: whoamiWith("editor") });
+    renderInApp(<ImposterDetail port={PORT} />);
     const editor = await openEditor("s-1");
 
     expect(editor.value).toContain("window.__pwned");
@@ -600,15 +597,15 @@ describe("AC7 — a stub body is rendered as text, never as markup", () => {
 
 describe("the write is conditioned on the revision the read handed over", () => {
   it("sends If-Match with the token that came back on the imposter read", async () => {
-    const calls = stubFleet({ read: () => ({ json: imposter([MODELLED]), revision: "default:4545@7" }) });
-    renderInApp(<ImposterDetail port={PORT} />, { whoami: whoamiWith("editor") });
+    const calls = stubFleet({ read: () => ({ json: imposter([MODELLED]), revision: "4545@7" }) });
+    renderInApp(<ImposterDetail port={PORT} />);
     await openEditor("s-1");
     await userEvent.setup().click(screen.getByRole("button", { name: /save stub/i }));
 
     await waitFor(() => expect(calls.some((c) => c.method === "PUT")).toBe(true));
     const put = calls.find((c) => c.method === "PUT");
     expect(put?.path).toBe(BY_ID("s-1"));
-    expect(put?.headers["If-Match"]).toBe("default:4545@7");
+    expect(put?.headers["If-Match"]).toBe("4545@7");
   });
 
   it("refuses to save at all when the read carried no revision", async () => {
@@ -616,7 +613,7 @@ describe("the write is conditioned on the revision the read handed over", () => 
     // reason is the only honest option: sending nothing would win every race by discarding the
     // other editor's work.
     stubFleet({ read: () => ({ json: imposter([MODELLED]), revision: null }) });
-    renderInApp(<ImposterDetail port={PORT} />, { whoami: whoamiWith("editor") });
+    renderInApp(<ImposterDetail port={PORT} />);
     await openEditor("s-1");
 
     expect((await screen.findByTestId("stub-no-revision")).textContent).toMatch(
@@ -626,8 +623,8 @@ describe("the write is conditioned on the revision the read handed over", () => 
   });
 
   it("offers no by-id edit for a stub that has no id, and says why", async () => {
-    stubFleet({ read: () => ({ json: imposter([IDLESS]), revision: "default:4545@7" }) });
-    renderInApp(<ImposterDetail port={PORT} />, { whoami: whoamiWith("editor") });
+    stubFleet({ read: () => ({ json: imposter([IDLESS]), revision: "4545@7" }) });
+    renderInApp(<ImposterDetail port={PORT} />);
 
     const disabled = (await screen.findByTestId("stub-not-addressable")) as HTMLElement;
     expect(disabled.textContent).toMatch(/no id/i);
@@ -644,8 +641,8 @@ describe("the write is conditioned on the revision the read handed over", () => 
   it("keeps the Actions cell to a short marker rather than a paragraph", async () => {
     // The regression: two sentences rendered per row forced the Actions column to hold a paragraph,
     // growing the row to roughly 200px and wrapping the buttons beside it mid-word.
-    stubFleet({ read: () => ({ json: imposter([IDLESS]), revision: "default:4545@7" }) });
-    renderInApp(<ImposterDetail port={PORT} />, { whoami: whoamiWith("editor") });
+    stubFleet({ read: () => ({ json: imposter([IDLESS]), revision: "4545@7" }) });
+    renderInApp(<ImposterDetail port={PORT} />);
 
     const cell = (await screen.findByTestId("stub-not-addressable")) as HTMLElement;
     expect(cell.textContent).not.toMatch(/overwrite a different stub/i);
@@ -653,25 +650,16 @@ describe("the write is conditioned on the revision the read handed over", () => 
   });
 
   it("explains it once, however many stubs lack an id", async () => {
-    stubFleet({ read: () => ({ json: imposter([IDLESS, IDLESS, IDLESS]), revision: "default:4545@7" }) });
-    renderInApp(<ImposterDetail port={PORT} />, { whoami: whoamiWith("editor") });
+    stubFleet({ read: () => ({ json: imposter([IDLESS, IDLESS, IDLESS]), revision: "4545@7" }) });
+    renderInApp(<ImposterDetail port={PORT} />);
 
     expect(await screen.findAllByTestId("stub-not-addressable")).toHaveLength(3);
     expect(screen.getAllByTestId("stub-idless-note")).toHaveLength(1);
   });
 
   it("says nothing about it when every stub is addressable", async () => {
-    stubFleet({ read: () => ({ json: imposter([MODELLED]), revision: "default:4545@7" }) });
-    renderInApp(<ImposterDetail port={PORT} />, { whoami: whoamiWith("editor") });
-
-    await screen.findByTestId("stub-row-0");
-    expect(screen.queryByTestId("stub-idless-note")).toBeNull();
-  });
-
-  it("does not explain a control a viewer was never offered", async () => {
-    // No Actions column for a viewer, so the note would answer a question they never asked.
-    stubFleet({ read: () => ({ json: imposter([IDLESS]), revision: "default:4545@7" }) });
-    renderInApp(<ImposterDetail port={PORT} />, { whoami: whoamiWith("viewer") });
+    stubFleet({ read: () => ({ json: imposter([MODELLED]), revision: "4545@7" }) });
+    renderInApp(<ImposterDetail port={PORT} />);
 
     await screen.findByTestId("stub-row-0");
     expect(screen.queryByTestId("stub-idless-note")).toBeNull();
@@ -685,15 +673,15 @@ describe("two concurrent editors — 409 becomes a rebase prompt, never an auto-
     const calls = stubFleet({
       read: () =>
         committedByOther
-          ? { json: imposter([theirs]), revision: "default:4545@9" }
-          : { json: imposter([MODELLED]), revision: "default:4545@7" },
+          ? { json: imposter([theirs]), revision: "4545@9" }
+          : { json: imposter([MODELLED]), revision: "4545@7" },
       write: (call) => {
         // The fleet refuses a write quoting a revision it has moved past.
-        if (call.headers["If-Match"] === "default:4545@9") return { status: 200, json: imposter([theirs]) };
+        if (call.headers["If-Match"] === "4545@9") return { status: 200, json: imposter([theirs]) };
         return { status: 409, json: { message: "revision conflict" } };
       },
     });
-    renderInApp(<ImposterDetail port={PORT} />, { whoami: whoamiWith("editor") });
+    renderInApp(<ImposterDetail port={PORT} />);
     const editor = await openEditor("s-1");
 
     const mine = '{"id":"s-1","responses":[{"is":{"statusCode":418,"body":"mine"}}]}';
@@ -714,8 +702,8 @@ describe("two concurrent editors — 409 becomes a rebase prompt, never an auto-
     const writes = calls.filter((c) => c.method === "PUT");
     // The retry quotes the FRESH token — the revision of the state the other editor left behind,
     // read after the conflict — and carries the operator's own edit unchanged.
-    expect(writes[0]?.headers["If-Match"]).toBe("default:4545@7");
-    expect(writes[1]?.headers["If-Match"]).toBe("default:4545@9");
+    expect(writes[0]?.headers["If-Match"]).toBe("4545@7");
+    expect(writes[1]?.headers["If-Match"]).toBe("4545@9");
     expect(writes[1]?.body).toBe(mine);
   });
 
@@ -725,11 +713,11 @@ describe("two concurrent editors — 409 becomes a rebase prompt, never an auto-
     stubFleet({
       read: () =>
         committedByOther
-          ? { json: imposter([theirs]), revision: "default:4545@9" }
-          : { json: imposter([MODELLED]), revision: "default:4545@7" },
+          ? { json: imposter([theirs]), revision: "4545@9" }
+          : { json: imposter([MODELLED]), revision: "4545@7" },
       write: () => ({ status: 409, json: { message: "revision conflict" } }),
     });
-    renderInApp(<ImposterDetail port={PORT} />, { whoami: whoamiWith("editor") });
+    renderInApp(<ImposterDetail port={PORT} />);
     const editor = await openEditor("s-1");
 
     await retype(editor, '{"id":"s-1","responses":[{"is":{"statusCode":418,"body":"mine"}}]}');
@@ -747,11 +735,11 @@ describe("two concurrent editors — 409 becomes a rebase prompt, never an auto-
 describe("a parked (202) write through the editor", () => {
   it("closes only once the parked write actually applies", async () => {
     const calls = stubFleet({
-      read: () => ({ json: imposter([MODELLED]), revision: "default:4545@7" }),
+      read: () => ({ json: imposter([MODELLED]), revision: "4545@7" }),
       write: () => ({ status: 202, json: { opId: "op-1" } }),
       op: () => ({ status: 200, json: { state: "applied", revision: 8 } }),
     });
-    renderInApp(<ImposterDetail port={PORT} />, { whoami: whoamiWith("editor") });
+    renderInApp(<ImposterDetail port={PORT} />);
     const editor = await openEditor("s-1");
     await retype(editor, '{"id":"s-1","responses":[{"is":{"statusCode":201,"body":"ok"}}]}');
     await userEvent.setup().click(screen.getByRole("button", { name: /save stub/i }));
@@ -772,8 +760,8 @@ describe("a parked (202) write through the editor", () => {
     stubFleet({
       read: () =>
         refused
-          ? { json: imposter([theirs]), revision: "default:4545@9" }
-          : { json: imposter([MODELLED]), revision: "default:4545@7" },
+          ? { json: imposter([theirs]), revision: "4545@9" }
+          : { json: imposter([MODELLED]), revision: "4545@7" },
       write: () => {
         refused = true;
         return { status: 202, json: { opId: "op-2" } };
@@ -783,7 +771,7 @@ describe("a parked (202) write through the editor", () => {
         json: { state: "failed", revision: 9, detail: "revision conflict: expected revision 7, stored revision 9 on port 4545" },
       }),
     });
-    renderInApp(<ImposterDetail port={PORT} />, { whoami: whoamiWith("editor") });
+    renderInApp(<ImposterDetail port={PORT} />);
     const editor = await openEditor("s-1");
     await retype(editor, '{"id":"s-1","responses":[{"is":{"statusCode":418,"body":"mine"}}]}');
     await userEvent.setup().click(screen.getByRole("button", { name: /save stub/i }));
@@ -811,14 +799,14 @@ describe("the poll must not refresh the token underneath a stale draft", () => {
     const calls = stubFleet({
       read: () =>
         committedByOther
-          ? { json: imposter([theirs]), revision: "default:4545@9" }
-          : { json: imposter([MODELLED]), revision: "default:4545@7" },
+          ? { json: imposter([theirs]), revision: "4545@9" }
+          : { json: imposter([MODELLED]), revision: "4545@7" },
       write: (call) => {
-        if (call.headers["If-Match"] === "default:4545@9") return { status: 200, json: imposter([theirs]) };
+        if (call.headers["If-Match"] === "4545@9") return { status: 200, json: imposter([theirs]) };
         return { status: 409, json: { message: "revision conflict" } };
       },
     });
-    renderInApp(<ImposterDetail port={PORT} />, { whoami: whoamiWith("editor") });
+    renderInApp(<ImposterDetail port={PORT} />);
     const editor = await openEditor("s-1");
     const mine = '{"id":"s-1","responses":[{"is":{"statusCode":418,"body":"mine"}}]}';
     await retype(editor, mine);
@@ -837,7 +825,7 @@ describe("the poll must not refresh the token underneath a stale draft", () => {
     // The save quoted the OPENING token, so the fleet refused it and the rebase prompt appeared —
     // instead of a fresh-token 200 that would have discarded the other editor's write unseen.
     const writes = calls.filter((c) => c.method === "PUT");
-    expect(writes[0]?.headers["If-Match"]).toBe("default:4545@7");
+    expect(writes[0]?.headers["If-Match"]).toBe("4545@7");
     await screen.findByTestId("stub-conflict");
   });
 });
@@ -845,24 +833,24 @@ describe("the poll must not refresh the token underneath a stale draft", () => {
 describe("deleting and adding a stub", () => {
   it("deletes by id, conditioned on the revision", async () => {
     const calls = stubFleet({
-      read: () => ({ json: imposter([MODELLED]), revision: "default:4545@7" }),
+      read: () => ({ json: imposter([MODELLED]), revision: "4545@7" }),
       write: () => ({ status: 200, json: imposter([]) }),
     });
-    renderInApp(<ImposterDetail port={PORT} />, { whoami: whoamiWith("editor") });
+    renderInApp(<ImposterDetail port={PORT} />);
     await userEvent.setup().click(await screen.findByRole("button", { name: "Delete s-1" }));
 
     await waitFor(() => expect(calls.some((c) => c.method === "DELETE")).toBe(true));
     const del = calls.find((c) => c.method === "DELETE");
     expect(del?.path).toBe(BY_ID("s-1"));
-    expect(del?.headers["If-Match"]).toBe("default:4545@7");
+    expect(del?.headers["If-Match"]).toBe("4545@7");
   });
 
   it("appends a new stub through the collection route, since a by-id PUT would 404", async () => {
     const calls = stubFleet({
-      read: () => ({ json: imposter([MODELLED]), revision: "default:4545@7" }),
+      read: () => ({ json: imposter([MODELLED]), revision: "4545@7" }),
       write: () => ({ status: 200, json: imposter([MODELLED]) }),
     });
-    renderInApp(<ImposterDetail port={PORT} />, { whoami: whoamiWith("editor") });
+    renderInApp(<ImposterDetail port={PORT} />);
     await userEvent.setup().click(await screen.findByRole("button", { name: /add stub/i }));
 
     const editor = (await screen.findByTestId("code-editor-fallback")) as HTMLTextAreaElement;
@@ -872,15 +860,6 @@ describe("deleting and adding a stub", () => {
     await waitFor(() => expect(calls.some((c) => c.method === "POST")).toBe(true));
     const post = calls.find((c) => c.method === "POST");
     expect(post?.path).toBe(`/imposters/${PORT}/stubs`);
-    expect(post?.headers["If-Match"]).toBe("default:4545@7");
-  });
-
-  it("offers no write control at all to a role that may not write", async () => {
-    stubFleet({ read: () => ({ json: imposter([MODELLED]), revision: "default:4545@7" }) });
-    renderInApp(<ImposterDetail port={PORT} />, { whoami: whoamiWith("viewer") });
-    await screen.findByTestId("stub-row-0");
-
-    expect(screen.queryByRole("button", { name: /edit/i })).toBeNull();
-    expect(screen.queryByRole("button", { name: /add stub/i })).toBeNull();
+    expect(post?.headers["If-Match"]).toBe("4545@7");
   });
 });

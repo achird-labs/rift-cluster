@@ -204,6 +204,27 @@ Tear it down the same way as the cluster demo:
 docker compose -f deploy/compose/front-door-demo.yml down -v
 ```
 
+## The admin plane is open until you give it a key
+
+Every manifest here ships **without** an admin credential, and that is a choice
+rather than an oversight: with no key set, the admin API on port 2525 answers
+anyone who can reach it, so a reference deployment applies and works with nothing
+to edit first. Set one — `MB_APIKEY` (equivalently `--api-key`) in compose, the
+optional `adminApiKey` in the Helm chart, the commented `admin-api-key` Secret
+entry in `deploy/k8s/statefulset.yaml` — and the **whole** admin plane closes
+behind that one key. There is one credential, not a set of them: every admin
+request carries it as a raw `Authorization: <key>` header, and the console
+exchanges it once for a session cookie via `POST /session` rather than holding it
+in the browser. What the key does *not* cover is deliberate: `/healthz` and
+`/readyz` stay open so orchestrators can probe a node that is refusing admin
+traffic, and the imposter data plane stays open because the mock is the thing
+under test — putting a credential in front of it would break every caller it
+exists to serve. An **empty** value is not the same as an unset one: it closes
+the plane behind a credential nobody can present, so leave the variable out
+entirely rather than setting it to `""`. `deploy/compose/smoke.overlay.yml` is
+the worked example of the closed shape; `deploy/compose/verify.sh` and
+`verify-pulled.sh` run against the open one and need no key.
+
 ## The rule these manifests exist to encode
 
 On SIGTERM a node **fails readiness first**, keeps serving in-flight work for

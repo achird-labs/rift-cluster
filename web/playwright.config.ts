@@ -100,8 +100,8 @@ export default defineConfig({
     /*
      * The seeded sentinel imposter, not `/console/`.
      *
-     * The console answers as soon as the node binds — before any tenant, principal or imposter
-     * exists — so waiting on it starts the suite mid-seed. `scripts/e2e-console.sh` creates
+     * The console answers as soon as the node binds — before any imposter exists — so waiting on
+     * it starts the suite mid-seed. `scripts/e2e-console.sh` creates
      * imposter 4699 as its very last action, so a 200 here means every seeding step committed.
      * Gateway traffic is auth-exempt, so the probe needs no credential.
      */

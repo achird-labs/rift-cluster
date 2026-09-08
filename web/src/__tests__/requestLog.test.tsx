@@ -6,7 +6,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { REQUEST_POLL_INTERVAL_MS } from "../app/query.ts";
 import { RequestLog } from "../screens/RequestLog.tsx";
-import { renderInApp, setTabVisibility, stubFetch, whoamiWith } from "./harness.tsx";
+import { renderInApp, setTabVisibility, stubFetch } from "./harness.tsx";
 
 const PORT = 4545;
 const REQUESTS = `/imposters/${PORT}/requests`;
@@ -73,7 +73,7 @@ describe("the merged journal (#147 H — the epic's exit criterion)", () => {
   // changed — an empty-but-present label would satisfy a weaker test and still say nothing true.
   it("renders no scope label at all when the merge reached every node", async () => {
     stubFetch({ ...THREE_NODE, [REQUESTS]: { json: [recorded()] } });
-    renderInApp(<RequestLog port={PORT} />, { whoami: whoamiWith("fleet-admin") });
+    renderInApp(<RequestLog port={PORT} />);
 
     // Wait for the rows, so this cannot pass merely by asserting on a screen that has not
     // rendered yet — the failure mode a bare `queryByTestId` null-check invites.
@@ -85,7 +85,7 @@ describe("the merged journal (#147 H — the epic's exit criterion)", () => {
   // complete merge like any other, so it must be label-free too rather than keeping a special case.
   it("renders no scope label on a single-node fleet either", async () => {
     stubFetch({ ...SINGLE_NODE, [REQUESTS]: { json: [recorded()] } });
-    renderInApp(<RequestLog port={PORT} />, { whoami: whoamiWith("fleet-admin") });
+    renderInApp(<RequestLog port={PORT} />);
 
     expect(await screen.findByText("/v1/payments/status")).toBeTruthy();
     expect(screen.queryByTestId("request-scope-label")).toBeNull();
@@ -98,7 +98,7 @@ describe("the merged journal (#147 H — the epic's exit criterion)", () => {
       ...THREE_NODE,
       [REQUESTS]: { json: [recorded()], headers: { "rift-cluster-partial": "true" } },
     });
-    renderInApp(<RequestLog port={PORT} />, { whoami: whoamiWith("fleet-admin") });
+    renderInApp(<RequestLog port={PORT} />);
 
     const label = await screen.findByTestId("request-scope-label");
     expect(label.getAttribute("role")).toBe("status");
@@ -142,7 +142,7 @@ describe("the merged journal (#147 H — the epic's exit criterion)", () => {
         );
       }),
     );
-    renderInApp(<RequestLog port={PORT} />, { whoami: whoamiWith("fleet-admin") });
+    renderInApp(<RequestLog port={PORT} />);
 
     await screen.findByTestId("request-scope-label");
 
@@ -154,7 +154,7 @@ describe("the merged journal (#147 H — the epic's exit criterion)", () => {
     vi.useRealTimers();
   });
 
-  // Coverage now comes from the response, not from fleet topology — so a principal refused
+  // Coverage now comes from the response, not from fleet topology — so a screen refused
   // `/_fleet/*` gets the same complete-merge answer as anyone else, rather than a per-node label.
   // This is the test that proves the topology inference is really gone rather than merely unused.
   it("does not fall back to a per-node label when the fleet projection is refused", async () => {
@@ -163,7 +163,7 @@ describe("the merged journal (#147 H — the epic's exit criterion)", () => {
       "/_fleet/health": { status: 404, json: { message: "not found" } },
       [REQUESTS]: { json: [recorded()] },
     });
-    renderInApp(<RequestLog port={PORT} />, { whoami: whoamiWith("editor") });
+    renderInApp(<RequestLog port={PORT} />);
 
     expect(await screen.findByText("/v1/payments/status")).toBeTruthy();
     expect(screen.queryByTestId("request-scope-label")).toBeNull();
@@ -239,7 +239,7 @@ describe("server cursor replaces client-side slicing", () => {
       // making the assertions below flake on timing rather than on behaviour.
       [`${REQUESTS}?since=eyJ2IjoyfQ`]: { json: [], headers: { "x-rift-next-index": "eyJ2IjoyfQ" } },
     });
-    renderInApp(<RequestLog port={PORT} />, { whoami: whoamiWith("fleet-admin") });
+    renderInApp(<RequestLog port={PORT} />);
 
     expect(await screen.findByText("/v1/payments/status")).toBeTruthy();
 
@@ -270,7 +270,7 @@ describe("server cursor replaces client-side slicing", () => {
       [REQUESTS]: { json: [recorded()], headers: { "x-rift-next-index": "eyJ2IjoxfQ" } },
       [`${REQUESTS}?since=eyJ2IjoxfQ`]: { json: [], headers: { "x-rift-next-index": "eyJ2IjoxfQ" } },
     });
-    renderInApp(<RequestLog port={PORT} />, { whoami: whoamiWith("fleet-admin") });
+    renderInApp(<RequestLog port={PORT} />);
 
     expect(await screen.findByText("/v1/payments/status")).toBeTruthy();
 
@@ -335,7 +335,7 @@ describe("server cursor replaces client-side slicing", () => {
         );
       }),
     );
-    renderInApp(<RequestLog port={PORT} />, { whoami: whoamiWith("fleet-admin") });
+    renderInApp(<RequestLog port={PORT} />);
     expect(await screen.findByText("/v1/payments/status")).toBeTruthy();
 
     mode = "down";
@@ -387,7 +387,7 @@ describe("server cursor replaces client-side slicing", () => {
         );
       }),
     );
-    renderInApp(<RequestLog port={PORT} />, { whoami: whoamiWith("fleet-admin") });
+    renderInApp(<RequestLog port={PORT} />);
     expect(await screen.findByText("/v1/late")).toBeTruthy();
 
     await vi.advanceTimersByTimeAsync(REQUEST_POLL_INTERVAL_MS + 100);
@@ -434,7 +434,7 @@ describe("server cursor replaces client-side slicing", () => {
         );
       }),
     );
-    renderInApp(<RequestLog port={PORT} />, { whoami: whoamiWith("fleet-admin") });
+    renderInApp(<RequestLog port={PORT} />);
     expect(await screen.findByText("/v1/payments/status")).toBeTruthy();
 
     // Well past the re-baseline threshold.
@@ -458,7 +458,7 @@ describe("server cursor replaces client-side slicing", () => {
         headers: { "x-rift-truncated": "true" },
       },
     });
-    renderInApp(<RequestLog port={PORT} />, { whoami: whoamiWith("fleet-admin") });
+    renderInApp(<RequestLog port={PORT} />);
 
     expect(
       await screen.findByText(/evicted|older entries/i, {}, { timeout: 2000 }),
@@ -498,7 +498,7 @@ describe("server cursor replaces client-side slicing", () => {
         );
       }),
     );
-    renderInApp(<RequestLog port={PORT} />, { whoami: whoamiWith("fleet-admin") });
+    renderInApp(<RequestLog port={PORT} />);
     expect(await screen.findByText(/evicted|older entries/i)).toBeTruthy();
 
     // Two further polls, neither carrying the header.
@@ -512,7 +512,7 @@ describe("server cursor replaces client-side slicing", () => {
 describe("unknown is not empty", () => {
   it("renders a node that answered with nothing as an empty log", async () => {
     stubFetch({ ...THREE_NODE, [REQUESTS]: { json: [] } });
-    renderInApp(<RequestLog port={PORT} />, { whoami: whoamiWith("fleet-admin") });
+    renderInApp(<RequestLog port={PORT} />);
 
     expect(await screen.findByTestId("request-log-empty")).toBeTruthy();
     expect(screen.queryByTestId("request-log-unknown")).toBeNull();
@@ -523,7 +523,7 @@ describe("unknown is not empty", () => {
   // test never called the mock.
   it("renders a node that could not answer as unknown, never as empty", async () => {
     stubFetch({ ...THREE_NODE, [REQUESTS]: { status: 503, json: { message: "unavailable" } } });
-    renderInApp(<RequestLog port={PORT} />, { whoami: whoamiWith("fleet-admin") });
+    renderInApp(<RequestLog port={PORT} />);
 
     expect(await screen.findByTestId("request-log-unknown")).toBeTruthy();
     expect(screen.queryByTestId("request-log-empty")).toBeNull();
@@ -536,7 +536,7 @@ describe("a busy imposter", () => {
       recorded({ path: `/v1/item/${i}`, timestamp: `2026-07-31T10:00:${String(i % 60).padStart(2, "0")}Z` }),
     );
     stubFetch({ ...THREE_NODE, [REQUESTS]: { json: many } });
-    renderInApp(<RequestLog port={PORT} />, { whoami: whoamiWith("fleet-admin") });
+    renderInApp(<RequestLog port={PORT} />);
 
     // Synchronises on a row, not on the scope label: #229 deletes that label for a complete
     // merge, so waiting for it here would hang forever on the very state this suite now expects.
@@ -560,9 +560,7 @@ describe("attacker-influenced payloads (RFC-006 §9.1)", () => {
       body: "<script>alert('body')</script>",
     });
     stubFetch({ ...THREE_NODE, [REQUESTS]: { json: [hostile] } });
-    const { container } = renderInApp(<RequestLog port={PORT} />, {
-      whoami: whoamiWith("fleet-admin"),
-    });
+    const { container } = renderInApp(<RequestLog port={PORT} />);
 
     await waitFor(() => expect(screen.getAllByTestId("request-row").length).toBe(1));
     // The body and headers live in the collapsed detail row, so asserting before opening it would
@@ -597,7 +595,7 @@ describe("why did this request not match (#208)", () => {
       },
     });
     stubFetch({ ...THREE_NODE, [REQUESTS]: { json: [unmatched] } });
-    renderInApp(<RequestLog port={PORT} />, { whoami: whoamiWith("fleet-admin") });
+    renderInApp(<RequestLog port={PORT} />);
 
     await waitFor(() => expect(screen.getAllByTestId("request-row").length).toBe(1));
     await userEvent.setup().click(screen.getByTestId("request-open"));
@@ -619,7 +617,7 @@ describe("why did this request not match (#208)", () => {
         json: [recorded({ matchOutcome: { matched: true, stubIndex: 2, stubId: "payments" } })],
       },
     });
-    renderInApp(<RequestLog port={PORT} />, { whoami: whoamiWith("fleet-admin") });
+    renderInApp(<RequestLog port={PORT} />);
 
     await waitFor(() => expect(screen.getAllByTestId("request-row").length).toBe(1));
     await userEvent.setup().click(screen.getByTestId("request-open"));
@@ -635,7 +633,7 @@ describe("why did this request not match (#208)", () => {
   // ever judged it.
   it("says nothing was recorded rather than claiming the request did not match", async () => {
     stubFetch({ ...THREE_NODE, [REQUESTS]: { json: [recorded()] } });
-    renderInApp(<RequestLog port={PORT} />, { whoami: whoamiWith("fleet-admin") });
+    renderInApp(<RequestLog port={PORT} />);
 
     await waitFor(() => expect(screen.getAllByTestId("request-row").length).toBe(1));
     await userEvent.setup().click(screen.getByTestId("request-open"));
@@ -653,7 +651,7 @@ describe("why did this request not match (#208)", () => {
       ...THREE_NODE,
       [REQUESTS]: { json: [recorded({ matchOutcome: { matched: "yes" } })] },
     });
-    renderInApp(<RequestLog port={PORT} />, { whoami: whoamiWith("fleet-admin") });
+    renderInApp(<RequestLog port={PORT} />);
 
     await waitFor(() => expect(screen.getAllByTestId("request-row").length).toBe(1));
     await userEvent.setup().click(screen.getByTestId("request-open"));
@@ -685,9 +683,7 @@ describe("why did this request not match (#208)", () => {
         ],
       },
     });
-    const { container } = renderInApp(<RequestLog port={PORT} />, {
-      whoami: whoamiWith("fleet-admin"),
-    });
+    const { container } = renderInApp(<RequestLog port={PORT} />);
 
     await waitFor(() => expect(screen.getAllByTestId("request-row").length).toBe(1));
     await userEvent.setup().click(screen.getByTestId("request-open"));
@@ -710,9 +706,7 @@ describe("the header shapes the engine actually emits", () => {
       headers: { "user-agent": "curl/8", "set-cookie": ["a=1", "b=2"], "content-length": 124 },
     });
     stubFetch({ ...THREE_NODE, [REQUESTS]: { json: [request] } });
-    const { container } = renderInApp(<RequestLog port={PORT} />, {
-      whoami: whoamiWith("fleet-admin"),
-    });
+    const { container } = renderInApp(<RequestLog port={PORT} />);
 
     await waitFor(() => expect(screen.getAllByTestId("request-row").length).toBe(1));
     await userEvent.setup().click(screen.getByTestId("request-open"));
@@ -732,7 +726,7 @@ describe("the header shapes the engine actually emits", () => {
       ...THREE_NODE,
       [REQUESTS]: { json: [recorded({ body: "3q2+7w==", _mode: "binary" })] },
     });
-    renderInApp(<RequestLog port={PORT} />, { whoami: whoamiWith("fleet-admin") });
+    renderInApp(<RequestLog port={PORT} />);
 
     await waitFor(() => expect(screen.getAllByTestId("request-row").length).toBe(1));
     await userEvent.setup().click(screen.getByTestId("request-open"));
@@ -746,7 +740,7 @@ describe("the header shapes the engine actually emits", () => {
       ...THREE_NODE,
       [REQUESTS]: { json: [recorded({ body: "hello" })] },
     });
-    renderInApp(<RequestLog port={PORT} />, { whoami: whoamiWith("fleet-admin") });
+    renderInApp(<RequestLog port={PORT} />);
 
     await waitFor(() => expect(screen.getAllByTestId("request-row").length).toBe(1));
     await userEvent.setup().click(screen.getByTestId("request-open"));
@@ -777,7 +771,7 @@ describe("switching imposters", () => {
         </>
       );
     }
-    renderInApp(<Switcher />, { whoami: whoamiWith("fleet-admin") });
+    renderInApp(<Switcher />);
 
     await waitFor(() => expect(screen.getAllByTestId("request-row").length).toBe(50));
     await userEvent.setup().click(screen.getByRole("button", { name: /next/i }));
@@ -795,7 +789,7 @@ describe("paging through a long log", () => {
   it("moves between pages when the pager is used", async () => {
     const many = Array.from({ length: 120 }, (_, i) => recorded({ path: `/v1/item/${i}` }));
     stubFetch({ ...THREE_NODE, [REQUESTS]: { json: many } });
-    renderInApp(<RequestLog port={PORT} />, { whoami: whoamiWith("fleet-admin") });
+    renderInApp(<RequestLog port={PORT} />);
 
     await waitFor(() => expect(screen.getAllByTestId("request-row").length).toBe(50));
     expect(screen.getByTestId("request-total").textContent).toContain("1–50");
@@ -828,7 +822,7 @@ describe("paging through a long log", () => {
         return Promise.resolve(new Response(JSON.stringify(body), { status: 200 }));
       }),
     );
-    renderInApp(<RequestLog port={PORT} />, { whoami: whoamiWith("fleet-admin") });
+    renderInApp(<RequestLog port={PORT} />);
 
     await waitFor(() => expect(screen.getAllByTestId("request-row").length).toBe(50));
     await userEvent.setup().click(screen.getByRole("button", { name: /next/i }));
@@ -851,7 +845,7 @@ describe("paging through a long log", () => {
   it("shows the last partial page without over-reading", async () => {
     const many = Array.from({ length: 60 }, (_, i) => recorded({ path: `/v1/item/${i}` }));
     stubFetch({ ...THREE_NODE, [REQUESTS]: { json: many } });
-    renderInApp(<RequestLog port={PORT} />, { whoami: whoamiWith("fleet-admin") });
+    renderInApp(<RequestLog port={PORT} />);
 
     await waitFor(() => expect(screen.getAllByTestId("request-row").length).toBe(50));
     await userEvent.setup().click(screen.getByRole("button", { name: /next/i }));
@@ -865,7 +859,7 @@ describe("polling (RFC-006 §6)", () => {
   it("refetches on the 2s request-log interval while the tab is visible", async () => {
     vi.useFakeTimers({ shouldAdvanceTime: true });
     const { calls } = stubFetch({ ...THREE_NODE, [REQUESTS]: { json: [recorded()] } });
-    renderInApp(<RequestLog port={PORT} />, { whoami: whoamiWith("fleet-admin") });
+    renderInApp(<RequestLog port={PORT} />);
     // Waits for the first load via a row — the scope label is gone on a complete merge (#229).
     await screen.findByTestId("request-row");
 
@@ -877,7 +871,7 @@ describe("polling (RFC-006 §6)", () => {
   it("stops polling while the tab is hidden and resumes when it is shown", async () => {
     vi.useFakeTimers({ shouldAdvanceTime: true });
     const { calls } = stubFetch({ ...THREE_NODE, [REQUESTS]: { json: [recorded()] } });
-    renderInApp(<RequestLog port={PORT} />, { whoami: whoamiWith("fleet-admin") });
+    renderInApp(<RequestLog port={PORT} />);
     // Waits for the first load via a row — the scope label is gone on a complete merge (#229).
     await screen.findByTestId("request-row");
 
@@ -920,7 +914,7 @@ describe("#250 — turning a request into a stub", () => {
       [REQUESTS]: { json: [recorded({ matchOutcome: { matched: false, tried: [] } })] },
       [IMPOSTER]: { json: imposterWith([{ id: "s-1", predicates: [{ equals: { path: "/x" } }] }]) },
     });
-    renderInApp(<RequestLog port={PORT} />, { whoami: whoamiWith("editor") });
+    renderInApp(<RequestLog port={PORT} />);
     await openRow();
 
     expect(await screen.findByTestId("request-stub-this")).toBeTruthy();
@@ -934,7 +928,7 @@ describe("#250 — turning a request into a stub", () => {
       [REQUESTS]: { json: [recorded({ matchOutcome: { matched: true, stubId: "s-1" } })] },
       [IMPOSTER]: { json: imposterWith([{ id: "s-1", predicates: [{ equals: { path: "/x" } }] }]) },
     });
-    renderInApp(<RequestLog port={PORT} />, { whoami: whoamiWith("editor") });
+    renderInApp(<RequestLog port={PORT} />);
     await openRow();
 
     expect(await screen.findByTestId("request-open-stub")).toBeTruthy();
@@ -949,27 +943,12 @@ describe("#250 — turning a request into a stub", () => {
       [REQUESTS]: { json: [recorded({ matchOutcome: { matched: true, stubIndex: 2 } })] },
       [IMPOSTER]: { json: imposterWith([{ predicates: [{ equals: { path: "/x" } }] }]) },
     });
-    renderInApp(<RequestLog port={PORT} />, { whoami: whoamiWith("editor") });
+    renderInApp(<RequestLog port={PORT} />);
     await openRow();
 
     expect(await screen.findByTestId("request-no-stub-action")).toBeTruthy();
     expect(screen.queryByTestId("request-stub-this")).toBeNull();
     expect(screen.queryByTestId("request-open-stub")).toBeNull();
-  });
-
-  it("offers nothing at all to a reader who cannot write stubs", async () => {
-    // The screen itself stays readable at `imposter.read`; only the actions are gated.
-    stubFetch({
-      ...SINGLE_NODE,
-      [REQUESTS]: { json: [recorded({ matchOutcome: { matched: false, tried: [] } })] },
-      [IMPOSTER]: { json: imposterWith([]) },
-    });
-    renderInApp(<RequestLog port={PORT} />, { whoami: whoamiWith("viewer") });
-    await openRow();
-
-    expect(screen.queryByTestId("request-stub-this")).toBeNull();
-    expect(screen.queryByTestId("request-no-stub-action")).toBeNull();
-    expect(await screen.findByTestId("request-row")).toBeTruthy();
   });
 
   it("opens the editor seeded from the request, matching method and path by default", async () => {
@@ -986,7 +965,7 @@ describe("#250 — turning a request into a stub", () => {
       },
       [IMPOSTER]: { json: imposterWith([{ id: "s-1", predicates: [{ equals: { path: "/x" } }] }]) },
     });
-    renderInApp(<RequestLog port={PORT} />, { whoami: whoamiWith("editor") });
+    renderInApp(<RequestLog port={PORT} />);
     await openRow();
     await userEvent.setup().click(await screen.findByTestId("request-stub-this"));
 
@@ -1019,7 +998,7 @@ describe("#250 — turning a request into a stub", () => {
       },
       [IMPOSTER]: { json: imposterWith([{ id: "s-1", predicates: [{ equals: { path: "/x" } }] }]) },
     });
-    renderInApp(<RequestLog port={PORT} />, { whoami: whoamiWith("editor") });
+    renderInApp(<RequestLog port={PORT} />);
     await openRow();
 
     const user = userEvent.setup();
@@ -1047,7 +1026,7 @@ describe("#250 — turning a request into a stub", () => {
       [REQUESTS]: { json: [recorded({ matchOutcome: { matched: false, tried: [] } })] },
       [IMPOSTER]: { json: imposterWith([{ id: "s-1", predicates: [{ equals: { path: "/x" } }] }]) },
     });
-    renderInApp(<RequestLog port={PORT} />, { whoami: whoamiWith("editor") });
+    renderInApp(<RequestLog port={PORT} />);
     await openRow();
     await userEvent.setup().click(await screen.findByTestId("request-stub-this"));
     await screen.findByTestId("code-editor-fallback");
@@ -1068,7 +1047,7 @@ describe("#250 — turning a request into a stub", () => {
       [REQUESTS]: { json: [recorded({ matchOutcome: { matched: true, stubId: "s-gone" } })] },
       [IMPOSTER]: { json: imposterWith([{ id: "s-1", predicates: [{ equals: { path: "/x" } }] }]) },
     });
-    renderInApp(<RequestLog port={PORT} />, { whoami: whoamiWith("editor") });
+    renderInApp(<RequestLog port={PORT} />);
     await openRow();
     await userEvent.setup().click(await screen.findByTestId("request-open-stub"));
 
@@ -1092,7 +1071,7 @@ describe("#250 — turning a request into a stub", () => {
         ]),
       },
     });
-    renderInApp(<RequestLog port={PORT} />, { whoami: whoamiWith("editor") });
+    renderInApp(<RequestLog port={PORT} />);
     await openRow();
     await userEvent.setup().click(await screen.findByTestId("request-open-stub"));
 
@@ -1106,7 +1085,7 @@ describe("#250 — turning a request into a stub", () => {
       [REQUESTS]: { json: [recorded({ matchOutcome: { matched: "yes" } })] },
       [IMPOSTER]: { json: imposterWith([]) },
     });
-    renderInApp(<RequestLog port={PORT} />, { whoami: whoamiWith("editor") });
+    renderInApp(<RequestLog port={PORT} />);
     await openRow();
 
     expect((await screen.findByTestId("request-no-stub-action")).textContent).toMatch(/unreadable/i);
@@ -1121,7 +1100,7 @@ describe("#250 — turning a request into a stub", () => {
       [REQUESTS]: { json: [recorded({ matchOutcome: null })] },
       [IMPOSTER]: { json: imposterWith([]) },
     });
-    renderInApp(<RequestLog port={PORT} />, { whoami: whoamiWith("editor") });
+    renderInApp(<RequestLog port={PORT} />);
     await openRow();
 
     expect(await screen.findByTestId("request-stub-this")).toBeTruthy();
@@ -1148,7 +1127,7 @@ describe("#250 — turning a request into a stub", () => {
         },
       },
     });
-    renderInApp(<RequestLog port={PORT} />, { whoami: whoamiWith("editor") });
+    renderInApp(<RequestLog port={PORT} />);
     await openRow();
     await userEvent.setup().click(await screen.findByTestId("request-stub-this"));
 
@@ -1167,7 +1146,7 @@ describe("#250 — turning a request into a stub", () => {
       [REQUESTS]: { json: [recorded({ matchOutcome: { matched: false, tried: [] } })] },
       [IMPOSTER]: { json: imposterWith([{ id: "catch-all", responses: [{ is: { statusCode: 200 } }] }]) },
     });
-    renderInApp(<RequestLog port={PORT} />, { whoami: whoamiWith("editor") });
+    renderInApp(<RequestLog port={PORT} />);
     await openRow();
     await userEvent.setup().click(await screen.findByTestId("request-stub-this"));
 
@@ -1182,7 +1161,7 @@ describe("#250 — turning a request into a stub", () => {
       [REQUESTS]: { json: [recorded({ matchOutcome: { matched: false, tried: [] } })] },
       [IMPOSTER]: { json: imposterWith([{ id: "s-1", predicates: [{ equals: { path: "/x" } }] }]) },
     });
-    renderInApp(<RequestLog port={PORT} />, { whoami: whoamiWith("editor") });
+    renderInApp(<RequestLog port={PORT} />);
     await openRow();
     await userEvent.setup().click(await screen.findByTestId("request-stub-this"));
 
@@ -1234,7 +1213,7 @@ describe("the fleet journal is one read, not a fan-out (#362)", () => {
         }),
       },
     });
-    renderInApp(<RequestLog port={null} />, { whoami: whoamiWith("fleet-admin") });
+    renderInApp(<RequestLog port={null} />);
 
     await screen.findByTestId("merged-request-row");
 
@@ -1263,7 +1242,7 @@ describe("the fleet journal is one read, not a fan-out (#362)", () => {
         ]),
       },
     });
-    renderInApp(<RequestLog port={null} />, { whoami: whoamiWith("fleet-admin") });
+    renderInApp(<RequestLog port={null} />);
 
     const rows = await screen.findAllByTestId("merged-request-row");
     expect(rows.length).toBe(2);
@@ -1290,7 +1269,7 @@ describe("the coverage cap banner reflects the server's coverage block (#362)", 
         }),
       },
     });
-    renderInApp(<RequestLog port={null} />, { whoami: whoamiWith("fleet-admin") });
+    renderInApp(<RequestLog port={null} />);
 
     const banner = await screen.findByTestId("merged-journal-partial");
     expect(banner.textContent).toMatch(/2 of 101/);
@@ -1310,7 +1289,7 @@ describe("the coverage cap banner reflects the server's coverage block (#362)", 
         }),
       },
     });
-    renderInApp(<RequestLog port={null} />, { whoami: whoamiWith("fleet-admin") });
+    renderInApp(<RequestLog port={null} />);
 
     await screen.findByTestId("merged-request-row");
     expect(screen.queryByTestId("merged-journal-partial")).toBeNull();
@@ -1318,7 +1297,7 @@ describe("the coverage cap banner reflects the server's coverage block (#362)", 
 });
 
 describe("the fleet journal's node, status and latency columns (#364)", () => {
-  // The merged journal reads every imposter the tenant has, so the fixture needs the listing as
+  // The merged journal reads every imposter the fleet has, so the fixture needs the listing as
   // well as the fleet-wide traffic.
   const FLEET_JOURNAL = {
     ...SINGLE_NODE,
@@ -1340,7 +1319,7 @@ describe("the fleet journal's node, status and latency columns (#364)", () => {
         json: fleetPage([{ port: PORT, request: recorded({ node: "rift-7", status: 503, latencyMs: 42 }) }]),
       },
     });
-    renderInApp(<RequestLog port={null} />, { whoami: whoamiWith("fleet-admin") });
+    renderInApp(<RequestLog port={null} />);
 
     expect((await screen.findByTestId("merged-cell-node")).textContent).toBe("rift-7");
     expect((await screen.findByTestId("merged-cell-status")).textContent).toContain("503");
@@ -1358,7 +1337,7 @@ describe("the fleet journal's node, status and latency columns (#364)", () => {
       ...FLEET_JOURNAL,
       [FLEET_REQUESTS]: { json: fleetPage([{ port: PORT, request: recorded() }]) },
     });
-    renderInApp(<RequestLog port={null} />, { whoami: whoamiWith("fleet-admin") });
+    renderInApp(<RequestLog port={null} />);
 
     expect((await screen.findByTestId("merged-cell-node")).textContent).toBe("\u2014");
     expect((await screen.findByTestId("merged-cell-status")).textContent).toBe("\u2014");
@@ -1374,7 +1353,7 @@ describe("the fleet journal's node, status and latency columns (#364)", () => {
         json: fleetPage([{ port: PORT, request: recorded({ node: "rift-1", status: 200, latencyMs: 0 }) }]),
       },
     });
-    renderInApp(<RequestLog port={null} />, { whoami: whoamiWith("fleet-admin") });
+    renderInApp(<RequestLog port={null} />);
 
     expect((await screen.findByTestId("merged-cell-latency")).textContent).toBe("0 ms");
   });

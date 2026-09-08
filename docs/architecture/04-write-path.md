@@ -1,8 +1,9 @@
 # Chapter 4 — The Write Path
 
 The life of an admin request: `POST /imposters`, `PUT .../stubs/by-id/:id`,
-`POST .../disable`, a proxy-mode recording appending a captured stub, a tenant
-being created. This path carries three of the four load-bearing requirements —
+`POST .../disable`, a proxy-mode recording appending a captured stub, the
+front-door route table being replaced. This path carries three of the four
+load-bearing requirements —
 R1 (servable everywhere at ack time), R3 (durable), R4 (never lost) — so it is
 specified end-to-end, including every way it can fail.
 
@@ -17,22 +18,22 @@ sequenceDiagram
     participant F as Follower (Node C)
 
     C->>B: POST /imposters {config}  [Idempotency-Key: k1]
-    B->>B: authz (Ch.8) · park intent {op_id=k1} in redb (pending_intents)
-    B->>L: forward ControlOp::PutImposter {op_id=k1, tenant, config}
+    B->>B: authenticate (Ch.10) · park intent {op_id=k1} in redb (pending_intents)
+    B->>L: forward ControlOp::PutImposter {op_id=k1, config}
     L->>L: dedup check (sm_op_dedup[k1]?) · validate config
     L->>F: AppendEntries(entry N)
     L->>B: AppendEntries(entry N)
     F-->>L: fsync'd ✓
     B-->>L: fsync'd ✓
     Note over L: entry N COMMITTED (majority, on disk)
-    L->>L: apply N — quota check · sm_configs + ImposterManager::apply_config<br/>revision := N · record sm_op_dedup[k1] = N
+    L->>L: apply N — sm_configs + ImposterManager::apply_config<br/>revision := N · record sm_op_dedup[k1] = N
     par barrier: wait for Ready nodes to APPLY N
         F-->>L: applied ≥ N (piggybacked on AppendEntries resp)
         B-->>L: applied ≥ N
     end
     L-->>B: ok {revision: N}
     B->>B: mark intent applied
-    B-->>C: 201 Created<br/>Rift-Cluster-Revision: tenant:8080@N<br/>Rift-Cluster-Op-Id: k1
+    B-->>C: 201 Created<br/>Rift-Cluster-Revision: 8080@N<br/>Rift-Cluster-Op-Id: k1
     Note over C: The next request through the LB —<br/>to ANY node — is served from config N.
 ```
 
@@ -77,12 +78,11 @@ corrupted silently). Hence op-ids, end to end:
 - Entries GC after 24 h; a retry older than that is a new operation
   (documented; retention configurable).
 
-**Quotas are checked at this step too, not before the append.** A refusal is
-therefore a *committed* decision: it lands in the log as
-`ControlOutcome::Failed { reason }` at a revision, identical on every node, and a
-write that was parked during an outage discovers it through
-`GET /_cluster/ops/:id` on replay rather than at submit time. See Chapter 8,
-"What T4 ships".
+**Admission rules that depend on applied state are checked at this step, not
+before the append.** A refusal is therefore a *committed* decision: it lands in
+the log as `ControlOutcome::Failed { reason }` at a revision, identical on every
+node, and a write that was parked during an outage discovers it through
+`GET /_cluster/ops/:id` on replay rather than at submit time.
 
 ## Every failure mode, and what the client sees
 

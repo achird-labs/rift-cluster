@@ -1,93 +1,36 @@
-import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { useQueryClient } from "@tanstack/react-query";
 import type { ReactNode } from "react";
 
-import { ApiError, apiGet } from "./api/client.ts";
-import { API_PATHS } from "./api/paths.ts";
-import type { components } from "./api/schema.ts";
+import { ApiError } from "./api/client.ts";
 import { Shell } from "./app/Shell.tsx";
-import { DEFAULT_TENANT, FLEET_SCOPE, selectableTenants } from "./app/rbac.ts";
-import { SessionProvider, initialTenant } from "./app/session.tsx";
+import { SESSION_KEY, useSession } from "./app/session.tsx";
 import { ErrorNote } from "./components/primitives.tsx";
 import { Login } from "./screens/Login.tsx";
 
-type WhoAmI = components["schemas"]["WhoAmI"];
-type Tenant = components["schemas"]["Tenant"];
-
+/**
+ * Sign-in, and nothing else.
+ *
+ * Since #550 there is one credential and one identity, so there is nothing left for this component
+ * to resolve beyond "is there a session". A `401` is the login screen; anything else that fails is
+ * an admin front we could not reach, and saying which is the difference between "paste your key
+ * again" and "the fleet is down".
+ */
 export function App(): ReactNode {
   const client = useQueryClient();
-  const whoami = useQuery({
-    queryKey: ["whoami"],
-    queryFn: () => apiGet<WhoAmI>(API_PATHS.whoami),
-    // No `retry` override: the shared policy already declines to retry a 4xx, so a 401 goes
-    // straight to the login screen while a dropped connection still gets its one retry. Turning
-    // retries off here would make a transient blip on the very first request look like an
-    // unreachable admin front.
-  });
+  const session = useSession();
 
-  if (whoami.isPending) return <p className="muted">Signing in…</p>;
+  if (session.isPending) return <p className="muted">Signing in…</p>;
 
-  if (whoami.isError) {
-    if (whoami.error instanceof ApiError && whoami.error.status === 401) {
-      return (
-        <Login onAuthenticated={() => void client.invalidateQueries({ queryKey: ["whoami"] })} />
-      );
+  if (session.isError) {
+    if (session.error instanceof ApiError && session.error.status === 401) {
+      return <Login onAuthenticated={() => void client.invalidateQueries({ queryKey: SESSION_KEY })} />;
     }
     return (
       <main className="screen">
-        <ErrorNote error={whoami.error} context="Could not reach the admin front" />
+        <ErrorNote error={session.error} context="Could not reach the admin front" />
       </main>
     );
   }
 
-  return <Authenticated whoami={whoami.data} />;
-}
-
-function Authenticated({ whoami }: { whoami: WhoAmI }): ReactNode {
-  const bound = selectableTenants(whoami);
-  const holdsFleetScope = whoami.bindings.some((binding) => binding.tenant === FLEET_SCOPE);
-
-  /*
-   * A FleetAdmin binds only to `*`, so its own bindings name no tenant to switch between. The list
-   * then has to come from `GET /admin/tenants` — fleet-scoped, so exactly that principal may read
-   * it, and no other role asks for it. A failure is not fatal: the console falls back to the
-   * principal's default tenant rather than refusing to render.
-   */
-  const tenants = useQuery({
-    queryKey: ["tenants"],
-    queryFn: async () => {
-      const list = await apiGet<Tenant[]>(API_PATHS.tenants);
-      const named = list.filter((tenant) => tenant.deleted !== true).map((tenant) => tenant.id);
-      /*
-       * `default` is unioned in, because it exists whether or not a record does.
-       *
-       * It is the tenant an unscoped request lands in (`TenantId::default()`), but `/admin/tenants`
-       * lists committed *records* — and nobody creates one for `default`. So a fleet whose operators
-       * never explicitly created it returned a list without it, the switcher offered one other
-       * tenant, `initialTenant` fell to that one, and every resource in `default` — which on most
-       * fleets is all of them — became unreachable from the console. With one other tenant the
-       * switcher did not even render, so there was no control to correct it with.
-       */
-      return named.includes(DEFAULT_TENANT) ? named : [DEFAULT_TENANT, ...named].sort();
-    },
-    enabled: holdsFleetScope,
-  });
-
-  if (holdsFleetScope && tenants.isPending) return <p className="muted">Reading tenants…</p>;
-
-  const available = holdsFleetScope ? (tenants.data ?? []) : bound;
-
-  return (
-    <>
-      {/* A failed tenant list is NOT an empty fleet, and must not read as one: the switcher would
-          simply vanish and the operator would be left with a console that looks healthy and has
-          silently lost every tenant but the default. Non-fatal — the default tenant still works —
-          so it is said out loud and the console renders anyway. */}
-      {tenants.isError ? (
-        <ErrorNote error={tenants.error} context="Could not list tenants, so the tenant switcher is unavailable" />
-      ) : null}
-      <SessionProvider whoami={whoami} tenants={available} initialTenant={initialTenant(available)}>
-        <Shell />
-      </SessionProvider>
-    </>
-  );
+  return <Shell />;
 }

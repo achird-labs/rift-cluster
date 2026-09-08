@@ -16,7 +16,6 @@ import {
   useSpaces,
   useTeardownSpace,
 } from "../app/queries.ts";
-import { useSession } from "../app/session.tsx";
 import { useHashQuery } from "../app/routing.ts";
 import { Card, Confirm, Empty, ErrorNote, Ident, Truncated, UNNAMED } from "../components/primitives.tsx";
 import { shadowingStubIndex } from "../features/requests/stubFromRequest.ts";
@@ -148,29 +147,22 @@ function ScenarioPanel({
   flow: string | null;
   state: ReturnType<typeof useScenarios>;
 }): ReactNode {
-  const { can } = useSession();
   const reset = useResetScenarios();
   const [confirming, setConfirming] = useState(false);
-  // Two capabilities, not one: `POST .../scenarios/reset` is `Action::ScenarioReset` (Operator) and
-  // `PUT .../scenarios/{name}/state` is `Action::ScenarioWrite` (Editor). See `rbac.ts`.
-  const mayReset = can("scenario.reset");
-  const mayWrite = can("scenario.write");
 
   return (
     <Card
       title="Scenarios"
       testId="scenarios-card"
       actions={
-        mayReset ? (
-          <button
-            className="btn sm danger"
-            type="button"
-            data-testid="reset-scenarios"
-            onClick={() => setConfirming(true)}
-          >
-            Reset all in this space
-          </button>
-        ) : undefined
+        <button
+          className="btn sm danger"
+          type="button"
+          data-testid="reset-scenarios"
+          onClick={() => setConfirming(true)}
+        >
+          Reset all in this space
+        </button>
       }
     >
       {reset.isError ? <ErrorNote error={reset.error} context="Scenarios were not reset" /> : null}
@@ -224,7 +216,7 @@ function ScenarioPanel({
         />
       ) : null}
       {state.data?.kind === "scenarios" && state.data.scenarios.length > 0 ? (
-        <ScenarioTable port={port} flow={flow} scenarios={state.data.scenarios} mayWrite={mayWrite} />
+        <ScenarioTable port={port} flow={flow} scenarios={state.data.scenarios} />
       ) : null}
     </Card>
   );
@@ -234,12 +226,10 @@ function ScenarioTable({
   port,
   flow,
   scenarios,
-  mayWrite,
 }: {
   port: number;
   flow: string | null;
   scenarios: ScenarioEntry[];
-  mayWrite: boolean;
 }): ReactNode {
   const [editing, setEditing] = useState<string | null>(null);
 
@@ -255,7 +245,7 @@ function ScenarioTable({
                 whether a state you just set will survive — and neither is published (#359). */}
             <th style={{ width: "14ch" }}>Owner</th>
             <th style={{ width: "14ch" }}>Fence</th>
-            {mayWrite ? <th style={{ width: "16ch" }} aria-label="Set state" /> : null}
+            <th style={{ width: "16ch" }} aria-label="Set state" />
           </tr>
         </thead>
         <tbody>
@@ -265,7 +255,6 @@ function ScenarioTable({
               port={port}
               flow={flow}
               scenario={scenario}
-              mayWrite={mayWrite}
               editing={editing === scenario.name}
               onEdit={() => setEditing(scenario.name)}
               onClose={() => setEditing(null)}
@@ -281,7 +270,6 @@ function ScenarioRow({
   port,
   flow,
   scenario,
-  mayWrite,
   editing,
   onEdit,
   onClose,
@@ -289,7 +277,6 @@ function ScenarioRow({
   port: number;
   flow: string | null;
   scenario: ScenarioEntry;
-  mayWrite: boolean;
   editing: boolean;
   onEdit: () => void;
   onClose: () => void;
@@ -318,25 +305,23 @@ function ScenarioRow({
             reason="The epoch and ownership generation a write against this flow is fenced with are not exposed."
           />
         </td>
-        {mayWrite ? (
-          <td>
-            <button
-              className="btn sm"
-              type="button"
-              data-testid={`set-scenario-state-${scenario.name}`}
-              // The draft is seeded here rather than at mount. This row survives the 5s poll, so a
-              // draft initialised once holds whatever the state was when the screen first painted —
-              // and submitting it after traffic (or another operator) moved the scenario would
-              // silently revert it to a stale value.
-              onClick={() => {
-                setDraft(scenario.state);
-                onEdit();
-              }}
-            >
-              Set state
-            </button>
-          </td>
-        ) : null}
+        <td>
+          <button
+            className="btn sm"
+            type="button"
+            data-testid={`set-scenario-state-${scenario.name}`}
+            // The draft is seeded here rather than at mount. This row survives the 5s poll, so a
+            // draft initialised once holds whatever the state was when the screen first painted —
+            // and submitting it after traffic (or another operator) moved the scenario would
+            // silently revert it to a stale value.
+            onClick={() => {
+              setDraft(scenario.state);
+              onEdit();
+            }}
+          >
+            Set state
+          </button>
+        </td>
       </tr>
       {/*
        * Outside the `editing` gate, deliberately. Cancel closes the editor, and a write already in
@@ -401,21 +386,16 @@ function ScenarioRow({
 }
 
 function SpacePanel({ port, flowId }: { port: number; flowId: string | null }): ReactNode {
-  const { can } = useSession();
   const space = useSpace(port, flowId);
   const teardown = useTeardownSpace();
   const [confirming, setConfirming] = useState(false);
-  // `DELETE .../spaces/{flowId}` is `Action::SpaceTeardown` (Operator); `POST .../spaces/{flowId}/stubs`
-  // is `Action::SpaceStubWrite` (Editor). Different tiers, so different controls.
-  const mayTearDown = can("space.teardown");
-  const mayAddStub = can("space.stubWrite");
 
   return (
     <Card
       title="Space"
       testId="space-card"
       actions={
-        mayTearDown && flowId !== null ? (
+        flowId !== null ? (
           <button
             className="btn sm danger"
             type="button"
@@ -467,7 +447,7 @@ function SpacePanel({ port, flowId }: { port: number; flowId: string | null }): 
         </div>
       ) : null}
       {space.data?.kind === "space" ? (
-        <SpaceBody port={port} flowId={flowId} space={space.data.space} mayAddStub={mayAddStub} />
+        <SpaceBody port={port} flowId={flowId} space={space.data.space} />
       ) : null}
     </Card>
   );
@@ -477,12 +457,10 @@ function SpaceBody({
   port,
   flowId,
   space,
-  mayAddStub,
 }: {
   port: number;
   flowId: string | null;
   space: Space;
-  mayAddStub: boolean;
 }): ReactNode {
   return (
     <>
@@ -574,7 +552,7 @@ function SpaceBody({
         </>
       )}
 
-      {mayAddStub && flowId !== null ? <AddSpaceStub port={port} flowId={flowId} /> : null}
+      {flowId !== null ? <AddSpaceStub port={port} flowId={flowId} /> : null}
     </>
   );
 }
@@ -660,7 +638,6 @@ function AddSpaceStub({ port, flowId }: { port: number; flowId: string }): React
 }
 
 function FlowStatePanel({ port, flowId }: { port: number; flowId: string | null }): ReactNode {
-  const { can } = useSession();
   const [draftKey, setDraftKey] = useState("");
   /** The key actually asked for, which is not the one being typed. */
   const [readKey, setReadKey] = useState<string | null>(null);
@@ -668,21 +645,12 @@ function FlowStatePanel({ port, flowId }: { port: number; flowId: string | null 
   const clear = useClearFlowState();
   const [confirming, setConfirming] = useState(false);
 
-  /*
-   * The asymmetry that looks like a bug and is not. There is no `FlowStateWrite` action: the server
-   * classifies `PUT .../flow-state/{flow}/{key}` as `Action::SpaceStubWrite` (Editor) and the
-   * `DELETE` beside it as `Action::FlowStateClear` (Operator). So an operator may clear an entry
-   * and may not set one, and the console must draw exactly that.
-   */
-  const maySet = can("space.stubWrite");
-  const mayClear = can("flowState.clear");
-
   return (
     <Card
       title="Flow state"
       testId="flow-state-card"
       actions={
-        mayClear && flowId !== null ? (
+        flowId !== null ? (
           <button
             className="btn sm danger"
             type="button"
@@ -755,8 +723,6 @@ function FlowStatePanel({ port, flowId }: { port: number; flowId: string | null 
           flowId={flowId}
           entryKey={readKey}
           entry={entry}
-          maySet={maySet}
-          mayClear={mayClear}
         />
       )}
     </Card>
@@ -768,15 +734,11 @@ function FlowStateResult({
   flowId,
   entryKey,
   entry,
-  maySet,
-  mayClear,
 }: {
   port: number;
   flowId: string | null;
   entryKey: string;
   entry: ReturnType<typeof useFlowStateEntry>;
-  maySet: boolean;
-  mayClear: boolean;
 }): ReactNode {
   const write = useSetFlowStateEntry();
   const clear = useClearFlowState();
@@ -806,7 +768,7 @@ function FlowStateResult({
       {entry.data?.kind === "absent" ? (
         /*
          * Deliberately does not say "not set" and stop there. The contract documents this 404 as
-         * "no such entry", but RFC-002 §8.4 renders a tenant the principal is not bound to as 404
+         * "no such entry", but a missing imposter answers 404
          * as well — so the status is consistent with reading someone else's imposter, and claiming
          * the key is unset would be a guess dressed as an answer.
          */
@@ -832,7 +794,7 @@ function FlowStateResult({
       {clear.isError ? <ErrorNote error={clear.error} context="The entry was not cleared" /> : null}
 
       <div className="acts">
-        {maySet && flowId !== null ? (
+        {flowId !== null ? (
           draft === null ? (
             <button
               className="btn sm"
@@ -880,7 +842,7 @@ function FlowStateResult({
           )
         ) : null}
 
-        {mayClear && flowId !== null ? (
+        {flowId !== null ? (
           <button
             className="btn sm danger"
             type="button"
@@ -1234,31 +1196,15 @@ function ActiveSpaces({ port }: { port: number }): ReactNode {
             </div>
           </dl>
 
-          {spaces.data.list.unavailable === "fleet-scope" ? (
+          {spaces.data.list.unavailable === "scope-unresolved" ? (
             /*
-             * A policy refusal, not a degraded read — distinct from the generic partial banner
-             * below because the fix and the framing are both different: this one never improves on
-             * a retry, so telling an operator to wait or retry would be a false promise.
-             */
-            <div className="banner info" data-testid="active-spaces-fleet-scope" role="status">
-              <span className="b-glyph" aria-hidden="true">
-                &#9670;
-              </span>
-              <div>
-                <strong>This imposter&rsquo;s spaces cannot be listed.</strong>
-                <p>
-                  This imposter uses <code>contextScope: &quot;fleet&quot;</code>, whose spaces are
-                  shared cluster-wide and carry no tenant marker, so they cannot be enumerated
-                  per-imposter. This is not a failure and will not change on a retry. Individual
-                  spaces remain readable by id.
-                </p>
-              </div>
-            </div>
-          ) : spaces.data.list.unavailable === "scope-unresolved" ? (
-            /*
-             * The other refusal reason, and unlike the one above this is transient: the node just
-             * could not read the imposter's own config, which a retry (or the node catching up)
-             * may resolve.
+             * A refusal, not a degraded read — distinct from the generic partial banner below
+             * because the framing is different: nothing was attempted, so "incomplete" would
+             * overstate what the node did. Transient, though: the node just could not read the
+             * imposter's own config, which a retry (or the node catching up) may resolve.
+             *
+             * The one variant left. `"fleet-scope"` was the other, and #550 removed it along with
+             * the tenancy it protected.
              */
             <div className="banner warn" data-testid="active-spaces-scope-unresolved" role="status">
               <span className="b-glyph" aria-hidden="true">

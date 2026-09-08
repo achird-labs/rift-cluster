@@ -16,7 +16,7 @@ const RECORDING_PORT = 4791;
 
 test.describe("recording: start, review, promote", () => {
   test("records a proxied request and promotes it into a static stub", async ({ page, request }) => {
-    await signIn(page, "editor");
+    await signIn(page);
     await goToScreen(page, "/imposters");
 
     // --- create a throwaway imposter to record on -----------------------------

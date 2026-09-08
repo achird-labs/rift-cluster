@@ -1,6 +1,6 @@
 //! `GET /openapi.json` (RFC-006 §5.1, issue #184): the published contract is reachable over HTTP,
-//! is the real document rather than an empty placeholder, and is gated the same way `/admin/whoami`
-//! is.
+//! is the real document rather than an empty placeholder, and is gated the same way every other
+//! admin route is.
 //!
 //! The document's *shape* is asserted by the unit tests in `src/openapi.rs` (route parity,
 //! `x-rift-origin`, the header components). What can only be checked here is that the binary
@@ -106,9 +106,9 @@ async fn openapi_json_endpoint_serves_the_contract() {
     );
     for path in [
         "/imposters",
-        "/admin/tenants",
         "/admin/fleet/name",
-        "/admin/whoami",
+        "/front-door/routes",
+        "/session",
         "/openapi.json",
     ] {
         assert!(
@@ -139,7 +139,7 @@ async fn openapi_json_endpoint_serves_the_contract() {
 ///
 /// This closes a tautology a reviewer found in #184. `every_published_ee_path_is_routable` cannot
 /// pin these routes, because `is_terminated_here` short-circuits on the same constant before it
-/// would consult the real router — so the constant checks itself, and deleting the `/admin/whoami`
+/// would consult the real router — so the constant checks itself, and deleting the `/openapi.json`
 /// arm from `handle` would leave the contract publishing a route nothing serves, with every test
 /// green. Only an HTTP probe against a live node catches that.
 ///
@@ -160,8 +160,8 @@ async fn every_direct_route_is_actually_served() {
         // exist is itself a 404 — an unknown op id and an unrouted path are deliberately
         // indistinguishable there, the same posture the cluster port takes. A 404 therefore proves
         // nothing either way and this check cannot speak to it. Its routing **and its
-        // authorization** are pinned instead by `tests/fleet_session.rs`:
-        // `fleet_routes_refuse_a_non_fleet_admin` includes it, and
+        // authentication** are pinned instead by `tests/fleet_session.rs`:
+        // `a_keyed_fleet_refuses_an_unauthenticated_request_on_every_surface` covers the gate, and
         // `fleet_ops_reports_a_committed_op` polls a real committed op through it.
         if template.contains("{opId}") {
             continue;
@@ -247,11 +247,11 @@ async fn the_contract_offers_no_membership_or_snapshot_operation() {
     server.shutdown().await;
 }
 
-/// The contract maps every tenancy and fleet route, so it is authenticated — the same posture as
-/// `/admin/whoami`. Without a configured key the node is in bootstrap bypass and answers anyone,
-/// which is why this test configures one: otherwise it would assert nothing.
+/// The contract maps every route this front serves, so it is authenticated. Without a configured
+/// key the admin plane is open and answers anyone, which is why this test configures one:
+/// otherwise it would assert nothing.
 ///
-/// Pins D-44 (the key half): a configured `--api-key` alone closes the open admin plane.
+/// Pins D-73: `--api-key` set closes the whole admin plane; unset leaves it open.
 #[tokio::test]
 async fn openapi_json_requires_authentication_once_a_key_is_configured() {
     let state = TempDir::new().expect("tempdir");

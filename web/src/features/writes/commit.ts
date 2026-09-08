@@ -15,12 +15,11 @@ type FleetOpStatus = components["schemas"]["FleetOpStatus"];
 /**
  * What became of a write, once we stopped guessing.
  *
- * The third case is the one worth defending. `GET /_fleet/ops/{opId}` is fleet-scoped
- * (`ClusterAdmin`/FleetAdmin only) and its `404` deliberately conflates "unknown op", "malformed
- * id" and "caller lacks fleet scope" — so an ordinary tenant admin toggling an imposter cannot poll
- * at all, and their write has very likely committed. Reporting that as `failed` would be the same
- * mistake this module exists to fix, just inverted: asserting an outcome nobody observed. So it gets
- * its own name and its own sentence on screen.
+ * The third case is the one worth defending. `GET /_fleet/ops/{opId}` answers `404` for an op the
+ * node cannot resolve — an id it has never seen, a malformed one, or one whose record this node
+ * has not caught up to — and that is not evidence the write did not land. Reporting it as `failed`
+ * would be the same mistake this module exists to fix, just inverted: asserting an outcome nobody
+ * observed. So it gets its own name and its own sentence on screen.
  */
 export type CommitOutcome =
   | { kind: "applied" }
@@ -28,7 +27,6 @@ export type CommitOutcome =
   | { kind: "unobservable"; reason: string };
 
 export type PollOptions = {
-  tenant?: string | null | undefined;
   /** Poll cadence. Tests pass `0`; no caller overrides it, so production uses the default below. */
   intervalMs?: number;
   /** Attempts per op before giving up as unobservable. Default gives roughly ten seconds. */
@@ -67,17 +65,13 @@ export function applied<T>(result: SendResult<T>): T {
  * "Cannot see the fleet projection" becomes the `"unreadable"` sentinel rather than an error —
  * distinct from `null`, which is an empty body and reads as still-pending.
  */
-async function readOp(
-  opId: string,
-  options: PollOptions,
-): Promise<FleetOpStatus | null | "unreadable"> {
+async function readOp(opId: string): Promise<FleetOpStatus | null | "unreadable"> {
   try {
-    return await apiGet<FleetOpStatus>(fleetOpPath(opId), { tenant: options.tenant });
+    return await apiGet<FleetOpStatus>(fleetOpPath(opId));
   } catch (error) {
     if (error instanceof ApiError && (error.status === 403 || error.status === 404)) {
-      // Not a failure of the write — a limit on what this principal can see. `404` covers an
-      // unknown id too, but we only ever poll ids the server just minted, so scope is the
-      // overwhelmingly likelier cause and neither is evidence the write did not land.
+      // Not a failure of the write — a limit on what this node can answer about it. We only ever
+      // poll ids the server just minted, so neither status is evidence the write did not land.
       return "unreadable";
     }
     /*
@@ -115,13 +109,13 @@ export async function pollCommit(
     if (attempt > 0) await sleep(interval);
 
     for (const opId of [...pending]) {
-      const status = await readOp(opId, options);
+      const status = await readOp(opId);
       if (status === "unreadable") {
         return {
           kind: "unobservable",
           reason:
-            "the fleet accepted the write, but reading its progress needs fleet-admin scope this " +
-            "session does not have",
+            "the fleet accepted the write, but this node could not answer for the op that " +
+            "carries it, so its progress cannot be read",
         };
       }
       if (status === null) continue;

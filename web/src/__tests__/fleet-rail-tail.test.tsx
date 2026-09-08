@@ -3,7 +3,7 @@ import { screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { Imposters } from "../screens/Imposters.tsx";
-import { renderInApp, stubFetch, whoamiWith } from "./harness.tsx";
+import { renderInApp, stubFetch } from "./harness.tsx";
 
 /**
  * The fleet rail's `Live tail · merged` panel (#362).
@@ -62,7 +62,7 @@ describe("the fleet rail's merged tail (#362)", () => {
       ...SINGLE_NODE,
       "/admin/requests": { json: page([row(4545, "GET", "/v1/charges", 201)]) },
     });
-    renderInApp(<Imposters />, { whoami: whoamiWith("fleet-admin") });
+    renderInApp(<Imposters />);
 
     const tail = await screen.findByTestId("merged-tail");
 
@@ -84,7 +84,7 @@ describe("the fleet rail's merged tail (#362)", () => {
       },
       "/admin/requests": { json: page([row(4545, "GET", "/v1/charges")]) },
     });
-    renderInApp(<Imposters />, { whoami: whoamiWith("fleet-admin") });
+    renderInApp(<Imposters />);
 
     await screen.findByTestId("merged-tail");
 
@@ -99,7 +99,7 @@ describe("the fleet rail's merged tail (#362)", () => {
       row(4545, "GET", `/v1/charge-${String(i)}`),
     );
     stubFetch({ ...SINGLE_NODE, "/admin/requests": { json: page(many) } });
-    renderInApp(<Imposters />, { whoami: whoamiWith("fleet-admin") });
+    renderInApp(<Imposters />);
 
     await screen.findByTestId("merged-tail");
 
@@ -112,7 +112,7 @@ describe("the fleet rail's merged tail (#362)", () => {
 
   it("says so when the journal cannot be read, rather than showing an empty tail", async () => {
     stubFetch({ ...SINGLE_NODE, "/admin/requests": { status: 503 } });
-    renderInApp(<Imposters />, { whoami: whoamiWith("fleet-admin") });
+    renderInApp(<Imposters />);
 
     // A 5xx is a hiccup by `retryTransportFailures`, so the honest message is one retry and one
     // backoff away — deliberately, and longer than the default `findBy` window.

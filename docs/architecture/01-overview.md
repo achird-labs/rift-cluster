@@ -81,7 +81,7 @@ flowchart TB
         direction LR
         M[Membership<br/>voters + learners]
         C[Imposter configs<br/>+ enabled bit]
-        T[Tenants, principals,<br/>role bindings]
+        T[Front-door route table<br/>+ its revision]
         I[Admin intent log<br/>+ op-id dedup]
     end
 

@@ -9,23 +9,23 @@
 //!
 //! # What `verify` deliberately does not carry
 //!
-//! A session proves **authentication only**. It resolves to a principal id and nothing more —
-//! no roles, no tenants, no bindings. The caller (`admin_front`) re-resolves the principal's
-//! bindings from local applied state on *every* request, exactly as the bearer-credential path
-//! already does. That is not an accident of scope: a TTL cache mapping session → bindings is
-//! named in issue #165 as the exact mutant `c25_key_revocation_survives_a_partition` exists to
-//! catch — disabling a principal or deleting a binding must cut a live session immediately, and
-//! a cache anywhere on this path is precisely what would let a revoked session keep working
-//! until the cache entry aged out. Do not add one here or in the caller.
+//! A session proves **authentication only**, and since #550 there is exactly one identity to
+//! authenticate as: the holder of the fleet's `--api-key`. [`verify`] therefore answers
+//! `Result<(), _>` — there is nothing for it to resolve *to*. It is deliberately not widened
+//! back into an identity channel: a cookie that carried authorization data would be a second
+//! source of truth for a decision the key already settles.
 //!
 //! # Token format
 //!
 //! `v1.<base64url_nopad(payload_json)>.<base64url_nopad(hmac_sha256)>`
 //!
-//! where the payload is `{"pid": "<principal id>", "iat": <unix secs>, "exp": <unix secs>,
-//! "kr": <key revision>}`. The HMAC signs the ASCII bytes of `v1.<payload_b64>` — the version
-//! tag is inside the signed span, not just a prefix on the wire, so a future `v2` format cannot
-//! be replayed as if it were `v1` by an attacker who only controls the tag.
+//! where the payload is `{"pid": "admin", "iat": <unix secs>, "exp": <unix secs>,
+//! "kr": <key revision>}`. `pid` is the fixed subject [`SUBJECT`] — the one administrator a
+//! keyed fleet has — kept in the signed span rather than dropped so the format stays readable
+//! in a log dump and a future second subject is a value change, not a format change. The HMAC
+//! signs the ASCII bytes of `v1.<payload_b64>` — the version tag is inside the signed span, not
+//! just a prefix on the wire, so a future `v2` format cannot be replayed as if it were `v1` by
+//! an attacker who only controls the tag.
 //!
 //! `kr` (key revision) is what makes rotation a fleet-wide kill switch with no table to sweep:
 //! every node verifies against its own applied [`SessionKey`], and a token minted under
@@ -44,20 +44,12 @@ type HmacSha256 = Hmac<Sha256>;
 /// prefix, so it cannot be swapped without invalidating the signature.
 const FORMAT_TAG: &str = "v1";
 
-/// What every session token starts with.
-///
-/// Used as a cheap discriminator by [`crate::principal::resolve_bindings`] so an ordinary API key
-/// never reaches the token verifier — which is what keeps the bearer path byte-identical for every
-/// credential that worked before sessions existed.
-pub(crate) const TOKEN_PREFIX: &str = "v1.";
-
-/// Seconds since the Unix epoch, floored to `0` on a pre-epoch clock.
-pub(crate) fn now_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
+/// The one subject a session token can name (#550, D-73). A keyed fleet has a single
+/// administrator — whoever holds `--api-key` — so the payload's `pid` is a constant, not an
+/// identity the token resolves. [`verify`] refuses any other value as [`SessionError::Malformed`]
+/// rather than ignoring the field: a token naming a subject this build does not know is a token
+/// from a format this build does not understand.
+pub(crate) const SUBJECT: &str = "admin";
 
 /// 8 hours: a work-day session (RFC-006 §5.3). `admin_front` mints with this TTL and renders
 /// the identical value as the `Set-Cookie: Max-Age` — one constant, so the two can never drift
@@ -118,9 +110,9 @@ struct Payload {
 /// hoping: see `hmac` 0.12.1's `HmacCore::new_from_slice` (`optim.rs`), which has no `Err` path
 /// that mint's fixed-length key input can reach.
 #[must_use]
-pub(crate) fn mint(key: &SessionKey, principal_id: &str, now_secs: u64, ttl_secs: u64) -> String {
+pub(crate) fn mint(key: &SessionKey, now_secs: u64, ttl_secs: u64) -> String {
     let payload = Payload {
-        pid: principal_id.to_owned(),
+        pid: SUBJECT.to_owned(),
         iat: now_secs,
         exp: now_secs.saturating_add(ttl_secs),
         kr: key.revision,
@@ -142,14 +134,15 @@ pub(crate) fn mint(key: &SessionKey, principal_id: &str, now_secs: u64, ttl_secs
     format!("{signed_span}.{sig_b64}")
 }
 
-/// Verify `token` against `key` as of `now_secs`. `Ok` carries the principal id and *only* the
-/// principal id — see the module doc for why bindings never travel with it.
+/// Verify `token` against `key` as of `now_secs`. `Ok(())` carries nothing — see the module
+/// doc for why a session resolves to no identity.
 ///
 /// Checks, in order: well-formed three-part token → signature (constant-time; see below) →
-/// the payload decodes → the key revision the token was minted under still matches `key`'s →
-/// not expired. Signature verification runs before the payload is ever parsed as JSON: nothing
-/// downstream trusts a byte of the claims until the MAC over them has already been accepted.
-pub(crate) fn verify(key: &SessionKey, token: &str, now_secs: u64) -> Result<String, SessionError> {
+/// the payload decodes → its subject is [`SUBJECT`] → the key revision the token was minted
+/// under still matches `key`'s → not expired. Signature verification runs before the payload is
+/// ever parsed as JSON: nothing downstream trusts a byte of the claims until the MAC over them
+/// has already been accepted.
+pub(crate) fn verify(key: &SessionKey, token: &str, now_secs: u64) -> Result<(), SessionError> {
     let mut parts = token.split('.');
     let (Some(tag), Some(payload_b64), Some(sig_b64), None) =
         (parts.next(), parts.next(), parts.next(), parts.next())
@@ -192,6 +185,9 @@ pub(crate) fn verify(key: &SessionKey, token: &str, now_secs: u64) -> Result<Str
     let payload: Payload =
         serde_json::from_slice(&payload_json).map_err(|_| SessionError::Malformed)?;
 
+    if payload.pid != SUBJECT {
+        return Err(SessionError::Malformed);
+    }
     // Rotation invalidates every outstanding session at once, with no table to sweep: a token
     // minted under a since-superseded revision is refused here, unconditionally, the instant
     // any node applies the next `SessionKeyPut`.
@@ -202,7 +198,7 @@ pub(crate) fn verify(key: &SessionKey, token: &str, now_secs: u64) -> Result<Str
         return Err(SessionError::Expired);
     }
 
-    Ok(payload.pid)
+    Ok(())
 }
 
 /// Lowercase hex, no separators. Hand-rolled for the same reason
@@ -246,16 +242,16 @@ mod tests {
     }
 
     #[test]
-    fn round_trip_mints_and_verifies_to_the_same_principal_id() {
+    fn round_trip_mints_and_verifies() {
         let key = test_key(1);
-        let token = mint(&key, "key:abc123", 1_000, SESSION_TTL_SECS);
-        assert_eq!(verify(&key, &token, 1_000), Ok("key:abc123".to_owned()));
+        let token = mint(&key, 1_000, SESSION_TTL_SECS);
+        assert_eq!(verify(&key, &token, 1_000), Ok(()));
     }
 
     #[test]
     fn expired_token_is_refused() {
         let key = test_key(1);
-        let token = mint(&key, "key:abc123", 1_000, 10);
+        let token = mint(&key, 1_000, 10);
         // One second past `exp` (1_010).
         assert_eq!(verify(&key, &token, 1_011), Err(SessionError::Expired));
         // Exactly at `exp` still verifies — `exp` is inclusive.
@@ -265,7 +261,7 @@ mod tests {
     #[test]
     fn rotating_the_key_invalidates_every_outstanding_session() {
         let old_key = test_key(1);
-        let token = mint(&old_key, "key:abc123", 1_000, SESSION_TTL_SECS);
+        let token = mint(&old_key, 1_000, SESSION_TTL_SECS);
         // Same key bytes, but the revision moved on (a rotation committed) — the token must stop
         // verifying immediately, with no table of outstanding sessions swept to make that true.
         let rotated = SessionKey {
@@ -281,15 +277,15 @@ mod tests {
     #[test]
     fn tampered_payload_fails_the_signature_check() {
         let key = test_key(1);
-        let token = mint(&key, "key:abc123", 1_000, SESSION_TTL_SECS);
+        let token = mint(&key, 1_000, SESSION_TTL_SECS);
         let mut parts: Vec<&str> = token.split('.').collect();
         assert_eq!(parts.len(), 3);
-        // Forge a payload claiming a different principal, re-encoded the same way the real one
-        // was, but signed by nobody who holds the key.
+        // Forge a payload claiming a longer session, re-encoded the same way the real one was,
+        // but signed by nobody who holds the key.
         let forged = Payload {
-            pid: "key:attacker".to_owned(),
+            pid: SUBJECT.to_owned(),
             iat: 1_000,
-            exp: 1_000 + SESSION_TTL_SECS,
+            exp: 1_000 + SESSION_TTL_SECS * 100,
             kr: 1,
         };
         let forged_json = serde_json::to_vec(&forged).expect("payload serializes");
@@ -308,7 +304,7 @@ mod tests {
     #[test]
     fn tampered_signature_is_rejected() {
         let key = test_key(1);
-        let token = mint(&key, "key:abc123", 1_000, SESSION_TTL_SECS);
+        let token = mint(&key, 1_000, SESSION_TTL_SECS);
         let mut parts: Vec<&str> = token.split('.').collect();
         assert_eq!(parts.len(), 3);
         // Flip the signature to some other well-formed-but-wrong base64url value.
@@ -334,17 +330,35 @@ mod tests {
         }
     }
 
+    /// A token whose subject is not [`SUBJECT`] is refused even when it is perfectly signed:
+    /// this build knows one administrator, and a payload naming another is a payload from a
+    /// format it does not understand. Signed with the real key on purpose — the point is that
+    /// the subject check is a check, not a side effect of the MAC failing.
     #[test]
-    fn verify_returns_only_the_principal_id_and_nothing_else() {
-        // Structural, not behavioural: `verify`'s `Ok` type is `String`, so there is no field a
-        // caller could read to obtain roles, tenants or bindings even by mistake — the type
-        // itself is the guarantee issue #185 asks for. This test exists so a future change that
-        // widens the return type (e.g. to carry bindings "for convenience") fails a review, not
-        // just a doc comment.
+    fn a_correctly_signed_token_naming_another_subject_is_refused() {
         let key = test_key(1);
-        let token = mint(&key, "key:abc123", 1_000, SESSION_TTL_SECS);
-        let principal_id: String = verify(&key, &token, 1_000).expect("verifies");
-        assert_eq!(principal_id, "key:abc123");
+        let payload = Payload {
+            pid: "key:attacker".to_owned(),
+            iat: 1_000,
+            exp: 1_000 + SESSION_TTL_SECS,
+            kr: 1,
+        };
+        let payload_b64 = base64::Engine::encode(
+            &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+            serde_json::to_vec(&payload).expect("payload serializes"),
+        );
+        let signed_span = format!("{FORMAT_TAG}.{payload_b64}");
+        let mut mac = HmacSha256::new_from_slice(&hex_decode(&key.key).expect("hex key"))
+            .expect("HMAC accepts any key length");
+        mac.update(signed_span.as_bytes());
+        let sig_b64 = base64::Engine::encode(
+            &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+            mac.finalize().into_bytes(),
+        );
+        assert_eq!(
+            verify(&key, &format!("{signed_span}.{sig_b64}"), 1_000),
+            Err(SessionError::Malformed)
+        );
     }
 
     #[test]

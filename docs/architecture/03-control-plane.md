@@ -1,8 +1,8 @@
 # Chapter 3 — The Control Plane
 
 The control plane is where the cluster agrees on the things it cannot afford to
-disagree about: **who is in the cluster, what the imposters are, who the
-tenants and principals are, and which admin requests have been accepted.** It
+disagree about: **who is in the cluster, what the imposters are, what the
+front door's route table says, and which admin requests have been accepted.** It
 is an embedded Raft group — `openraft` running inside every `rift-cluster-server`
 process, speaking over the same HMAC-authenticated cluster port as everything
 else. There is no external coordinator, no sidecar, no operator-managed quorum
@@ -38,7 +38,7 @@ flowchart TB
     subgraph Node["each rift-cluster-server process"]
         RN["openraft node<br/>(leader OR follower/learner)"]
         SM["State machine (apply loop)"]
-        DB[("redb — cluster-state-dir<br/>raft_log · raft_vote · snapshot meta<br/>sm_configs · sm_tenants · sm_principals<br/>sm_bindings · sm_op_dedup · pending_intents")]
+        DB[("redb — cluster-state-dir<br/>raft_log · raft_vote · snapshot meta<br/>sm_configs · sm_routes · sm_routes_revision<br/>sm_session_key · sm_fleet_name<br/>sm_op_dedup · pending_intents")]
         IM["ImposterManager (OSS engine)"]
         RPC["cluster RPC (hyper + HMAC)<br/>/internal/v1/raft/append · vote · snapshot"]
     end
@@ -55,9 +55,9 @@ flowchart TB
   mean "survives a full-cluster power loss": a majority has the entry on disk
   before any client sees success.
 - **The state machine** holds the applied view: imposter config records
-  (`(tenant, port) → {config, enabled, revision}` where `revision` is simply
+  (`port → {config, enabled, revision}` where `revision` is simply
   the Raft log index — monotone and totally ordered fleet-wide for free),
-  tenancy records, and the op-id dedup map that gives admin retries
+  the front-door route table, and the op-id dedup map that gives admin retries
   exactly-once *effect*.
 - **Apply is deterministic and cannot fail.** All validation happens on the
   leader *before* the entry is appended; apply only writes `sm_*` tables and
@@ -187,6 +187,52 @@ during the drain, which is the handover a rolling restart depends on. On the ret
 a member with persisted state holds elections for a 3 s *restart grace* until it
 hears a leader; a fresh node and a single-voter fleet are unaffected, and a
 genuinely dead leader is still replaced once the grace expires.
+
+## Cluster-internal security — the peer secret
+
+*Moved here from Chapter 8 by D-73 (#550), which retired that chapter's tenancy body. This
+section was never about tenancy: it is the control plane's own transport, and it belongs beside
+the RPCs it protects.*
+
+The node-to-node surface (Raft RPCs, owner-forwarded ops, replication, journal
+pulls) shares one model:
+
+- **A dedicated cluster port**, explicitly configured, intended for a private
+  network; binding `0.0.0.0` requires an explicit acknowledgment flag. Never
+  multiplexed with data-plane or admin ports.
+- **Shared-secret HMAC on every message**:
+  `X-Rift-Cluster-Auth: t=<ts>,n=<nonce>,mac=HMAC-SHA256(secret, ts‖nonce‖method‖path‖body)`,
+  ±30 s skew window, bounded nonce cache that **fails closed** on overflow.
+  Startup refuses clustering without a secret unless `--cluster-insecure` is
+  passed, which logs loudly at startup (`cluster port started WITHOUT
+  authentication`, with `insecure = true`) so a fleet can be audited for it.
+- **Integrity and authenticity, not confidentiality** — the threat model is
+  "no unauthenticated peer joins or injects ops", with confidentiality
+  delegated to network isolation (VPC/namespace/WireGuard). mTLS between nodes
+  is a hardening milestone, deliberately not a Phase-1 gate.
+- **Version skew**: every message carries a protocol version; majors must
+  match (mismatch → clean rejection, not undefined behavior), minors are
+  additive — the contract that makes rolling upgrades safe (Chapter 10).
+
+The **admin** plane is a different credential and a different tier: one API key
+(`--api-key`/`MB_APIKEY`, D-73), TLS at the load balancer plus application auth.
+Probe endpoints (`/readyz`, `/healthz`) are deliberately unauthenticated and
+stateless-safe, because kubelets and LBs do not hold credentials. The cluster
+secret and the admin key are never the same value and never interchangeable —
+the cluster port is a peer surface, not an operator one.
+
+**The admin plane originates no outbound HTTP on a caller's behalf.** The one
+route that did — `POST /admin/imposters/{port}/try` (#335), which dialled
+`127.0.0.1:{port}` behind an `is_locally_bound` gate — was found reachable past
+the gate on BSD/macOS (#344: the engine's `0.0.0.0` bind coexists with a
+foreign `127.0.0.1` socket, and the loopback dial lands on the foreign one —
+including, on a `--cluster-insecure` fleet, the cluster RPC listener). Since
+#344 the try is answered **in-process**: the sample request is dispatched to
+the imposter this node's engine holds, over an in-memory HTTP/1 connection,
+with no socket opened. The containment is now structural rather than checked —
+there is no address to get wrong — and the `is_locally_bound` gate remains only
+so a bind-failed imposter is reported as such (`502`, "not bound") instead of
+answered as though it were serving.
 
 ## What the control plane costs
 

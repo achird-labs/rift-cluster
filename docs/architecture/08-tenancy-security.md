@@ -1,5 +1,32 @@
 # Chapter 8 — Multi-Tenancy & Security
 
+> **Retired by D-71** (RFC-007 §3.2, #550), which records the scope decision; **D-73** is the
+> entry that replaces this chapter's mechanism. **Nothing below describes running code.**
+> Tenants, principals, role bindings, the five roles, quotas, the `X-Rift-Tenant` header, the
+> `/admin/tenants*` and `/admin/whoami` surfaces and the indistinguishable-404 rule were removed
+> in full; RFC-002, which specified them, is superseded.
+>
+> **What replaced it:** one credential. `--api-key` set closes the admin plane to that key, unset
+> leaves it open, and `POST /session` exchanges the key for the console's cookie. Everyone who can
+> administer the fleet administers all of it.
+>
+> **Where the still-true parts went.** This chapter had two sections that were never about
+> tenancy, and they have been *moved* rather than deleted:
+>
+> - the **cluster port's peer secret** (HMAC on every node-to-node message, the
+>   `--cluster-insecure` acknowledgment, version skew) → [Chapter 3 — Control
+>   Plane](03-control-plane.md), beside the RPCs it protects;
+> - **`/_fleet/*`, `PUT /admin/fleet/name` and the console session exchange** → [Chapter 10 —
+>   Operations](10-operations.md), rewritten for one credential.
+>
+> The rest is kept as the record of what was designed and shipped, and of why it was withdrawn:
+> tenancy was the largest surface in the system and the one that leaked into core correctness —
+> D-68 existed because only the default tenant's routes were ever compiled into the router. Read
+> it for the reasoning; do not read it as a description of any code. Sections below that name a
+> file (`authz.rs`, `principal.rs`, `tenancy.rs`, `authorizer.rs`) name a file that no longer
+> exists.
+
+
 A shared, always-on mock cluster is only shareable if teams cannot trample
 each other's configs, and only operable if "who may do what" has a real
 answer. This chapter covers the tenancy and RBAC design (RFC-002, issue #17)
@@ -637,144 +664,6 @@ third-party credential at all. The rule it stood for is worth keeping in mind
 anyway: a control-plane record carries the *name* of a credential, never a
 credential. Today no record carries either.
 
-## Cluster-internal security
-
-The node-to-node surface (Raft RPCs, owner-forwarded ops, replication, journal
-pulls) shares one model:
-
-- **A dedicated cluster port**, explicitly configured, intended for a private
-  network; binding `0.0.0.0` requires an explicit acknowledgment flag. Never
-  multiplexed with data-plane or admin ports.
-- **Shared-secret HMAC on every message**:
-  `X-Rift-Cluster-Auth: t=<ts>,n=<nonce>,mac=HMAC-SHA256(secret, ts‖nonce‖method‖path‖body)`,
-  ±30 s skew window, bounded nonce cache that **fails closed** on overflow.
-  Startup refuses clustering without a secret unless `--cluster-insecure` is
-  passed, which logs loudly at startup (`cluster port started WITHOUT
-  authentication`, with `insecure = true`) so a fleet can be audited for it.
-- **Integrity and authenticity, not confidentiality** — the threat model is
-  "no unauthenticated peer joins or injects ops", with confidentiality
-  delegated to network isolation (VPC/namespace/WireGuard). mTLS between nodes
-  is a hardening milestone, deliberately not a Phase-1 gate.
-- **Version skew**: every message carries a protocol version; majors must
-  match (mismatch → clean rejection, not undefined behavior), minors are
-  additive — the contract that makes rolling upgrades safe (Chapter 10).
-
-Admin-plane auth (bearer key today, U-9 principals tomorrow) is TLS-at-the-LB
-plus application auth; probe endpoints (`/readyz`, `/healthz`) are
-deliberately unauthenticated and stateless-safe, because kubelets and LBs
-don't hold credentials.
-
-**The admin plane originates no outbound HTTP on a caller's behalf.** The one
-route that did — `POST /admin/imposters/{port}/try` (#335), which dialled
-`127.0.0.1:{port}` behind an `is_locally_bound` gate — was found reachable past
-the gate on BSD/macOS (#344: the engine's `0.0.0.0` bind coexists with a
-foreign `127.0.0.1` socket, and the loopback dial lands on the foreign one —
-including, on a `--cluster-insecure` fleet, the cluster RPC listener). Since
-#344 the try is answered **in-process**: the sample request is dispatched to
-the imposter this node's engine holds, over an in-memory HTTP/1 connection,
-with no socket opened. The containment is now structural rather than checked —
-there is no address to get wrong — and the `is_locally_bound` gate remains only
-so a bind-failed imposter is reported as such (`502`, "not bound") instead of
-answered as though it were serving.
-
-## Console sessions and the fleet projection (issue #185, RFC-006 §5.2–§5.3)
-
-### `/_fleet/*` is `ClusterAdmin` — RFC-006 §12 Q3, settled
-
-The console cannot hold the cluster-port credential, so the admin port terminates a **read-only
-projection** of the operator surface: `GET /_fleet/members`, `/_fleet/health`, `/_fleet/ops/:id`.
-`/_cluster/*` on the cluster port is unchanged, and node-vs-node comparison still means asking each
-node directly.
-
-RFC-006 §12 Q3 left open whether `/_fleet/health` is in-tenant-`Viewer`-visible (tenant-filtered) or
-`ClusterAdmin`-only, noting that "topology is infrastructure, not tenant data — but 'which nodes
-exist' may itself be sensitive in some shops." **Settled: `ClusterAdmin`.** Three reasons:
-
-1. **It must not be a privilege *reduction*.** `/_cluster/*` rides the cluster port behind the HMAC
-   secret today — strictly more privileged than any tenant role. Projecting it onto the admin port
-   at a lower tier would use a convenience feature to widen access to infrastructure state, which is
-   the same shape of mistake as the `/events` decision above.
-2. **Consistency with the mapping that already exists.** `principal::map_action` routes
-   `SYSTEM_READ` — `/config`, `/metrics`, `/logs` — to `Action::ClusterAdmin`. `/_fleet/*` is that
-   category exactly: fleet-level, no per-tenant meaning. Anything lower would make `/_fleet/health`
-   *more* visible than `/config`, which reports strictly less.
-3. **Node identities and ring topology are infrastructure inventory**, which is the RFC's own worry.
-
-`Action::ClusterAdmin` is FleetAdmin-only by construction (`authz::decide`), so this means fleet
-admins exclusively — checked deliberately rather than inherited.
-
-**Consequence for the request-log screen (#189), recorded so it is not discovered late:** a
-non-FleetAdmin cannot learn the node count, so that screen shows the unqualified "this is one node's
-view" label rather than "N of M nodes". The unqualified label is still honest, which is the actual
-requirement; the count is an enhancement available to fleet admins.
-
-Unlike `/events`, this is **not** a fail-closed placeholder awaiting a capability. A tenant-filtered
-fleet view is not deferred work — there is nothing per-tenant in a ring to filter.
-
-### `PUT /admin/fleet/name` — the first fleet-scoped *write* on the admin port (issue #373)
-
-The section above is about a read-only projection, and stays true: `/_fleet/*` projects
-`/_cluster/*` and mutates nothing. Naming the fleet is the first thing on this port that is
-fleet-scoped and **not** a projection, so it is recorded here rather than left to be inferred from
-the route table.
-
-It is `Action::ClusterAdmin` on `FLEET_SCOPE`, by reason 1 above rather than by analogy: a fleet's
-name is fleet-wide state, and a `TenantAdmin` of `acme` sending `X-Rift-Tenant: acme` must not
-become eligible to rename the cluster every other tenant is also looking at. `control::validate`
-enforces the same thing a second time — `require_fleet_scope` refuses the op outright — so a
-mis-built `ControlOp` fails at admission rather than filing a fleet-wide rename under one tenant's
-name. That belt-and-braces is deliberate: the since-removed audit-sink surface shipped exactly that
-bug once (`TenantId::default()` instead of `FLEET_SCOPE`).
-
-Why it is replicated rather than a per-node flag is a control-plane question, not a security one,
-and is recorded on `ControlOp::FleetNamePut` itself. The security-relevant half is that the name is
-**a label, never an identity**: nothing authorizes, addresses, or routes by it, so a fleet renamed
-mid-flight changes what an operator sees and nothing about what anyone may do. Node ids remain what
-every decision in this chapter is made against.
-
-### The session-signing key is a secret in the replicated log, deliberately
-
-A browser cannot hold the long-lived API key, so `POST /session` exchanges it once for an
-HMAC-signed cookie (`HttpOnly`, `Secure`, `SameSite=Strict`, 8-hour `Max-Age`). The key that signs
-it is a fleet-wide control-plane record, so **every node verifies from its own applied state and a
-login is not a Raft write** — only the first mint and any rotation are.
-
-That record carries an actual secret into the replicated log — the one op that does, and
-deliberately. The distinction is what the secret means *outside* the fleet:
-
-- an op naming a credential for a third-party system would spread power that exists somewhere
-  else, so no op ever did (and since #549 there is no op that could);
-- this key is **fleet-internal and meaningless anywhere else**, and cannot be stored hashed the way
-  a principal's API key is (§3.2, argon2id), because verifying an HMAC requires the key itself — a
-  digest would make the cookie unverifiable by anyone, including us.
-
-It therefore sits inside the same trust boundary as the state directory, which already holds every
-principal's argon2 record and all committed config. Deriving it from the cluster secret instead was
-considered and rejected: that secret is optional (`--cluster-insecure`), so an unauthenticated
-fleet would have nothing to derive from.
-
-**Rotation is the containment, and it is structural.** Every token carries the key record's
-`revision`; verification refuses a token whose revision is not the current one, so writing a new key
-invalidates every outstanding session at once without sweeping a table.
-
-### What the cookie does and does not prove
-
-The cookie proves **authentication only**. Every request still resolves the principal's bindings
-from local applied state, so disabling a principal or deleting a binding cuts a live session with
-§3.1 semantics — the same as for a bearer. **There is deliberately no cache over session →
-bindings**: that is the named mutant `c25_key_revocation_survives_a_partition` exists to catch, and
-adding one would reintroduce exactly the window that test closes.
-
-CSRF is `SameSite=Strict` plus a required `X-Rift-CSRF` header on cookie-authenticated mutations.
-**Bearer-authenticated requests are exempt**, because a bearer cannot be attached by a victim's
-browser — which is the entire attack.
-
-Known and accepted limits (RFC-006 §10): **no per-session server-side revocation in v1** — the
-bounds are TTL, key rotation and principal disable, and there is no session table. No OIDC/SSO in
-v1; when `AuthSource::Oidc` arrives it mints the same cookie. `POST /session` is the one moment the
-long-lived key transits the page, so it is held in component state only, never persisted, and
-dropped after the exchange.
-
 ## Explicit non-goals
 
 Recorded so the boundary cannot be oversold: no per-principal data-plane
@@ -783,9 +672,11 @@ ports; no compute/memory isolation between tenants (quotas bound object
 counts, not CPU); and no cross-cluster tenancy federation. Each of these is
 a conscious "no", not an omission.
 
-The data-plane one is the load-bearing one, and it is asserted rather than only
-written down: `c27_tenancy_isolates_ownership_but_not_the_data_plane` requires
-both imposters to answer unauthenticated traffic through every node, and goes red
-the moment a credential is required. Tenancy governs who may *configure* a mock,
-never who may call it — putting a credential in front of the data plane would
-break every system under test the mock exists to serve.
+The data-plane one is the load-bearing one, and it is **the one non-goal that outlived tenancy**:
+putting a credential in front of the data plane would break every system under test the mock exists
+to serve. Tenancy governed who may *configure* a mock, never who may call it; with tenancy gone the
+same rule holds against the one admin key, and it is asserted rather than only written down —
+`the_gateway_stays_open_and_never_carries_the_admin_key` (`tests/fleet_session.rs`) requires the
+`/__rift/*` gateway to answer unauthenticated on a keyed fleet, and additionally that the key does
+not leak into the imposter's recorded request. (`c27_tenancy_isolates_ownership_but_not_the_data_
+plane`, the chaos scenario that used to assert the tenancy half, left with tenancy.)

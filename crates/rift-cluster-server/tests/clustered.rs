@@ -9,7 +9,6 @@
 use std::time::Duration;
 
 use clap::Parser;
-use rift_cluster::{DEFAULT_TENANT, TenantId};
 use rift_cluster_server::cli::EeCli;
 use rift_cluster_server::compose;
 use tempfile::TempDir;
@@ -937,11 +936,11 @@ async fn the_imposters_flag_bootstraps_through_the_log_and_a_restart_does_not_du
     let node = server.node().expect("clustered");
     assert_eq!(
         node.configured_ports().expect("ports"),
-        vec![(TenantId::new(DEFAULT_TENANT), port)],
+        vec![port],
         "the imposter must be in the replicated log, not just this node's manager"
     );
     let revision_after_first_boot = node
-        .imposter_revision(DEFAULT_TENANT, port)
+        .imposter_revision(port)
         .expect("read the imposter's revision")
         .expect("the imposter exists");
     server.shutdown().await;
@@ -955,7 +954,7 @@ async fn the_imposters_flag_bootstraps_through_the_log_and_a_restart_does_not_du
     let node = restarted.node().expect("clustered");
     assert_eq!(
         node.configured_ports().expect("ports"),
-        vec![(TenantId::new(DEFAULT_TENANT), port)],
+        vec![port],
         "the same document must still describe exactly one imposter after a restart"
     );
     // The dedup collapse is the mechanism, and it is only observable on the *record*: the op is
@@ -968,7 +967,7 @@ async fn the_imposters_flag_bootstraps_through_the_log_and_a_restart_does_not_du
     // the deduped entry does advance the applied index by one. That is the honest cost of an
     // `op_id`-keyed dedup and not something this test should pretend away.
     assert_eq!(
-        node.imposter_revision(DEFAULT_TENANT, port)
+        node.imposter_revision(port)
             .expect("read the imposter's revision")
             .expect("the imposter still exists"),
         revision_after_first_boot,

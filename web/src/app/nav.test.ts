@@ -4,28 +4,23 @@ import { ISSUE_URL, NAV, NAV_GROUPS, groupOf, liveEntries, plannedEntries } from
 import { toHash } from "./routing.ts";
 
 describe("nav model", () => {
-  it("ships the screens C4, C6 and C7 actually built as live entries", () => {
-    // C6 (#189) turns `requests` live and adds the front-door route editor beside it. C7 (#190)
-    // turns `administration` live.
+  it("ships the screens C4 and C6 actually built as live entries", () => {
+    // C6 (#189) turns `requests` live and adds the front-door route editor beside it. #550 removed
+    // the `administration` entry along with the tenancy and principal surfaces it opened.
     //
     // The order is the nav bar's section grouping, not authoring order — and it is the design's:
-    // the four mock screens, then the fleet-scoped one, then administration.
+    // the four mock screens, then the fleet-scoped one.
     expect(liveEntries().map((e) => e.id)).toEqual([
       "imposters",
       "routes",
       "scenarios",
       "requests",
       "cluster",
-      "administration",
     ]);
   });
 
-  it("offers scenarios on the read capability, not on a write one (#232)", () => {
-    // The screen gates each control separately — reset is Operator, set-state is Editor — so the
-    // entry itself must gate on the weakest thing it can do. Requiring a write capability here
-    // would hide the whole screen from a viewer entitled to read every scenario on it.
+  it("files scenarios under the mocks run, beside the screens it is read with (#232)", () => {
     const scenarios = liveEntries().find((entry) => entry.id === "scenarios");
-    expect(scenarios?.requires).toBe("scenario.read");
     expect(scenarios?.group).toBe("mocks");
   });
 

@@ -146,10 +146,13 @@ export function exportFilename(port: number, name: string | undefined): string {
   return named === "" ? `imposter-${port}.json` : `imposter-${port}-${named}.json`;
 }
 
-export function exportSetFilename(tenant: string | null): string {
-  const named = tenant === null ? "" : slug(tenant);
-  return named === "" ? "imposters.json" : `imposters-${named}.json`;
-}
+/**
+ * The filename a whole-set export downloads under.
+ *
+ * A constant since #550: it used to carry the tenant, which is the only thing that could have told
+ * two whole-set exports apart. One fleet-wide set, one name.
+ */
+export const EXPORT_SET_FILENAME = "imposters.json";
 
 // ---------------------------------------------------------------------------------------------
 // import
@@ -188,7 +191,7 @@ function entryOf(imposter: Record<string, unknown>): ImportEntry {
  *
  * Accepts both shapes the API deals in, because both are shapes THIS console produces: a single
  * imposter object (what a one-imposter export downloads) and a `{"imposters": [...]}` set document
- * (what a whole-tenant export downloads, and what `PUT /imposters` takes). Accepting only one would
+ * (what a whole-set export downloads, and what `PUT /imposters` takes). Accepting only one would
  * mean an export this console wrote could not be imported by it.
  *
  * A bare array is accepted too — it is what `GET /imposters` itself returns for the list, so

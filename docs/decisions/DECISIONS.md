@@ -742,10 +742,10 @@ configuration, and present only in `snapshot-install.overlay.yml`.
 requirement exists) and putting it in the shared `chaos.overlay.yml` (it changed every catch-up
 path and broke C4/C6/C7).
 
-### D-44 — The first principal closes the open admin plane
-- **Status:** active
+### ~~D-44 — The first principal closes the open admin plane~~
+- **Status:** superseded
 - **Decided:** T2 (#161) · RFC-002 §3.4
-- **Code:** crates/rift-cluster-server/src/principal.rs
+- **Superseded by:** D-73
 
 A fleet with neither `--api-key` nor any stored principal keeps the pre-tenancy open admin plane,
 so an upgrade denies nobody. The moment the first principal is committed — or a key is
@@ -757,10 +757,16 @@ reopen it (`should_bypass` is `api_key.is_none() && !has_any_principals()`).
 *Rejected:* requiring a key whenever `--cluster` is set — breaks every existing keyless fleet on
 upgrade.
 
-### D-45 — Cross-tenant and unowned-port probes answer one indistinguishable 404
-- **Status:** active
+**Superseded by D-73 (2026-09-07, #550).** Principals are gone, so the "first principal" half of
+this rule has nothing left to count. What survives is its *other* half, unchanged and now the
+whole rule: `--api-key` set closes the admin plane, unset leaves it open, and an upgrade denies
+nobody. `should_bypass`, `has_any_principals` and the `rift_cluster_no_principals` gauge went with
+the principals; the rejected alternative is still rejected for its original reason.
+
+### ~~D-45 — Cross-tenant and unowned-port probes answer one indistinguishable 404~~
+- **Status:** superseded
 - **Decided:** T2 (#161) · RFC-002 §8.4 · narrowed by #182
-- **Code:** crates/rift-cluster-server/src/admin_front.rs
+- **Superseded by:** D-73
 
 A tenant the principal is not bound to, a port owned by another tenant, and a port owned by
 nobody all answer the same terse `404`; `403` is reserved for "bound here, role insufficient".
@@ -769,10 +775,15 @@ otherwise let a tenant map which ports other tenants hold.
 
 *Rejected:* letting unowned ports fall through to upstream's 404.
 
-### D-46 — The legacy `--api-key` cannot hold a console session
-- **Status:** active
+**Superseded by D-73 (2026-09-07, #550).** There is no cross-tenant probe to defeat: one
+credential means one view of the fleet, and a port either has an applied imposter or it does not.
+Upstream's own descriptive 404 is what a caller sees again, because the enumeration it used to
+enable — *which other tenant holds this port* — is not a question the system can be asked.
+
+### ~~D-46 — The legacy `--api-key` cannot hold a console session~~
+- **Status:** superseded
 - **Decided:** C2 (#185)
-- **Code:** crates/rift-cluster-server/src/admin_front.rs
+- **Superseded by:** D-73
 
 `POST /session` with the legacy key answers `400`, never a cookie: the synthetic
 `legacy:api-key` identity has no principal row, so a session minted for it could never resolve
@@ -781,6 +792,13 @@ and log in with its key; the legacy key is a curl/bootstrap credential only.
 
 *Rejected:* minting the cookie and letting later requests fail `401` — indistinguishable from a
 rotated key or a skewed clock.
+
+**Superseded by D-73 (2026-09-07, #550).** Reversed, not merely retired: the `--api-key` **is**
+the credential `POST /session` accepts, because it is the only credential the fleet has. The
+reasoning here was sound for its world — a token naming an identity with no row behind it can
+never resolve — and it stops applying the moment the token names no identity at all. A fleet
+running with no key has nothing to exchange and answers `400`, which is this entry's
+silent-fallback rule surviving its own decision.
 
 ### D-47 — Strict sequencing is owner-routed on the ring, opt-in per imposter, and degrades rather than fails
 > **Amended by D-57** (2026-08-28, #514): a cursor **reset** is delivered per-peer, retried, and
@@ -2256,14 +2274,14 @@ and would still be answering with a log what the uploaded TSV answers directly.
 the philosophy rejects — C10's assertion is the contract's own bound, and the artifact is the
 separate question of what the run actually measured underneath it.
 
-### D-68 — Both front-door route endpoints publish `installed`; the write says what it cannot do
+### ~~D-68 — Both front-door route endpoints publish `installed`; the write says what it cannot do~~
 
-- **Status:** amended
+- **Status:** superseded
 - **Decided:** 2026-09-01
 - **Refines:** D-54
+- **Superseded by:** D-73
 - **Amends:** docs/architecture/13-front-door-and-sources.md
 - **Implemented by:** #536
-- **Code:** crates/rift-cluster-server/src/admin_front.rs, crates/rift-cluster/src/control.rs
 
 `routes_installed_for` is the single definition of which tenants' routes are compiled into the
 shared front door, and only the default tenant's are. That rule is deliberate — the front door is
@@ -2318,6 +2336,19 @@ console derives the whole not-installed treatment from the table read alone. The
 comparing the word to what `route-hits` "already means by it" describes a second source that is
 gone; the rule it stated — one definition, no drift between write, read and compiler — is
 unchanged and now has fewer places to drift between.
+
+**Superseded by D-73 (2026-09-07, #550).** The rule this entry existed to signal is gone with its
+subject. `routes_installed_for` had exactly one input — the tenant — and there are no tenants, so
+there is one fleet-wide route table and every stored route is compiled into the front door.
+`installed` would be a constant `true`: a field that says nothing, on two endpoints, forever. It
+is removed along with `RouteTableView`, `routes_installed_for` and the console's not-installed
+banner, rank muting and "why" text.
+
+The entry is worth reading anyway, and D-71 cites it for this: `installed` existed **because
+tenancy reached the router**. A boundary added to the admin plane leaked into which routes a
+data-plane request could reach, and the fix was a body field explaining that a `200` did not mean
+what a `200` means. That is the strongest single argument for removing tenancy rather than
+freezing it.
 
 ### D-69 — A space-scoped stub is replicated config; a space teardown deletes it fleet-wide
 
@@ -2560,3 +2591,106 @@ table, the puller and the provider registry to serve a flag that is read once at
 `Rift-Spec-Warnings` header. The header reported a *deployed* imposter drifting from the spec that
 generated it; with nothing stored there is no baseline to drift from, so the field would be
 provably empty.
+
+---
+
+### D-73 — One tenant, one credential: the admin plane is closed by `--api-key` or open; the console exchanges that key for a cookie; nothing in the fleet is tenant-scoped
+
+- **Status:** active
+- **Decided:** 2026-09-07 · RFC-007 §3.2 · #550
+- **Supersedes:** D-44, D-45, D-46, D-68
+- **Amends:** RFC-006 §5.3
+- **Implemented by:** #550
+- **Code:** crates/rift-cluster-server/src/admin_front.rs, crates/rift-cluster-server/src/session.rs, crates/rift-cluster-server/src/compose.rs, crates/rift-cluster/src/control.rs, crates/rift-cluster/src/raft/store.rs
+
+A RiftCluster fleet has **one administrator**. Authentication is open-source Rift's own
+`--api-key` (`MB_APIKEY`), sent as the raw `Authorization` value and compared constant-time:
+**set ⇒ the whole admin plane is closed to that key; unset ⇒ open, exactly as upstream behaves.**
+There is no principal, no role, no binding, no quota and no tenant anywhere in the system, and
+therefore no per-resource authorization: everyone who can administer the fleet can administer all
+of it. Isolation between teams is a deployment (two fleets), not a feature (RFC-007 §3.3).
+
+`/healthz` and `/readyz` on the probe listener stay open — a liveness probe that needs a
+credential is a liveness probe that fails for the wrong reason — and so does the `/__rift/*`
+data-plane gateway, which upstream exempts from its own key gate for the reason the key must not
+be *injected* onto that leg either: it reaches the imposter, where an `Authorization` header
+would land in its predicates and its recorded request log.
+
+**`POST /session` survives** (RFC-007 §8 Q1's default, taken). It exchanges the API key for the
+`rift_session` cookie so the browser does not keep the key after login: the token format, the `kr`
+key-revision kill switch, the constant-time compare, the 8-hour TTL, `SM_SESSION_KEY_TABLE`,
+`ControlOp::SessionKeyPut` and the CSRF gate are all unchanged. Two things about it did change.
+Its payload's `pid` is now a fixed subject (`"admin"`), and `session::verify` answers
+`Result<(), _>` — there is no identity for a session to resolve *to*, and a cookie that carried
+authorization data would be a second source of truth for a decision the key already settles. And
+**this supersedes D-46**, which refused the legacy `--api-key` a session because the synthetic
+identity it named had no principal row behind it: with one credential there is no other key, so
+the key *is* what the exchange accepts. Rotating `SessionKeyPut` remains the only revocation.
+
+**Keys lose their tenant component — a true removal, not a `default` shim.** `sm_configs` is keyed
+by `u16`, `sm_routes` by route id, `sm_routes_revision` is a one-row table beside
+`sm_session_key`/`sm_fleet_name`, `sm_journal_gens` is `(u16, &str)` and `sm_proxy_recorded` is
+`(u16, &str)`; `sm_tenants`, `sm_principals` and `sm_bindings` are gone, and `SnapshotPayload`
+shrinks with them (`routes_revisions` becomes a scalar `Option<u64>`). Every `ControlOp` variant
+drops its `tenant` field and the six tenancy/RBAC variants leave entirely. **This is a deliberate
+fleet-wide log-format break** — the same one #549 (D-72) declared, and for the same reason: a
+changed field set changes the encoding of ops that still exist, so a fleet upgrading across this
+commit starts from a fresh `--cluster-state-dir`.
+
+**`Rift-Cluster-Revision` names its subject.** It was `default:<port>@<rev>` and
+`default@<rev>` — a hardcoded segment the write path emitted and the `If-Match` parser demanded
+back. It is now `<port>@<rev>` for an imposter and `routes@<rev>` for the route table. A bare
+revision integer is still accepted. Keeping the token self-describing rather than reducing it to a
+number is what stops an imposter's revision being fed back as a precondition on the route table.
+
+**D-68 dissolves rather than being amended again.** Its whole subject was that only the default
+tenant's routes were compiled into the shared front door, so a `200` on a non-default tenant's
+`PUT /front-door/routes` meant *stored* and not *dispatching*, and `installed` was the field that
+said which. With one fleet-wide table every stored route is installed: the field would be a
+constant `true`, which is a field that says nothing. `installed`, `RouteTableView`,
+`routes_installed_for` and the console's not-installed treatment all go.
+
+**`ContextScope` loses `Tenant`.** `Imposter` (`i<port>:`) and `Fleet` (`f:`) remain; the
+`t<tenant>:` and `t??:` prefixes, `tenant_of`, `by_tenant` and `FlowNet`'s tenant fan-out are
+gone. A config declaring `"contextScope": "tenant"` is **refused at admission with a message
+naming #550**, never silently aliased — folding it into either survivor would change which
+imposters share flow state, which is the one thing the key decides. Relatedly, a `fleet`-scoped
+space *listing* is now served rather than refused: it was `FleetAdmin`-only because `f:` carries
+no tenant component and enumerating it handed one tenant another's flow ids, and there is no
+longer a boundary for it to cross.
+
+**The loopback gate is upstream's own again.** `compose` no longer clears `cli.oss.api_key`, so
+the loopback admin listener runs open-source Rift's `api_key_matches`, and the U-9
+`.admin_authorizer(EeAuthorizer)` seam is not installed — one comparison, implemented once, in
+upstream. That has a sharp consequence the front must handle: **a cookie-authenticated request
+carries no `Authorization` at all**, and upstream's raw compare will refuse it. So `admin_front`
+authenticates first and then *injects the configured key* on both internal legs — `proxy` (the
+proxied reads) and `fetch` (the render re-read after a committed write). Forwarding the session
+token instead, which is what the code did before #550, now fails: the write commits and only the
+render is refused, so the client is told `401` about a change that actually landed. Pinned by
+`fleet_session.rs`'s `the_api_key_mints_a_session_and_the_cookie_is_accepted_on_every_node`.
+
+**Quotas: none survive.** `max_flow_entries` was never enforced anywhere, and
+`max_stubs_per_imposter` is a property of an imposter rather than of a tenant — if a stub ceiling
+is wanted it belongs upstream, in the engine that owns the stub list, not in a cluster-only
+record. `Quotas`, `TenantConfigUsage`, `quotas_for` and `quota_refusal_for_config` are removed
+rather than re-homed under a fleet-wide default, because a ceiling nobody configured and nothing
+reports is indistinguishable from no ceiling.
+
+*Rejected:* keeping a `default` tenant shim — the field with one legal value. It preserves every
+key shape, every `TenantId` construction and every `tenant.as_str()` call site in exchange for
+nothing: the log format breaks anyway (the removed variants see to that), so the compatibility
+the shim would buy does not exist, and what remains is a thousand mentions of a concept the system
+no longer has. D-68 is the evidence for how that ends — tenancy reached the router, and the field
+that documented the leak outlived three attempts to explain it.
+
+*Rejected:* keeping any quota. A per-fleet `max_imposters` is a different feature from a
+per-tenant one — there is no other tenant to protect capacity from — and shipping the record
+without the tenant would leave a limit whose only effect is to refuse the operator their own
+fleet.
+
+*Rejected:* dropping `POST /session` and having the console send the key on every request. It is
+one fewer route and one fewer replicated record, but it puts a long-lived credential in the page
+for the whole session, and rotation would then have no kill switch short of changing the flag on
+every node and restarting. The cookie is the only revocation this design has; removing it would
+leave none.

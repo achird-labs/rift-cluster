@@ -230,228 +230,78 @@ it, so a stray flag on a single node is not an error.
 | `--cluster-write-barrier-timeout <SECONDS>` | How long the barrier waits (default `2`) before answering anyway with a `Rift-Cluster-Warnings: unapplied=<node,…>` header |
 | `--cluster-admin-async` | Answer admin writes with an immediate `202` + op id after durably parking them; poll `GET /_cluster/ops/:id` for the outcome |
 | `--cluster-flow-fsync-interval-ms <MILLIS>` | Group-fsync cadence for `durability: "async"` flow-state writes (default `50`) — the bound on what a whole-fleet crash can lose for imposters that did not choose `"sync"` or `"none"` |
-| `--cluster-legacy-key-is-fleet-admin <true\|false>` | Whether the legacy `--api-key`'s synthetic principal also gets `FleetAdmin` on the fleet scope, on top of its `TenantAdmin` binding on `default` (RFC-002 §3.4). **Default `true`** — see below |
 
 Each flag also has an environment-variable spelling (`RIFT_CLUSTER_BIND`,
 `RIFT_CLUSTER_SECRET_FILE`, …), which is the intended vehicle for the secret.
 
-### RBAC and the legacy `--api-key` migration (issue #161)
+### The admin credential (D-73, #550)
 
-Every admin request — terminated or proxied — is authenticated and authorized
-against RFC-002's principal/role/tenant model. A request's credential resolves
-to a principal one of two ways:
+The admin plane has **one** credential: open-source Rift's own `--api-key`
+(`MB_APIKEY`), sent as the *entire, raw* `Authorization` header value — there is
+no `Bearer ` prefix and none is stripped — and compared in constant time.
 
-- **A stored principal** (`PrincipalPut`, minted via `BindingPut` into a
-  tenant): its bindings, read fresh from the Raft state machine on every
-  request — never cached, so a revoked binding is refused on the very next
-  request through any node.
-- **The legacy `--api-key`**, mapped to a synthetic principal bound
-  `TenantAdmin` on `default`. This is what keeps every pre-#161 deployment
-  working unchanged: the day of an upgrade, nothing observable changes.
-
-`--cluster-legacy-key-is-fleet-admin` is the staged default that turns that
-into a deprecation rather than a breaking change:
-
-1. **This release: default `true`.** The legacy key also gets `FleetAdmin` on
-   the fleet scope, so it can do everything it always could, including
-   fleet-wide and cluster-admin operations.
-2. **A future release: default `false`.** The legacy key stays `TenantAdmin`
-   on `default` only; fleet-wide operations need a real `FleetAdmin`
-   principal.
-3. **A later release: the flag is removed**, along with the `FleetAdmin`
-   grant.
-
-If a fleet has **no principal defined at all and no `--api-key` configured**,
-the admin plane stays fully open — the pre-#161 behavior, so an upgrade never
-starts denying a fleet that never set up authorization. `GET /metrics` reports
-this as `rift_cluster_no_principals` (see below), so it is something to check
-for rather than discover.
-
-### The tenancy admin surface (issue #162)
-
-Tenants, principals and bindings are managed over the public admin address.
-Every route here is answered by the cluster's own control plane — none of it is
-proxied to the core admin — so any node can serve the reads.
-
-| Route | Method | Requires |
-|---|---|---|
-| `/admin/tenants` | `POST`, `GET` | `FleetAdmin` |
-| `/admin/tenants/:id` | `GET`, `PUT`, `DELETE` | `FleetAdmin` |
-| `/admin/tenants/:id/principals` | `POST`, `GET` | `TenantAdmin` of `:id` |
-| `/admin/tenants/:id/principals/:pid` | `PUT`, `DELETE` | `FleetAdmin` |
-| `/admin/tenants/:id/bindings/:pid` | `PUT`, `DELETE` | `TenantAdmin` of `:id` — `FleetAdmin` when `:id` is `*` |
-| `/admin/whoami` | `GET` | any authenticated principal |
-
-The tenant is taken from the **path**, not from `X-Rift-Tenant`. That header
-selects which of your bindings you are acting under on a *resource* route; on
-these routes the tenant is the record you are addressing.
-
-Two asymmetries worth knowing before they surprise you:
-
-- **Deleting a principal is a fleet operation, even on a tenant-shaped path.**
-  Principals are fleet-global — one identity may be bound in several tenants —
-  so a tenant admin deleting one would destroy a credential another tenant
-  depends on. *Minting* one is tenant-scoped, because a new identity grants
-  nothing outside the tenant it is bound to.
-- **Binding on `*` requires `FleetAdmin`.** `*` is the reserved fleet scope, and
-  the only role that may be bound there is `fleet-admin` — so a write to
-  `/admin/tenants/*/bindings/:pid` is a grant of fleet privilege regardless of
-  how the path reads.
-
-A refusal on this surface is a `404`, not a `403`, whenever you hold no binding
-in the tenant named — byte-identical to the answer for a tenant that does not
-exist. That is deliberate (RFC-002 §8.4): a `403` would confirm which tenants
-your neighbours have.
-
-#### Bootstrapping the first fleet admin
-
-Every route above needs a `FleetAdmin`, and a fresh fleet has none. **Use
-`--api-key` to bootstrap**, not the open admin plane:
+- **`--api-key` set ⇒ the admin plane is closed** to that key. Every route this
+  binary serves demands it: terminated, proxied, `/front-door/routes`,
+  `/_fleet/*`, `/openapi.json`, and any path nothing classifies (an unmatched
+  path must answer `401`, not the backend's 404, or it is a route-existence
+  oracle).
+- **`--api-key` unset ⇒ the admin plane is open**, exactly as an unclustered
+  `rift` behaves. There is no second switch and no grace window.
+- A **blank or whitespace-only** key is a misconfiguration and fails closed. A
+  request with no `Authorization` header reaches the comparison as `""`, so a
+  blank configured key would otherwise authenticate everyone.
 
 ```sh
-rift-cluster-server --cluster … --api-key "$BOOTSTRAP_KEY"     # fleet-admin, see below
-curl -sX POST http://$ADMIN/admin/tenants/default/principals \
-  -H "authorization: $BOOTSTRAP_KEY" \
-  -d '{"displayName":"ops","role":"tenant-admin"}'
-curl -sX PUT "http://$ADMIN/admin/tenants/*/bindings/key:…" \
-  -H "authorization: $BOOTSTRAP_KEY" -d '{"role":"fleet-admin"}'
+rift-cluster-server --cluster --api-key "$RIFT_ADMIN_KEY" ...
+curl -H "authorization: $RIFT_ADMIN_KEY" http://$ADMIN/imposters
 ```
 
-The legacy key is bound `FleetAdmin` on `*` while
-`--cluster-legacy-key-is-fleet-admin` is on (default `true` this release, see
-above), which is what makes the second call land. Drop the flag — and the
-`--api-key` — once a real fleet admin exists.
+There is **no per-resource authorization**. Whoever holds the key administers
+the whole fleet; isolation between teams is two fleets, not a feature. Tenants,
+principals, roles, bindings and quotas were removed in #550 — see D-73 for the
+reasoning and RFC-002 (superseded) for what they were.
 
-The open plane (no principals *and* no `--api-key`) does not get you there, and
-it is worth knowing why rather than discovering it: it stops being open the
-instant the first principal exists, and a tenant-scoped mint may not ask for
-`fleet-admin` — fleet privilege binds only on `*`, and binding on `*` requires
-fleet privilege you do not yet have. So the very first call closes the door
-behind itself and leaves you a `tenant-admin` that cannot promote anything,
-including itself. That refusal is the design working (a tenant admin must never
-be able to self-promote), which is precisely why bootstrapping is `--api-key`'s
-job and not the open plane's.
+Two surfaces stay open regardless of the key:
 
-#### Creating a tenant and issuing a key
+- **`/healthz` and `/readyz`** on the probe listener (`--cluster-probe-bind`) —
+  a liveness probe that needs a credential fails for the wrong reason.
+- **`/__rift/{port}/*`**, the data-plane gateway. It is app-under-test traffic,
+  and the key is neither required on it nor forwarded through it: the request
+  reaches the imposter, where an `Authorization` header would land in its
+  predicates and its recorded request log.
+
+### `POST /session` — a browser holds the key once
+
+The console should not keep the key after login, so it exchanges it:
 
 ```sh
-# 1. Create the tenant (FleetAdmin).
-curl -sX POST http://$ADMIN/admin/tenants \
-  -H "authorization: $FLEET_KEY" \
-  -d '{"id":"acme","displayName":"Acme Corp",
-       "quotas":{"maxImposters":100,"maxStubsPerImposter":500,
-                 "maxFlowEntries":100000},
-       "journalRetentionSecs":0}'
-# journalRetentionSecs sits beside `quotas`, not inside it: it is a duration
-# policy rather than an object count (RFC-002 §11 Q2). See "Quotas" below.
+curl -sX POST http://$ADMIN/session -H 'content-type: application/json' \
+  -d "{\"apiKey\":\"$RIFT_ADMIN_KEY\"}" -i
+# 200
+# set-cookie: rift_session=v1.…; HttpOnly; Secure; SameSite=Strict; Max-Age=28800; Path=/
 
-# 2. Mint a principal in it. The response is the ONLY place the key appears.
-curl -sX POST http://$ADMIN/admin/tenants/acme/principals \
-  -H "authorization: $FLEET_KEY" \
-  -d '{"displayName":"ci-runner","role":"editor"}'
-# {"id":"key:9f86d0…","displayName":"ci-runner","role":"editor",
-#  "tenant":"acme","apiKey":"rift_kZ3v…"}
+curl -s http://$ADMIN/imposters -H "cookie: rift_session=v1.…"
 
-# 3. Use it.
-curl -s http://$ADMIN/admin/whoami -H "authorization: rift_kZ3v…"
-# {"principalId":"key:9f86d0…","bindings":[{"tenant":"acme","role":"editor"}],
-#  "authorizationDisabled":false}
+curl -sX DELETE http://$ADMIN/session -i    # 204, cookie cleared
 ```
 
-**`apiKey` is shown once.** Capture it at creation or it is gone: the control
-plane stores an argon2id hash and a SHA-256 fingerprint, and neither can
-reproduce the key. There is no "reveal" endpoint and there will not be one —
-a key that can be re-read is a key that leaks from whatever stores it. To rotate,
-mint a new principal and `DELETE` the old one; the id is derived from the key, so
-a new key is necessarily a new principal.
+- **The cookie works on every node.** The signing key is a fleet-wide
+  control-plane record, so each node verifies from its own applied state and a
+  login is not a Raft write — only the first mint and any rotation are.
+- **It proves authentication and nothing else.** Its subject is the constant
+  `"admin"`; there is no identity for it to resolve to.
+- **Rotation is the only revocation.** Committing a new `SessionKeyPut`
+  invalidates every outstanding session at once (each token carries the key
+  record's revision), with no session table to sweep. The other bound is the
+  8-hour `Max-Age`. There is no per-session revocation, and no principal to
+  disable.
+- **CSRF.** A cookie-authenticated *mutation* must carry `X-Rift-CSRF` (any
+  value) or it is refused `403`. A key-authenticated request is exempt — a
+  bearer cannot be attached by a victim's browser, which is the whole attack.
+  That `403` is the only one this front produces.
+- A fleet running with **no** `--api-key` has nothing to exchange and answers
+  `400` rather than handing out a cookie that proves nothing.
 
-`PUT /admin/tenants/:id/principals/:pid` changes the display name and the
-`disabled` flag only. Disabling is the immediate revocation lever: it is a
-Raft-committed fact with no cache in front of it, so the key stops
-authenticating on the very next request through **any** node.
-
-**`whoami` is the cheapest check that authorization is wired at all.** It
-reports the caller's own identity and bindings and authorizes nothing beyond
-having authenticated. `"authorizationDisabled": true` with a null `principalId`
-means the fleet has no principals and no `--api-key` — the open admin plane
-described above, not an unbound principal.
-
-#### The per-request cost of a key
-
-Each authenticated admin request performs **one** argon2id verification, roughly
-20–50 ms, at the pinned OWASP 2024 cost (m = 19456 KiB, t = 2, p = 1). There is
-no verification cache: caching authorization data is what RFC-002 §8.5 forbids,
-and a cache keyed on the credential would need invalidating on four separate op
-variants with a failure mode that fails *open*. Budget for that latency on the
-admin plane. It does not touch the data plane — gateway traffic under
-`/__rift/` is never authenticated.
-
-A credential that matches no principal is refused having performed **zero**
-argon2id work, so an unauthenticated caller cannot use the admin port as a
-memory-amplification lever.
-
-### Upgrading a fleet
-
-Quota enforcement takes effect **inside the replicated apply path**, which makes
-it upgrade-sensitive:
-
-- **Finish rolling out a version before writing against its new rules.** This
-  release adds two apply-time refusals (a quota ceiling, and a zero-valued quota
-  at validation). A node still running the previous version applies the *same*
-  committed entry without them, so during a partial rollout two nodes can reach
-  different outcomes for one entry and diverge. Upgrade all nodes, then start
-  using the new behaviour. (This is the same rule earlier tenancy slices
-  introduced; it is written down here because this release is the first to make
-  it easy to trip on a routine write.)
-
-### Quotas (issue #163)
-
-`quotas` on the tenant record bounds **object counts**, and is enforced on the
-replicated apply path:
-
-| Field | Enforced |
-|---|---|
-| `maxImposters` | Yes. Counts the tenant's existing ports *excluding* the one being written, so replacing an imposter you already own never trips the ceiling |
-| `maxStubsPerImposter` | Yes — on the payload for a create/replace, and on the *result* for a stub edit |
-| `maxFlowEntries` | Stored; enforced by the flow owner |
-| `journalRetentionSecs` | Moved **off** `quotas` onto the tenant record itself (it is a duration policy, not a count). Stored; applied by the request shards in M3 |
-
-> **If you set `quotas.journalRetentionSecs` on an earlier M2 build, re-set it.**
-> The field moved to the top level of the tenant body; a stored record still
-> carrying it under `quotas` decodes with the *new* field at its default of `0`
-> (unlimited), silently. Nothing enforces the value yet — M3 (#147) is what will
-> read it — so the practical window to fix this is before that lands, but the
-> value is lost now rather than then.
-
-A ceiling of `0` is refused at validation rather than stored: it makes the tenant
-permanently unusable, and "unlimited" has its own spelling (a large number). A
-tenant with no stored record gets generous defaults, so a fleet that never
-configured tenancy is not capacity-locked.
-
-Quotas bound object counts, **not compute**. One tenant's pathological regex
-still degrades a shared node; that is a stated non-goal, not a gap.
-
-**A quota refusal is a committed decision, not a submit-time error.** This
-matters for the async/parked write path. Enforcement happens where the op
-applies, so a write parked during a minority-side outage
-(`--cluster-admin-async`, or a `503 + op-id`) is validated **on replay, against
-the quota as it stands then**. A tenant at its ceiling can therefore be accepted
-at submit and refused at replay:
-
-```sh
-curl -sX POST http://$ADMIN/imposters -H "authorization: $KEY" -d @imposter.json
-# 202  {"opId":"3f2a…"}          <- parked, outcome not yet knowable
-
-curl -s http://$ADMIN/_cluster/ops/3f2a… -H "authorization: $KEY"
-# {"outcome":"failed","reason":"tenant \"acme\" is at its ceiling of 100 imposters",
-#  "revision":93}
-```
-
-There is deliberately **no quota reservation at park time**: a reservation would
-have to survive a leader change and expire on its own, which is more machinery
-than the problem earns and a new source of divergence between nodes. Poll
-`GET /_cluster/ops/:id` for the real outcome — that is the contract for every
-parked write, and a quota refusal is simply one of the outcomes it can report.
 
 ### Startup guards
 
@@ -695,11 +545,6 @@ per imposter — two nodes disagreeing have not converged) and
 `rift_cluster_dedup_hits_total` (ops collapsed by op-id — a replay and a retry
 proving to be one operation), plus the R4 ledger's `rift_cluster_intents_pending`
 (resampled by every replay sweep, so a restart's carried-over ledger reads true).
-`rift_cluster_no_principals` is `1` when the fleet has no principal defined at
-all (issue #161) — the condition under which the admin plane's open-by-default
-bypass applies; resampled continuously, because a `PrincipalPut` can flip it at
-any moment the fleet is running.
-
 The pull-on-miss net (issue #49) keeps `rift_cluster_pull_on_miss_retries_total`
 — requests sent back through the matcher once, which is what C16 reads. There is
 deliberately no `rescues_total`: the hook cannot see the retry's outcome, so such
@@ -776,7 +621,8 @@ means the write is durable on a majority and, with the default
 `--cluster-write-barrier=ready-nodes`, applied on every Ready node; if the
 barrier times out the response still succeeds and names the lagging nodes in
 `Rift-Cluster-Warnings`. Every mutating response carries
-`Rift-Cluster-Revision` (`<tenant>:<port>@<log-index>`) and
+`Rift-Cluster-Revision` (`<port>@<log-index>`, or `routes@<log-index>` for a
+front-door route-table write) and
 `Rift-Cluster-Op-Id`.
 
 Acceptance is never lost (R4): every mutation is durably parked on the
@@ -817,7 +663,7 @@ first, before resolution ever runs. Concurrent
 writers to the *same* imposter are last-writer-wins by default; a
 single-imposter write may carry an `If-Match` header to condition on the
 record's current revision instead — either the exact `Rift-Cluster-Revision`
-value (`default:<port>@<revision>`) or a bare revision integer, optionally
+value (`<port>@<revision>`) or a bare revision integer, optionally
 quoted like a normal ETag. A stale or mismatched `If-Match` is refused with
 `409` (`resource conflict` type, message starting `revision conflict`); a
 collection-wide mutation (`PUT /imposters`, `DELETE /imposters`) has no single
@@ -860,8 +706,7 @@ gave the imposter *listing* that treatment, and the savedRequests route now
 gets it too, so a caller cannot get a different answer — cursor header
 included — by spelling the path differently.
 
-**Why terminate instead of decorating the proxied body**, the way the
-imposter listing's tenant filter does: the merged response's cursor is a
+**Why terminate instead of decorating the proxied body:** the merged response's cursor is a
 different *kind* of value from upstream's, so proxying first and then
 rewriting a header upstream just set is the fragile direction, and the
 issue's acceptance criteria pin the classification flipping outright.
@@ -953,11 +798,8 @@ because another node's seq means nothing in this node's numbering; and
 merge path evaluates no predicates, so terminating a scoped tail would answer
 with the whole fleet's requests instead of your subset.
 
-**`GET /events` still proxies per-node and is FleetAdmin-gated.** That
-asymmetry is deliberate — the firehose spans every tenant and is not yet
-filtered server-side (issue #163), whereas the per-port tail carries one
-imposter's requests and is authorized as the port-scoped `imposter.read` it
-always was. Terminating the per-port tail changed no authorization posture.
+**`GET /events` still proxies per-node.** It is upstream's own firehose,
+answered by the node it reaches; the per-port tail is what this front merges.
 
 **`DELETE savedRequests`/`.../requests` is explicitly transitional, and a
 `match`-scoped clear never fans out at all.** Without `?match=`, it clears
@@ -1183,7 +1025,7 @@ curl -sX PUT "$ADMIN/imposters" -H "Authorization: Bearer $KEY" \
 
 Because the second call is a plain `PUT /imposters`, everything the write path
 already provides applies unchanged: `Rift-Cluster-Revision` / `Rift-Cluster-Op-Id`,
-the write barrier, `Idempotency-Key` dedup, park-and-replay, quotas and RBAC. The
+the write barrier, `Idempotency-Key` dedup and park-and-replay. The
 compiler never runs in the apply path, and apply never parses OpenAPI.
 
 **What deliberately does not exist.** There is no stored spec, no `/specs/{id}`,
@@ -1224,7 +1066,7 @@ an unknown value is a `400` naming the key, never a silent default):
 |---|---|---|
 | `readConsistency` | `"strong"` (default) \| `"local"` | `strong`: every read is owner-answered — correct under any LB, at most one LAN RPC. `local`: reads stay on this node's replica — fast, at most one replication push behind the owner |
 | `durability` | `"none"` \| `"async"` (default) \| `"sync"` | What a write survives: `sync` fsyncs before the ack (a full-fleet restart loses nothing), `async` is group-fsynced every `--cluster-flow-fsync-interval-ms` (bounded loss), `none` never touches disk |
-| `contextScope` | `"imposter"` (default) \| `"tenant"` \| `"fleet"` | Which imposters share a flow-id namespace. `imposter`: this imposter's flow ids are its own — two imposters resolving the same id (the ordinary result of both using `flowIdSource: "header:X-Session"`) stay isolated, matching single-node behaviour. `tenant` (#288): one namespace across the owning tenant's imposters — a suite spanning two of *your* mocks carries one context through both, and no other tenant's imposter can reach it. `fleet`: one namespace across every imposter of every tenant; **admission requires `FleetAdmin`** (#288) — an Editor's write of a fleet-scoped config is refused with a `400` naming the requirement, nothing committed. Fleet-scoped configs admitted before the gate keep serving; re-admitting one (any config write that carries the knob) needs `FleetAdmin` |
+| `contextScope` | `"imposter"` (default) \| `"fleet"` | Which imposters share a flow-id namespace. `imposter`: this imposter's flow ids are its own — two imposters resolving the same id (the ordinary result of both using `flowIdSource: "header:X-Session"`) stay isolated, matching single-node behaviour. `fleet`: one namespace across every imposter in the fleet. The third value, `"tenant"`, was removed with tenancy (#550) and is **refused by name** with a `400`, never aliased to either survivor |
 
 ### `contextScope` and the isolation it restores (#152)
 
@@ -1240,30 +1082,18 @@ reads.
 **behaviour change** for a fleet that was relying on the old sharing: set
 `contextScope: "fleet"` on those imposters to keep it, explicitly.
 
-The three namespaces are disjoint by construction — every scope carries its
-own prefix (`i<port>:`, `t<tenant>:`, `f:`) rather than using bare ids — so no
-caller-chosen flow id can be crafted to read across a boundary, not even one
-shaped like another scope's prefix.
+The two namespaces are disjoint by construction — every scope carries its own
+prefix (`i<port>:`, `f:`) rather than using bare ids — so no caller-chosen flow
+id can be crafted to read across the boundary, not even one shaped like the
+other scope's prefix.
 
-**`tenant` (#288)** is the middle ground: one namespace shared by all of a
-tenant's imposters and reachable by no other tenant's. The tenant is not in the
-config (the core schema carries no tenancy — open-core rule); the clustered
-store learns it at provide time from the control-plane record that owns the
-port, so an imposter's scope is fixed by who committed it. **`fleet` is gated:**
-because it crosses every tenant's boundary, admitting a config that sets it
-requires the writing principal to hold `FleetAdmin` — refused otherwise with a
-`400` naming the requirement, before anything commits. Configs admitted before
-the gate keep serving unchanged; the next config write that *carries the knob*
-is what needs the role — a stub edit on a fleet-scoped imposter carries no
-`flowState` and is not gated, whoever makes it. Under the open admin plane (no
-principal configured) nothing gates, exactly as no other authorization does
-there. The `--imposters` bootstrap is not a way around the gate either: it runs
-before any principal is in view, so once the admin plane is enforced — an
-`--api-key` is configured or any principal exists, the same predicate the
-front's bypass reads — a bootstrap document that sets `contextScope: "fleet"`
-fails the start with the same `400`, naming the port and the way in
-(`PUT /imposters` as a `FleetAdmin`, or `tenant` scope in the document).
-Configs admitted before the gate keep serving.
+**`"tenant"` is refused, not aliased (#550, D-73).** The namespace it selected —
+one shared by an owning tenant's imposters — has no meaning in a fleet with no
+tenants, and quietly folding it into `imposter` or `fleet` would change which
+imposters share flow state without saying so. A config carrying it is refused at
+admission with a `400` naming #550 and the two values that remain, and nothing
+commits. `fleet` is no longer gated by a role: there is one administrator, so
+there is no boundary for a fleet-wide namespace to cross.
 
 **One residual difference from single-node.** The namespace is keyed by the
 imposter's *port*, not by the store instance, so deleting an imposter and
@@ -1401,13 +1231,13 @@ operator, because each is a deliberate refusal to round a fact off:
   `savedRequests` read are already the fleet's answer, stamped
   `Rift-Cluster-Partial` when the merge could not be sure of it — the console
   does not need to, and must not, merge those itself.
-- **An empty list is not the same claim as an empty tenant.** When the answering
+- **An empty list is not the same claim as an empty fleet.** When the answering
   node is degraded — not ready, draining, isolated, leaderless, or **evicted
-  from the voter set** — the empty state says the tenant *cannot be confirmed*
+  from the voter set** — the empty state says the fleet *cannot be confirmed*
   empty and names why. An imposter the node has not applied would not appear.
-  The same caveat appears when the console holds the fleet scope but the
-  `/_fleet/*` read itself failed: that is a *lost* signal, and reporting it as
-  "nothing to report" would present the gap as a clean reading.
+  The same caveat appears when the `/_fleet/*` read itself failed: that is a
+  *lost* signal, and reporting it as "nothing to report" would present the gap
+  as a clean reading.
 
   Eviction is the one worth knowing about, because it has no other tell. A node
   removed from the effective membership while still running is not draining, is
@@ -1416,32 +1246,16 @@ operator, because each is a deliberate refusal to round a fact off:
   while owning no part of the ring and receiving no further replication.
 - **Unknown renders as `—`, never `0`.** `current_leader: null` means this node
   knows of no leader; showing `0` would name node 0.
-- **A refusal from `/_fleet/*` is reported as insufficient scope, not a missing
-  page.** Both statuses mean the same thing here: the route authorizes
-  `Action::ClusterAdmin` with no tenant scope, so a principal bound to the
-  tenant but lacking the role gets **403**, while an unbound one gets the
-  RFC-002 §8.4 **404**. The console treats them alike, because the alternative
-  is telling an operator their fleet has no cluster.
+- **A `401` from `/_fleet/*` is reported as a lost session, not a missing page.**
+  Telling an operator their fleet has no cluster because their cookie expired is
+  the wrong answer to the wrong question.
 
-The tenant switcher sends `X-Rift-Tenant` and nothing else — RFC-002 §8.1's
-rules apply unchanged, and the header selects among bindings the principal
-already holds. It is hidden entirely for a single-tenant principal. A
-`FleetAdmin` binds only to the fleet scope `*`, so its switcher list comes from
-`GET /admin/tenants`, which is fleet-scoped and therefore readable by exactly
-that principal; if that call fails the console says so rather than letting the
-switcher quietly disappear, which would read as a fleet with one tenant.
+The console shows **the one fleet**. There is no tenant switcher and no scope
+to choose: whoever logged in holds the fleet's one credential, so every screen
+shows everything and every control is offered unconditionally (#550, D-73).
 
-The console always opens **in a tenant it actually sends**. An unselected
-tenant would mean no `X-Rift-Tenant` — which lands in `default` — while the
-switcher displayed the first tenant in its list, so every read would be
-labelled with a tenant it never asked for; for a principal not bound to
-`default` those reads all 404 while the console claims otherwise. It therefore
-opens on the remembered tenant, else `default` when the principal is bound
-there, else the first it holds.
-
-Screens whose backend or slice has not shipped — request log (#189),
-administration (#190) — appear as greyed nav entries carrying their issue
-number. A visible roadmap, not a 404 and not an omission.
+Screens whose backend or slice has not shipped appear as greyed nav entries
+carrying their issue number. A visible roadmap, not a 404 and not an omission.
 
 Reads poll every 5 seconds while the tab is visible and **stop while it is
 hidden** (RFC-006 §6). SSE is deferred to v2 and will carry cache invalidation

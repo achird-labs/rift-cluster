@@ -104,7 +104,7 @@ export function ControlPlane({ fleet }: { fleet: FleetView | undefined }): React
     return (
       <section className="rail-sect">
         <h2 className="eyebrow">Control plane</h2>
-        <PendingPanel issue={361} reason="The fleet projection is scoped to fleet.read, and this principal is refused it." />
+        <PendingPanel issue={361} reason="This node served no fleet projection, so its ring view is unavailable." />
       </section>
     );
   }
@@ -158,18 +158,18 @@ export function ControlPlane({ fleet }: { fleet: FleetView | undefined }): React
 }
 
 /**
- * The merged tail — the newest requests across every imposter the tenant owns (#362).
+ * The merged tail — the newest requests across every imposter the fleet serves (#362).
  *
  * Reads `GET /admin/requests`, which merges the fleet server-side, rather than fanning out across
  * imposters here: this panel used to be a placeholder precisely because assembling it client-side
  * would have been a different thing wearing the same label — N reads per poll, ordered by whichever
  * came back first, presented as one ordered stream.
  *
- * "Live" here means polled, like every other live surface in this console: the session is an
- * HttpOnly cookie and `EventSource` cannot carry the `X-Rift-Tenant` header, so the server's SSE
- * tail (`/admin/requests/stream`) is not reachable from the browser without a transport this
- * console does not yet have. The poll shares `useFleetRequests`' cache with the request log, so
- * opening both costs one read, not two.
+ * "Live" here means polled, like every other live surface in this console: the server's SSE tail
+ * (`/admin/requests/stream`) is published but this console has never consumed it. (The reason it
+ * could not — `EventSource` cannot set the `X-Rift-Tenant` header — went away with #550; adopting
+ * the stream is its own change, not a side effect of removing tenancy.) The poll shares
+ * `useFleetRequests`' cache with the request log, so opening both costs one read, not two.
  *
  * Capped to the newest few rows — this is a rail, not the log. The request log is the whole answer,
  * and the footer says so rather than letting a truncated rail read as the complete picture.
@@ -212,7 +212,7 @@ function LiveTail(): ReactNode {
         </ul>
       )}
       <p className="muted tail-foot">
-        Newest {rows.length === 0 ? "" : `${String(rows.length)} `}across this tenant — ordered by
+        Newest {rows.length === 0 ? "" : `${String(rows.length)} `}across the fleet — ordered by
         recorded timestamp, so rows from different imposters are about this order rather than a
         sequence. The request log is the full journal.
       </p>

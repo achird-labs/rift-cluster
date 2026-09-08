@@ -1220,7 +1220,7 @@ fn read_paths(body: &serde_json::Value) -> BTreeSet<String> {
         .collect()
 }
 
-/// The fleet read answers for **every** imposter the tenant owns, not just the first, and states
+/// The fleet read answers for **every** applied imposter, not just the first, and states
 /// its coverage.
 ///
 /// Traffic is driven at both imposters through *different* nodes' front doors, so a correct answer
@@ -1230,7 +1230,7 @@ fn read_paths(body: &serde_json::Value) -> BTreeSet<String> {
 /// Pins D-32: a live fleet read carries the `coverage` block end to end — `covered` names both
 /// imposters, `omitted` is empty and `capped` is false below the cap.
 #[tokio::test]
-async fn the_fleet_read_merges_every_imposter_the_tenant_owns() {
+async fn the_fleet_read_merges_every_applied_imposter() {
     let states = [
         TempDir::new().expect("tempdir"),
         TempDir::new().expect("tempdir"),

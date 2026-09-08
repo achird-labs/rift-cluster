@@ -58,6 +58,21 @@ stringData:
   # with it, and a node started without it refuses to start unless explicitly
   # told to run insecure.
   cluster-secret: "CHANGE-ME-before-deploying"
+  # The ADMIN plane's credential — deliberately absent, not merely blank.
+  #
+  # With no MB_APIKEY the admin API is open: anyone who can reach port 2525 can
+  # configure the fleet. That is what this reference manifest ships, and what
+  # `deploy/compose/docker-compose.yml` ships, because a reference that demands
+  # a credential to be edited before it applies is a reference nobody runs.
+  #
+  # To close the plane, add the key here and uncomment the MB_APIKEY env entry
+  # in the StatefulSet below. It closes the WHOLE admin plane behind that one
+  # key, sent as `Authorization: <key>`; /healthz, /readyz and the imposter
+  # data plane stay open regardless. An EMPTY value is not "open" — it is a
+  # plane closed behind a credential nobody can present — so leave the key out
+  # entirely rather than setting it to "".
+  #
+  #   admin-api-key: "CHANGE-ME-before-deploying"
 ---
 apiVersion: apps/v1
 kind: StatefulSet
@@ -169,6 +184,15 @@ spec:
                 secretKeyRef:
                   name: rift-cluster-secret
                   key: cluster-secret
+            # Uncomment together with `admin-api-key` in the Secret above to
+            # close the admin plane. Left out, the plane is open — see that
+            # comment for what "open" does and does not cover.
+            #
+            # - name: MB_APIKEY
+            #   valueFrom:
+            #     secretKeyRef:
+            #       name: rift-cluster-secret
+            #       key: admin-api-key
           # Liveness: is the process alive? Answered throughout the join and
           # throughout the drain, because restarting a node in either state
           # makes things strictly worse. `failureThreshold` is generous for the

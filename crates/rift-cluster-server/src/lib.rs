@@ -17,12 +17,9 @@
 //! * [`probes`] — the unauthenticated `/readyz` + `/healthz` listener.
 //! * [`cluster_api`] — the authenticated `/_cluster/*` operator surface on the
 //!   cluster port.
-//! * `tenancy` — RFC-002 §5's `/admin/tenants*` and `/admin/whoami` surface,
-//!   terminated by [`admin_front`].
+//! * [`session`] — the console's API-key-for-cookie exchange (`POST /session`).
 
 pub mod admin_front;
-pub mod authorizer;
-pub mod authz;
 pub mod bootstrap;
 pub mod cli;
 pub mod cluster_api;
@@ -33,11 +30,9 @@ pub mod compose;
 mod console;
 pub mod fleet;
 pub mod openapi;
-pub mod principal;
 pub mod probes;
 pub mod readiness;
 pub mod session;
-mod tenancy;
 
 pub use cli::EeCli;
 pub use compose::ComposedServer;

@@ -19,22 +19,14 @@ export type ApiPath = keyof paths;
 export const CSRF_HEADER = "X-Rift-CSRF";
 
 /**
- * RFC-002 §8.1's tenant selector. It **selects among the principal's existing bindings; it never
- * grants one** — `admin_front.rs::requested_tenant` reads it and `authorize_action` only ever
- * intersects it against bindings already loaded from applied state.
- *
- * Sent only when a tenant is actually in view. An empty value would be a claim of a tenant named
- * `""`, which is a tenant the caller is not bound to and answers 404 (§8.4) — quite different from
- * omitting the header, which means "my default tenant".
- */
-export const TENANT_HEADER = "X-Rift-Tenant";
-
-/**
  * The optimistic-concurrency token the fleet stamps on a single-imposter read, and takes back as
- * `If-Match` on the write (contract: `default:<port>@<revision>`).
+ * `If-Match` on the write (contract: `<port>@<revision>` for an imposter, `routes@<revision>` for
+ * the front-door table).
  *
- * Reading it is the whole point of `apiGetWithRevision`: a stub write sent without it is
- * last-writer-wins, which is the lost-update bug stated as a default.
+ * Carried verbatim in both directions — nothing here parses it, which is why the `default:` prefix
+ * dropping out of the spelling in #550 changed nothing on this side. Reading it is the whole point
+ * of `apiGetWithRevision`: a stub write sent without it is last-writer-wins, which is the
+ * lost-update bug stated as a default.
  */
 export const REVISION_HEADER = "Rift-Cluster-Revision";
 
@@ -47,9 +39,8 @@ export const REVISION_HEADER = "Rift-Cluster-Revision";
  */
 export const IDEMPOTENCY_HEADER = "Idempotency-Key";
 
-/** Per-call context the schema cannot express: the tenant in view, and the write's precondition. */
+/** Per-call context the schema cannot express: the write's precondition, and its retry key. */
 export type RequestOptions = {
-  tenant?: string | null | undefined;
   /**
    * Sent as `If-Match`. Omit it and the write is unconditional — so callers that hold a token pass
    * it, and callers that do not hold one refuse to write rather than sending nothing.
@@ -159,18 +150,13 @@ async function request(
   if (body !== undefined) {
     headers["Content-Type"] = "application/json";
   }
-  const tenant = options?.tenant;
-  if (tenant !== undefined && tenant !== null && tenant !== "") {
-    headers[TENANT_HEADER] = tenant;
-  }
   const ifMatch = options?.ifMatch;
   if (ifMatch !== undefined && ifMatch !== null && ifMatch !== "") {
     headers["If-Match"] = ifMatch;
   }
   const idempotencyKey = options?.idempotencyKey;
   // Never on `GET` (#371): a read cannot double-apply, and the admin front refuses the header on
-  // one route outright (minting a principal), so sending it where it has no meaning invites a 400
-  // for nothing.
+  // sending it where it has no meaning invites a 400 for nothing.
   if (method !== "GET" && idempotencyKey !== undefined && idempotencyKey !== null && idempotencyKey !== "") {
     headers[IDEMPOTENCY_HEADER] = idempotencyKey;
   }
@@ -218,13 +204,8 @@ async function request(
  *
  * Errors are raised exactly as `request` raises them, so a 403 or a 404 still surfaces normally.
  */
-export async function apiGetText(
-  path: ApiPath | (string & {}),
-  options?: RequestOptions,
-): Promise<string> {
+export async function apiGetText(path: ApiPath | (string & {})): Promise<string> {
   const headers: Record<string, string> = { Accept: "application/json" };
-  const tenant = options?.tenant;
-  if (tenant !== undefined && tenant !== null && tenant !== "") headers[TENANT_HEADER] = tenant;
 
   const response = await fetch(path, {
     method: "GET",

@@ -178,7 +178,7 @@ surface this RFC removes. It also built a flow-state tier stronger than upstream
 | MCP server | Nothing, for now | RFC-006 §8 retired | #547 |
 | Cluster metric families, observability overlay, dashboards, rule tests | Upstream's metrics server, untouched; `/_fleet/members` for tests | RFC-001 metrics section retired | #548 |
 | Tracking sources (`git+`, `s3:`, `registry:`, scheduler, `auth_ref`), datasets, stored specs with drift and validation, the blob store | Upstream `file:`/`https:` sources; stateless `POST /specs/compile` | D-18, D-19, D-23, D-29, D-30, D-31, D-34, D-48, D-49, D-50, D-51, D-52, D-53, D-55, D-56; RFC-005; RFC-004 §3.4–§3.6 | #549 |
-| Tenants, principals, bindings, roles, quotas, `X-Rift-Tenant`, the tenant half of every key and of the revision header | One API key; `POST /session` exchanges it | D-44, D-45, D-46; RFC-002 | #550 |
+| Tenants, principals, bindings, roles, quotas, `X-Rift-Tenant`, the tenant half of every key and of the revision header | One API key; `POST /session` exchanges it | D-44, D-45, D-46, D-68 superseded; RFC-002 superseded; chapter 08 retired — all by **D-73** | #550 |
 | Journal shards, merge-on-read, anti-entropy, generation clears, vector cursors, fleet request tail | Upstream per-node journal | D-32, D-37, D-38, D-39; RFC-001 §7.5 | #552 |
 | Console: Admin, Sources, Scenarios screens; planned Specs entry | Four screens: Imposters, Requests, Routes, Cluster | RFC-006 §4 amended | #553 |
 
@@ -192,7 +192,12 @@ surface this RFC removes. It also built a flow-state tier stronger than upstream
   A test that needs fleet-wide verification pins a node or reads all of them. If Rift ever grows a
   shared journal, it grows it in the engine, once, for every deployment shape.
 - **One credential.** Everyone who can administer the fleet can administer all of it. Isolation
-  between teams is a deployment (two fleets), not a feature.
+  between teams is a deployment (two fleets), not a feature. **Landed by #550 (D-73):**
+  `--api-key` set closes the whole admin plane, unset leaves it open, and `POST /session`
+  exchanges the key for the console's cookie. Nothing in the fleet is tenant-scoped — not a redb
+  key, not a `ControlOp`, not the `Rift-Cluster-Revision` header, not a flow-id namespace. The
+  trade is stated in full there, including what it costs: a keylogging XSS at login time takes
+  the fleet's credential and there is no narrower key to mint instead (RFC-006 §9.3).
 
 These are losses. They are accepted because each of the removed subsystems was a second
 distributed system riding inside the first, and the first one — configuration, routing, and the
@@ -240,12 +245,12 @@ was re-seeded and checked with the vault harness
 | cluster — one leader, three voters, same applied index, console on every node, no imposter port published | 8 | **keep** |
 | imposter through the front door on all three nodes; predicates; 401/200/404 | 8 | **keep** (router) |
 | proxy — proxyOnce replays on another node; proxyTransparent; generated predicate | 4 | **keep** |
-| front door — host, prefix, strip, priority, method, proxy target, replicated to node 3, `installed` | 10 | **keep**; the tenant-table assertion **goes** (#550) |
+| front door — host, prefix, strip, priority, method, proxy target, replicated to node 3, ~~`installed`~~ | 10 | **keep**; the tenant-table assertion and `installed` both **went** (#550, D-73) |
 | scenarios — state crossed nodes | 2 | **keep** (added to the smoke check) |
 | spaces — node-local space stubs, erased on reconcile, flow KV across nodes | 5 | **keep**; the node-local assertions describe bug #537, fixed by PR #541 |
-| tenancy — cross-tenant 404, header borrowing refused, data plane not isolated | 5 | **goes** (#550) |
-| console session — bootstrap key refused, minted principal accepted, cookie on node 3 | 6 | **goes**; replaced by "the API key holds a session on every node" |
-| RBAC ladder | 6 | **goes** (#550) |
+| tenancy — cross-tenant 404, header borrowing refused, data plane not isolated | 5 | **went** (#550); the data-plane half survives as `the_gateway_stays_open_and_never_carries_the_admin_key` |
+| console session — bootstrap key refused, minted principal accepted, cookie on node 3 | 6 | **went** (#550); replaced by `the_api_key_mints_a_session_and_the_cookie_is_accepted_on_every_node` |
+| RBAC ladder | 6 | **went** (#550) |
 | observability — journal records the serving node; audit has entries; one proxyOnce claim | 3 | journal per node **keep**; audit **goes** (#546); claim **keep** |
 
 ### 5.2 Per child
@@ -290,6 +295,11 @@ taken once the API has stopped shrinking (#554).
 1. **Should `POST /session` survive?** With one API key the console could send the key on every
    request. A cookie keeps the key out of the browser's storage after login; that is the only
    reason to keep the exchange. Default: keep it, simplified (#550).
+   **Resolved by #550 (D-73):** kept, simplified. The default was taken, and a second reason
+   emerged for it — rotating the signing key is the *only* revocation a one-credential fleet has,
+   so dropping the cookie would have left none. The payload's subject is now the constant
+   `"admin"` and `verify` answers `Result<(), _>`; a session proves authentication and resolves
+   to no identity.
 2. **Does the Requests screen offer a node picker or only show the node it reached?** Default:
    show the node it reached and say so (#553). A picker is a later addition if anyone asks.
 3. **Is `Rift-Cluster-Partial` still needed anywhere?** Fleet reads that fan out (`/_fleet/members`)
@@ -313,7 +323,7 @@ Updated as PRs merge. Status is one of `open`, `in progress`, `merged`.
 | #547 | MCP | open | — |
 | #548 | Metrics and observability | open | — |
 | #549 | Sources, datasets, specs, blobs | in progress | — |
-| #550 | Tenancy and RBAC | open | — |
+| #550 | Tenancy and RBAC | in progress | — |
 | ~~#551~~ | Flow state, sequencer, proxyOnce, spaces | withdrawn 2026-09-06 — stays | — |
 | #552 | Journal merge | open | — |
 | #553 | Console | open | — |
@@ -328,7 +338,9 @@ Closed as out of scope on 2026-09-06, with the reason on each: #148, #149, #151,
 D-17, D-20, D-21, D-22, D-24, D-25, D-26, D-27, D-28, D-33, D-35, D-36, D-40, D-41, D-42, D-43,
 D-47, D-54, D-57, D-58, D-59, D-60, D-61, D-62, D-63, D-64, D-65, D-66, D-67.
 
-**Amend:** D-68 (`installed` from the route-table endpoints only).
+**Amend:** ~~D-68 (`installed` from the route-table endpoints only)~~ — **superseded** by D-73
+(#550) instead: with one fleet-wide route table every stored route is installed, so `installed`
+would be a constant `true` and is removed from both endpoints.
 
 **Supersede, by the child that removes the code:**
 
@@ -336,7 +348,7 @@ D-47, D-54, D-57, D-58, D-59, D-60, D-61, D-62, D-63, D-64, D-65, D-66, D-67.
 |---|---|
 | #545 | D-70 |
 | #549 | D-18, D-19, D-23, D-29, D-30, D-31, D-34, D-48, D-49, D-50, D-51, D-52, D-53, D-55, D-56 |
-| #550 | D-44, D-45, D-46 |
+| #550 | D-44, D-45, D-46, D-68 |
 | #552 | D-32, D-37, D-38, D-39 |
 
 Already superseded before this RFC: D-1, D-2, D-12. D-69 (space stubs replicate, #541) landed after v1 and is unaffected.

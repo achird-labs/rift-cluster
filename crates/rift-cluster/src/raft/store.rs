@@ -9,19 +9,11 @@
 //!   before a log id, `get_log_state` has nowhere else to recover it from.
 //! * `raft_vote`     — `() -> Vote<u64>` (JSON).
 //! * `raft_snapshot` — `() -> StoredSnapshot` (JSON): the last installed/built snapshot.
-//! * `sm_configs`    — `(tenant, port) -> StoredImposter` (JSON): the applied
+//! * `sm_configs`    — `port -> StoredImposter` (JSON): the applied
 //!   config, its enabled flag, and the revision (log index) that last wrote it.
-//! * `sm_routes`     — `(tenant, route id) -> Route` (JSON): the front door's
-//!   replicated route table (issue #131). Read as a whole per tenant to
-//!   recompile a [`CompiledRoutes`] after every mutating op.
-//! * `sm_tenants`    — `tenant id -> Tenant` (JSON): tenant records, including
-//!   deleted tombstones (issue #159, RFC-002 §10 slice T1).
-//! * `sm_principals` — `principal id -> Principal` (JSON): fleet-wide identities,
-//!   not tenant-scoped — a principal exists once and is bound to tenants via
-//!   `sm_bindings` (issue #159).
-//! * `sm_bindings`   — `(principal id, tenant) -> Role` (JSON): principal-major,
-//!   deliberately not tenant-major — see its `TableDefinition`'s doc comment
-//!   for why the key order is load-bearing (issue #159).
+//! * `sm_routes`     — `route id -> Route` (JSON): the front door's
+//!   replicated route table (issue #131). Read as a whole to recompile a
+//!   [`CompiledRoutes`] after every mutating op.
 //! * `sm_op_dedup`   — `op_id -> DedupEntry` (JSON): the response recorded for an
 //!   applied op, kept for [`DEDUP_TTL_SECS`] so a replayed intent (crash-replay,
 //!   client retry with the same `Idempotency-Key`) is exactly-once-in-effect.
@@ -56,7 +48,7 @@
 //! fatal to the node, and that is the correct severity for a log that can no
 //! longer be applied.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::ops::{Bound, RangeBounds};
 use std::path::{Path, PathBuf};
@@ -85,9 +77,8 @@ use serde::{Deserialize, Serialize};
 
 use super::TypeConfig;
 use crate::control::{
-    self, ControlOp, ControlRequest, ControlResponse, DEFAULT_TENANT, FLEET_SCOPE,
-    PreconditionTarget, Principal, Quotas, Role, SessionKey, StubEdit, StubEditScript, Tenant,
-    TenantConfigUsage, TenantId, routes_installed_for,
+    self, ControlOp, ControlRequest, ControlResponse, PreconditionTarget, SessionKey, StubEdit,
+    StubEditScript,
 };
 use crate::stores::flow::FlowNet;
 use crate::stores::journal::ClusterJournal;
@@ -99,47 +90,34 @@ const LOG_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("raft_log");
 const LOG_META_TABLE: TableDefinition<(), &[u8]> = TableDefinition::new("raft_log_meta");
 const VOTE_TABLE: TableDefinition<(), &[u8]> = TableDefinition::new("raft_vote");
 const SNAPSHOT_TABLE: TableDefinition<(), &[u8]> = TableDefinition::new("raft_snapshot");
-const SM_CONFIGS_TABLE: TableDefinition<(&str, u16), &str> = TableDefinition::new("sm_configs");
-/// `(tenant, route id) -> Route` (JSON): the front door's replicated route
-/// table (issue #131). One row per route rather than one row per table, so a
-/// `DeleteRoute` is a single-key removal instead of a read-modify-write of
-/// the whole tenant's set.
-const SM_ROUTES_TABLE: TableDefinition<(&str, &str), &str> = TableDefinition::new("sm_routes");
-/// `tenant -> revision`: the log index at which `tenant`'s route table was last
-/// mutated (issue #210). A missing row reads as `0`.
+/// `port -> StoredImposter` (JSON). One row per replicated imposter; the port is
+/// the whole key since #550 removed tenancy — an imposter is fleet-unique by port
+/// and nothing else scopes it.
+const SM_CONFIGS_TABLE: TableDefinition<u16, &str> = TableDefinition::new("sm_configs");
+/// `route id -> Route` (JSON): the front door's replicated route table (issue
+/// #131). One row per route rather than one row per table, so a `DeleteRoute` is
+/// a single-key removal instead of a read-modify-write of the whole set.
+const SM_ROUTES_TABLE: TableDefinition<&str, &str> = TableDefinition::new("sm_routes");
+/// The log index at which the route table was last mutated (issue #210), under
+/// [`ROUTES_REVISION_ROW`]. A missing row reads as `0`.
 ///
-/// A separate table rather than a field on each `sm_routes` row, because the
-/// thing a client conditions a whole-table replace on is the *set*, not any one
-/// route — and a per-row copy would have no answer at all for a tenant whose
-/// last mutation was a delete that emptied the table.
+/// A one-row table rather than a field on each `sm_routes` row, because the thing
+/// a client conditions a whole-table replace on is the *set*, not any one route —
+/// and a per-row copy would have no answer at all when the last mutation was a
+/// delete that emptied the table. Same shape as [`SM_SESSION_KEY_TABLE`] and
+/// [`SM_FLEET_NAME_TABLE`], and for the same reason: it snapshots, installs and
+/// clears through the ordinary table path rather than a hand-written special case.
 ///
-/// `0` for "never written" is load-bearing in the safe direction: a tenant that
-/// has never had a route reads `0`, so a client that conditions on `0` and
-/// writes first wins, and every later stale token fails. It is never a value
-/// that makes a stale precondition pass, because a real mutation stamps a log
-/// index and log indices start above zero.
+/// `0` for "never written" is load-bearing in the safe direction: a fleet that has
+/// never had a route reads `0`, so a client that conditions on `0` and writes
+/// first wins, and every later stale token fails. It is never a value that makes a
+/// stale precondition pass, because a real mutation stamps a log index and log
+/// indices start above zero.
 const SM_ROUTES_REVISION_TABLE: TableDefinition<&str, u64> =
     TableDefinition::new("sm_routes_revision");
-/// `tenant id -> Tenant` (JSON): tenant records, including deleted tombstones
-/// (issue #159, RFC-002 §10 slice T1). See [`Tenant::deleted`]'s doc for why a
-/// delete leaves the row behind instead of removing it.
-const SM_TENANTS_TABLE: TableDefinition<&str, &str> = TableDefinition::new("sm_tenants");
-/// `principal id -> Principal` (JSON). Fleet-wide, not tenant-scoped: a
-/// principal is one identity that may be bound to many tenants, so unlike
-/// `sm_configs`/`sm_routes` this key carries no tenant component
-/// at all.
-const SM_PRINCIPALS_TABLE: TableDefinition<&str, &str> = TableDefinition::new("sm_principals");
-/// `(principal id, tenant) -> Role` (JSON): a principal's binding to one
-/// tenant (issue #159).
-///
-/// Principal-major, **not** tenant-major, and that ordering is load-bearing.
-/// The hot path is per-request: authenticate a principal, then resolve *that
-/// principal's* bindings — a redb prefix range under `(principal_id, ..)`, one
-/// seek. "Which principals are bound to tenant X" is an admin listing, not a
-/// per-request check, and it pays a full-table scan under this key order —
-/// that trade is deliberate. Keying tenant-major would flip the cost onto
-/// every authorized request instead of onto an occasional admin query.
-const SM_BINDINGS_TABLE: TableDefinition<(&str, &str), &str> = TableDefinition::new("sm_bindings");
+/// The single key `sm_routes_revision` uses, named rather than `()` for the same
+/// reason [`SESSION_KEY_ROW`] is: it reads like the rest of the schema.
+const ROUTES_REVISION_ROW: &str = "revision";
 /// The fleet's session-signing key as JSON, under [`SESSION_KEY_ROW`] (RFC-006 §5.3, issue
 /// #185). A one-row table rather than a field on some metadata blob, so it snapshots, installs
 /// and gets cleared through exactly the same code path as every other replicated table, rather
@@ -158,23 +136,23 @@ const SM_FLEET_NAME_TABLE: TableDefinition<&str, &str> = TableDefinition::new("s
 /// The single key `sm_fleet_name` uses, named rather than `()` for the same reason
 /// [`SESSION_KEY_ROW`] is: it reads like the rest of the schema.
 const FLEET_NAME_ROW: &str = "name";
-/// `(tenant, port, space-tag) -> generation` (issue #224): the applied clear-generation
+/// `(port, space-tag) -> generation` (issue #224): the applied clear-generation
 /// counters `ControlOp::JournalClearGen` bumps. A small, monotone, per-key counter table whose
-/// key is three-part: `space-tag` is
+/// key is two-part: `space-tag` is
 /// [`journal_gen_space_key`]'s own encoding of `Option<&str>`, not a bare `&str`, because a
 /// port-wide clear (`None`) must never be representable the same way as a space-scoped one
 /// (`Some`) no matter what the space is named.
-const SM_JOURNAL_GENS_TABLE: TableDefinition<(&str, u16, &str), u64> =
+const SM_JOURNAL_GENS_TABLE: TableDefinition<(u16, &str), u64> =
     TableDefinition::new("sm_journal_gens");
 
-/// `(tenant, port, sig-hash) -> recorded-response JSON` (#226): the applied proxy-recording
+/// `(port, sig-hash) -> recorded-response JSON` (#226): the applied proxy-recording
 /// markers `ControlOp::ProxyRecorded` writes. A row is both facts at once: *this signature is
 /// Recorded* (the claim table any owner — including one elected after a handoff — answers
 /// `AlreadyRecorded` from), and *this is the replayable response* (`lookup()`'s durable source
 /// for a stub-less proxyOnce recording, which has no recorded stub in config to replay from).
 /// Keyed like `sm_journal_gens` minus the space tag: the sig-hash is already a fixed-alphabet
 /// hex string, so no encoding is needed to keep key families apart.
-const SM_PROXY_RECORDED_TABLE: TableDefinition<(&str, u16, &str), &str> =
+const SM_PROXY_RECORDED_TABLE: TableDefinition<(u16, &str), &str> =
     TableDefinition::new("sm_proxy_recorded");
 
 /// What [`place_recorded_stub`] did, carrying exactly what the engine drive needs to
@@ -300,7 +278,7 @@ struct AppliedState {
     logical_clock_secs: u64,
 }
 
-/// What `sm_configs` stores per `(tenant, port)`: the canonical config JSON,
+/// What `sm_configs` stores per port: the canonical config JSON,
 /// whether the imposter is enabled (always `true` until the `SetEnabled` slice
 /// lands with #15), and the log index that last wrote this record.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -324,49 +302,36 @@ struct DedupEntry {
 /// heal would double-apply the intents replayed across it.
 ///
 /// **#549 removed five fields** — `sources`, `specs`, `spec_blobs`, `datasets` and
-/// `dataset_blobs` — along with the tables they carried. Unlike [`ControlOp`], where a
-/// removed variant makes an old log entry undecodable, removing a field here is
-/// *backward*-compatible on its own: this struct sets no `deny_unknown_fields`, so a
-/// payload built before the removal still installs and its five extra keys are dropped —
-/// which is exactly right, because there is no longer a table for those rows to land in.
-/// The removal is still a fleet-wide break overall (the `ControlOp` variants are gone), so
-/// a fleet upgrading across this commit starts from a fresh `cluster-state-dir`; that is a
-/// property of the log, not of this payload.
+/// `dataset_blobs` — and **#550 three more** (`tenants`, `principals`, `bindings`)
+/// along with the tables they carried, and dropped the tenant component from every
+/// surviving row shape. Unlike [`ControlOp`], where a removed variant makes an old log
+/// entry undecodable, removing a field here is *backward*-compatible on its own: this
+/// struct sets no `deny_unknown_fields`, so a payload built before the removal still
+/// parses and its extra keys are dropped — but a **changed tuple arity** is not, and
+/// #550 changed several. The removal is a fleet-wide break overall (the `ControlOp`
+/// variants and their encodings are gone), so a fleet upgrading across this commit
+/// starts from a fresh `cluster-state-dir`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct SnapshotPayload {
-    /// `(tenant, port, stored-imposter JSON)` rows of `sm_configs`.
-    configs: Vec<(String, u16, String)>,
-    /// `(tenant, route id, route JSON)` rows of `sm_routes`. Defaulted so a
-    /// snapshot built before issue #131 still installs cleanly on an upgraded
-    /// node — it just carries no routes, the same as a fleet that never wrote
-    /// any.
+    /// `(port, stored-imposter JSON)` rows of `sm_configs`.
+    configs: Vec<(u16, String)>,
+    /// `(route id, route JSON)` rows of `sm_routes`. Defaulted so a snapshot
+    /// built before issue #131 still installs cleanly on an upgraded node — it
+    /// just carries no routes, the same as a fleet that never wrote any.
     #[serde(default)]
-    routes: Vec<(String, String, String)>,
-    /// `(tenant, revision)` rows of `sm_routes_revision` (issue #210).
+    routes: Vec<(String, String)>,
+    /// The `sm_routes_revision` row (issue #210), absent when no route table has
+    /// ever been written.
     ///
-    /// Defaulted for the same reason `routes` is, and the failure it prevents
-    /// is the one #210 exists to close: a node that installs a snapshot without
-    /// these rows reads every tenant's table as revision 0, so a client holding
-    /// a real token would be *refused* until the next write re-stamps it.
-    /// Annoying, and deliberately the safe direction — a pre-#210 snapshot
-    /// carries no revisions at all, and 0 fails every stale precondition rather
-    /// than passing one. The opposite default (inherit the last applied index)
-    /// would let a token minted before the join silently pass here.
+    /// Defaulted for the same reason `routes` is, and the failure it prevents is
+    /// the one #210 exists to close: a node that installs a snapshot without it
+    /// reads the table as revision 0, so a client holding a real token would be
+    /// *refused* until the next write re-stamps it. Annoying, and deliberately the
+    /// safe direction — `None` fails every stale precondition rather than passing
+    /// one. The opposite default (inherit the last applied index) would let a
+    /// token minted before the join silently pass here.
     #[serde(default)]
-    routes_revisions: Vec<(String, u64)>,
-    /// `(tenant id, Tenant JSON)` rows of `sm_tenants` (issue #159). Defaulted
-    /// for the same reason `routes` is: a pre-#159 snapshot still
-    /// installs, carrying no tenants — a table omitted here is a table that
-    /// vanishes on the next follower catch-up (#134/#137 already taught this
-    /// crate that lesson once).
-    #[serde(default)]
-    tenants: Vec<(String, String)>,
-    /// `(principal id, Principal JSON)` rows of `sm_principals` (issue #159).
-    #[serde(default)]
-    principals: Vec<(String, String)>,
-    /// `(principal id, tenant, Role JSON)` rows of `sm_bindings` (issue #159).
-    #[serde(default)]
-    bindings: Vec<(String, String, String)>,
+    routes_revision: Option<u64>,
     /// The `sm_session_key` row, if a console login has ever minted one (RFC-006 §5.3, issue
     /// #185). `#[serde(default)]` for the #134/#137 reason every table above carries it, and
     /// this is the failure shape if it is ever forgotten here: a node that installs a snapshot without it and then
@@ -384,7 +349,7 @@ struct SnapshotPayload {
     /// "unnamed" until the next rename.
     #[serde(default)]
     fleet_name: Option<String>,
-    /// `(tenant, port, space, generation)` rows of `sm_journal_gens` (issue #224).
+    /// `(port, space, generation)` rows of `sm_journal_gens` (issue #224).
     /// `#[serde(default)]` for the #134/#137 reason every table above carries it: a snapshot
     /// built before this field existed must still install, and the empty vec it decodes to means
     /// exactly what an upgrading fleet's history actually is — no clear has ever committed. The
@@ -392,14 +357,14 @@ struct SnapshotPayload {
     /// that joins by snapshot and reads every generation as `0` would silently resurrect entries
     /// its peers have already agreed are cleared, the very inversion issue #224 exists to close.
     #[serde(default)]
-    journal_gens: Vec<(String, u16, Option<String>, u64)>,
-    /// `(tenant, port, sig-hash, recorded-response JSON)` rows of `sm_proxy_recorded` (#226).
+    journal_gens: Vec<(u16, Option<String>, u64)>,
+    /// `(port, sig-hash, recorded-response JSON)` rows of `sm_proxy_recorded` (#226).
     /// `#[serde(default)]` for the #134/#137 reason every table above carries it. The failure
     /// if it were forgotten: a node that joins by snapshot answers `Claimed` for signatures
     /// the fleet already recorded, and the engine calls the real upstream a second time — the
     /// exact duplicate `proxyOnce` exists to prevent.
     #[serde(default)]
-    proxy_recorded: Vec<(String, u16, String, String)>,
+    proxy_recorded: Vec<(u16, String, String)>,
     /// `(op_id, dedup-entry JSON)` rows of `sm_op_dedup`.
     dedup: Vec<(String, String)>,
     last_applied_log: Option<LogId<u64>>,
@@ -470,9 +435,6 @@ pub async fn new<P: AsRef<Path>>(path: P) -> StorageResult<(RedbLogStore, RedbSt
         write_txn.open_table(SM_CONFIGS_TABLE).map_err(io)?;
         write_txn.open_table(SM_ROUTES_TABLE).map_err(io)?;
         write_txn.open_table(SM_ROUTES_REVISION_TABLE).map_err(io)?;
-        write_txn.open_table(SM_TENANTS_TABLE).map_err(io)?;
-        write_txn.open_table(SM_PRINCIPALS_TABLE).map_err(io)?;
-        write_txn.open_table(SM_BINDINGS_TABLE).map_err(io)?;
         write_txn.open_table(SM_SESSION_KEY_TABLE).map_err(io)?;
         write_txn.open_table(SM_FLEET_NAME_TABLE).map_err(io)?;
         write_txn.open_table(SM_JOURNAL_GENS_TABLE).map_err(io)?;
@@ -1187,8 +1149,8 @@ impl RedbStateMachine {
         Ok(())
     }
 
-    /// Read the applied config JSON for `tenant`'s `port`, or `None` if no
-    /// config has been applied for it.
+    /// Read the applied config JSON for `port`, or `None` if no config has been
+    /// applied for it.
     ///
     /// This is the node's read path: reads answer from the applied state machine
     /// directly and never go through Raft, so a follower or a restarted node can
@@ -1196,7 +1158,7 @@ impl RedbStateMachine {
     /// state machine as `&mut self`, so the node keeps a cheap `Clone` of this
     /// handle (both share one `Arc<Database>`) purely for reads.
     #[allow(clippy::result_large_err)]
-    pub fn read_config(&self, tenant: &str, port: u16) -> StorageResult<Option<String>> {
+    pub fn read_config(&self, port: u16) -> StorageResult<Option<String>> {
         let read_txn = self
             .db
             .begin_read()
@@ -1205,7 +1167,7 @@ impl RedbStateMachine {
             .open_table(SM_CONFIGS_TABLE)
             .map_err(|e| StorageIOError::read_state_machine(&e))?;
         table
-            .get((tenant, port))
+            .get(port)
             .map_err(|e| StorageIOError::read_state_machine(&e))?
             .map(|g| {
                 serde_json::from_str::<StoredImposter>(g.value())
@@ -1215,18 +1177,14 @@ impl RedbStateMachine {
             .transpose()
     }
 
-    /// `(tenant, port)` for every port fleet-wide that currently has an applied
-    /// config, ascending — `redb` iterates `sm_configs` key-ordered
-    /// `(tenant, port)`, so this is tenant-major then port-ascending within
-    /// each tenant.
+    /// Every port fleet-wide that currently has an applied config, ascending —
+    /// `redb` iterates `sm_configs` key-ordered on the port.
     ///
-    /// Fleet-wide and not tenant-scoped on purpose: this backs the operator
-    /// surface `GET /_cluster/config`, which reports what the whole node has
-    /// converged on, not one tenant's view of it. Ports rather than bodies:
-    /// the operator endpoints report *what* the node has converged on, and a
-    /// fleet's full config set is far larger than the answer to that question.
+    /// Ports rather than bodies: this backs the operator surface
+    /// `GET /_cluster/config`, which reports *what* the node has converged on,
+    /// and a fleet's full config set is far larger than the answer to that.
     #[allow(clippy::result_large_err)]
-    pub fn configured_ports(&self) -> StorageResult<Vec<(TenantId, u16)>> {
+    pub fn configured_ports(&self) -> StorageResult<Vec<u16>> {
         let read_txn = self
             .db
             .begin_read()
@@ -1240,24 +1198,23 @@ impl RedbStateMachine {
             .map_err(|e| StorageIOError::read_state_machine(&e))?
         {
             let (key, _) = item.map_err(|e| StorageIOError::read_state_machine(&e))?;
-            let (tenant, port) = key.value();
-            ports.push((TenantId::new(tenant), port));
+            ports.push(key.value());
         }
         Ok(ports)
     }
 
-    /// `tenant`'s route table, as currently applied. Like [`Self::read_config`],
+    /// The route table, as currently applied. Like [`Self::read_config`],
     /// this is the node's own read path — it answers from local durable state
     /// without a Raft round trip. It is also the *only* read path for routes:
     /// upstream has no `GET /front-door/routes` to proxy to (U-11's admin CRUD
     /// was deferred), so `GET /front-door/routes` in the clustered admin front
     /// calls straight through to this.
     #[allow(clippy::result_large_err)]
-    pub fn route_table(&self, tenant: &str) -> StorageResult<RouteTable> {
-        Ok(self.route_table_with_revision(tenant)?.0)
+    pub fn route_table(&self) -> StorageResult<RouteTable> {
+        Ok(self.route_table_with_revision()?.0)
     }
 
-    /// `tenant`'s route table and the revision it is at, read in **one** redb
+    /// The route table and the revision it is at, read in **one** redb
     /// transaction (issue #210).
     ///
     /// One transaction is the whole point, not tidiness: two separate reads
@@ -1268,7 +1225,7 @@ impl RedbStateMachine {
     /// that landed in between. A single read transaction sees one consistent
     /// snapshot and the question does not arise.
     #[allow(clippy::result_large_err)]
-    pub fn route_table_with_revision(&self, tenant: &str) -> StorageResult<(RouteTable, u64)> {
+    pub fn route_table_with_revision(&self) -> StorageResult<(RouteTable, u64)> {
         let read_txn = self
             .db
             .begin_read()
@@ -1276,7 +1233,7 @@ impl RedbStateMachine {
         let revision = read_txn
             .open_table(SM_ROUTES_REVISION_TABLE)
             .map_err(|e| StorageIOError::read_state_machine(&e))?
-            .get(tenant)
+            .get(ROUTES_REVISION_ROW)
             .map_err(|e| StorageIOError::read_state_machine(&e))?
             .map_or(0, |v| v.value());
         let table = read_txn
@@ -1288,10 +1245,7 @@ impl RedbStateMachine {
             .map_err(|e| StorageIOError::read_state_machine(&e))?
         {
             let (key, value) = item.map_err(|e| StorageIOError::read_state_machine(&e))?;
-            let (row_tenant, id) = key.value();
-            if row_tenant != tenant {
-                continue;
-            }
+            let id = key.value();
             match serde_json::from_str::<Route>(value.value()) {
                 Ok(route) => routes.push(route),
                 Err(e) => {
@@ -1308,7 +1262,7 @@ impl RedbStateMachine {
     }
 
     /// The stored revision of one imposter, or `None` when the applied state
-    /// holds no record for `(tenant, port)`.
+    /// holds no record for `port`.
     ///
     /// This is the read half of the single-imposter `If-Match` contract (C5,
     /// issue #188): the front stamps it onto the proxied imposter read so an
@@ -1321,7 +1275,7 @@ impl RedbStateMachine {
     /// read itself (served by the engine) still succeeds, and answering it
     /// with no token merely leaves that imposter unconditionable.
     #[allow(clippy::result_large_err)]
-    pub fn imposter_revision(&self, tenant: &str, port: u16) -> StorageResult<Option<u64>> {
+    pub fn imposter_revision(&self, port: u16) -> StorageResult<Option<u64>> {
         let read_txn = self
             .db
             .begin_read()
@@ -1330,7 +1284,7 @@ impl RedbStateMachine {
             .open_table(SM_CONFIGS_TABLE)
             .map_err(|e| StorageIOError::read_state_machine(&e))?;
         let Some(guard) = table
-            .get((tenant, port))
+            .get(port)
             .map_err(|e| StorageIOError::read_state_machine(&e))?
         else {
             return Ok(None);
@@ -1338,307 +1292,10 @@ impl RedbStateMachine {
         match serde_json::from_str::<StoredImposter>(guard.value()) {
             Ok(stored) => Ok(Some(stored.revision)),
             Err(e) => {
-                tracing::error!(tenant, port, error = %e, "corrupt stored imposter; read carries no revision token");
+                tracing::error!(port, error = %e, "corrupt stored imposter; read carries no revision token");
                 Ok(None)
             }
         }
-    }
-
-    /// The tenant that owns `port`'s applied config, or `None` if no tenant
-    /// has one.
-    ///
-    /// **Not O(1).** `sm_configs` is keyed `(tenant, port)` — tenant-major —
-    /// so there is no index that seeks directly to a port; this is a full
-    /// scan of every applied config fleet-wide, `O(configured ports)`. Ports
-    /// are fleet-unique (RFC-002 §3.2, enforced by
-    /// [`Self::port_claimed_by_another_tenant`]), so at most one row can ever
-    /// match — this stops at the first hit rather than scanning to confirm
-    /// uniqueness.
-    #[allow(clippy::result_large_err)]
-    pub fn owning_tenant(&self, port: u16) -> StorageResult<Option<TenantId>> {
-        let read_txn = self
-            .db
-            .begin_read()
-            .map_err(|e| StorageIOError::read_state_machine(&e))?;
-        let table = read_txn
-            .open_table(SM_CONFIGS_TABLE)
-            .map_err(|e| StorageIOError::read_state_machine(&e))?;
-        for item in table
-            .iter()
-            .map_err(|e| StorageIOError::read_state_machine(&e))?
-        {
-            let (key, _) = item.map_err(|e| StorageIOError::read_state_machine(&e))?;
-            let (tenant, row_port) = key.value();
-            if row_port == port {
-                return Ok(Some(TenantId::new(tenant)));
-            }
-        }
-        Ok(None)
-    }
-
-    /// The principal record for `id`, or `None` if no such principal exists
-    /// (issue #161). Like [`Self::read_config`], this answers from local
-    /// applied state with no Raft round trip — authenticating a request must
-    /// not require this node to be leader.
-    #[allow(clippy::result_large_err)]
-    pub fn principal(&self, id: &str) -> StorageResult<Option<Principal>> {
-        let read_txn = self
-            .db
-            .begin_read()
-            .map_err(|e| StorageIOError::read_state_machine(&e))?;
-        let table = read_txn
-            .open_table(SM_PRINCIPALS_TABLE)
-            .map_err(|e| StorageIOError::read_state_machine(&e))?;
-        table
-            .get(id)
-            .map_err(|e| StorageIOError::read_state_machine(&e))?
-            .map(|g| {
-                serde_json::from_str::<Principal>(g.value()).map_err(|e| {
-                    tracing::error!(principal_id = %id, error = %e, "corrupt stored principal");
-                    StorageError::from(StorageIOError::read_state_machine(&e))
-                })
-            })
-            .transpose()
-    }
-
-    /// Every tenant `id` is bound in, with the role for each (RFC-002 §4,
-    /// issue #161) — the whole-of-request read: authenticate, then load
-    /// *this* principal's bindings, then intersect with what was requested.
-    ///
-    /// `sm_bindings` is keyed principal-major exactly so this can be a single
-    /// seek (see the `TableDefinition`'s doc); this reads the whole table and
-    /// filters instead. A fleet's principal/binding count is nowhere near what
-    /// would make that choice matter — simplicity over the seek this key
-    /// order enables but does not require.
-    #[allow(clippy::result_large_err)]
-    pub fn principal_bindings(&self, id: &str) -> StorageResult<Vec<(TenantId, Role)>> {
-        let read_txn = self
-            .db
-            .begin_read()
-            .map_err(|e| StorageIOError::read_state_machine(&e))?;
-        let table = read_txn
-            .open_table(SM_BINDINGS_TABLE)
-            .map_err(|e| StorageIOError::read_state_machine(&e))?;
-        let mut bindings = Vec::new();
-        for item in table
-            .iter()
-            .map_err(|e| StorageIOError::read_state_machine(&e))?
-        {
-            let (key, value) = item.map_err(|e| StorageIOError::read_state_machine(&e))?;
-            let (principal_id, tenant) = key.value();
-            if principal_id != id {
-                continue;
-            }
-            // A row that will not parse is committed-state corruption, not an
-            // absent binding: reported as an error rather than skipped, or a
-            // principal with a broken row would silently lose access instead
-            // of the operator learning their state is corrupt.
-            let role: Role = serde_json::from_str(value.value()).map_err(|e| {
-                tracing::error!(principal_id = %id, tenant, error = %e, "corrupt stored binding");
-                StorageError::from(StorageIOError::read_state_machine(&e))
-            })?;
-            bindings.push((TenantId::new(tenant), role));
-        }
-        Ok(bindings)
-    }
-
-    /// One tenant record by id, or `None` when no row exists (issue #162).
-    ///
-    /// Tombstones are returned rather than hidden: `GET /admin/tenants/:id`
-    /// reporting `deleted: true` is how an operator learns an id is spent
-    /// rather than free, and hiding it here would make a deleted tenant
-    /// indistinguishable from one that never existed on the one surface whose
-    /// job is to tell them apart.
-    #[allow(clippy::result_large_err)]
-    pub fn tenant(&self, id: &str) -> StorageResult<Option<Tenant>> {
-        let read_txn = self
-            .db
-            .begin_read()
-            .map_err(|e| StorageIOError::read_state_machine(&e))?;
-        let table = read_txn
-            .open_table(SM_TENANTS_TABLE)
-            .map_err(|e| StorageIOError::read_state_machine(&e))?;
-        table
-            .get(id)
-            .map_err(|e| StorageIOError::read_state_machine(&e))?
-            .map(|g| {
-                serde_json::from_str::<Tenant>(g.value()).map_err(|e| {
-                    tracing::error!(tenant = %id, error = %e, "corrupt stored tenant");
-                    StorageError::from(StorageIOError::read_state_machine(&e))
-                })
-            })
-            .transpose()
-    }
-
-    /// Every tenant record, id-ascending, tombstones included (issue #162) —
-    /// what `GET /admin/tenants` reports. Like [`Self::principal`], this
-    /// answers from local applied state and needs no leadership.
-    #[allow(clippy::result_large_err)]
-    pub fn tenants(&self) -> StorageResult<Vec<Tenant>> {
-        let read_txn = self
-            .db
-            .begin_read()
-            .map_err(|e| StorageIOError::read_state_machine(&e))?;
-        let table = read_txn
-            .open_table(SM_TENANTS_TABLE)
-            .map_err(|e| StorageIOError::read_state_machine(&e))?;
-        let mut out = Vec::new();
-        for item in table
-            .iter()
-            .map_err(|e| StorageIOError::read_state_machine(&e))?
-        {
-            let (key, value) = item.map_err(|e| StorageIOError::read_state_machine(&e))?;
-            // Corruption is an error, not a skipped row, for the same reason
-            // `principal_bindings` gives: silently omitting a tenant from the
-            // listing is how an operator concludes it was already deleted.
-            let tenant: Tenant = serde_json::from_str(value.value()).map_err(|e| {
-                tracing::error!(tenant = key.value(), error = %e, "corrupt stored tenant");
-                StorageError::from(StorageIOError::read_state_machine(&e))
-            })?;
-            out.push(tenant);
-        }
-        Ok(out)
-    }
-
-    /// Every tenant's config-table usage (issue #372), in **one** scan of
-    /// `sm_configs` — not one scan per tenant. `GET /admin/tenants` needs every
-    /// listed tenant's usage in the same response, and a per-tenant scan there
-    /// would turn a page of N tenants into N full-table scans (the listing's
-    /// AC7); this builds the whole map from a single pass instead, the same way
-    /// [`Self::desired_configs`] builds its whole engine-desired set from one.
-    ///
-    /// A row that will not parse is skipped for this tenant's usage rather than
-    /// aborting the whole map: unlike [`Self::desired_configs`] (which drives
-    /// the engine and must not silently shrink what it tears down), a usage
-    /// figure is advisory, and one corrupt imposter must not blank out every
-    /// other tenant's numbers. It is still loud — logged at `error` — so the
-    /// corruption itself is not silently lost, and [`TenantConfigUsage::incomplete`]
-    /// carries the fact forward into the response as `Rift-Cluster-Partial`
-    /// rather than letting the skip quietly shrink `imposters`/`max_stubs`
-    /// with nothing to say so. The skip has a second-order effect worth
-    /// naming too: a skipped row's port never reaches `ports`, so that
-    /// imposter's flow entries also vanish from the flow-entry fan-out
-    /// (`FlowNet::fleet_entry_counts` is only ever asked about ports this map
-    /// reports) — one corrupt row understates two figures, not one.
-    #[allow(clippy::result_large_err)]
-    pub fn tenant_config_usage(&self) -> StorageResult<HashMap<String, TenantConfigUsage>> {
-        let read_txn = self
-            .db
-            .begin_read()
-            .map_err(|e| StorageIOError::read_state_machine(&e))?;
-        let table = read_txn
-            .open_table(SM_CONFIGS_TABLE)
-            .map_err(|e| StorageIOError::read_state_machine(&e))?;
-        let mut usage: HashMap<String, TenantConfigUsage> = HashMap::new();
-        for item in table
-            .iter()
-            .map_err(|e| StorageIOError::read_state_machine(&e))?
-        {
-            let (key, value) = item.map_err(|e| StorageIOError::read_state_machine(&e))?;
-            let (tenant, port) = key.value();
-            let stored: StoredImposter = match serde_json::from_str(value.value()) {
-                Ok(stored) => stored,
-                Err(e) => {
-                    tracing::error!(tenant, port, error = %e, "corrupt stored imposter; excluded from usage");
-                    usage.entry(tenant.to_owned()).or_default().incomplete = true;
-                    continue;
-                }
-            };
-            let config: ImposterConfig = match serde_json::from_str(&stored.config_json) {
-                Ok(config) => config,
-                Err(e) => {
-                    tracing::error!(tenant, port, error = %e, "corrupt stored config; excluded from usage");
-                    usage.entry(tenant.to_owned()).or_default().incomplete = true;
-                    continue;
-                }
-            };
-            let entry = usage.entry(tenant.to_owned()).or_default();
-            entry.imposters = entry.imposters.saturating_add(1);
-            let stubs = u32::try_from(config.stubs.len()).unwrap_or(u32::MAX);
-            entry.max_stubs = entry.max_stubs.max(stubs);
-            entry.ports.push(port);
-        }
-        Ok(usage)
-    }
-
-    /// Every principal bound to `tenant`, with the role each holds there,
-    /// principal-id-ascending (issue #162) — what
-    /// `GET /admin/tenants/:id/principals` reports.
-    ///
-    /// This is the listing `sm_bindings`' principal-major key order pays for
-    /// with a full scan (see its `TableDefinition`'s doc): the trade is
-    /// deliberate, because the per-request direction — one principal's
-    /// bindings — is the one that had to stay a single seek.
-    ///
-    /// A binding naming a principal with no `sm_principals` row is impossible
-    /// through the ops (`PrincipalDelete` cascades its bindings away, and
-    /// `PrincipalCreate` writes both rows in one revision), so one found here
-    /// is committed-state corruption and is reported as an error rather than
-    /// skipped — a silently-dropped row would hide exactly the inconsistency
-    /// worth knowing about.
-    #[allow(clippy::result_large_err)]
-    pub fn tenant_principals(&self, tenant: &str) -> StorageResult<Vec<(Principal, Role)>> {
-        let read_txn = self
-            .db
-            .begin_read()
-            .map_err(|e| StorageIOError::read_state_machine(&e))?;
-        let bindings = read_txn
-            .open_table(SM_BINDINGS_TABLE)
-            .map_err(|e| StorageIOError::read_state_machine(&e))?;
-        let principals = read_txn
-            .open_table(SM_PRINCIPALS_TABLE)
-            .map_err(|e| StorageIOError::read_state_machine(&e))?;
-        let mut out = Vec::new();
-        for item in bindings
-            .iter()
-            .map_err(|e| StorageIOError::read_state_machine(&e))?
-        {
-            let (key, value) = item.map_err(|e| StorageIOError::read_state_machine(&e))?;
-            let (principal_id, bound_tenant) = key.value();
-            if bound_tenant != tenant {
-                continue;
-            }
-            let role: Role = serde_json::from_str(value.value()).map_err(|e| {
-                tracing::error!(principal_id, tenant, error = %e, "corrupt stored binding");
-                StorageError::from(StorageIOError::read_state_machine(&e))
-            })?;
-            let guard = principals
-                .get(principal_id)
-                .map_err(|e| StorageIOError::read_state_machine(&e))?
-                .ok_or_else(|| {
-                    tracing::error!(principal_id, tenant, "binding names an absent principal");
-                    StorageError::from(StorageIOError::read_state_machine(&std::io::Error::other(
-                        format!("binding names principal {principal_id:?}, which has no record"),
-                    )))
-                })?;
-            let principal: Principal = serde_json::from_str(guard.value()).map_err(|e| {
-                tracing::error!(principal_id, error = %e, "corrupt stored principal");
-                StorageError::from(StorageIOError::read_state_machine(&e))
-            })?;
-            out.push((principal, role));
-        }
-        Ok(out)
-    }
-
-    /// Whether the fleet has any principal defined at all (RFC-002 §3.4).
-    /// Governs the legacy-admin-plane bypass and the `rift_cluster_no_principals`
-    /// gauge: presence is presence regardless of whether a given row happens
-    /// to parse, so a corrupt row still counts — the wrong answer here is
-    /// "false" (it would silently reopen the pre-#161 open admin plane on a
-    /// fleet that in fact has principals).
-    #[allow(clippy::result_large_err)]
-    pub fn has_any_principals(&self) -> StorageResult<bool> {
-        let read_txn = self
-            .db
-            .begin_read()
-            .map_err(|e| StorageIOError::read_state_machine(&e))?;
-        let table = read_txn
-            .open_table(SM_PRINCIPALS_TABLE)
-            .map_err(|e| StorageIOError::read_state_machine(&e))?;
-        let mut iter = table
-            .iter()
-            .map_err(|e| StorageIOError::read_state_machine(&e))?;
-        Ok(iter.next().is_some())
     }
 
     /// Last engine side-effect failure per port (0 = set-level), as recorded by
@@ -1683,8 +1340,8 @@ impl RedbStateMachine {
     ///
     /// This gap is real, not defensive: a `PutImposter` whose bind fails still commits and still
     /// reads back (`bind_failure_does_not_fail_apply`), by design — a bind failure must not wedge
-    /// the replicated log. So a committed config proves the *record* is this tenant's and proves
-    /// nothing whatever about who is listening on that port.
+    /// the replicated log. So a committed config proves the *record* exists and proves nothing
+    /// whatever about who is listening on that port.
     #[must_use]
     pub fn is_locally_bound(&self, port: u16) -> bool {
         self.engine.as_ref().is_some_and(|engine| {
@@ -1741,9 +1398,9 @@ impl RedbStateMachine {
     ///
     /// A single in-memory pass over [`ImposterManager::list_imposters`], not a redb transaction:
     /// `/_cluster/members` (and therefore `/_fleet/members`) used to derive this from
-    /// `configured_ports`, a redb read transaction scanning the fleet-wide `SM_CONFIGS` table and
-    /// allocating a `TenantId` per row — turning a 5-second console poll, fanned out to every peer,
-    /// into an O(all imposters in the fleet) table scan on every node. The engine already holds
+    /// `configured_ports`, a redb read transaction scanning the fleet-wide `SM_CONFIGS` table —
+    /// turning a 5-second console poll, fanned out to every peer, into an O(all imposters in the
+    /// fleet) table scan on every node. The engine already holds
     /// exactly the set this needs, in memory, so this walks that instead.
     ///
     /// The same narrowing [`Self::bind_failure`] documents applies per port: a port the engine
@@ -2026,7 +1683,7 @@ impl RedbStateMachine {
                 .map_err(|e| StorageIOError::read_state_machine(&e))?
             {
                 let (key, value) = item.map_err(|e| StorageIOError::read_state_machine(&e))?;
-                let (_tenant, port, space_key) = key.value();
+                let (port, space_key) = key.value();
                 // `set_clear_gen`, not `reset_clear_gen`: this is priming a journal that starts
                 // at 0, not correcting one that may be ahead the way a snapshot install must —
                 // the monotone guard is harmless here and keeps this call sharing the apply
@@ -2045,70 +1702,13 @@ impl RedbStateMachine {
     /// Test-only: overwrite a raw `sm_configs` row, bypassing validation — the
     /// broken-record refusal path is unreachable through the public API.
     #[cfg(test)]
-    fn inject_raw_config(&self, tenant: &str, port: u16, value: &str) {
+    fn inject_raw_config(&self, port: u16, value: &str) {
         let txn = self.db.begin_write().expect("test txn");
         {
             let mut table = txn.open_table(SM_CONFIGS_TABLE).expect("test table");
-            table.insert((tenant, port), value).expect("test insert");
+            table.insert(port, value).expect("test insert");
         }
         txn.commit().expect("test commit");
-    }
-
-    /// Test-only: the raw `sm_configs` row for an arbitrary `(tenant, port)` —
-    /// unlike [`Self::read_config`], which only ever answers for
-    /// [`DEFAULT_TENANT`], this is what issue #159's cross-tenant tests need.
-    #[cfg(test)]
-    fn raw_config_row(&self, tenant: &str, port: u16) -> Option<String> {
-        let txn = self.db.begin_read().expect("test txn");
-        let table = txn.open_table(SM_CONFIGS_TABLE).expect("test table");
-        table
-            .get((tenant, port))
-            .expect("test get")
-            .map(|g| g.value().to_owned())
-    }
-
-    /// Test-only: the raw `sm_routes` row for an arbitrary `(tenant, id)`.
-    #[cfg(test)]
-    fn raw_route_row(&self, tenant: &str, id: &str) -> Option<String> {
-        let txn = self.db.begin_read().expect("test txn");
-        let table = txn.open_table(SM_ROUTES_TABLE).expect("test table");
-        table
-            .get((tenant, id))
-            .expect("test get")
-            .map(|g| g.value().to_owned())
-    }
-
-    /// Test-only: the parsed `sm_tenants` row for `id`.
-    #[cfg(test)]
-    fn test_tenant(&self, id: &str) -> Option<Tenant> {
-        let txn = self.db.begin_read().expect("test txn");
-        let table = txn.open_table(SM_TENANTS_TABLE).expect("test table");
-        table
-            .get(id)
-            .expect("test get")
-            .map(|g| serde_json::from_str(g.value()).expect("tenant row parses"))
-    }
-
-    /// Test-only: the parsed `sm_principals` row for `id`.
-    #[cfg(test)]
-    fn test_principal_row(&self, id: &str) -> Option<Principal> {
-        let txn = self.db.begin_read().expect("test txn");
-        let table = txn.open_table(SM_PRINCIPALS_TABLE).expect("test table");
-        table
-            .get(id)
-            .expect("test get")
-            .map(|g| serde_json::from_str(g.value()).expect("principal row parses"))
-    }
-
-    /// Test-only: the parsed `sm_bindings` row for `(principal_id, tenant)`.
-    #[cfg(test)]
-    fn test_binding(&self, principal_id: &str, tenant: &str) -> Option<Role> {
-        let txn = self.db.begin_read().expect("test txn");
-        let table = txn.open_table(SM_BINDINGS_TABLE).expect("test table");
-        table
-            .get((principal_id, tenant))
-            .expect("test get")
-            .map(|g| serde_json::from_str(g.value()).expect("role row parses"))
     }
 
     /// Remove dedup entries whose TTL has passed relative to `now_secs` — the
@@ -2194,7 +1794,7 @@ impl RedbStateMachine {
     /// # Errors
     /// Storage I/O.
     #[allow(clippy::result_large_err)]
-    pub fn journal_gen(&self, tenant: &str, port: u16, space: Option<&str>) -> StorageResult<u64> {
+    pub fn journal_gen(&self, port: u16, space: Option<&str>) -> StorageResult<u64> {
         let read_txn = self
             .db
             .begin_read()
@@ -2204,12 +1804,12 @@ impl RedbStateMachine {
             .map_err(|e| StorageIOError::read_state_machine(&e))?;
         let space_key = journal_gen_space_key(space);
         Ok(table
-            .get((tenant, port, space_key.as_str()))
+            .get((port, space_key.as_str()))
             .map_err(|e| StorageIOError::read_state_machine(&e))?
             .map_or(0, |v| v.value()))
     }
 
-    /// The applied proxy-recording marker for `(tenant, port, sig_hash)` (#226): the
+    /// The applied proxy-recording marker for `(port, sig_hash)` (#226): the
     /// recorded-response JSON `ControlOp::ProxyRecorded` committed, or `None` when the
     /// signature has never been recorded (or was cleared). Local durable state — any node
     /// answers without leadership, which is what lets a post-handoff owner say
@@ -2218,12 +1818,7 @@ impl RedbStateMachine {
     /// # Errors
     /// Storage I/O.
     #[allow(clippy::result_large_err)]
-    pub fn proxy_recorded_resp(
-        &self,
-        tenant: &str,
-        port: u16,
-        sig_hash: &str,
-    ) -> StorageResult<Option<String>> {
+    pub fn proxy_recorded_resp(&self, port: u16, sig_hash: &str) -> StorageResult<Option<String>> {
         let read_txn = self
             .db
             .begin_read()
@@ -2232,36 +1827,28 @@ impl RedbStateMachine {
             .open_table(SM_PROXY_RECORDED_TABLE)
             .map_err(|e| StorageIOError::read_state_machine(&e))?;
         Ok(table
-            .get((tenant, port, sig_hash))
+            .get((port, sig_hash))
             .map_err(|e| StorageIOError::read_state_machine(&e))?
             .map(|v| v.value().to_owned()))
     }
 
     /// The desired engine state as of now, read from an open (possibly
-    /// mid-transaction) view of `sm_configs`: every tenant's config, unioned —
+    /// mid-transaction) view of `sm_configs`: every applied config,
     /// parsed — disabled ones included (a paused imposter stays bound, #817).
-    ///
-    /// Union rather than default-tenant-only: ports are fleet-unique across
-    /// tenants (RFC-002 §3.2, enforced by [`Self::port_claimed_by_another_tenant`]),
-    /// so one shared `ImposterManager` can bind every tenant's imposters with
-    /// no collision — there is nothing tenant-specific for the engine to key
-    /// on.
     ///
     /// `Ok(Err((port, reason)))` means a stored record failed to parse. That
     /// must abort the sync, not shrink it: `apply_config` deletes every live
     /// imposter missing from the desired set, so silently skipping a broken
     /// record would tear down a healthy imposter and report it as an
     /// operator-issued delete. The caller refuses the sync and records the
-    /// failure instead — the engine keeps serving its last-known state. This
-    /// still holds with the union: a broken record in *any* tenant aborts the
-    /// whole sync, exactly as it did when only the default tenant was read.
+    /// failure instead — the engine keeps serving its last-known state.
     fn desired_configs(
-        table: &impl ReadableTable<(&'static str, u16), &'static str>,
+        table: &impl ReadableTable<u16, &'static str>,
     ) -> Result<Result<Vec<ImposterConfig>, (u16, String)>, redb::StorageError> {
         let mut desired = Vec::new();
         for item in table.iter()? {
             let (key, value) = item?;
-            let (_tenant, port) = key.value();
+            let port = key.value();
             let stored = match serde_json::from_str::<StoredImposter>(value.value()) {
                 Ok(stored) => stored,
                 Err(e) => {
@@ -2284,9 +1871,7 @@ impl RedbStateMachine {
     /// Build the engine action for a config op: a full sync when every stored
     /// record parses, a recorded refusal when one does not.
     #[allow(clippy::result_large_err)]
-    fn sync_action(
-        configs: &Table<'_, (&'static str, u16), &'static str>,
-    ) -> StorageResult<EngineAction> {
+    fn sync_action(configs: &Table<'_, u16, &'static str>) -> StorageResult<EngineAction> {
         let io =
             |e: redb::StorageError| StorageError::from(StorageIOError::write_state_machine(&e));
         Ok(match Self::desired_configs(configs).map_err(io)? {
@@ -2296,47 +1881,25 @@ impl RedbStateMachine {
     }
 
     /// The desired route table as of now, read from an open (possibly
-    /// mid-transaction) view of `sm_routes`: the **default tenant's** routes only.
+    /// mid-transaction) view of `sm_routes`.
     ///
-    /// Deliberately NOT the union, unlike [`Self::desired_configs`] — and the asymmetry is the
-    /// point, so it is spelled out here rather than left to be "fixed" later.
-    ///
-    /// Imposters can be unioned safely because a request names the resource it wants: a port is
-    /// fleet-unique (RFC-002 §3.2), so binding every tenant's ports into one engine is collision-
-    /// free and each request resolves to exactly one owner. **Front-door routes have no such
-    /// discriminator.** The front door is a single listener and an arriving data-plane request
-    /// carries no tenant identity — RFC-002 §7 keeps that plane open and anonymous on purpose — so
-    /// a unioned table is one shared *matching* namespace that every tenant writes into.
-    ///
-    /// Concretely, unioning here would let any principal holding `imposter.write` in any tenant
-    /// publish `{"match": {}, "priority": i32::MAX}` — an empty match is an explicitly legal
-    /// catch-all and the priority is unbounded — and capture **100% of front-door traffic
-    /// fleet-wide**. That is a denial of service against every other tenant, and where the target
-    /// names another tenant's now-bound port, a public read of its mocks. Constraining
-    /// `RouteTarget.port` to the writing tenant's own ports does not fix it: the shadowing lives in
-    /// the match, not the target.
-    ///
-    /// So routes stay default-only until the front door has a tenant dimension to route on (a host
-    /// mapping, a listener per tenant, or an explicit per-tenant prefix). Tenanted routes are still
-    /// *stored*, and [`Self::route_table`] reads them back per tenant so a tenant sees what it
-    /// wrote — they are simply not compiled into the shared front door.
+    /// **Every stored route is compiled in.** Before #550 this filtered to the default
+    /// tenant's routes, because the front door is a single listener with no tenant
+    /// discriminator and a unioned table would have let any tenant publish a catch-all
+    /// that captured the whole fleet's traffic (D-68). With one fleet-wide table there is
+    /// nothing to filter and nobody to shadow: what is stored is what dispatches, which is
+    /// why D-68's `installed` field went with tenancy.
     ///
     /// `Ok(Err((id, reason)))` means a stored record failed to parse — this
     /// crate is the only writer of `sm_routes`, so it should never happen in
     /// practice, but the read path stays defensive rather than trusting that.
     fn desired_routes(
-        table: &impl ReadableTable<(&'static str, &'static str), &'static str>,
+        table: &impl ReadableTable<&'static str, &'static str>,
     ) -> Result<Result<RouteTable, (String, String)>, redb::StorageError> {
         let mut routes = Vec::new();
         for item in table.iter()? {
             let (key, value) = item?;
-            let (tenant, id) = key.value();
-            // The rule itself lives in `routes_installed_for`, which the admin plane's hit read
-            // also calls — so what is compiled here and what the console reports as installed are
-            // the same decision, not two copies of it (issue #368).
-            if !routes_installed_for(tenant) {
-                continue;
-            }
+            let id = key.value();
             match serde_json::from_str::<Route>(value.value()) {
                 Ok(route) => routes.push(route),
                 Err(e) => {
@@ -2354,7 +1917,7 @@ impl RedbStateMachine {
     /// record parses, a recorded refusal when one does not.
     #[allow(clippy::result_large_err)]
     fn sync_routes_action(
-        routes: &Table<'_, (&'static str, &'static str), &'static str>,
+        routes: &Table<'_, &'static str, &'static str>,
     ) -> StorageResult<EngineAction> {
         let io =
             |e: redb::StorageError| StorageError::from(StorageIOError::write_state_machine(&e));
@@ -2378,7 +1941,7 @@ impl RedbStateMachine {
     /// not a revision conflict and must not read as one.
     #[allow(clippy::result_large_err)]
     fn check_expected_revision(
-        configs: &Table<'_, (&'static str, u16), &'static str>,
+        configs: &Table<'_, u16, &'static str>,
         routes_revision: &Table<'_, &'static str, u64>,
         op: &ControlOp,
         expected: u64,
@@ -2393,34 +1956,32 @@ impl RedbStateMachine {
             ));
         };
         match target {
-            PreconditionTarget::Imposter(tenant, port) => {
-                match configs.get((tenant.as_str(), port)).map_err(io)? {
-                    None => Ok(Err(format!(
-                        "revision conflict: expected revision {expected} but no imposter on port \
+            PreconditionTarget::Imposter(port) => match configs.get(port).map_err(io)? {
+                None => Ok(Err(format!(
+                    "revision conflict: expected revision {expected} but no imposter on port \
                          {port}"
-                    ))),
-                    Some(guard) => match serde_json::from_str::<StoredImposter>(guard.value()) {
-                        Ok(record) if record.revision == expected => Ok(Ok(())),
-                        Ok(record) => Ok(Err(format!(
-                            "revision conflict: expected revision {expected}, stored revision \
+                ))),
+                Some(guard) => match serde_json::from_str::<StoredImposter>(guard.value()) {
+                    Ok(record) if record.revision == expected => Ok(Ok(())),
+                    Ok(record) => Ok(Err(format!(
+                        "revision conflict: expected revision {expected}, stored revision \
                              {actual} on port {port}",
-                            actual = record.revision
-                        ))),
-                        Err(e) => {
-                            tracing::error!(port, error = %e, "corrupt stored record");
-                            Ok(Err(format!("corrupt stored record for port {port}: {e}")))
-                        }
-                    },
-                }
-            }
-            // A tenant with no row has never had its table written: revision 0
-            // (issue #210). Absence is a real revision here, not a missing
-            // record — unlike the imposter arm above, where there is nothing to
-            // condition on at all — so it compares rather than refuses, and a
-            // client that conditions on 0 and writes first legitimately wins.
-            PreconditionTarget::RouteTable(tenant) => {
+                        actual = record.revision
+                    ))),
+                    Err(e) => {
+                        tracing::error!(port, error = %e, "corrupt stored record");
+                        Ok(Err(format!("corrupt stored record for port {port}: {e}")))
+                    }
+                },
+            },
+            // No row means the table has never been written: revision 0 (issue
+            // #210). Absence is a real revision here, not a missing record —
+            // unlike the imposter arm above, where there is nothing to condition
+            // on at all — so it compares rather than refuses, and a client that
+            // conditions on 0 and writes first legitimately wins.
+            PreconditionTarget::RouteTable => {
                 let actual = routes_revision
-                    .get(tenant.as_str())
+                    .get(ROUTES_REVISION_ROW)
                     .map_err(io)?
                     .map_or(0, |v| v.value());
                 if actual == expected {
@@ -2435,209 +1996,20 @@ impl RedbStateMachine {
         }
     }
 
-    /// The stored [`Tenant`] record at `id`, or `None` when there is none.
-    ///
-    /// A record that will not parse is treated as `None`: the callers here use it to decide
-    /// whether a tenant exists, and every replica holds the same bad bytes, so refusing
-    /// deterministically (as "unknown tenant") is safe — it can never diverge
-    /// two replicas' apply of the same committed op.
-    #[allow(clippy::result_large_err)]
-    /// `Ok(Ok(None))` is "no such tenant"; `Ok(Err(reason))` is a corrupt row.
-    ///
-    /// The two must not collapse into one answer. A corrupt row is not an
-    /// absent one: the tenant's configs, routes and bindings are all
-    /// still live, so treating it as missing makes `TenantDelete` skip the
-    /// entire cascade and report `Applied` — the operator is told the tenant is
-    /// gone while its imposters keep serving. Surfacing it as a committed
-    /// refusal matches how `check_expected_revision` already treats a record it
-    /// cannot parse, and is deterministic: every replica holds the same bytes.
-    #[allow(clippy::result_large_err)]
-    fn stored_tenant(
-        tenants: &Table<'_, &'static str, &'static str>,
-        id: &str,
-    ) -> StorageResult<Result<Option<Tenant>, String>> {
-        let io =
-            |e: redb::StorageError| StorageError::from(StorageIOError::write_state_machine(&e));
-        let Some(guard) = tenants.get(id).map_err(io)? else {
-            return Ok(Ok(None));
-        };
-        match serde_json::from_str::<Tenant>(guard.value()) {
-            Ok(stored) => Ok(Ok(Some(stored))),
-            Err(e) => {
-                tracing::error!(tenant = id, error = %e, "corrupt stored tenant");
-                Ok(Err(format!(
-                    "stored tenant {id:?} cannot be read: its record is corrupt"
-                )))
-            }
-        }
-    }
-
-    /// The tenant's quotas: [`Quotas::default`] when it has **no** stored
-    /// record, and a committed refusal when the record exists but will not parse
-    /// (issue #163).
-    ///
-    /// The two cases are deliberately not the same, and conflating them is a
-    /// fail-open:
-    ///
-    /// - **No record** is a domain value, not an error. `default` has no stored
-    ///   row on a fresh cluster (nothing writes one), so a fleet that never
-    ///   configured tenancy must not find every write refused because an absent
-    ///   record read as a quota of nothing. The *generous* default is correct.
-    /// - **A corrupt record** is a gate that cannot read what it is gating.
-    ///   Answering `Quotas::default()` there would hand the tenant the generous
-    ///   ceiling precisely when the operator's real — possibly much tighter —
-    ///   one became unreadable, and nothing downstream would notice: a quota is
-    ///   a resource gate, and a gate that cannot classify its input must treat
-    ///   it as the dangerous class. So it refuses, the same way `TenantDelete`
-    ///   already refuses against an unreadable row.
-    ///
-    /// An earlier version of this defended the fail-open by claiming
-    /// `require_live_tenant` had already refused corruption upstream. It had
-    /// not: that helper is called only from the `PrincipalPut` /
-    /// `PrincipalCreate` / `BindingPut` arms, and *neither* caller of this
-    /// function — `PutImposter` via [`Self::quota_refusal_for_config`], or
-    /// `PatchStubs` directly — goes through it.
-    #[allow(clippy::result_large_err)]
-    fn quotas_for(
-        tenants: &Table<'_, &'static str, &'static str>,
-        tenant: &str,
-    ) -> StorageResult<Result<Quotas, String>> {
-        Ok(match Self::stored_tenant(tenants, tenant)? {
-            Err(reason) => Err(format!(
-                "tenant {tenant:?} has an unreadable record, so its quota cannot \
-                 be checked: {reason}"
-            )),
-            Ok(None) => Ok(Quotas::default()),
-            Ok(Some(record)) => Ok(record.quotas),
-        })
-    }
-
-    /// `Some(reason)` when committing `config` on `port` would put `tenant`
-    /// over a ceiling (RFC-002 §4.4, issue #163).
-    ///
-    /// Two ceilings apply. `max_stubs_per_imposter` is a property of the
-    /// payload alone. `max_imposters` counts what the tenant already holds —
-    /// and counts it **excluding `port`**, because replacing an existing
-    /// imposter does not add one; without that, a tenant sitting exactly at its
-    /// limit could never update anything it already owned.
-    #[allow(clippy::result_large_err)]
-    fn quota_refusal_for_config(
-        configs: &Table<'_, (&'static str, u16), &'static str>,
-        tenants: &Table<'_, &'static str, &'static str>,
-        tenant: &str,
-        port: u16,
-        config: &ImposterConfig,
-    ) -> StorageResult<Option<String>> {
-        let quotas = match Self::quotas_for(tenants, tenant)? {
-            Ok(quotas) => quotas,
-            Err(reason) => return Ok(Some(reason)),
-        };
-        let stubs = config.stubs.len();
-        if stubs > quotas.max_stubs_per_imposter as usize {
-            return Ok(Some(format!(
-                "tenant {tenant:?} allows at most {} stubs per imposter; this config carries {stubs}",
-                quotas.max_stubs_per_imposter
-            )));
-        }
-        let mut held = 0u32;
-        for item in configs
-            .iter()
-            .map_err(|e| StorageError::from(StorageIOError::write_state_machine(&e)))?
-        {
-            let (key, _) =
-                item.map_err(|e| StorageError::from(StorageIOError::write_state_machine(&e)))?;
-            let (stored_tenant, stored_port) = key.value();
-            if stored_tenant == tenant && stored_port != port {
-                held = held.saturating_add(1);
-            }
-        }
-        if held >= quotas.max_imposters {
-            return Ok(Some(format!(
-                "tenant {tenant:?} is at its ceiling of {} imposters",
-                quotas.max_imposters
-            )));
-        }
-        Ok(None)
-    }
-
-    /// `Err` when `tenant` names no live tenant record — used by every op that
-    /// addresses an *existing* tenant rather than creating one
-    /// (`PrincipalPut`, `BindingPut` against an ordinary tenant). A deleted
-    /// tenant reads the same as a missing one: its tombstone (`deleted:
-    /// true`) exists so the id's history survives, not so new state can still
-    /// be attached to it.
-    #[allow(clippy::result_large_err)]
-    fn require_live_tenant(
-        tenants: &Table<'_, &'static str, &'static str>,
-        tenant: &str,
-    ) -> StorageResult<Result<(), String>> {
-        // `default` is live by definition, with or without a stored row.
-        // Nothing ever writes one on a fresh cluster (there is no bootstrap
-        // `TenantPut`), and `validate` refuses to delete it — so requiring a
-        // row here would make `PrincipalPut { tenant: "default" }` fail on
-        // every new cluster until someone thought to create the tenant that
-        // the rest of the code already treats as always-present.
-        if tenant == DEFAULT_TENANT {
-            return Ok(Ok(()));
-        }
-        Ok(match Self::stored_tenant(tenants, tenant)? {
-            // A corrupt row keeps its own reason: "unknown" would send an
-            // operator looking for a tenant that is present but unreadable.
-            Err(reason) => Err(reason),
-            Ok(Some(t)) if !t.deleted => Ok(()),
-            Ok(_) => Err(format!("unknown tenant {tenant:?}")),
-        })
-    }
-
-    /// Whether `port` is already claimed by a tenant other than `tenant`.
-    ///
-    /// Ports are fleet-unique across tenants (RFC-002 §3.2): `sm_configs` is
-    /// keyed `(tenant, port)`, so nothing at the table level stops two
-    /// tenants from claiming the same port, and this full scan is the check
-    /// that stands in for it. Called by `PutImposter` — every replicated
-    /// imposter write reaches the log through that one op (D-72), so one check
-    /// covers them all. A re-write from the
-    /// *same* tenant that already owns the port is an upsert, not a
-    /// collision, and this returns `false` for it.
-    #[allow(clippy::result_large_err)]
-    fn port_claimed_by_another_tenant(
-        configs: &Table<'_, (&'static str, u16), &'static str>,
-        tenant: &str,
-        port: u16,
-    ) -> StorageResult<bool> {
-        let io =
-            |e: redb::StorageError| StorageError::from(StorageIOError::write_state_machine(&e));
-        for item in configs.iter().map_err(io)? {
-            let (key, _) = item.map_err(io)?;
-            let (owner, p) = key.value();
-            if p == port && owner != tenant {
-                return Ok(true);
-            }
-        }
-        Ok(false)
-    }
-
-    /// Mutate `sm_configs` for one validated op and return the engine actions it
-    /// implies. `Ok(Err(reason))` is a deterministic domain refusal (recorded as
-    /// a `Failed` outcome); `Err(_)` is real storage I/O and fails apply.
-    ///
-    /// The metric gauges set here fire before the batch's commit; they are
-    /// observe-only (never inputs to any decision), and an apply that fails
-    /// after them is fatal to the node — the process-local registry dies with
-    /// the process that briefly over-reported.
-    #[allow(clippy::result_large_err)]
+    // Six table handles plus the journal, the op and the index: every one is a distinct piece
+    // of the apply transaction, and grouping them into a struct would only move the arity.
     #[allow(clippy::too_many_arguments)]
+    // `StorageError` is openraft's, carried here because this is the apply path openraft's
+    // storage contract expects. Same reason as the other sites in this file.
+    #[allow(clippy::result_large_err)]
     fn mutate_tables(
-        configs: &mut Table<'_, (&'static str, u16), &'static str>,
-        routes: &mut Table<'_, (&'static str, &'static str), &'static str>,
+        configs: &mut Table<'_, u16, &'static str>,
+        routes: &mut Table<'_, &'static str, &'static str>,
         routes_revision: &mut Table<'_, &'static str, u64>,
-        tenants: &mut Table<'_, &'static str, &'static str>,
-        principals: &mut Table<'_, &'static str, &'static str>,
-        bindings: &mut Table<'_, (&'static str, &'static str), &'static str>,
         session_key: &mut Table<'_, &'static str, &'static str>,
         fleet_name: &mut Table<'_, &'static str, &'static str>,
-        journal_gens: &mut Table<'_, (&'static str, u16, &'static str), u64>,
-        proxy_recorded: &mut Table<'_, (&'static str, u16, &'static str), &'static str>,
+        journal_gens: &mut Table<'_, (u16, &'static str), u64>,
+        proxy_recorded: &mut Table<'_, (u16, &'static str), &'static str>,
         // The local journal to push a committed generation into (issue #224), resolved once by
         // `apply` rather than upgraded per op — `None` in storage tests, on an embedder that
         // never wires one, or when a shutdown race has already dropped it (see the `journal`
@@ -2645,45 +2017,17 @@ impl RedbStateMachine {
         journal: Option<&ClusterJournal>,
         op: &ControlOp,
         index: u64,
-        issued_at_secs: u64,
     ) -> StorageResult<Result<Vec<EngineAction>, String>> {
         let io =
             |e: redb::StorageError| StorageError::from(StorageIOError::write_state_machine(&e));
         match op {
-            ControlOp::PutImposter { tenant, config } => {
+            ControlOp::PutImposter { config } => {
                 // `validate` guaranteed the port; a missing one here means a
                 // caller skipped validation, and a deterministic refusal is the
                 // safe answer.
                 let Some(port) = config.port else {
                     return Ok(Err("config must carry an explicit port".to_owned()));
                 };
-                // Ports are fleet-unique across tenants (RFC-002 §3.2). The
-                // reason is named as the port only, never the other tenant:
-                // naming it would turn this refusal into a cross-tenant
-                // enumeration oracle (RFC-002 §8.4) — an operator could probe
-                // ports to learn which tenants exist and what they run. Do not
-                // "improve" this message; it is deliberately incomplete.
-                if Self::port_claimed_by_another_tenant(configs, tenant.as_str(), port)? {
-                    return Ok(Err(format!("port {port} is already bound in this fleet")));
-                }
-                // Quotas (RFC-002 §4.4, issue #163). Checked here, at apply, on
-                // every replica — not pre-commit at the leader.
-                //
-                // The issue says "enforced at the Raft leader", meaning: in the
-                // one place that sees the tenant's whole write stream, rather
-                // than in a handler counting its own node's view (which
-                // over-commits under concurrent writes). Apply satisfies that
-                // and one thing leader-side validation cannot: a refusal here
-                // is a *committed* decision, so all three nodes record the same
-                // `Failed` outcome at the same revision — which is what the
-                // acceptance criteria actually demand, and what makes the
-                // refusal discoverable through `op_status` after a parked
-                // replay.
-                if let Some(reason) =
-                    Self::quota_refusal_for_config(configs, tenants, tenant.as_str(), port, config)?
-                {
-                    return Ok(Err(reason));
-                }
                 let config_json = serde_json::to_string(config)
                     .map_err(|e| StorageIOError::write_state_machine(&e))?;
                 let stored = StoredImposter {
@@ -2693,25 +2037,21 @@ impl RedbStateMachine {
                 };
                 let value = serde_json::to_string(&stored)
                     .map_err(|e| StorageIOError::write_state_machine(&e))?;
-                configs
-                    .insert((tenant.as_str(), port), value.as_str())
-                    .map_err(io)?;
+                configs.insert(port, value.as_str()).map_err(io)?;
                 // A replace is a new imposter in the recording sense (#226): the old
                 // config's recorded stubs are gone from the stub list this put installs,
                 // and a surviving marker row would answer `AlreadyRecorded` with the *old*
                 // upstream's response — so the markers die with the config they described,
                 // exactly as they do on `DeleteImposter`.
-                proxy_recorded
-                    .retain(|(t, p, _), _| !(t == tenant.as_str() && p == port))
-                    .map_err(io)?;
+                proxy_recorded.retain(|(p, _), _| p != port).map_err(io)?;
                 crate::metrics::config_applied(port, index);
                 Ok(Ok(vec![Self::sync_action(configs)?]))
             }
-            ControlOp::PatchStubs { tenant, port, edit } => {
+            ControlOp::PatchStubs { port, edit } => {
                 // Block-scoped so the read guard's borrow of `configs` ends
                 // before the insert below.
                 let mut record: StoredImposter = {
-                    match configs.get((tenant.as_str(), *port)).map_err(io)? {
+                    match configs.get(*port).map_err(io)? {
                         None => return Ok(Err(format!("no imposter on port {port}"))),
                         Some(guard) => match serde_json::from_str(guard.value()) {
                             Ok(record) => record,
@@ -2734,81 +2074,48 @@ impl RedbStateMachine {
                 if let Err(reason) = control::apply_edit(&mut config.stubs, edit) {
                     return Ok(Err(reason));
                 }
-                // The per-imposter stub ceiling, checked on the *result* of the
-                // edit rather than on the edit script: a script is a sequence of
-                // adds, moves and deletes, so only the config it produces knows
-                // how many stubs the imposter ends up with. `max_imposters` is
-                // not re-checked — a patch edits an imposter that already
-                // exists and cannot add one.
-                let quotas = match Self::quotas_for(tenants, tenant.as_str())? {
-                    Ok(quotas) => quotas,
-                    Err(reason) => return Ok(Err(reason)),
-                };
-                if config.stubs.len() > quotas.max_stubs_per_imposter as usize {
-                    return Ok(Err(format!(
-                        "tenant {:?} allows at most {} stubs per imposter; this edit would leave {}",
-                        tenant.as_str(),
-                        quotas.max_stubs_per_imposter,
-                        config.stubs.len()
-                    )));
-                }
                 record.config_json = serde_json::to_string(&config)
                     .map_err(|e| StorageIOError::write_state_machine(&e))?;
                 record.revision = index;
                 let value = serde_json::to_string(&record)
                     .map_err(|e| StorageIOError::write_state_machine(&e))?;
-                configs
-                    .insert((tenant.as_str(), *port), value.as_str())
-                    .map_err(io)?;
+                configs.insert(*port, value.as_str()).map_err(io)?;
                 crate::metrics::config_applied(*port, index);
                 Ok(Ok(vec![EngineAction::Patch {
                     port: *port,
                     edit: edit.clone(),
                 }]))
             }
-            ControlOp::DeleteImposter { tenant, port } => {
+            ControlOp::DeleteImposter { port } => {
                 // Removing an absent port is a no-op, not a failure: deletes are
                 // idempotent at the state-machine level (the admin-surface 404
                 // for a missing imposter is the write path's concern).
-                configs.remove((tenant.as_str(), *port)).map_err(io)?;
+                configs.remove(*port).map_err(io)?;
                 // Recordings die with their imposter (#226) — the clustered mirror of the
                 // manager's own port-reclaim `clear`, and atomic with the delete here.
-                proxy_recorded
-                    .retain(|(t, p, _), _| !(t == tenant.as_str() && p == *port))
-                    .map_err(io)?;
+                proxy_recorded.retain(|(p, _), _| p != *port).map_err(io)?;
                 crate::metrics::config_removed(*port);
                 Ok(Ok(vec![Self::sync_action(configs)?]))
             }
-            ControlOp::DeleteAll { tenant } => {
-                let tenant = tenant.as_str();
+            ControlOp::DeleteAll => {
                 let removed: Vec<u16> = {
                     let mut removed = Vec::new();
                     for item in configs.iter().map_err(io)? {
                         let (key, _value) = item.map_err(io)?;
-                        let (t, port) = key.value();
-                        if t != tenant {
-                            continue;
-                        }
-                        removed.push(port);
+                        removed.push(key.value());
                     }
                     removed
                 };
-                configs.retain(|(t, _), _| t != tenant).map_err(io)?;
-                proxy_recorded
-                    .retain(|(t, _, _), _| t != tenant)
-                    .map_err(io)?;
+                configs.retain(|_, _| false).map_err(io)?;
+                proxy_recorded.retain(|_, _| false).map_err(io)?;
                 for port in removed {
                     crate::metrics::config_removed(port);
                 }
                 Ok(Ok(vec![Self::sync_action(configs)?]))
             }
-            ControlOp::SetEnabled {
-                tenant,
-                port,
-                enabled,
-            } => {
+            ControlOp::SetEnabled { port, enabled } => {
                 let mut record: StoredImposter = {
-                    match configs.get((tenant.as_str(), *port)).map_err(io)? {
+                    match configs.get(*port).map_err(io)? {
                         None => return Ok(Err(format!("no imposter on port {port}"))),
                         Some(guard) => match serde_json::from_str(guard.value()) {
                             Ok(record) => record,
@@ -2839,237 +2146,50 @@ impl RedbStateMachine {
                 record.revision = index;
                 let value = serde_json::to_string(&record)
                     .map_err(|e| StorageIOError::write_state_machine(&e))?;
-                configs
-                    .insert((tenant.as_str(), *port), value.as_str())
-                    .map_err(io)?;
+                configs.insert(*port, value.as_str()).map_err(io)?;
                 crate::metrics::config_applied(*port, index);
                 Ok(Ok(vec![EngineAction::SetEnabled {
                     port: *port,
                     enabled: *enabled,
                 }]))
             }
-            ControlOp::PutRoutes { tenant, table } => {
-                // Whole-table replace: clear this tenant's rows, then insert
+            ControlOp::PutRoutes { table } => {
+                // Whole-table replace: clear every row, then insert
                 // the validated set. `validate` already confirmed the table
                 // as a unit, so there is nothing left to check here — only to
                 // store, deterministically, on every replica.
-                let tenant_str = tenant.as_str();
-                routes.retain(|(t, _), _| t != tenant_str).map_err(io)?;
+                routes.retain(|_, _| false).map_err(io)?;
                 for route in &table.routes {
                     let value = serde_json::to_string(route)
                         .map_err(|e| StorageIOError::write_state_machine(&e))?;
                     routes
-                        .insert((tenant_str, route.id.as_str()), value.as_str())
+                        .insert(route.id.as_str(), value.as_str())
                         .map_err(io)?;
                 }
                 // The applying log index, so the stamp is the same on every
                 // replica and is exactly the revision the front reports back to
                 // the client that caused it (issue #210).
-                routes_revision.insert(tenant_str, index).map_err(io)?;
+                routes_revision
+                    .insert(ROUTES_REVISION_ROW, index)
+                    .map_err(io)?;
                 Ok(Ok(vec![Self::sync_routes_action(routes)?]))
             }
-            ControlOp::DeleteRoute { tenant, id } => {
+            ControlOp::DeleteRoute { id } => {
                 // Idempotent no-op if absent, like `DeleteImposter` — the
                 // admin-surface 404 for a missing route (if the operator
                 // wants one) is the write path's concern, not apply's.
-                routes.remove((tenant.as_str(), id.as_str())).map_err(io)?;
+                routes.remove(id.as_str()).map_err(io)?;
                 // Stamped even when the remove found nothing: the revision is
                 // the table's, and this op *committed* against that table, so
                 // an outstanding precondition must not survive it (issue #210).
                 // Making the stamp conditional on the row's existence would
                 // make the revision depend on state the client cannot see.
-                routes_revision.insert(tenant.as_str(), index).map_err(io)?;
+                routes_revision
+                    .insert(ROUTES_REVISION_ROW, index)
+                    .map_err(io)?;
                 Ok(Ok(vec![Self::sync_routes_action(routes)?]))
             }
-            ControlOp::TenantPut {
-                tenant,
-                display_name,
-                quotas,
-                journal_retention_secs,
-            } => {
-                let tenant_str = tenant.as_str();
-                // An upsert preserves `created_at_secs` and clears any
-                // tombstone: recreating a previously-deleted tenant id is
-                // allowed (ids are not permanently burned — only `"default"`
-                // is protected, and `validate` refuses to delete it at all).
-                let created_at_secs = match Self::stored_tenant(tenants, tenant_str)? {
-                    // Refuse rather than silently re-stamp: overwriting an
-                    // unreadable row would destroy the only copy of whatever
-                    // it held and reset the tenant's age to now.
-                    Err(reason) => return Ok(Err(reason)),
-                    Ok(Some(existing)) => existing.created_at_secs,
-                    Ok(None) => issued_at_secs,
-                };
-                let record = Tenant {
-                    id: tenant.clone(),
-                    display_name: display_name.clone(),
-                    quotas: quotas.clone(),
-                    created_at_secs,
-                    deleted: false,
-                    journal_retention_secs: *journal_retention_secs,
-                };
-                let value = serde_json::to_string(&record)
-                    .map_err(|e| StorageIOError::write_state_machine(&e))?;
-                tenants.insert(tenant_str, value.as_str()).map_err(io)?;
-                Ok(Ok(Vec::new()))
-            }
-            ControlOp::TenantDelete { tenant } => {
-                let tenant_str = tenant.as_str();
-                let mut record = match Self::stored_tenant(tenants, tenant_str)? {
-                    // Corrupt is NOT absent. The tenant's configs, routes and
-                    // bindings are all still live, so answering
-                    // `Applied` here would report a deletion that never
-                    // happened and leave its imposters serving traffic.
-                    Err(reason) => return Ok(Err(reason)),
-                    // Deleting a tenant that was never created is idempotent,
-                    // like every other delete in this match.
-                    Ok(None) => return Ok(Ok(Vec::new())),
-                    Ok(Some(record)) => record,
-                };
-                if record.deleted {
-                    return Ok(Ok(Vec::new()));
-                }
-                // The cascade runs *before* the tombstone write, inside the
-                // same write transaction as everything else here: a tenant
-                // deleted but still holding configs or routes would be
-                // resources no principal can administer (nothing can bind to
-                // a deleted tenant) — a single committed op is what keeps
-                // "tombstoned" and "cleaned up" from ever being observed
-                // apart, on any replica.
-                configs.retain(|(t, _), _| t != tenant_str).map_err(io)?;
-                routes.retain(|(t, _), _| t != tenant_str).map_err(io)?;
-                // Bindings cascade too, and this one is a security property
-                // rather than tidiness. A tombstoned id may be recreated (the
-                // tombstone records that it existed, it does not reserve it),
-                // plausibly by a different operator for a different customer.
-                // Bindings left behind would make every one of the old
-                // tenant's principals live again the moment the name is
-                // reused — privilege resurrection across an ownership change,
-                // and unfixable afterwards because the rows are already
-                // committed to the log.
-                bindings.retain(|(_, t), _| t != tenant_str).map_err(io)?;
-                record.deleted = true;
-                let value = serde_json::to_string(&record)
-                    .map_err(|e| StorageIOError::write_state_machine(&e))?;
-                tenants.insert(tenant_str, value.as_str()).map_err(io)?;
-                Ok(Ok(vec![
-                    Self::sync_action(configs)?,
-                    Self::sync_routes_action(routes)?,
-                ]))
-            }
-            ControlOp::PrincipalPut { tenant, principal } => {
-                if let Err(reason) = Self::require_live_tenant(tenants, tenant.as_str())? {
-                    return Ok(Err(reason));
-                }
-                let value = serde_json::to_string(principal)
-                    .map_err(|e| StorageIOError::write_state_machine(&e))?;
-                principals
-                    .insert(principal.id.as_str(), value.as_str())
-                    .map_err(io)?;
-                Ok(Ok(Vec::new()))
-            }
-            // Both rows, one transaction, one revision (issue #162). Every
-            // arm in this match already runs inside the apply's single write
-            // txn, so writing the principal and its binding here is atomic by
-            // construction — that is precisely why this is one op rather than
-            // the caller submitting two.
-            ControlOp::PrincipalCreate {
-                tenant,
-                principal,
-                role,
-            } => {
-                if let Err(reason) = Self::require_live_tenant(tenants, tenant.as_str())? {
-                    return Ok(Err(reason));
-                }
-                let principal_value = serde_json::to_string(principal)
-                    .map_err(|e| StorageIOError::write_state_machine(&e))?;
-                let role_value = serde_json::to_string(role)
-                    .map_err(|e| StorageIOError::write_state_machine(&e))?;
-                principals
-                    .insert(principal.id.as_str(), principal_value.as_str())
-                    .map_err(io)?;
-                bindings
-                    .insert(
-                        (principal.id.as_str(), tenant.as_str()),
-                        role_value.as_str(),
-                    )
-                    .map_err(io)?;
-                Ok(Ok(Vec::new()))
-            }
-            // `tenant` addresses no stored record here — `sm_principals` is
-            // fleet-wide, keyed by principal id alone (see its
-            // `TableDefinition`'s doc) — so, like every other delete in this
-            // match, removing an absent principal is idempotent.
-            ControlOp::PrincipalDelete {
-                tenant: _,
-                principal_id,
-            } => {
-                principals.remove(principal_id.as_str()).map_err(io)?;
-                // The principal's bindings go with it. A principal id can be
-                // an external value — an OIDC `subject`, an mTLS SAN — and
-                // identity providers do recycle those, so orphaned bindings
-                // would hand a *different* human every role the previous
-                // holder of the name had, the moment the id is re-created.
-                // This is the read the principal-major key order exists for:
-                // a prefix range under `(principal_id, ..)` rather than a scan.
-                bindings
-                    .retain(|(p, _), _| p != principal_id.as_str())
-                    .map_err(io)?;
-                Ok(Ok(Vec::new()))
-            }
-            ControlOp::BindingPut {
-                tenant,
-                principal_id,
-                role,
-            } => {
-                // The fleet scope is never a stored tenant row (`validate`
-                // already limited it to `Role::FleetAdmin` bindings only), so
-                // there is nothing to look up for it.
-                if tenant.as_str() != FLEET_SCOPE
-                    && let Err(reason) = Self::require_live_tenant(tenants, tenant.as_str())?
-                {
-                    return Ok(Err(reason));
-                }
-                // The principal must exist. Before #162 this op was reachable
-                // only through `RaftNode::submit`, so a binding naming nothing
-                // was a fixture mistake; the admin surface now exposes it to
-                // any tenant admin, where a mistyped id would durably and
-                // replicatedly commit a binding with no principal behind it.
-                //
-                // That is not merely untidy: `tenant_principals` resolves every
-                // binding to its principal to answer
-                // `GET /admin/tenants/:id/principals`, and a row it cannot
-                // resolve is committed-state corruption it reports as an error
-                // — so one typo would permanently 500 the very listing an
-                // operator would use to find and remove it.
-                //
-                // Enforced here, at the write, rather than tolerated at the
-                // read: skipping an unresolvable row in the listing would hide
-                // a binding that really does grant access, which is the worse
-                // failure of the two.
-                if principals.get(principal_id.as_str()).map_err(io)?.is_none() {
-                    return Ok(Err(format!(
-                        "unknown principal {:?}: a binding must name a principal that exists",
-                        principal_id.as_str()
-                    )));
-                }
-                let value = serde_json::to_string(role)
-                    .map_err(|e| StorageIOError::write_state_machine(&e))?;
-                bindings
-                    .insert((principal_id.as_str(), tenant.as_str()), value.as_str())
-                    .map_err(io)?;
-                Ok(Ok(Vec::new()))
-            }
-            ControlOp::BindingDelete {
-                tenant,
-                principal_id,
-            } => {
-                bindings
-                    .remove((principal_id.as_str(), tenant.as_str()))
-                    .map_err(io)?;
-                Ok(Ok(Vec::new()))
-            }
-            ControlOp::SessionKeyPut { key, .. } => {
+            ControlOp::SessionKeyPut { key } => {
                 // Overwrites unconditionally: minting the *first* key and rotating an existing
                 // one are the same op (RFC-006 §5.3), and the record's `revision` — stamped from
                 // this apply's log index, not carried in the op — is what `session::verify`
@@ -3087,7 +2207,7 @@ impl RedbStateMachine {
                     .map_err(io)?;
                 Ok(Ok(Vec::new()))
             }
-            ControlOp::FleetNamePut { name, .. } => {
+            ControlOp::FleetNamePut { name } => {
                 // Overwrites unconditionally, same reasoning as `SessionKeyPut` above: setting
                 // the first name and renaming are one op, so the second write must replace the
                 // first outright rather than accumulate — a fleet with two names is exactly the
@@ -3097,18 +2217,14 @@ impl RedbStateMachine {
                     .map_err(io)?;
                 Ok(Ok(Vec::new()))
             }
-            ControlOp::JournalClearGen {
-                tenant,
-                port,
-                space,
-            } => {
-                // Tenant-exists / port-ownership are deliberately not checked here — see
+            ControlOp::JournalClearGen { port, space } => {
+                // Whether an imposter exists on `port` is deliberately not checked here — see
                 // `validate`'s doc for this op. A clear is a convergence primitive, not a config
                 // write: it must succeed even against a port nothing has configured yet, the
                 // same way `ClusterJournal::set_clear_gen` creates the shard on first touch
                 // rather than refusing an unknown one.
                 let space_key = journal_gen_space_key(space.as_deref());
-                let key = (tenant.as_str(), *port, space_key.as_str());
+                let key = (*port, space_key.as_str());
                 // Apply *increments* rather than storing a value the submitter chose (see the
                 // op's own doc on `ControlOp::JournalClearGen`): two clears racing from two
                 // different leaders both take effect, composing to +2 — harmlessly stronger than
@@ -3142,7 +2258,6 @@ impl RedbStateMachine {
                 Ok(Ok(Vec::new()))
             }
             ControlOp::ProxyRecorded {
-                tenant,
                 port,
                 sig_hash,
                 resp,
@@ -3155,7 +2270,7 @@ impl RedbStateMachine {
                 // (`AfterProxyMerging`) is the opposite contract: the same signature
                 // commits once per proxied request, and the merge below is the point.
                 let already_recorded = proxy_recorded
-                    .get((tenant.as_str(), *port, sig_hash.as_str()))
+                    .get((*port, sig_hash.as_str()))
                     .map_err(io)?
                     .is_some();
                 let merging = stub.as_ref().is_some_and(|recorded| {
@@ -3170,7 +2285,7 @@ impl RedbStateMachine {
                 // recording racing a concurrent `DeleteImposter` must not re-insert a marker
                 // after the delete's purge, or a later imposter on the same port would
                 // wrongly answer `AlreadyRecorded` with the dead imposter's response.
-                if configs.get((tenant.as_str(), *port)).map_err(io)?.is_none() {
+                if configs.get(*port).map_err(io)?.is_none() {
                     return Ok(Err(format!("no imposter on port {port}")));
                 }
 
@@ -3178,16 +2293,13 @@ impl RedbStateMachine {
                     // Stub-less recording (no predicate generators): the row alone is the
                     // durable replay source `lookup()` answers from.
                     proxy_recorded
-                        .insert(
-                            (tenant.as_str(), *port, sig_hash.as_str()),
-                            resp_json.as_str(),
-                        )
+                        .insert((*port, sig_hash.as_str()), resp_json.as_str())
                         .map_err(io)?;
                     return Ok(Ok(Vec::new()));
                 };
 
                 let mut record: StoredImposter = {
-                    match configs.get((tenant.as_str(), *port)).map_err(io)? {
+                    match configs.get(*port).map_err(io)? {
                         None => return Ok(Err(format!("no imposter on port {port}"))),
                         Some(guard) => match serde_json::from_str(guard.value()) {
                             Ok(record) => record,
@@ -3220,35 +2332,17 @@ impl RedbStateMachine {
                     recorded.placement,
                     &recorded.proxy_to,
                 );
-                let quotas = match Self::quotas_for(tenants, tenant.as_str())? {
-                    Ok(quotas) => quotas,
-                    Err(reason) => return Ok(Err(reason)),
-                };
-                if config.stubs.len() > quotas.max_stubs_per_imposter as usize {
-                    return Ok(Err(format!(
-                        "tenant {:?} allows at most {} stubs per imposter; this recording would \
-                         leave {}",
-                        tenant.as_str(),
-                        quotas.max_stubs_per_imposter,
-                        config.stubs.len()
-                    )));
-                }
                 record.config_json = serde_json::to_string(&config)
                     .map_err(|e| StorageIOError::write_state_machine(&e))?;
                 record.revision = index;
                 let value = serde_json::to_string(&record)
                     .map_err(|e| StorageIOError::write_state_machine(&e))?;
-                configs
-                    .insert((tenant.as_str(), *port), value.as_str())
-                    .map_err(io)?;
+                configs.insert(*port, value.as_str()).map_err(io)?;
                 // Both facts land in this one apply transaction — the marker row is written
                 // only alongside the stub mutation, so "recorded but stub-less" is
                 // unrepresentable by construction (#226).
                 proxy_recorded
-                    .insert(
-                        (tenant.as_str(), *port, sig_hash.as_str()),
-                        resp_json.as_str(),
-                    )
+                    .insert((*port, sig_hash.as_str()), resp_json.as_str())
                     .map_err(io)?;
                 crate::metrics::config_applied(*port, index);
                 let action = match placed {
@@ -3273,13 +2367,11 @@ impl RedbStateMachine {
                 };
                 Ok(Ok(vec![action]))
             }
-            ControlOp::ProxyRecordedClear { tenant, port } => {
+            ControlOp::ProxyRecordedClear { port } => {
                 // Clearing an empty table is a no-op, not a failure — idempotent like every
                 // delete here. Recorded *stubs* stay: they are imposter config, deleted
                 // through the stub-edit surfaces (#226's documented split).
-                proxy_recorded
-                    .retain(|(t, p, _), _| !(t == tenant.as_str() && p == *port))
-                    .map_err(io)?;
+                proxy_recorded.retain(|(p, _), _| p != *port).map_err(io)?;
                 Ok(Ok(Vec::new()))
             }
         }
@@ -3564,10 +2656,7 @@ impl RedbStateMachine {
         let (
             configs,
             routes,
-            routes_revisions,
-            tenants,
-            principals,
-            bindings,
+            routes_revision,
             session_key,
             fleet_name,
             journal_gens,
@@ -3587,8 +2676,7 @@ impl RedbStateMachine {
                 .map_err(|e| StorageIOError::read_state_machine(&e))?
             {
                 let (key, value) = item.map_err(|e| StorageIOError::read_state_machine(&e))?;
-                let (tenant, port) = key.value();
-                configs.push((tenant.to_owned(), port, value.value().to_owned()));
+                configs.push((key.value(), value.value().to_owned()));
             }
             let routes_table = read_txn
                 .open_table(SM_ROUTES_TABLE)
@@ -3599,61 +2687,17 @@ impl RedbStateMachine {
                 .map_err(|e| StorageIOError::read_state_machine(&e))?
             {
                 let (key, value) = item.map_err(|e| StorageIOError::read_state_machine(&e))?;
-                let (tenant, id) = key.value();
-                routes.push((tenant.to_owned(), id.to_owned(), value.value().to_owned()));
+                routes.push((key.value().to_owned(), value.value().to_owned()));
             }
             // Travels with the routes themselves (issue #210). Omitting it
-            // would not lose data, but it would silently reset every tenant's
-            // table to revision 0 on the joining node — see the field's doc.
-            let routes_revision_table = read_txn
+            // would not lose data, but it would silently reset the table to
+            // revision 0 on the joining node — see the field's doc.
+            let routes_revision = read_txn
                 .open_table(SM_ROUTES_REVISION_TABLE)
-                .map_err(|e| StorageIOError::read_state_machine(&e))?;
-            let mut routes_revisions = Vec::new();
-            for item in routes_revision_table
-                .iter()
                 .map_err(|e| StorageIOError::read_state_machine(&e))?
-            {
-                let (key, value) = item.map_err(|e| StorageIOError::read_state_machine(&e))?;
-                routes_revisions.push((key.value().to_owned(), value.value()));
-            }
-            let tenants_table = read_txn
-                .open_table(SM_TENANTS_TABLE)
-                .map_err(|e| StorageIOError::read_state_machine(&e))?;
-            let mut tenants = Vec::new();
-            for item in tenants_table
-                .iter()
+                .get(ROUTES_REVISION_ROW)
                 .map_err(|e| StorageIOError::read_state_machine(&e))?
-            {
-                let (key, value) = item.map_err(|e| StorageIOError::read_state_machine(&e))?;
-                tenants.push((key.value().to_owned(), value.value().to_owned()));
-            }
-            let principals_table = read_txn
-                .open_table(SM_PRINCIPALS_TABLE)
-                .map_err(|e| StorageIOError::read_state_machine(&e))?;
-            let mut principals = Vec::new();
-            for item in principals_table
-                .iter()
-                .map_err(|e| StorageIOError::read_state_machine(&e))?
-            {
-                let (key, value) = item.map_err(|e| StorageIOError::read_state_machine(&e))?;
-                principals.push((key.value().to_owned(), value.value().to_owned()));
-            }
-            let bindings_table = read_txn
-                .open_table(SM_BINDINGS_TABLE)
-                .map_err(|e| StorageIOError::read_state_machine(&e))?;
-            let mut bindings = Vec::new();
-            for item in bindings_table
-                .iter()
-                .map_err(|e| StorageIOError::read_state_machine(&e))?
-            {
-                let (key, value) = item.map_err(|e| StorageIOError::read_state_machine(&e))?;
-                let (principal_id, tenant) = key.value();
-                bindings.push((
-                    principal_id.to_owned(),
-                    tenant.to_owned(),
-                    value.value().to_owned(),
-                ));
-            }
+                .map(|v| v.value());
             // Travels with the snapshot like every other replicated table, with a sharp
             // failure if it did not: a follower that installs without it and then wins an
             // election either has no key to sign a login with (if none had ever been minted) or,
@@ -3688,13 +2732,8 @@ impl RedbStateMachine {
                 .map_err(|e| StorageIOError::read_state_machine(&e))?
             {
                 let (key, value) = item.map_err(|e| StorageIOError::read_state_machine(&e))?;
-                let (tenant, port, space_key) = key.value();
-                journal_gens.push((
-                    tenant.to_owned(),
-                    port,
-                    decode_journal_gen_space_key(space_key),
-                    value.value(),
-                ));
+                let (port, space_key) = key.value();
+                journal_gens.push((port, decode_journal_gen_space_key(space_key), value.value()));
             }
             // Travels with the snapshot for the #134/#137 reason every table above does. The
             // #226-specific failure if forgotten: a snapshot-joined node answers `Claimed`
@@ -3708,13 +2747,8 @@ impl RedbStateMachine {
                 .map_err(|e| StorageIOError::read_state_machine(&e))?
             {
                 let (key, value) = item.map_err(|e| StorageIOError::read_state_machine(&e))?;
-                let (tenant, port, sig_hash) = key.value();
-                proxy_recorded.push((
-                    tenant.to_owned(),
-                    port,
-                    sig_hash.to_owned(),
-                    value.value().to_owned(),
-                ));
+                let (port, sig_hash) = key.value();
+                proxy_recorded.push((port, sig_hash.to_owned(), value.value().to_owned()));
             }
             let dedup_table = read_txn
                 .open_table(SM_DEDUP_TABLE)
@@ -3730,10 +2764,7 @@ impl RedbStateMachine {
             (
                 configs,
                 routes,
-                routes_revisions,
-                tenants,
-                principals,
-                bindings,
+                routes_revision,
                 session_key,
                 fleet_name,
                 journal_gens,
@@ -3745,10 +2776,7 @@ impl RedbStateMachine {
         let payload = SnapshotPayload {
             configs,
             routes,
-            routes_revisions,
-            tenants,
-            principals,
-            bindings,
+            routes_revision,
             session_key,
             fleet_name,
             journal_gens,
@@ -3825,15 +2853,6 @@ impl RaftStateMachine<TypeConfig> for RedbStateMachine {
             let mut routes_revision = write_txn
                 .open_table(SM_ROUTES_REVISION_TABLE)
                 .map_err(|e| StorageIOError::write_state_machine(&e))?;
-            let mut tenants = write_txn
-                .open_table(SM_TENANTS_TABLE)
-                .map_err(|e| StorageIOError::write_state_machine(&e))?;
-            let mut principals = write_txn
-                .open_table(SM_PRINCIPALS_TABLE)
-                .map_err(|e| StorageIOError::write_state_machine(&e))?;
-            let mut bindings = write_txn
-                .open_table(SM_BINDINGS_TABLE)
-                .map_err(|e| StorageIOError::write_state_machine(&e))?;
             let mut session_key = write_txn
                 .open_table(SM_SESSION_KEY_TABLE)
                 .map_err(|e| StorageIOError::write_state_machine(&e))?;
@@ -3902,9 +2921,6 @@ impl RaftStateMachine<TypeConfig> for RedbStateMachine {
                                         &mut configs,
                                         &mut routes,
                                         &mut routes_revision,
-                                        &mut tenants,
-                                        &mut principals,
-                                        &mut bindings,
                                         &mut session_key,
                                         &mut fleet_name,
                                         &mut journal_gens,
@@ -3912,16 +2928,12 @@ impl RaftStateMachine<TypeConfig> for RedbStateMachine {
                                         journal.as_deref(),
                                         &request.op,
                                         log_id.index,
-                                        applied.logical_clock_secs,
                                     )?,
                                 },
                                 None => Self::mutate_tables(
                                     &mut configs,
                                     &mut routes,
                                     &mut routes_revision,
-                                    &mut tenants,
-                                    &mut principals,
-                                    &mut bindings,
                                     &mut session_key,
                                     &mut fleet_name,
                                     &mut journal_gens,
@@ -3929,7 +2941,6 @@ impl RaftStateMachine<TypeConfig> for RedbStateMachine {
                                     journal.as_deref(),
                                     &request.op,
                                     log_id.index,
-                                    applied.logical_clock_secs,
                                 )?,
                             },
                         };
@@ -4171,9 +3182,9 @@ impl RedbStateMachine {
             configs_table
                 .retain(|_, _| false)
                 .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
-            for (tenant, port, value) in &payload.configs {
+            for (port, value) in &payload.configs {
                 configs_table
-                    .insert((tenant.as_str(), *port), value.as_str())
+                    .insert(*port, value.as_str())
                     .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
             }
             let mut routes_table = write_txn
@@ -4182,9 +3193,9 @@ impl RedbStateMachine {
             routes_table
                 .retain(|_, _| false)
                 .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
-            for (tenant, id, value) in &payload.routes {
+            for (id, value) in &payload.routes {
                 routes_table
-                    .insert((tenant.as_str(), id.as_str()), value.as_str())
+                    .insert(id.as_str(), value.as_str())
                     .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
             }
             let routes_action = match Self::desired_routes(&routes_table)
@@ -4195,18 +3206,18 @@ impl RedbStateMachine {
             };
 
             // Cleared before repopulating, like every table above: a payload
-            // carrying no revision for a tenant means the fleet holds none, and
-            // leaving this node's stale row would let a token this node minted
-            // before the install keep passing against a table it no longer has.
+            // carrying no revision means the fleet holds none, and leaving this
+            // node's stale row would let a token this node minted before the
+            // install keep passing against a table it no longer has.
             let mut routes_revision_table = write_txn
                 .open_table(SM_ROUTES_REVISION_TABLE)
                 .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
             routes_revision_table
                 .retain(|_, _| false)
                 .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
-            for (tenant, revision) in &payload.routes_revisions {
+            if let Some(revision) = payload.routes_revision {
                 routes_revision_table
-                    .insert(tenant.as_str(), *revision)
+                    .insert(ROUTES_REVISION_ROW, revision)
                     .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
             }
 
@@ -4216,42 +3227,6 @@ impl RedbStateMachine {
                 Ok(desired) => EngineAction::Sync(desired),
                 Err((port, error)) => EngineAction::RefuseSync { port, error },
             };
-
-            let mut tenants_table = write_txn
-                .open_table(SM_TENANTS_TABLE)
-                .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
-            tenants_table
-                .retain(|_, _| false)
-                .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
-            for (id, value) in &payload.tenants {
-                tenants_table
-                    .insert(id.as_str(), value.as_str())
-                    .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
-            }
-
-            let mut principals_table = write_txn
-                .open_table(SM_PRINCIPALS_TABLE)
-                .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
-            principals_table
-                .retain(|_, _| false)
-                .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
-            for (id, value) in &payload.principals {
-                principals_table
-                    .insert(id.as_str(), value.as_str())
-                    .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
-            }
-
-            let mut bindings_table = write_txn
-                .open_table(SM_BINDINGS_TABLE)
-                .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
-            bindings_table
-                .retain(|_, _| false)
-                .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
-            for (principal_id, tenant, value) in &payload.bindings {
-                bindings_table
-                    .insert((principal_id.as_str(), tenant.as_str()), value.as_str())
-                    .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
-            }
 
             // Cleared before it is repopulated, exactly like the tables above: a payload carrying
             // no key means no console login has ever minted one on the leader, and leaving a stale local
@@ -4297,10 +3272,10 @@ impl RedbStateMachine {
             journal_gens_table
                 .retain(|_, _| false)
                 .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
-            for (tenant, port, space, generation) in &payload.journal_gens {
+            for (port, space, generation) in &payload.journal_gens {
                 let space_key = journal_gen_space_key(space.as_deref());
                 journal_gens_table
-                    .insert((tenant.as_str(), *port, space_key.as_str()), *generation)
+                    .insert((*port, space_key.as_str()), *generation)
                     .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
             }
 
@@ -4314,9 +3289,9 @@ impl RedbStateMachine {
             proxy_recorded_table
                 .retain(|_, _| false)
                 .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
-            for (tenant, port, sig_hash, resp) in &payload.proxy_recorded {
+            for (port, sig_hash, resp) in &payload.proxy_recorded {
                 proxy_recorded_table
-                    .insert((tenant.as_str(), *port, sig_hash.as_str()), resp.as_str())
+                    .insert((*port, sig_hash.as_str()), resp.as_str())
                     .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
             }
 
@@ -4360,18 +3335,15 @@ impl RedbStateMachine {
         // generations are durable in `sm_journal_gens` regardless of whether anything is
         // listening on the other end right now.
         if let Some(journal) = self.journal.get().and_then(Weak::upgrade) {
-            // `ClusterJournal` itself is tenant-oblivious (it always has been — see its own
-            // module doc: entries key on `(node_id, seq, clear_gen)`, nothing tenant-shaped), so
-            // only `port`/`space`/`generation` travel across this boundary; `tenant` stays behind
-            // in `sm_journal_gens`, which is the source of truth `journal_gen` reads back from.
-            //
+            // `ClusterJournal` keys entries on `(node_id, seq, clear_gen)` — see its own module
+            // doc — so
             // `reset_clear_gen`, not `set_clear_gen` (Non-blocker 1): the durable table was just
             // cleared and reinserted from this exact payload, unconditionally, because a
             // generation this node still held could be higher than what the fleet now agrees on
             // — `set_clear_gen`'s `fetch_max` cannot lower to match, and leaving it high would
             // let one node's forgotten-but-not-really clear silently win the fleet-wide max a
             // merge computes, dropping every other node's entries.
-            for (_tenant, port, space, generation) in &payload.journal_gens {
+            for (port, space, generation) in &payload.journal_gens {
                 journal.reset_clear_gen(*port, space.as_deref(), *generation);
             }
         }
@@ -4452,8 +3424,7 @@ mod tests {
     };
     use redb::{ReadableDatabase, ReadableTable, TableDefinition};
 
-    use super::{SESSION_KEY_ROW, SM_PRINCIPALS_TABLE, SM_SESSION_KEY_TABLE};
-    use crate::control::hash_api_key;
+    use super::{SESSION_KEY_ROW, SM_SESSION_KEY_TABLE};
     use rift_cluster_base::seams::{
         CompiledRoutes, ImposterConfig, ImposterManager, RecordedRequest, RequestJournal,
         ResponseMode, Route, RouteMatch, RouteTable, RouteTarget,
@@ -4462,13 +3433,9 @@ mod tests {
     use tempfile::TempDir;
     use uuid::Uuid;
 
-    use super::{
-        DEDUP_TTL_SECS, DedupEntry, RedbLogStore, RedbStateMachine, SM_CONFIGS_TABLE,
-        SM_DEDUP_TABLE, SM_TENANTS_TABLE, StoredImposter, new,
-    };
+    use super::{DEDUP_TTL_SECS, DedupEntry, RedbLogStore, RedbStateMachine, SM_DEDUP_TABLE, new};
     use crate::control::{
-        AuthSource, ControlOp, ControlOutcome, ControlRequest, ControlResponse, DEFAULT_TENANT,
-        FLEET_SCOPE, Principal, PrincipalId, Quotas, Role, StubEdit, StubEditScript, TenantId,
+        ControlOp, ControlOutcome, ControlRequest, ControlResponse, StubEdit, StubEditScript,
     };
     use crate::raft::TypeConfig;
     use crate::stores::flow::FlowNet;
@@ -4584,7 +3551,6 @@ mod tests {
         request(
             op_id,
             ControlOp::PutRoutes {
-                tenant: TenantId::default(),
                 table: RouteTable { routes },
             },
         )
@@ -4625,7 +3591,6 @@ mod tests {
         request(
             op_id,
             ControlOp::PutImposter {
-                tenant: TenantId::default(),
                 config: Box::new(config(port, stubs)),
             },
         )
@@ -4633,7 +3598,7 @@ mod tests {
 
     fn stored_stub_ids(sm: &RedbStateMachine, port: u16) -> Vec<String> {
         let body = sm
-            .read_config(DEFAULT_TENANT, port)
+            .read_config(port)
             .expect("read config")
             .expect("config present");
         let config: serde_json::Value = serde_json::from_str(&body).expect("parses");
@@ -4692,16 +3657,10 @@ mod tests {
             .await
             .expect("apply");
         assert_eq!(responses, vec![ControlResponse::applied(5)]);
-        let body = sm
-            .read_config(DEFAULT_TENANT, 8080)
-            .expect("read")
-            .expect("present");
+        let body = sm.read_config(8080).expect("read").expect("present");
         let parsed: serde_json::Value = serde_json::from_str(&body).expect("parses");
         assert_eq!(parsed["port"], 8080);
-        assert_eq!(
-            sm.configured_ports().expect("ports"),
-            vec![(TenantId::default(), 8080)]
-        );
+        assert_eq!(sm.configured_ports().expect("ports"), vec![8080]);
     }
 
     /// A validation refusal is a committed, deterministic outcome: the response
@@ -4713,7 +3672,6 @@ mod tests {
             request(
                 op_id,
                 ControlOp::PutImposter {
-                    tenant: TenantId::default(),
                     config: serde_json::from_value(json!({ "port": 1, "protocol": "smtp" }))
                         .expect("parses"),
                 },
@@ -4730,11 +3688,7 @@ mod tests {
             }
             other => panic!("expected failed outcome, got {other:?}"),
         }
-        assert_eq!(
-            sm.read_config(DEFAULT_TENANT, 1).expect("read"),
-            None,
-            "nothing mutated"
-        );
+        assert_eq!(sm.read_config(1).expect("read"), None, "nothing mutated");
     }
 
     /// Same `op_id` twice — the crash-replay / same-`Idempotency-Key` case —
@@ -4750,7 +3704,6 @@ mod tests {
             request(
                 op_id,
                 ControlOp::PatchStubs {
-                    tenant: TenantId::default(),
                     port: 8080,
                     edit: StubEditScript(vec![StubEdit::Add {
                         stub: serde_json::from_value(json!({ "id": "a" })).expect("parses"),
@@ -4853,9 +3806,7 @@ mod tests {
             .expect("apply must not fail on a bind failure");
         assert_eq!(responses, vec![ControlResponse::applied(1)]);
         assert!(
-            sm.read_config(DEFAULT_TENANT, port)
-                .expect("read")
-                .is_some(),
+            sm.read_config(port).expect("read").is_some(),
             "the committed config is in the tables regardless"
         );
         let failures = sm.apply_failures();
@@ -4901,7 +3852,6 @@ mod tests {
         let patch = request(
             2,
             ControlOp::PatchStubs {
-                tenant: TenantId::default(),
                 port: 18083,
                 edit: StubEditScript(vec![StubEdit::Move { from: 2, to: 0 }]),
             },
@@ -4928,33 +3878,16 @@ mod tests {
 
         sm.apply(vec![entry(
             3,
-            request(
-                3,
-                ControlOp::DeleteImposter {
-                    tenant: TenantId::default(),
-                    port: 18084,
-                },
-            ),
+            request(3, ControlOp::DeleteImposter { port: 18084 }),
         )])
         .await
         .expect("apply delete");
         assert_eq!(engine.count(), 1);
-        assert_eq!(
-            sm.configured_ports().expect("ports"),
-            vec![(TenantId::default(), 18085)]
-        );
+        assert_eq!(sm.configured_ports().expect("ports"), vec![18085]);
 
-        sm.apply(vec![entry(
-            4,
-            request(
-                4,
-                ControlOp::DeleteAll {
-                    tenant: TenantId::default(),
-                },
-            ),
-        )])
-        .await
-        .expect("apply delete-all");
+        sm.apply(vec![entry(4, request(4, ControlOp::DeleteAll))])
+            .await
+            .expect("apply delete-all");
         assert_eq!(engine.count(), 0);
         assert!(sm.configured_ports().expect("ports").is_empty());
 
@@ -5153,10 +4086,7 @@ mod tests {
             .await
             .expect("install");
         assert!(
-            follower
-                .read_config(DEFAULT_TENANT, 8080)
-                .expect("read")
-                .is_some(),
+            follower.read_config(8080).expect("read").is_some(),
             "installed snapshot serves the config"
         );
 
@@ -5181,7 +4111,6 @@ mod tests {
             request(
                 op_id,
                 ControlOp::PatchStubs {
-                    tenant: TenantId::default(),
                     port: 4444,
                     edit: StubEditScript(vec![StubEdit::Add {
                         stub: serde_json::from_value(json!({ "id": "a" })).expect("parses"),
@@ -5208,13 +4137,7 @@ mod tests {
         let responses = sm
             .apply(vec![entry(
                 1,
-                request(
-                    1,
-                    ControlOp::DeleteImposter {
-                        tenant: TenantId::default(),
-                        port: 5555,
-                    },
-                ),
+                request(1, ControlOp::DeleteImposter { port: 5555 }),
             )])
             .await
             .expect("apply");
@@ -5260,7 +4183,6 @@ mod tests {
                 op_id,
                 issued,
                 ControlOp::PutImposter {
-                    tenant: TenantId::default(),
                     config: Box::new(config(8080, json!([]))),
                 },
             )
@@ -5275,10 +4197,7 @@ mod tests {
             request_at(
                 2,
                 1_000 + DEDUP_TTL_SECS + 1,
-                ControlOp::DeleteImposter {
-                    tenant: TenantId::default(),
-                    port: 9999,
-                },
+                ControlOp::DeleteImposter { port: 9999 },
             ),
         )])
         .await
@@ -5307,7 +4226,7 @@ mod tests {
             .expect("apply");
         assert_eq!(engine.count(), 1);
 
-        sm.inject_raw_config(crate::control::DEFAULT_TENANT, 18088, "not json");
+        sm.inject_raw_config(18088, "not json");
 
         let responses = sm
             .apply(vec![entry(2, put(2, 18089, json!([])))])
@@ -5375,7 +4294,6 @@ mod tests {
         let disable = request(
             2,
             ControlOp::SetEnabled {
-                tenant: TenantId::default(),
                 port: 18090,
                 enabled: false,
             },
@@ -5383,10 +4301,7 @@ mod tests {
         let responses = sm.apply(vec![entry(2, disable)]).await.expect("apply");
         assert_eq!(responses, vec![ControlResponse::applied(2)]);
 
-        let body = sm
-            .read_config(DEFAULT_TENANT, 18090)
-            .expect("read")
-            .expect("present");
+        let body = sm.read_config(18090).expect("read").expect("present");
         assert!(
             body.contains("\"enabled\":false"),
             "the stored config carries the flag: {body}"
@@ -5402,7 +4317,6 @@ mod tests {
         let ghost = request(
             3,
             ControlOp::SetEnabled {
-                tenant: TenantId::default(),
                 port: 19999,
                 enabled: false,
             },
@@ -5431,7 +4345,6 @@ mod tests {
             request(
                 2,
                 ControlOp::SetEnabled {
-                    tenant: TenantId::default(),
                     port: 18091,
                     enabled: false,
                 },
@@ -5467,13 +4380,7 @@ mod tests {
 
         sm.apply(vec![entry(
             2,
-            request(
-                2,
-                ControlOp::DeleteImposter {
-                    tenant: TenantId::default(),
-                    port,
-                },
-            ),
+            request(2, ControlOp::DeleteImposter { port }),
         )])
         .await
         .expect("apply delete");
@@ -5494,7 +4401,6 @@ mod tests {
             ..request(op_id, op)
         };
         let add = |id: &str| ControlOp::PatchStubs {
-            tenant: TenantId::default(),
             port: 8080,
             edit: StubEditScript(vec![StubEdit::Add {
                 stub: serde_json::from_value(json!({ "id": id })).expect("parses"),
@@ -5549,14 +4455,7 @@ mod tests {
         let absent = sm
             .apply(vec![entry(
                 4,
-                conditioned(
-                    4,
-                    5,
-                    ControlOp::DeleteImposter {
-                        tenant: TenantId::default(),
-                        port: 9999,
-                    },
-                ),
+                conditioned(4, 5, ControlOp::DeleteImposter { port: 9999 }),
             )])
             .await
             .expect("apply");
@@ -5571,16 +4470,7 @@ mod tests {
         // A precondition on an op with no single-imposter target is refused
         // deterministically (the front already answers 400 before minting one).
         let multi = sm
-            .apply(vec![entry(
-                5,
-                conditioned(
-                    5,
-                    1,
-                    ControlOp::DeleteAll {
-                        tenant: TenantId::default(),
-                    },
-                ),
-            )])
+            .apply(vec![entry(5, conditioned(5, 1, ControlOp::DeleteAll))])
             .await
             .expect("apply");
         assert!(
@@ -5604,7 +4494,6 @@ mod tests {
             ..request(
                 op_id,
                 ControlOp::SetEnabled {
-                    tenant: TenantId::default(),
                     port: 8080,
                     enabled: false,
                 },
@@ -5624,617 +4513,12 @@ mod tests {
         );
     }
 
-    // -- issue #159: tenancy and RBAC records (RFC-002 §10 slice T1) -----------
-
-    fn tenant_put_req(op_id: u128, tenant: &str, display_name: &str) -> ControlRequest {
-        request(
-            op_id,
-            ControlOp::TenantPut {
-                tenant: TenantId::new(tenant),
-                display_name: display_name.to_owned(),
-                quotas: Quotas::default(),
-                journal_retention_secs: 0,
-            },
-        )
-    }
-
-    /// A well-formed argon2id hash shape. Not a real hash of anything — apply
-    /// only ever stores it, it never verifies a password against it — so a
-    /// fixed placeholder stands in wherever a valid one is needed.
-    const VALID_ARGON2_HASH: &str =
-        "$argon2id$v=19$m=19456,t=2,p=1$c29tZXNhbHQ$RdescudvJCsgt3ub+b+dWRWJTmaaJObG";
-
-    fn test_principal(id: &str) -> Principal {
-        Principal {
-            id: PrincipalId::new(id),
-            display_name: id.to_owned(),
-            auth: AuthSource::ApiKey {
-                hash: VALID_ARGON2_HASH.to_owned(),
-            },
-            disabled: false,
-        }
-    }
-
-    fn principal_put_req(op_id: u128, tenant: &str, principal: Principal) -> ControlRequest {
-        request(
-            op_id,
-            ControlOp::PrincipalPut {
-                tenant: TenantId::new(tenant),
-                principal,
-            },
-        )
-    }
-
-    fn binding_put_req(
-        op_id: u128,
-        tenant: &str,
-        principal_id: &str,
-        role: Role,
-    ) -> ControlRequest {
-        request(
-            op_id,
-            ControlOp::BindingPut {
-                tenant: TenantId::new(tenant),
-                principal_id: PrincipalId::new(principal_id),
-                role,
-            },
-        )
-    }
-
-    #[tokio::test]
-    async fn tenant_put_then_principal_put_then_binding_put_all_commit_and_read_back() {
-        let (_td, mut sm) = fresh_sm(None).await;
-
-        let response = apply_one(&mut sm, 1, tenant_put_req(1, "acme", "Acme Corp")).await;
-        assert_eq!(response.outcome, ControlOutcome::Applied);
-        let tenant = sm.test_tenant("acme").expect("tenant stored");
-        assert_eq!(tenant.display_name, "Acme Corp");
-        assert!(!tenant.deleted);
-
-        let response = apply_one(
-            &mut sm,
-            2,
-            principal_put_req(2, "acme", test_principal("alice")),
-        )
-        .await;
-        assert_eq!(response.outcome, ControlOutcome::Applied);
-        let principal = sm.test_principal_row("alice").expect("principal stored");
-        assert_eq!(principal.display_name, "alice");
-
-        let response = apply_one(
-            &mut sm,
-            3,
-            binding_put_req(3, "acme", "alice", Role::Editor),
-        )
-        .await;
-        assert_eq!(response.outcome, ControlOutcome::Applied);
-        assert_eq!(sm.test_binding("alice", "acme"), Some(Role::Editor));
-    }
-
-    // -- issue #161: the production read path (`principal`, `principal_bindings`,
-    // `has_any_principals`) that authentication and authorization are built on --
-
-    #[tokio::test]
-    async fn has_any_principals_reflects_the_fleet_before_and_after_a_put() {
-        let (_td, mut sm) = fresh_sm(None).await;
-        assert!(!sm.has_any_principals().expect("read"));
-
-        apply_one(&mut sm, 1, tenant_put_req(1, "acme", "Acme Corp")).await;
-        apply_one(
-            &mut sm,
-            2,
-            principal_put_req(2, "acme", test_principal("alice")),
-        )
-        .await;
-        assert!(sm.has_any_principals().expect("read"));
-    }
-
-    #[tokio::test]
-    async fn principal_reads_back_the_stored_record_and_none_for_an_unknown_id() {
-        let (_td, mut sm) = fresh_sm(None).await;
-        assert_eq!(sm.principal("alice").expect("read"), None);
-
-        apply_one(&mut sm, 1, tenant_put_req(1, "acme", "Acme Corp")).await;
-        apply_one(
-            &mut sm,
-            2,
-            principal_put_req(2, "acme", test_principal("alice")),
-        )
-        .await;
-
-        let principal = sm.principal("alice").expect("read").expect("stored");
-        assert_eq!(principal.id, PrincipalId::new("alice"));
-        assert_eq!(principal.display_name, "alice");
-        assert_eq!(sm.principal("bob").expect("read"), None);
-    }
-
-    /// `sm_bindings` is principal-major (`(principal id, tenant)`), so this is
-    /// the read that proves a lookup by principal id actually collects every
-    /// tenant it names, not just the first — and that a different principal's
-    /// rows never leak in.
-    #[tokio::test]
-    async fn principal_bindings_collects_every_tenant_and_nothing_belonging_to_another_principal() {
-        let (_td, mut sm) = fresh_sm(None).await;
-        apply_one(&mut sm, 1, tenant_put_req(1, "acme", "Acme Corp")).await;
-        apply_one(&mut sm, 2, tenant_put_req(2, "globex", "Globex Inc")).await;
-        apply_one(
-            &mut sm,
-            3,
-            principal_put_req(3, "acme", test_principal("alice")),
-        )
-        .await;
-        apply_one(
-            &mut sm,
-            4,
-            principal_put_req(4, "acme", test_principal("bob")),
-        )
-        .await;
-
-        apply_one(
-            &mut sm,
-            5,
-            binding_put_req(5, "acme", "alice", Role::Editor),
-        )
-        .await;
-        apply_one(
-            &mut sm,
-            6,
-            binding_put_req(6, "globex", "alice", Role::Viewer),
-        )
-        .await;
-        // Bob's own binding must never appear in Alice's read.
-        apply_one(
-            &mut sm,
-            7,
-            binding_put_req(7, "acme", "bob", Role::TenantAdmin),
-        )
-        .await;
-
-        let mut alice = sm.principal_bindings("alice").expect("read");
-        alice.sort_by(|a, b| a.0.as_str().cmp(b.0.as_str()));
-        assert_eq!(
-            alice,
-            vec![
-                (TenantId::new("acme"), Role::Editor),
-                (TenantId::new("globex"), Role::Viewer),
-            ]
-        );
-
-        assert_eq!(
-            sm.principal_bindings("bob").expect("read"),
-            vec![(TenantId::new("acme"), Role::TenantAdmin)]
-        );
-
-        assert_eq!(
-            sm.principal_bindings("nobody").expect("read"),
-            Vec::new(),
-            "an unbound (or unknown) principal has no bindings, not an error"
-        );
-    }
-
-    /// `validate` cannot see whether "acme" exists — that is state, checked in
-    /// `mutate_tables` once the op is known to be well-formed.
-    #[tokio::test]
-    async fn principal_put_against_a_nonexistent_tenant_is_a_committed_failure() {
-        let (_td, mut sm) = fresh_sm(None).await;
-        let response = apply_one(
-            &mut sm,
-            1,
-            principal_put_req(1, "ghost", test_principal("alice")),
-        )
-        .await;
-        match response.outcome {
-            ControlOutcome::Failed { reason } => assert!(reason.contains("ghost"), "{reason}"),
-            other => panic!("a principal in an unknown tenant must be refused, got {other:?}"),
-        }
-        assert!(sm.test_principal_row("alice").is_none());
-    }
-
-    #[tokio::test]
-    async fn binding_put_against_a_nonexistent_tenant_is_a_committed_failure() {
-        let (_td, mut sm) = fresh_sm(None).await;
-        let response = apply_one(
-            &mut sm,
-            1,
-            binding_put_req(1, "ghost", "alice", Role::Viewer),
-        )
-        .await;
-        match response.outcome {
-            ControlOutcome::Failed { reason } => assert!(reason.contains("ghost"), "{reason}"),
-            other => panic!("a binding against an unknown tenant must be refused, got {other:?}"),
-        }
-        assert!(sm.test_binding("alice", "ghost").is_none());
-    }
-
-    #[tokio::test]
-    async fn binding_put_fleet_admin_on_an_ordinary_tenant_is_a_committed_failure() {
-        let (_td, mut sm) = fresh_sm(None).await;
-        apply_one(&mut sm, 1, tenant_put_req(1, "payments", "Payments")).await;
-        let response = apply_one(
-            &mut sm,
-            2,
-            binding_put_req(2, "payments", "alice", Role::FleetAdmin),
-        )
-        .await;
-        assert!(
-            matches!(response.outcome, ControlOutcome::Failed { .. }),
-            "{response:?}"
-        );
-        assert!(sm.test_binding("alice", "payments").is_none());
-    }
-
-    #[tokio::test]
-    async fn binding_put_editor_on_the_fleet_scope_is_a_committed_failure() {
-        let (_td, mut sm) = fresh_sm(None).await;
-        let response = apply_one(
-            &mut sm,
-            1,
-            binding_put_req(1, FLEET_SCOPE, "alice", Role::Editor),
-        )
-        .await;
-        assert!(
-            matches!(response.outcome, ControlOutcome::Failed { .. }),
-            "{response:?}"
-        );
-        assert!(sm.test_binding("alice", FLEET_SCOPE).is_none());
-    }
-
-    /// Ports are fleet-unique across tenants (RFC-002 §3.2): a second tenant
-    /// claiming a port another tenant already holds must be refused, and the
-    /// refusal must never name the tenant that holds it — naming it would be a
-    /// cross-tenant enumeration oracle (RFC-002 §8.4).
-    #[tokio::test]
-    async fn a_cross_tenant_port_collision_is_refused_without_naming_the_owner() {
-        let (_td, mut sm) = fresh_sm(None).await;
-        apply_one(&mut sm, 1, tenant_put_req(1, "acme", "Acme")).await;
-        apply_one(&mut sm, 2, tenant_put_req(2, "globex", "Globex")).await;
-
-        let first = request(
-            3,
-            ControlOp::PutImposter {
-                tenant: TenantId::new("acme"),
-                config: Box::new(config(9100, json!([]))),
-            },
-        );
-        assert_eq!(
-            apply_one(&mut sm, 3, first).await.outcome,
-            ControlOutcome::Applied
-        );
-
-        let second = request(
-            4,
-            ControlOp::PutImposter {
-                tenant: TenantId::new("globex"),
-                config: Box::new(config(9100, json!([]))),
-            },
-        );
-        match apply_one(&mut sm, 4, second).await.outcome {
-            ControlOutcome::Failed { reason } => {
-                assert!(reason.contains("9100"), "{reason}");
-                assert!(
-                    !reason.contains("acme"),
-                    "the refusal must not name the owner: {reason}"
-                );
-            }
-            other => panic!("a cross-tenant port collision must be refused, got {other:?}"),
-        }
-    }
-
-    /// A re-`PutImposter` from the tenant that already owns the port is an
-    /// upsert, not a collision — the fleet-uniqueness check must not refuse a
-    /// tenant overwriting its own imposter.
-    #[tokio::test]
-    async fn a_same_tenant_re_put_is_not_a_port_collision() {
-        let (_td, mut sm) = fresh_sm(None).await;
-        apply_one(&mut sm, 1, tenant_put_req(1, "acme", "Acme")).await;
-        for index in [2u64, 3] {
-            let op = request(
-                u128::from(index),
-                ControlOp::PutImposter {
-                    tenant: TenantId::new("acme"),
-                    config: Box::new(config(9101, json!([]))),
-                },
-            );
-            assert_eq!(
-                apply_one(&mut sm, index, op).await.outcome,
-                ControlOutcome::Applied
-            );
-        }
-    }
-
-    /// Deleting a tenant takes its bindings with it.
-    ///
-    /// A tombstone records that an id existed; it does not reserve it, and the
-    /// upsert path deliberately allows recreating one. So a binding left behind
-    /// is a role that comes back to life the moment the name is reused —
-    /// plausibly by a different operator for a different customer. That is
-    /// privilege resurrection across an ownership change, and it cannot be
-    /// repaired after the fact because the rows are already in the log.
-    #[tokio::test]
-    async fn tenant_delete_takes_its_bindings_with_it_so_a_reused_id_grants_nothing() {
-        let (_td, mut sm) = fresh_sm(None).await;
-        apply_one(&mut sm, 1, tenant_put_req(1, "acme", "Acme")).await;
-        apply_one(
-            &mut sm,
-            2,
-            principal_put_req(2, "acme", test_principal("alice")),
-        )
-        .await;
-        apply_one(
-            &mut sm,
-            3,
-            binding_put_req(3, "acme", "alice", Role::TenantAdmin),
-        )
-        .await;
-        assert_eq!(sm.test_binding("alice", "acme"), Some(Role::TenantAdmin));
-
-        apply_one(
-            &mut sm,
-            4,
-            request(
-                4,
-                ControlOp::TenantDelete {
-                    tenant: TenantId::new("acme"),
-                },
-            ),
-        )
-        .await;
-        assert_eq!(
-            sm.test_binding("alice", "acme"),
-            None,
-            "a deleted tenant's bindings must not survive it"
-        );
-
-        // The id is recreated — a different customer, the same name.
-        apply_one(&mut sm, 5, tenant_put_req(5, "acme", "Acme Reborn")).await;
-        assert_eq!(
-            sm.test_binding("alice", "acme"),
-            None,
-            "recreating the id must not resurrect the old tenant's roles"
-        );
-    }
-
-    /// Deleting a principal takes its bindings with it, for the same reason —
-    /// and this one is likelier, because a principal id can be an external
-    /// value (an OIDC `subject`, an mTLS SAN) and identity providers recycle
-    /// those. Orphaned bindings would hand a different human every role the
-    /// previous holder of the name had.
-    #[tokio::test]
-    async fn principal_delete_takes_its_bindings_with_it_across_every_tenant() {
-        let (_td, mut sm) = fresh_sm(None).await;
-        apply_one(&mut sm, 1, tenant_put_req(1, "acme", "Acme")).await;
-        apply_one(&mut sm, 2, tenant_put_req(2, "globex", "Globex")).await;
-        apply_one(
-            &mut sm,
-            3,
-            principal_put_req(3, "acme", test_principal("alice")),
-        )
-        .await;
-        apply_one(
-            &mut sm,
-            4,
-            binding_put_req(4, "acme", "alice", Role::Editor),
-        )
-        .await;
-        apply_one(
-            &mut sm,
-            5,
-            binding_put_req(5, "globex", "alice", Role::Viewer),
-        )
-        .await;
-        // A second principal's binding is the control: the cascade must be
-        // scoped to the principal being deleted, not a table wipe.
-        apply_one(
-            &mut sm,
-            6,
-            principal_put_req(6, "acme", test_principal("bob")),
-        )
-        .await;
-        apply_one(&mut sm, 7, binding_put_req(7, "acme", "bob", Role::Viewer)).await;
-
-        apply_one(
-            &mut sm,
-            8,
-            request(
-                8,
-                ControlOp::PrincipalDelete {
-                    tenant: TenantId::new("acme"),
-                    principal_id: PrincipalId::new("alice"),
-                },
-            ),
-        )
-        .await;
-
-        assert_eq!(sm.test_principal_row("alice"), None);
-        assert_eq!(
-            sm.test_binding("alice", "acme"),
-            None,
-            "the deleted principal's bindings must go with it"
-        );
-        assert_eq!(
-            sm.test_binding("alice", "globex"),
-            None,
-            "including bindings in tenants the delete did not name"
-        );
-        assert_eq!(
-            sm.test_binding("bob", "acme"),
-            Some(Role::Viewer),
-            "another principal's binding must be untouched"
-        );
-    }
-
-    /// A tenant row that will not parse is refused, not treated as absent.
-    ///
-    /// The two states look identical to a naive read and could not be more
-    /// different: the tenant's configs and routes are all still live.
-    /// Answering `Applied` would tell the operator the tenant is gone while its
-    /// imposters keep serving traffic — the "wrong but quiet" failure this
-    /// repo's error rules exist to prevent.
-    #[tokio::test]
-    async fn tenant_delete_refuses_a_corrupt_row_instead_of_reporting_success() {
-        let (_td, mut sm) = fresh_sm(None).await;
-        apply_one(&mut sm, 1, tenant_put_req(1, "acme", "Acme")).await;
-        apply_one(
-            &mut sm,
-            2,
-            request(
-                2,
-                ControlOp::PutImposter {
-                    tenant: TenantId::default(),
-                    config: Box::new(config(9300, json!([]))),
-                },
-            ),
-        )
-        .await;
-
-        // Corrupt acme's row behind the state machine's back.
-        {
-            let txn = sm.db.begin_write().expect("test txn");
-            {
-                let mut table = txn.open_table(SM_TENANTS_TABLE).expect("test table");
-                table.insert("acme", "{not json").expect("test insert");
-            }
-            txn.commit().expect("test commit");
-        }
-
-        match apply_one(
-            &mut sm,
-            3,
-            request(
-                3,
-                ControlOp::TenantDelete {
-                    tenant: TenantId::new("acme"),
-                },
-            ),
-        )
-        .await
-        .outcome
-        {
-            ControlOutcome::Failed { reason } => {
-                assert!(reason.contains("corrupt"), "{reason}");
-                assert!(reason.contains("acme"), "{reason}");
-            }
-            other => panic!("a corrupt tenant row must refuse, not report success: {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn tenant_delete_cascades_configs_and_routes_in_one_revision_and_tombstones() {
-        let (_td, mut sm) = fresh_sm(None).await;
-        apply_one(&mut sm, 1, tenant_put_req(1, "acme", "Acme")).await;
-        apply_one(
-            &mut sm,
-            2,
-            request(
-                2,
-                ControlOp::PutImposter {
-                    tenant: TenantId::new("acme"),
-                    config: Box::new(config(9200, json!([]))),
-                },
-            ),
-        )
-        .await;
-        apply_one(
-            &mut sm,
-            3,
-            request(
-                3,
-                ControlOp::PutRoutes {
-                    tenant: TenantId::new("acme"),
-                    table: RouteTable {
-                        routes: vec![test_route("r1", 9200)],
-                    },
-                },
-            ),
-        )
-        .await;
-
-        let response = apply_one(
-            &mut sm,
-            5,
-            request(
-                5,
-                ControlOp::TenantDelete {
-                    tenant: TenantId::new("acme"),
-                },
-            ),
-        )
-        .await;
-        assert_eq!(response.outcome, ControlOutcome::Applied);
-
-        // The cascade landed in the same revision as the tombstone: nothing
-        // half-deleted survives it.
-        assert!(sm.raw_config_row("acme", 9200).is_none());
-        assert!(sm.raw_route_row("acme", "r1").is_none());
-
-        let tenant = sm.test_tenant("acme").expect("the tombstone survives");
-        assert!(tenant.deleted);
-    }
-
-    #[tokio::test]
-    async fn snapshot_round_trips_tenants_principals_and_bindings() {
-        let (_td, mut sm) = fresh_sm(None).await;
-        apply_one(&mut sm, 1, tenant_put_req(1, "acme", "Acme")).await;
-        apply_one(
-            &mut sm,
-            2,
-            principal_put_req(2, "acme", test_principal("alice")),
-        )
-        .await;
-        apply_one(
-            &mut sm,
-            3,
-            binding_put_req(3, "acme", "alice", Role::Editor),
-        )
-        .await;
-
-        let mut builder = sm.clone();
-        let Snapshot { meta, snapshot } = builder.build_snapshot().await.expect("build snapshot");
-
-        let (_td2, mut follower) = fresh_sm(None).await;
-        follower
-            .install_snapshot(&meta, snapshot)
-            .await
-            .expect("install snapshot");
-
-        let tenant = follower.test_tenant("acme").expect("tenant survived");
-        assert_eq!(tenant.display_name, "Acme");
-        let principal = follower
-            .test_principal_row("alice")
-            .expect("principal survived");
-        assert_eq!(principal.display_name, "alice");
-        assert_eq!(follower.test_binding("alice", "acme"), Some(Role::Editor));
-    }
-
-    /// A snapshot written before issue #159 still installs — the three new
-    /// fields default to empty, which is what "this fleet declared no tenancy
-    /// records" is. Mirrors `a_pre_sources_snapshot_still_installs`: this crate
-    /// has been bitten by a table omitted from the snapshot before (#134/#137),
-    /// and the fix both times is the same defaulted-field discipline.
-    #[tokio::test]
-    async fn a_pre_tenancy_snapshot_still_installs() {
-        let (_td, sm) = fresh_sm(None).await;
-        let legacy = json!({
-            "configs": [],
-            "dedup": [],
-            "last_applied_log": null,
-            "last_membership": { "log_id": null, "membership": { "configs": [], "nodes": {} } },
-        });
-        let payload: super::SnapshotPayload =
-            serde_json::from_value(legacy).expect("a pre-#159 snapshot payload still decodes");
-        assert!(payload.tenants.is_empty());
-        assert!(payload.principals.is_empty());
-        assert!(payload.bindings.is_empty());
-        assert!(sm.test_tenant("default").is_none());
-    }
-
     // -- issue #224: journal clear generations ---------------------------------
 
     fn journal_clear(op_id: u128, port: u16, space: Option<&str>) -> ControlRequest {
         request(
             op_id,
             ControlOp::JournalClearGen {
-                tenant: TenantId::default(),
                 port,
                 space: space.map(str::to_owned),
             },
@@ -6246,22 +4530,17 @@ mod tests {
         let (_td, mut sm) = fresh_sm(None).await;
         let response = apply_one(&mut sm, 1, journal_clear(1, 8080, None)).await;
         assert_eq!(response.outcome, ControlOutcome::Applied);
-        assert_eq!(
-            sm.journal_gen(DEFAULT_TENANT, 8080, None)
-                .expect("read gen"),
-            1
-        );
+        assert_eq!(sm.journal_gen(8080, None).expect("read gen"), 1);
 
         apply_one(&mut sm, 2, journal_clear(2, 8080, None)).await;
         assert_eq!(
-            sm.journal_gen(DEFAULT_TENANT, 8080, None)
-                .expect("read gen"),
+            sm.journal_gen(8080, None).expect("read gen"),
             2,
             "a second clear on the same port bumps again"
         );
     }
 
-    /// Two clears for the same `(tenant, port)`, applied in log order (as every replica
+    /// Two clears for the same port, applied in log order (as every replica
     /// applies them), both succeed and compose to +2 — never one silently overwriting the
     /// other with the identical value. This is the entire reason
     /// `ControlOp::JournalClearGen` carries no number of its own: a submitted value would let
@@ -6274,8 +4553,7 @@ mod tests {
         assert_eq!(first.outcome, ControlOutcome::Applied);
         assert_eq!(second.outcome, ControlOutcome::Applied);
         assert_eq!(
-            sm.journal_gen(DEFAULT_TENANT, 8080, None)
-                .expect("read gen"),
+            sm.journal_gen(8080, None).expect("read gen"),
             2,
             "two racing clears must compose to +2, not collapse to the same value twice"
         );
@@ -6285,20 +4563,14 @@ mod tests {
     async fn a_space_clear_leaves_the_port_generation_untouched() {
         let (_td, mut sm) = fresh_sm(None).await;
         apply_one(&mut sm, 1, journal_clear(1, 8080, Some("f"))).await;
+        assert_eq!(sm.journal_gen(8080, Some("f")).expect("read gen"), 1);
         assert_eq!(
-            sm.journal_gen(DEFAULT_TENANT, 8080, Some("f"))
-                .expect("read gen"),
-            1
-        );
-        assert_eq!(
-            sm.journal_gen(DEFAULT_TENANT, 8080, None)
-                .expect("read gen"),
+            sm.journal_gen(8080, None).expect("read gen"),
             0,
             "a space-scoped clear must not bump the port-wide generation"
         );
         assert_eq!(
-            sm.journal_gen(DEFAULT_TENANT, 8080, Some("g"))
-                .expect("read gen"),
+            sm.journal_gen(8080, Some("g")).expect("read gen"),
             0,
             "a space-scoped clear must not bump a sibling space's generation"
         );
@@ -6335,19 +4607,12 @@ mod tests {
             .expect("install snapshot");
 
         assert_eq!(
-            restored
-                .journal_gen(DEFAULT_TENANT, 8080, None)
-                .expect("read gen"),
+            restored.journal_gen(8080, None).expect("read gen"),
             1,
             "a node joining by snapshot must not read a cleared port back as 0 — that would \
              resurrect entries its peers already agree are cleared"
         );
-        assert_eq!(
-            restored
-                .journal_gen(DEFAULT_TENANT, 8080, Some("f"))
-                .expect("read gen"),
-            1
-        );
+        assert_eq!(restored.journal_gen(8080, Some("f")).expect("read gen"), 1);
     }
 
     /// A snapshot payload serialized before issue #224 still installs — `journal_gens` defaults
@@ -6366,11 +4631,7 @@ mod tests {
         let payload: super::SnapshotPayload =
             serde_json::from_value(legacy).expect("a pre-#224 snapshot payload still decodes");
         assert!(payload.journal_gens.is_empty());
-        assert_eq!(
-            sm.journal_gen(DEFAULT_TENANT, 8080, None)
-                .expect("read gen"),
-            0
-        );
+        assert_eq!(sm.journal_gen(8080, None).expect("read gen"), 0);
     }
 
     // -- ProxyRecorded / ProxyRecordedClear (#226) ---------------------------------
@@ -6413,7 +4674,6 @@ mod tests {
         request(
             op_id,
             ControlOp::ProxyRecorded {
-                tenant: TenantId::default(),
                 port,
                 sig_hash: sig_hash.to_owned(),
                 resp: rift_cluster_base::seams::RecordedResponse {
@@ -6429,8 +4689,7 @@ mod tests {
     }
 
     fn marker(sm: &RedbStateMachine, port: u16, sig_hash: &str) -> Option<String> {
-        sm.proxy_recorded_resp(DEFAULT_TENANT, port, sig_hash)
-            .expect("read marker")
+        sm.proxy_recorded_resp(port, sig_hash).expect("read marker")
     }
 
     /// The failure the snapshot field's own doc names: a snapshot built before #226 must
@@ -6463,7 +4722,6 @@ mod tests {
             request(
                 1,
                 ControlOp::PutImposter {
-                    tenant: TenantId::default(),
                     config: Box::new(proxy_imposter_config(8080)),
                 },
             ),
@@ -6476,90 +4734,12 @@ mod tests {
         apply_one(
             &mut sm,
             3,
-            request(
-                3,
-                ControlOp::DeleteImposter {
-                    tenant: TenantId::default(),
-                    port: 8080,
-                },
-            ),
+            request(3, ControlOp::DeleteImposter { port: 8080 }),
         )
         .await;
         assert!(
             marker(&sm, 8080, "aa11").is_none(),
             "the delete purges the port's markers atomically"
-        );
-    }
-
-    /// A recording that would blow the tenant's stub ceiling is a committed refusal that
-    /// names the ceiling — and writes NO marker row, or the claim would settle Recorded
-    /// against a stub that never landed (the atomicity #226 exists to guarantee).
-    #[tokio::test]
-    async fn a_recording_over_the_stub_ceiling_is_refused_and_writes_no_marker() {
-        let (_td, mut sm) = fresh_sm(None).await;
-        apply_one(
-            &mut sm,
-            1,
-            tenant_put_with_quotas(
-                1,
-                "acme",
-                Quotas {
-                    max_imposters: 4,
-                    max_stubs_per_imposter: 1,
-                    max_flow_entries: 100,
-                },
-                0,
-            ),
-        )
-        .await;
-        apply_one(
-            &mut sm,
-            2,
-            request(
-                2,
-                ControlOp::PutImposter {
-                    tenant: TenantId::new("acme"),
-                    config: Box::new(proxy_imposter_config(8081)),
-                },
-            ),
-        )
-        .await;
-        let refused = apply_one(
-            &mut sm,
-            3,
-            request(
-                3,
-                ControlOp::ProxyRecorded {
-                    tenant: TenantId::new("acme"),
-                    port: 8081,
-                    sig_hash: "bb22".to_owned(),
-                    resp: rift_cluster_base::seams::RecordedResponse {
-                        status: 200,
-                        headers: Vec::new(),
-                        body: b"over".to_vec(),
-                        latency_ms: None,
-                        timestamp_secs: 0,
-                    },
-                    stub: Some(recorded_stub(
-                        "over",
-                        crate::control::RecordedStubPlacement::BeforeProxy,
-                    )),
-                },
-            ),
-        )
-        .await;
-        let ControlOutcome::Failed { reason } = &refused.outcome else {
-            panic!("a recording over the ceiling must be refused: {refused:?}");
-        };
-        assert!(
-            reason.contains("at most 1 stubs"),
-            "names the ceiling: {reason}"
-        );
-        assert!(
-            sm.proxy_recorded_resp("acme", 8081, "bb22")
-                .expect("read marker")
-                .is_none(),
-            "a refused recording writes no marker"
         );
     }
 
@@ -6575,7 +4755,6 @@ mod tests {
             request(
                 1,
                 ControlOp::PutImposter {
-                    tenant: TenantId::default(),
                     config: Box::new(proxy_imposter_config(8080)),
                 },
             ),
@@ -6621,7 +4800,7 @@ mod tests {
             "the first recording wins the row: {row}"
         );
         let config_json = sm
-            .read_config(DEFAULT_TENANT, 8080)
+            .read_config(8080)
             .expect("read config")
             .expect("imposter present");
         let config: ImposterConfig = serde_json::from_str(&config_json).expect("config parses");
@@ -6833,29 +5012,6 @@ mod tests {
         );
     }
 
-    /// This slice adds tenancy *records*; it must not change any answer the
-    /// existing single-tenant API gives. A default-tenant `PutImposter` works
-    /// exactly as it did before #159 — including with no `TenantPut` for
-    /// `"default"` ever having been applied: a resource op does not require
-    /// its tenant to have a stored `Tenant` row (only `PrincipalPut` and
-    /// `BindingPut` do).
-    #[tokio::test]
-    async fn a_pre_tenancy_imposter_reads_back_under_default_with_no_tenant_record() {
-        let (_td, mut sm) = fresh_sm(None).await;
-        let response = apply_one(&mut sm, 1, put(1, 9300, json!([{ "id": "a" }]))).await;
-        assert_eq!(response.outcome, ControlOutcome::Applied);
-        assert!(
-            sm.read_config(DEFAULT_TENANT, 9300)
-                .expect("read")
-                .is_some(),
-            "the default-tenant read path is unaffected by #159"
-        );
-        assert!(
-            sm.test_tenant("default").is_none(),
-            "a default-tenant resource op does not require a TenantPut for \"default\""
-        );
-    }
-
     // -- issue #131: replicated route table ------------------------------------
 
     #[tokio::test]
@@ -6866,7 +5022,7 @@ mod tests {
             .await
             .expect("apply");
         assert_eq!(responses, vec![ControlResponse::applied(1)]);
-        let table = sm.route_table(DEFAULT_TENANT).expect("read route table");
+        let table = sm.route_table().expect("read route table");
         assert_eq!(table.routes.len(), 1);
         assert_eq!(table.routes[0].id, "a");
     }
@@ -6885,7 +5041,7 @@ mod tests {
         sm.apply(vec![entry(2, put_routes(2, vec![test_route("c", 3)]))])
             .await
             .expect("apply replacement table");
-        let table = sm.route_table(DEFAULT_TENANT).expect("read route table");
+        let table = sm.route_table().expect("read route table");
         assert_eq!(
             table
                 .routes
@@ -6904,23 +5060,10 @@ mod tests {
             .await
             .expect("apply put");
 
-        let delete = |op_id: u128| {
-            request(
-                op_id,
-                ControlOp::DeleteRoute {
-                    tenant: TenantId::default(),
-                    id: "a".to_owned(),
-                },
-            )
-        };
+        let delete = |op_id: u128| request(op_id, ControlOp::DeleteRoute { id: "a".to_owned() });
         let responses = sm.apply(vec![entry(2, delete(2))]).await.expect("delete");
         assert_eq!(responses, vec![ControlResponse::applied(2)]);
-        assert!(
-            sm.route_table(DEFAULT_TENANT)
-                .expect("read")
-                .routes
-                .is_empty()
-        );
+        assert!(sm.route_table().expect("read").routes.is_empty());
 
         // Deleting again (an absent route) is idempotent, like DeleteImposter.
         let responses = sm
@@ -6976,7 +5119,7 @@ mod tests {
             "the replay must return the ORIGINAL revision, not its own index"
         );
         assert_eq!(
-            sm.route_table(DEFAULT_TENANT).expect("read").routes[0].id,
+            sm.route_table().expect("read").routes[0].id,
             "a",
             "the replayed op_id must not have applied a second time"
         );
@@ -7003,7 +5146,7 @@ mod tests {
             .expect("install");
 
         let mut ids: Vec<String> = follower
-            .route_table(DEFAULT_TENANT)
+            .route_table()
             .expect("read")
             .routes
             .into_iter()
@@ -7023,7 +5166,6 @@ mod tests {
         request(
             op_id,
             ControlOp::FleetNamePut {
-                tenant: TenantId::new(crate::FLEET_SCOPE),
                 name: name.to_owned(),
             },
         )
@@ -7163,7 +5305,6 @@ mod tests {
                     request(
                         op,
                         ControlOp::PutImposter {
-                            tenant: TenantId::default(),
                             config: Box::new(bulky_config(port, tag, 4 * 1024 * 1024)),
                         },
                     ),
@@ -7254,7 +5395,6 @@ mod tests {
                 request(
                     1,
                     ControlOp::PutImposter {
-                        tenant: TenantId::default(),
                         config: Box::new(big),
                     },
                 ),
@@ -7629,24 +5769,16 @@ mod tests {
     // -- issue #210: the route table's revision precondition ------------------
 
     fn delete_route(op_id: u128, id: &str) -> ControlRequest {
-        request(
-            op_id,
-            ControlOp::DeleteRoute {
-                tenant: TenantId::default(),
-                id: id.to_owned(),
-            },
-        )
+        request(op_id, ControlOp::DeleteRoute { id: id.to_owned() })
     }
 
-    fn routes_revision(sm: &RedbStateMachine, tenant: &str) -> u64 {
-        sm.route_table_with_revision(tenant)
-            .expect("read route table")
-            .1
+    fn routes_revision(sm: &RedbStateMachine) -> u64 {
+        sm.route_table_with_revision().expect("read route table").1
     }
 
-    fn route_ids(sm: &RedbStateMachine, tenant: &str) -> Vec<String> {
+    fn route_ids(sm: &RedbStateMachine) -> Vec<String> {
         let mut ids: Vec<String> = sm
-            .route_table(tenant)
+            .route_table()
             .expect("read")
             .routes
             .into_iter()
@@ -7671,7 +5803,7 @@ mod tests {
 
         // A table nobody has written is revision 0, and conditioning on 0 is
         // how a first writer wins the race to create one.
-        assert_eq!(routes_revision(&sm, DEFAULT_TENANT), 0);
+        assert_eq!(routes_revision(&sm), 0);
         for s in [&mut sm, &mut sm2] {
             let response = s
                 .apply(vec![entry(
@@ -7680,7 +5812,6 @@ mod tests {
                         1,
                         0,
                         ControlOp::PutRoutes {
-                            tenant: TenantId::default(),
                             table: RouteTable {
                                 routes: vec![test_route("a", 1)],
                             },
@@ -7692,7 +5823,7 @@ mod tests {
             assert_eq!(response, vec![ControlResponse::applied(1)]);
         }
         assert_eq!(
-            routes_revision(&sm, DEFAULT_TENANT),
+            routes_revision(&sm),
             1,
             "the stamp is the applying log index"
         );
@@ -7706,7 +5837,6 @@ mod tests {
                     2,
                     0,
                     ControlOp::PutRoutes {
-                        tenant: TenantId::default(),
                         table: RouteTable {
                             routes: vec![test_route("clobber", 2)],
                         },
@@ -7722,7 +5852,6 @@ mod tests {
                     2,
                     0,
                     ControlOp::PutRoutes {
-                        tenant: TenantId::default(),
                         table: RouteTable {
                             routes: vec![test_route("clobber", 2)],
                         },
@@ -7743,12 +5872,12 @@ mod tests {
             other => panic!("expected a committed refusal, got {other:?}"),
         }
         assert_eq!(
-            route_ids(&sm, DEFAULT_TENANT),
+            route_ids(&sm),
             vec!["a".to_owned()],
             "a refused precondition must not have replaced the table"
         );
         assert_eq!(
-            routes_revision(&sm, DEFAULT_TENANT),
+            routes_revision(&sm),
             1,
             "a refusal does not advance the revision either"
         );
@@ -7760,7 +5889,7 @@ mod tests {
             .await
             .expect("apply");
         assert_eq!(applied, vec![ControlResponse::applied(3)]);
-        assert_eq!(routes_revision(&sm, DEFAULT_TENANT), 3);
+        assert_eq!(routes_revision(&sm), 3);
 
         // Even a delete that removed nothing: the op committed against the
         // table, so the revision it leaves behind must reflect that.
@@ -7768,25 +5897,9 @@ mod tests {
             .await
             .expect("apply");
         assert_eq!(
-            routes_revision(&sm, DEFAULT_TENANT),
+            routes_revision(&sm),
             4,
             "an idempotent delete still committed against this table"
-        );
-
-        // Per tenant, not fleet-wide: writing one tenant's table must not
-        // invalidate another's outstanding precondition.
-        assert_eq!(routes_revision(&sm, "acme"), 0);
-        sm.apply(vec![entry(
-            5,
-            put_routes_in(5, "acme", vec![test_route("z", 3)]),
-        )])
-        .await
-        .expect("apply");
-        assert_eq!(routes_revision(&sm, "acme"), 5);
-        assert_eq!(
-            routes_revision(&sm, DEFAULT_TENANT),
-            4,
-            "another tenant's write must not touch this tenant's revision"
         );
     }
 
@@ -7800,13 +5913,6 @@ mod tests {
         sm.apply(vec![entry(1, put_routes(1, vec![test_route("a", 1)]))])
             .await
             .expect("apply");
-        sm.apply(vec![entry(
-            2,
-            put_routes_in(2, "acme", vec![test_route("z", 2)]),
-        )])
-        .await
-        .expect("apply");
-
         let mut builder = sm.clone();
         let Snapshot { meta, snapshot } = builder.build_snapshot().await.expect("build snapshot");
 
@@ -7816,8 +5922,7 @@ mod tests {
             .await
             .expect("install");
 
-        assert_eq!(routes_revision(&follower, DEFAULT_TENANT), 1);
-        assert_eq!(routes_revision(&follower, "acme"), 2);
+        assert_eq!(routes_revision(&follower), 1);
 
         // And it is a live precondition on the follower, not just a stored
         // number: a stale token is refused there too.
@@ -7838,8 +5943,8 @@ mod tests {
         );
     }
 
-    /// A snapshot built before #210 carries no revisions at all. It must still
-    /// install, and every tenant must read as revision 0 — which *fails* a
+    /// A snapshot built before #210 carries no revision at all. It must still
+    /// install, and the table must read as revision 0 — which *fails* a
     /// stale precondition rather than passing one. The dangerous alternative
     /// (inheriting the last applied index) would let a token minted before the
     /// join silently pass.
@@ -7848,7 +5953,7 @@ mod tests {
         let (_td, sm, _routes) = fresh_sm_with_routes().await;
         let legacy = json!({
             "configs": [],
-            "routes": [["default", "a", "{}"]],
+            "routes": [["a", "{}"]],
             "dedup": [],
             "last_applied_log": null,
             "last_membership": { "log_id": null, "membership": { "configs": [], "nodes": {} } },
@@ -7856,11 +5961,11 @@ mod tests {
         let payload: super::SnapshotPayload =
             serde_json::from_value(legacy).expect("a pre-#210 snapshot payload still decodes");
         assert!(
-            payload.routes_revisions.is_empty(),
-            "the missing field defaults to no rows, not a parse failure"
+            payload.routes_revision.is_none(),
+            "the missing field defaults to absent, not a parse failure"
         );
         assert_eq!(
-            routes_revision(&sm, DEFAULT_TENANT),
+            routes_revision(&sm),
             0,
             "a table with no stored revision reads 0"
         );
@@ -7890,280 +5995,6 @@ mod tests {
             "reconcile_engine must re-seed the routes handle from sm_routes, \
              not only the engine"
         );
-    }
-
-    // -- issue #163: leader-side quotas ---------------------------------------
-    //
-    // RFC-002 §4.4. These are the state-machine half of the gate; the
-    // every-node claims are asserted across a real three-node cluster in
-    // `tests/cluster.rs`.
-
-    /// A `PutImposter` in a named tenant — the existing `put` helper is
-    /// default-tenant only (issue #182).
-    fn put_in(op_id: u128, tenant: &str, port: u16, stubs: serde_json::Value) -> ControlRequest {
-        request(
-            op_id,
-            ControlOp::PutImposter {
-                tenant: TenantId::new(tenant),
-                config: Box::new(config(port, stubs)),
-            },
-        )
-    }
-
-    /// A `PutRoutes` in a named tenant — the existing `put_routes` helper is
-    /// default-tenant only (issue #182).
-    fn put_routes_in(op_id: u128, tenant: &str, routes: Vec<Route>) -> ControlRequest {
-        request(
-            op_id,
-            ControlOp::PutRoutes {
-                tenant: TenantId::new(tenant),
-                table: RouteTable { routes },
-            },
-        )
-    }
-
-    /// Like [`RedbStateMachine::read_config`], but parses straight to the
-    /// stub ids a quota test wants to assert on, instead of the raw config
-    /// JSON.
-    fn stub_ids_in_tenant(sm: &RedbStateMachine, tenant: &str, port: u16) -> Vec<String> {
-        let read_txn = sm.db.begin_read().expect("read txn");
-        let table = read_txn
-            .open_table(SM_CONFIGS_TABLE)
-            .expect("open sm_configs");
-        let guard = table
-            .get((tenant, port))
-            .expect("get config")
-            .expect("config present");
-        let stored: StoredImposter =
-            serde_json::from_str(guard.value()).expect("stored imposter parses");
-        let config: serde_json::Value =
-            serde_json::from_str(&stored.config_json).expect("config parses");
-        config["stubs"]
-            .as_array()
-            .expect("stubs array")
-            .iter()
-            .map(|s| s["id"].as_str().expect("test stubs carry ids").to_owned())
-            .collect()
-    }
-
-    fn tenant_put_with_quotas(
-        op_id: u128,
-        tenant: &str,
-        quotas: Quotas,
-        journal_retention_secs: u64,
-    ) -> ControlRequest {
-        request(
-            op_id,
-            ControlOp::TenantPut {
-                tenant: TenantId::new(tenant),
-                display_name: tenant.to_owned(),
-                quotas,
-                journal_retention_secs,
-            },
-        )
-    }
-
-    fn put_in_tenant(op_id: u128, tenant: &str, port: u16) -> ControlRequest {
-        request(
-            op_id,
-            ControlOp::PutImposter {
-                tenant: TenantId::new(tenant),
-                config: Box::new(config(port, json!([{ "id": "a" }]))),
-            },
-        )
-    }
-
-    /// §11 open question 1, as a test: a quota refusal is not an error the
-    /// submitter sees at submit time — it is a committed `Failed` at a revision,
-    /// which is exactly what makes it discoverable through `op_status` after a
-    /// parked write replays.
-    #[tokio::test]
-    async fn a_quota_refusal_is_a_committed_failed_decision_naming_the_ceiling() {
-        let (_td, mut sm) = fresh_sm(None).await;
-        apply_one(
-            &mut sm,
-            1,
-            tenant_put_with_quotas(
-                1,
-                "acme",
-                Quotas {
-                    max_imposters: 1,
-                    ..Quotas::default()
-                },
-                0,
-            ),
-        )
-        .await;
-
-        let first = apply_one(&mut sm, 2, put_in_tenant(2, "acme", 8080)).await;
-        assert_eq!(
-            first.outcome,
-            ControlOutcome::Applied,
-            "the first imposter is inside the ceiling"
-        );
-
-        let refused = apply_one(&mut sm, 3, put_in_tenant(3, "acme", 8081)).await;
-        let ControlOutcome::Failed { reason } = &refused.outcome else {
-            panic!("the second imposter is over the ceiling: {refused:?}");
-        };
-        assert!(
-            reason.contains("ceiling") && reason.contains('1'),
-            "the refusal must name the ceiling it hit, not just fail: {reason}"
-        );
-        assert_eq!(refused.revision, 3, "the refusal has a revision of its own");
-
-        assert!(
-            sm.read_config(DEFAULT_TENANT, 8081)
-                .expect("read")
-                .is_none(),
-            "a refused write must not land"
-        );
-    }
-
-    /// The `max_imposters` count excludes the port being written, so a tenant
-    /// sitting exactly at its ceiling can still update what it already owns.
-    /// Without this, a full tenant would be frozen rather than merely full.
-    #[tokio::test]
-    async fn a_tenant_at_its_ceiling_can_still_replace_an_imposter_it_owns() {
-        let (_td, mut sm) = fresh_sm(None).await;
-        apply_one(
-            &mut sm,
-            1,
-            tenant_put_with_quotas(
-                1,
-                "acme",
-                Quotas {
-                    max_imposters: 1,
-                    ..Quotas::default()
-                },
-                0,
-            ),
-        )
-        .await;
-        apply_one(&mut sm, 2, put_in_tenant(2, "acme", 8080)).await;
-
-        let replace = apply_one(
-            &mut sm,
-            3,
-            request(
-                3,
-                ControlOp::PutImposter {
-                    tenant: TenantId::new("acme"),
-                    config: Box::new(config(8080, json!([{ "id": "b" }]))),
-                },
-            ),
-        )
-        .await;
-        assert_eq!(
-            replace.outcome,
-            ControlOutcome::Applied,
-            "replacing an owned imposter adds none, so the ceiling is not reached"
-        );
-    }
-
-    /// The per-imposter stub ceiling applies to a `PutImposter` payload and to
-    /// the *result* of a `PatchStubs` — a script is a sequence of edits, so only
-    /// the config it produces knows how many stubs the imposter ends up with.
-    #[tokio::test]
-    async fn the_stub_ceiling_refuses_both_a_config_and_an_edit_that_would_exceed_it() {
-        let (_td, mut sm) = fresh_sm(None).await;
-        apply_one(
-            &mut sm,
-            1,
-            tenant_put_with_quotas(
-                1,
-                "acme",
-                Quotas {
-                    max_stubs_per_imposter: 2,
-                    ..Quotas::default()
-                },
-                0,
-            ),
-        )
-        .await;
-
-        let too_many = apply_one(
-            &mut sm,
-            2,
-            request(
-                2,
-                ControlOp::PutImposter {
-                    tenant: TenantId::new("acme"),
-                    config: Box::new(config(
-                        8080,
-                        json!([{ "id": "a" }, { "id": "b" }, { "id": "c" }]),
-                    )),
-                },
-            ),
-        )
-        .await;
-        let ControlOutcome::Failed { reason } = &too_many.outcome else {
-            panic!("three stubs against a ceiling of two must fail: {too_many:?}");
-        };
-        assert!(reason.contains('2'), "{reason}");
-
-        // At the ceiling: accepted.
-        let at_ceiling = apply_one(
-            &mut sm,
-            3,
-            request(
-                3,
-                ControlOp::PutImposter {
-                    tenant: TenantId::new("acme"),
-                    config: Box::new(config(8080, json!([{ "id": "a" }, { "id": "b" }]))),
-                },
-            ),
-        )
-        .await;
-        assert_eq!(at_ceiling.outcome, ControlOutcome::Applied);
-
-        // And an edit that would push it over is refused on its result.
-        let over_by_edit = apply_one(
-            &mut sm,
-            4,
-            request(
-                4,
-                ControlOp::PatchStubs {
-                    tenant: TenantId::new("acme"),
-                    port: 8080,
-                    edit: StubEditScript(vec![StubEdit::Add {
-                        stub: serde_json::from_value(json!({ "id": "c" }))
-                            .expect("test stub parses"),
-                        index: None,
-                    }]),
-                },
-            ),
-        )
-        .await;
-        let ControlOutcome::Failed { reason } = &over_by_edit.outcome else {
-            panic!("an edit taking the imposter to three stubs must fail: {over_by_edit:?}");
-        };
-        assert!(reason.contains('2'), "{reason}");
-        assert_eq!(
-            stub_ids_in_tenant(&sm, "acme", 8080),
-            vec!["a".to_owned(), "b".to_owned()],
-            "the refused edit left the stored config untouched"
-        );
-    }
-
-    /// A fleet with no tenant records configured must not find every write
-    /// refused because an absent record read as a quota of nothing.
-    #[tokio::test]
-    async fn a_tenant_with_no_stored_record_gets_the_generous_default_quota() {
-        let (_td, mut sm) = fresh_sm(None).await;
-        for (index, port) in (8080u16..8090).enumerate() {
-            let response = apply_one(
-                &mut sm,
-                index as u64 + 1,
-                put(index as u128 + 1, port, json!([{ "id": "a" }])),
-            )
-            .await;
-            assert_eq!(
-                response.outcome,
-                ControlOutcome::Applied,
-                "an unconfigured default tenant must not be capacity-locked"
-            );
-        }
     }
 
     /// An older snapshot, written before #185 existed, must still install —
@@ -8236,7 +6067,6 @@ mod tests {
                 1,
                 1_000,
                 ControlOp::SessionKeyPut {
-                    tenant: TenantId::new(FLEET_SCOPE),
                     key: "42".repeat(32),
                 },
             ),
@@ -8250,50 +6080,6 @@ mod tests {
             sm.session_key().is_err(),
             "a corrupt session-key row read back as an absent key — the next login would mint a \
              second key and silently invalidate every live session"
-        );
-    }
-
-    /// A corrupt principal row is an **error**, never `None`.
-    ///
-    /// `None` means "no such principal", which every authentication path treats as "this credential
-    /// resolves to nobody" — and on a fleet with no `--api-key` and no principals, `should_bypass`
-    /// turns that into an *open admin plane*. So a corrupt row reading back as `None` would convert
-    /// disk corruption into an authorization bypass. It must fail closed instead.
-    #[tokio::test]
-    async fn a_corrupt_principal_row_is_an_error_not_an_absent_principal() {
-        let (_td, mut sm) = fresh_sm(None).await;
-        let principal = Principal {
-            id: PrincipalId::new("p-corrupt"),
-            display_name: "corrupt".to_owned(),
-            auth: AuthSource::ApiKey {
-                hash: hash_api_key("some-key"),
-            },
-            disabled: false,
-        };
-        apply_one(
-            &mut sm,
-            1,
-            request_at(
-                1,
-                1_000,
-                ControlOp::PrincipalPut {
-                    tenant: TenantId::default(),
-                    principal,
-                },
-            ),
-        )
-        .await;
-        assert!(
-            sm.principal("p-corrupt").expect("read").is_some(),
-            "principal was stored"
-        );
-
-        corrupt_row(&sm, SM_PRINCIPALS_TABLE, "p-corrupt");
-
-        assert!(
-            sm.principal("p-corrupt").is_err(),
-            "a corrupt principal row read back as an absent principal — on a fleet with no \
-             --api-key that is an open admin plane, not a 401"
         );
     }
 
@@ -8311,7 +6097,6 @@ mod tests {
                 1,
                 1_000,
                 ControlOp::SessionKeyPut {
-                    tenant: TenantId::new(FLEET_SCOPE),
                     key: "42".repeat(32),
                 },
             ),
@@ -8418,106 +6203,6 @@ mod tests {
         );
     }
 
-    /// A zero ceiling is refused at validation rather than stored. It is
-    /// representable and almost never intended: it makes the tenant permanently
-    /// unable to hold a single imposter, and the operator finds out later from a
-    /// write that fails for a reason they will not connect to a quota they set.
-    #[tokio::test]
-    async fn a_zero_quota_ceiling_is_refused_rather_than_stored() {
-        let (_td, mut sm) = fresh_sm(None).await;
-        for quotas in [
-            Quotas {
-                max_imposters: 0,
-                ..Quotas::default()
-            },
-            Quotas {
-                max_stubs_per_imposter: 0,
-                ..Quotas::default()
-            },
-        ] {
-            let response =
-                apply_one(&mut sm, 1, tenant_put_with_quotas(1, "acme", quotas, 0)).await;
-            let ControlOutcome::Failed { reason } = &response.outcome else {
-                panic!("a zero ceiling must be refused: {response:?}");
-            };
-            assert!(reason.contains('0'), "{reason}");
-        }
-    }
-
-    /// A quota is a resource gate, and a gate that cannot read what it is
-    /// gating must treat it as the dangerous class. A corrupt tenant record used
-    /// to yield `Quotas::default()` — the *generous* ceiling — on the strength
-    /// of a comment claiming `require_live_tenant` had already refused upstream.
-    /// It had not: that helper is wired only to the principal/binding arms, and
-    /// neither `PutImposter` nor `PatchStubs` goes through it. So the operator's
-    /// real ceiling silently became 1000 exactly when it became unreadable.
-    #[tokio::test]
-    async fn a_corrupt_tenant_record_refuses_a_write_rather_than_granting_the_default_quota() {
-        let (_td, mut sm) = fresh_sm(None).await;
-        apply_one(
-            &mut sm,
-            1,
-            tenant_put_with_quotas(
-                1,
-                "acme",
-                Quotas {
-                    max_imposters: 1,
-                    ..Quotas::default()
-                },
-                0,
-            ),
-        )
-        .await;
-
-        // Corrupt acme's row behind the state machine's back.
-        {
-            let txn = sm.db.begin_write().expect("test txn");
-            {
-                let mut table = txn.open_table(SM_TENANTS_TABLE).expect("test table");
-                table.insert("acme", "{not json").expect("test insert");
-            }
-            txn.commit().expect("test commit");
-        }
-
-        let refused = apply_one(&mut sm, 2, put_in_tenant(2, "acme", 8080)).await;
-        let ControlOutcome::Failed { reason } = &refused.outcome else {
-            panic!("an unreadable quota must refuse, never fall open: {refused:?}");
-        };
-        assert!(
-            reason.contains("unreadable") || reason.contains("corrupt"),
-            "the refusal must say the quota could not be read: {reason}"
-        );
-        assert!(
-            sm.read_config(DEFAULT_TENANT, 8080)
-                .expect("read")
-                .is_none(),
-            "nothing may land while the ceiling is unknown"
-        );
-
-        // And the same for the edit path, which reaches `quotas_for` directly.
-        let refused = apply_one(
-            &mut sm,
-            3,
-            request(
-                3,
-                ControlOp::PatchStubs {
-                    tenant: TenantId::new("acme"),
-                    port: 8080,
-                    edit: StubEditScript(vec![StubEdit::Add {
-                        stub: serde_json::from_value(json!({ "id": "a" }))
-                            .expect("test stub parses"),
-                        index: None,
-                    }]),
-                },
-            ),
-        )
-        .await;
-        assert!(
-            matches!(refused.outcome, ControlOutcome::Failed { .. }),
-            "the edit path must fail closed too: {refused:?}"
-        );
-    }
-
     /// The snapshot-install call site of `AttributedAction::unattributed`. The
     /// restart path is covered above; this is the other one, and it is the one a
     /// joining follower takes — where inventing attribution would be worst,
@@ -8559,326 +6244,5 @@ mod tests {
             "a snapshot is the sum of many principals' writes, so naming any one \
              of them would be a lie: {seen:?}"
         );
-    }
-
-    /// §11 open question 2, pinned: `journal_retention_secs` is a per-tenant
-    /// policy on the tenant record, not a field of `Quotas`. Stored now, applied
-    /// by the M3 shards (#147) — so this asserts it round-trips, which is the
-    /// whole of what this slice owes it.
-    #[tokio::test]
-    async fn journal_retention_round_trips_on_the_tenant_record_not_in_quotas() {
-        let (_td, mut sm) = fresh_sm(None).await;
-        apply_one(
-            &mut sm,
-            1,
-            tenant_put_with_quotas(1, "acme", Quotas::default(), 3_600),
-        )
-        .await;
-
-        let tenant = sm
-            .tenant("acme")
-            .expect("read tenant")
-            .expect("tenant present");
-        assert_eq!(tenant.journal_retention_secs, 3_600);
-    }
-
-    // -- issue #182: tenant-aware reads and engine sync ------------------------
-
-    /// Two tenants, one imposter each on distinct ports: each tenant's
-    /// `read_config` sees only its own port, never the other's.
-    #[tokio::test]
-    async fn read_config_is_isolated_per_tenant() {
-        let (_td, mut sm) = fresh_sm(None).await;
-        sm.apply(vec![entry(
-            1,
-            put_in(1, "acme", 19001, json!([{ "id": "a" }])),
-        )])
-        .await
-        .expect("apply acme");
-        sm.apply(vec![entry(
-            2,
-            put_in(2, "globex", 19002, json!([{ "id": "b" }])),
-        )])
-        .await
-        .expect("apply globex");
-
-        assert!(
-            sm.read_config("acme", 19001).expect("read").is_some(),
-            "acme sees its own port"
-        );
-        assert!(
-            sm.read_config("acme", 19002).expect("read").is_none(),
-            "acme must not see globex's port"
-        );
-        assert!(
-            sm.read_config("globex", 19002).expect("read").is_some(),
-            "globex sees its own port"
-        );
-        assert!(
-            sm.read_config("globex", 19001).expect("read").is_none(),
-            "globex must not see acme's port"
-        );
-    }
-
-    /// `desired_configs` (the engine-sync read) is the union of every tenant's
-    /// configs, not just the default tenant's — one shared `ImposterManager`
-    /// binds them all because ports are fleet-unique across tenants
-    /// (RFC-002 §3.2).
-    #[tokio::test]
-    async fn engine_sync_binds_the_union_of_every_tenant() {
-        let engine = Arc::new(ImposterManager::new());
-        let (_td, mut sm) = fresh_sm(Some(engine.clone())).await;
-
-        sm.apply(vec![
-            entry(1, put_in(1, "acme", 19011, json!([{ "id": "a" }]))),
-            entry(2, put_in(2, "globex", 19012, json!([{ "id": "b" }]))),
-        ])
-        .await
-        .expect("apply");
-
-        assert_eq!(
-            engine.count(),
-            2,
-            "the engine must bind both tenants' imposters from one sync"
-        );
-        assert_eq!(engine_stub_ids(&engine, 19011), vec!["a"]);
-        assert_eq!(engine_stub_ids(&engine, 19012), vec!["b"]);
-
-        engine.shutdown().await;
-    }
-
-    /// `desired_routes` compiles the **default tenant's routes only** — unlike `desired_configs`,
-    /// which unions.
-    ///
-    /// This asymmetry is a security property, not an oversight, so it is pinned rather than left
-    /// to a comment. A front-door request carries no tenant identity (RFC-002 §7 keeps the data
-    /// plane anonymous), so a unioned table would be one shared matching namespace: an empty match
-    /// is a legal catch-all and `priority` is an unbounded `i32`, so any tenant could publish
-    /// `{match: {}, priority: i32::MAX}` and swallow every other tenant's front-door traffic
-    /// fleet-wide. Flip `desired_routes` back to a union and the second half of this test goes red.
-    #[tokio::test]
-    async fn route_sync_compiles_only_the_default_tenants_routes() {
-        let (_td, mut sm, routes) = fresh_sm_with_routes().await;
-
-        sm.apply(vec![entry(
-            1,
-            put_routes_in(1, DEFAULT_TENANT, vec![test_route("default-a", 19021)]),
-        )])
-        .await
-        .expect("apply default routes");
-        sm.apply(vec![entry(
-            2,
-            put_routes_in(2, "globex", vec![test_route("globex-a", 19022)]),
-        )])
-        .await
-        .expect("apply globex routes");
-
-        let loaded = routes.load();
-        let default_route = loaded
-            .resolve(
-                None,
-                &hyper::Method::GET,
-                "/default-a",
-                &hyper::HeaderMap::new(),
-            )
-            .expect("the default tenant's route compiles");
-        assert_eq!(default_route.target.port, 19021);
-        assert!(
-            loaded
-                .resolve(
-                    None,
-                    &hyper::Method::GET,
-                    "/globex-a",
-                    &hyper::HeaderMap::new(),
-                )
-                .is_none(),
-            "a non-default tenant's route must NOT reach the shared front door — it would be \
-             matching in a namespace every other tenant also routes through"
-        );
-
-        // Stored, though — `route_table` reads it back, so a tenant still sees what it wrote.
-        let stored = sm.route_table("globex").expect("read globex's table");
-        assert_eq!(
-            stored.routes.len(),
-            1,
-            "globex's route is stored, just not compiled"
-        );
-    }
-
-    /// `owning_tenant` resolves a fleet-unique port to the tenant that holds
-    /// it, and `None` for a port nobody has configured.
-    #[tokio::test]
-    async fn owning_tenant_resolves_the_right_tenant_and_none_when_unconfigured() {
-        let (_td, mut sm) = fresh_sm(None).await;
-        sm.apply(vec![entry(1, put_in(1, "acme", 19031, json!([])))])
-            .await
-            .expect("apply acme");
-        sm.apply(vec![entry(2, put_in(2, "globex", 19032, json!([])))])
-            .await
-            .expect("apply globex");
-
-        assert_eq!(
-            sm.owning_tenant(19031).expect("read"),
-            Some(TenantId::new("acme"))
-        );
-        assert_eq!(
-            sm.owning_tenant(19032).expect("read"),
-            Some(TenantId::new("globex"))
-        );
-        assert_eq!(
-            sm.owning_tenant(19099).expect("read"),
-            None,
-            "an unconfigured port owns nothing"
-        );
-    }
-
-    /// `tenant_config_usage` builds every tenant's usage from **one** call —
-    /// not one scan per tenant (issue #372, AC7). A single `sm.tenant_config_usage()`
-    /// here must already carry the right imposter count, the right ports, and
-    /// the right worst-single-imposter stub count for every tenant at once;
-    /// there is no second call this test could make that a per-tenant-scan
-    /// implementation would need and a single-scan one would not.
-    #[tokio::test]
-    async fn the_listing_scans_the_config_table_once() {
-        let (_td, mut sm) = fresh_sm(None).await;
-        sm.apply(vec![entry(
-            1,
-            put_in(1, "acme", 19051, json!([{"id": "s1"}, {"id": "s2"}])),
-        )])
-        .await
-        .expect("apply acme imposter 1");
-        sm.apply(vec![entry(
-            2,
-            put_in(
-                2,
-                "acme",
-                19052,
-                json!([{"id": "s1"}, {"id": "s2"}, {"id": "s3"}, {"id": "s4"}, {"id": "s5"},
-                       {"id": "s6"}, {"id": "s7"}]),
-            ),
-        )])
-        .await
-        .expect("apply acme imposter 2");
-        sm.apply(vec![entry(
-            3,
-            put_in(3, "globex", 19053, json!([{"id": "only"}])),
-        )])
-        .await
-        .expect("apply globex imposter");
-
-        let usage = sm.tenant_config_usage().expect("one-scan usage");
-
-        let acme = usage.get("acme").expect("acme present");
-        assert_eq!(acme.imposters, 2, "acme holds two imposters");
-        assert_eq!(
-            acme.max_stubs, 7,
-            "the worst imposter (7 stubs), not the sum (9)"
-        );
-        let mut acme_ports = acme.ports.clone();
-        acme_ports.sort_unstable();
-        assert_eq!(acme_ports, vec![19051, 19052]);
-
-        let globex = usage.get("globex").expect("globex present, same call");
-        assert_eq!(globex.imposters, 1);
-        assert_eq!(globex.max_stubs, 1);
-        assert_eq!(globex.ports, vec![19053]);
-
-        assert!(
-            !usage.contains_key("unconfigured-tenant"),
-            "a tenant with no config rows has no entry, not a zeroed one"
-        );
-    }
-
-    /// Issue #372: a corrupt `sm_configs` row must not silently shrink
-    /// `imposters`/`max_stubs`/`ports` with nothing to say so — the skip has
-    /// to leave a mark `dispatch` can turn into `Rift-Cluster-Partial`.
-    #[tokio::test]
-    async fn a_corrupt_config_row_marks_the_tenant_usage_partial() {
-        let (_td, mut sm) = fresh_sm(None).await;
-        sm.apply(vec![entry(
-            1,
-            put_in(1, "acme", 19061, json!([{"id": "a"}, {"id": "b"}])),
-        )])
-        .await
-        .expect("apply acme's readable imposter");
-        // A second, corrupt row for acme — bypassing validation, since the
-        // broken-record path is unreachable through the public API.
-        sm.inject_raw_config("acme", 19062, "not json");
-        // A wholly separate tenant, readable end to end, to prove one
-        // tenant's corruption does not spill onto another's figures.
-        sm.apply(vec![entry(
-            2,
-            put_in(2, "globex", 19063, json!([{"id": "only"}])),
-        )])
-        .await
-        .expect("apply globex's readable imposter");
-
-        let usage = sm
-            .tenant_config_usage()
-            .expect("a corrupt row must not fail the scan");
-
-        let acme = usage.get("acme").expect("acme present");
-        assert_eq!(
-            acme.imposters, 1,
-            "the corrupt row is excluded from the count, not counted as one"
-        );
-        assert_eq!(
-            acme.ports,
-            vec![19061],
-            "the corrupt row's port never reaches `ports`"
-        );
-        assert!(
-            acme.incomplete,
-            "a skipped row must mark this tenant's usage incomplete, not just log and move on"
-        );
-
-        let globex = usage.get("globex").expect("globex present");
-        assert_eq!(globex.imposters, 1);
-        assert!(
-            !globex.incomplete,
-            "a tenant with no corrupt rows of its own must not inherit another tenant's flag"
-        );
-    }
-
-    /// The union must preserve `desired_configs`'s existing abort semantics:
-    /// one broken record — in *any* tenant, not just the one being written —
-    /// still refuses the whole engine sync rather than silently shrinking it.
-    #[tokio::test]
-    async fn a_broken_record_in_one_tenant_still_aborts_the_whole_sync() {
-        let engine = Arc::new(ImposterManager::new());
-        let (_td, mut sm) = fresh_sm(Some(engine.clone())).await;
-        sm.apply(vec![entry(
-            1,
-            put_in(1, "acme", 19041, json!([{ "id": "a" }])),
-        )])
-        .await
-        .expect("apply acme");
-        assert_eq!(engine.count(), 1);
-
-        // Corrupt a *different* tenant's record directly, bypassing
-        // validation (the broken-record path is unreachable through the
-        // public API, like `a_broken_stored_record_refuses_sync_instead_of_deleting`).
-        sm.inject_raw_config("globex", 19042, "not json");
-
-        let responses = sm
-            .apply(vec![entry(2, put_in(2, "acme", 19043, json!([])))])
-            .await
-            .expect("apply still succeeds — the refusal is engine status");
-        assert_eq!(responses, vec![ControlResponse::applied(2)]);
-        assert_eq!(
-            engine.count(),
-            1,
-            "globex's broken record must abort the union sync fleet-wide: \
-             acme's new imposter must not be created by a partial sync, and \
-             acme's live one must not be torn down"
-        );
-        assert_eq!(engine_stub_ids(&engine, 19041), vec!["a"]);
-        assert!(
-            sm.apply_failures().contains_key(&19042),
-            "the broken record is surfaced as node status: {:?}",
-            sm.apply_failures()
-        );
-
-        engine.shutdown().await;
     }
 }
