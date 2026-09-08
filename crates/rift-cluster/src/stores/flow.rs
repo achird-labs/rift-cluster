@@ -567,16 +567,15 @@ impl FlowNet {
     /// entry, and the ordinary write path never pushes for a port no engine
     /// serves.
     ///
-    /// Only `i<port>:`. A `fleet`- or `tenant`-scoped flow is not this
-    /// imposter's to drop, and ports are fleet-unique across tenants (RFC-002
-    /// §3.2), so `i<port>:` can never be another tenant's namespace.
+    /// Only `i<port>:`. A `fleet`-scoped flow is not this imposter's to drop,
+    /// and ports are fleet-unique, so `i<port>:` names exactly one imposter.
     ///
     /// `Async` durability: the imposter whose knob would have chosen is gone,
     /// and this is a rare admin-path write. A crash inside the fsync interval
     /// is covered by the reconcile-time sweep on restart, which finds the
     /// namespace orphaned and drops it again.
     pub async fn clear_imposter_scope(&self, port: u16) -> usize {
-        let prefix = ContextScope::Imposter.prefix_for(Some(port), None);
+        let prefix = crate::stores::flow_config::ContextScope::Imposter.prefix_for(Some(port));
         let mut dropped = 0;
         for flow_id in self.shard.flow_ids() {
             if !flow_id.starts_with(&prefix) {

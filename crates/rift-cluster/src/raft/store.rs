@@ -3930,7 +3930,7 @@ mod tests {
     /// #565 / the D-5 amendment: a committed `DeleteImposter` drops the deleted
     /// port's imposter-scoped flow state on this node — and nothing else. A
     /// sibling port's `i<port>:` state, a fleet-scoped `f:` flow and a
-    /// tenant-scoped `t<tenant>:` flow are not the deleted imposter's to lose.
+    /// flow under any other prefix are not the deleted imposter's to lose.
     /// A `PutImposter` over the same port with changed stubs is a config
     /// change, not a delete, and keeps the state (D-5). `DeleteAll` clears
     /// every deleted port the same way.
@@ -3972,13 +3972,7 @@ mod tests {
 
         sm.apply(vec![entry(
             4,
-            request(
-                4,
-                ControlOp::DeleteImposter {
-                    tenant: TenantId::default(),
-                    port: 18094,
-                },
-            ),
+            request(4, ControlOp::DeleteImposter { port: 18094 }),
         )])
         .await
         .expect("apply delete");
@@ -4000,17 +3994,9 @@ mod tests {
             .await
             .expect("apply re-create");
         assert!(shard.get("i18094:checkout", "checkout").is_none());
-        sm.apply(vec![entry(
-            6,
-            request(
-                6,
-                ControlOp::DeleteAll {
-                    tenant: TenantId::default(),
-                },
-            ),
-        )])
-        .await
-        .expect("apply delete-all");
+        sm.apply(vec![entry(6, request(6, ControlOp::DeleteAll))])
+            .await
+            .expect("apply delete-all");
         assert_eq!(engine.count(), 0);
         assert!(
             shard.get("i18095:checkout", "checkout").is_none(),
