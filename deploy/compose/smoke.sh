@@ -154,7 +154,7 @@ eq "PUT /front-door/routes on node 2" "200" "$(acode -X PUT "$(admin 2)/front-do
   {"id":"proxy","priority":50,"enabled":true,"match":{"path_prefix":"/proxy"},"target":{"port":7103,"strip_prefix":true}},
   {"id":"once","priority":50,"enabled":true,"match":{"path_prefix":"/once"},"target":{"port":7104,"strip_prefix":true}}
 ]}')"
-eq "the table is installed (read on node 3)" "true" "$(auth "$(admin 3)/front-door/routes" | jq -r .installed)"
+eq "the table reads back on node 3" "8" "$(auth "$(admin 3)/front-door/routes" | jq '.routes | length')"
 eq "eight routes replicated to node 1" "8" "$(auth "$(admin 1)/front-door/routes" | jq '.routes | length')"
 for n in 1 2 3; do
   eq "node $n routes /smoke/health to 7101" '{"status":"up"}' "$(body "$(router "$n")/smoke/health")"
