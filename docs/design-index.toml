@@ -171,4 +171,4 @@ status = "amended"
 verified_sha = ""
 verified_on = ""
 code = ["web/src/**"]
-note = "The Administration screen and the route table's not-installed treatment are retired by D-73 (#550) and carry callouts; the prototype HTML is a design artifact and still renders them."
+note = "Rewritten for the five screens by #553 (D-71): Imposters with Import OpenAPI and Record, Requests per node, Scenarios, Router, Cluster, and the single-key login. The prototype HTML is a design artifact that predates the trim and still renders retired screens; the D-70 callout stays on the Router section."

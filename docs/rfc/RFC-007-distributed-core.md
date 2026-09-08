@@ -186,7 +186,7 @@ surface this RFC removes. It also built a flow-state tier stronger than upstream
 | Tracking sources (`git+`, `s3:`, `registry:`, scheduler, `auth_ref`), datasets, stored specs with drift and validation, the blob store | Upstream `file:`/`https:` sources; stateless `POST /specs/compile` | D-18, D-19, D-23, D-29, D-30, D-31, D-34, D-48, D-49, D-50, D-51, D-52, D-53, D-55, D-56; RFC-005; RFC-004 §3.4–§3.6 | #549 |
 | Tenants, principals, bindings, roles, quotas, `X-Rift-Tenant`, the tenant half of every key and of the revision header | One API key; `POST /session` exchanges it | D-44, D-45, D-46, D-68 superseded; RFC-002 superseded; chapter 08 retired — all by **D-73** | #550 |
 | Journal shards, merge-on-read, anti-entropy, generation clears, vector cursors, fleet request tail | Upstream per-node journal | D-32, D-37, D-38, D-39 superseded by **D-74**; RFC-001 §7.5.1–§7.5.2 retired (§7.5.3 proxyOnce stays); chapter 07 retired, its proxyOnce section moved to chapter 06 | #552 |
-| Console: Admin, Sources, Scenarios screens; planned Specs entry | Four screens: Imposters, Requests, Routes, Cluster | RFC-006 §4 amended | #553 |
+| Console: Admin, Sources screens; planned Specs entry; the merged Requests view; the greyed roadmap run | Five screens: Imposters (with Import OpenAPI), Requests, Scenarios, Router, Cluster — Scenarios stays with the flow-state tier (v1.1) | RFC-006 §4 amended | #553 |
 
 ### 3.3 The trade, stated once
 
@@ -345,7 +345,7 @@ Updated as PRs merge. Status is one of `open`, `in progress`, `merged`.
 | #550 | Tenancy and RBAC | in progress | — |
 | ~~#551~~ | Flow state, sequencer, proxyOnce, spaces | withdrawn 2026-09-06 — stays | — |
 | #552 | Journal merge | in progress | — |
-| #553 | Console | open | — |
+| #553 | Console | in progress | — |
 | #554 | Docs and naming | open | — |
 
 Closed as out of scope on 2026-09-06, with the reason on each: #148, #149, #151, #279, #280,

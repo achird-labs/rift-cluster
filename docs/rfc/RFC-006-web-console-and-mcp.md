@@ -117,6 +117,19 @@ Three rules, in priority order:
 > opaque vector cursor — and `Rift-Cluster-Partial` no longer rides that route at all; it rides
 > `/_fleet/members` and `/_fleet/health` only.
 
+> **Amended by D-71** (RFC-007 §3.2, #553): the console is **five screens in two groups** —
+> Mocks: *Imposters*, *Requests*, *Scenarios*, *Router*; Fleet: *Cluster* — and that is the whole
+> information architecture. The **Front-door routes** row below is the *Router* screen: RFC-007 §6
+> names the feature for what it does, the label and heading follow, and the API path
+> `/front-door/routes` is unchanged pending #554. The *Request log* row's "merged journal" is
+> history too: since D-74 (#552) the screen reads one node's journal and names that node. The
+> *Imposters* row gains **Import OpenAPI**, the one-shot compile of RFC-007 §3.1 —
+> `POST /specs/compile`, which stores nothing (D-72), then the ordinary `POST /imposters`. And
+> the paragraph below the table — *"screens whose backend has not shipped render as a named,
+> greyed nav entry"* — no longer describes anything: the roadmap chips carried screens that were
+> promised and unbuilt, and every screen the reduced console promises is built, so the nav has no
+> planned run. The shipped design is `docs/design/console/README.md`.
+
 | Screen | Backend | Availability |
 |---|---|---|
 | **Imposters** — list, per-imposter detail, enable/disable; filter/sort/bulk (#252) | `GET/POST/DELETE /imposters*` (terminated routes — `classify()` and the `Terminated` enum in `admin_front.rs`; reads proxied to the engine). Filtering and sorting are **client-side** over the list already fetched — no query parameter is added, because `GET /imposters` returns the tenant's whole set and a server-side filter would give "what is in this list" a second source of truth. Bulk actions are **N calls, not a batch endpoint**: one request per imposter, reported per item (see below) | v1, bulk #252 |

@@ -5,6 +5,7 @@ import {
   CSRF_HEADER,
   IDEMPOTENCY_HEADER,
   REVISION_HEADER,
+  RawBody,
   RawJsonBody,
   apiGet,
   apiGetWithRevision,
@@ -186,6 +187,18 @@ describe("conditioning a write on a revision", () => {
     await apiSend("PUT", "/imposters/4545/stubs/by-id/s-1", new RawJsonBody(text));
     expect((fetchMock.mock.calls[0]?.[1] as RequestInit).body).toBe(text);
     expect(headersOf(fetchMock)["Content-Type"]).toBe("application/json");
+  });
+
+  it("declares a raw non-JSON body under the media type it names", async () => {
+    // `POST /specs/compile` takes the operator's OpenAPI document as written. The server sniffs the
+    // bytes, so the header is declarative — but a YAML body labelled `application/json` is still
+    // a lie in every proxy log between here and there.
+    const fetchMock = mockFetch(json({ imposter: {}, operations: [] }));
+    const text = "openapi: 3.0.3\n";
+    await apiSend("POST", "/specs/compile?port=4545", new RawBody(text, "application/yaml"));
+    expect((fetchMock.mock.calls[0]?.[1] as RequestInit).body).toBe(text);
+    expect(headersOf(fetchMock)["Content-Type"]).toBe("application/yaml");
+    expect(headersOf(fetchMock)[CSRF_HEADER]).toBeTruthy();
   });
 });
 

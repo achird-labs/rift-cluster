@@ -58,18 +58,35 @@ export type RequestOptions = {
 };
 
 /**
- * A body the caller has already serialized, sent verbatim.
+ * A body the caller has already serialized, sent verbatim under the media type it names.
+ *
+ * Exists for the one route whose body is not JSON the console assembled: `POST /specs/compile`
+ * takes an OpenAPI document as the operator wrote it — JSON or YAML — and the server sniffs the
+ * bytes rather than trusting the header, so the media type here is declarative. It is still sent
+ * truthfully: a YAML body labelled `application/json` would be a lie a proxy or a log reader has
+ * no way to see through.
+ */
+export class RawBody {
+  readonly text: string;
+  readonly contentType: string;
+
+  constructor(text: string, contentType: string) {
+    this.text = text;
+    this.contentType = contentType;
+  }
+}
+
+/**
+ * A JSON body the caller has already serialized, sent verbatim.
  *
  * The raw-JSON stub editor saves the operator's own text. Handing that text to `JSON.stringify` as
  * a string would send a JSON *string*; parsing and re-stringifying it would reorder keys and drop
  * their whitespace, producing a stored stub that differs from what they typed in ways they never
  * asked for. This is the only way to say "these exact bytes are the body".
  */
-export class RawJsonBody {
-  readonly text: string;
-
+export class RawJsonBody extends RawBody {
   constructor(text: string) {
-    this.text = text;
+    super(text, "application/json");
   }
 }
 
@@ -148,7 +165,7 @@ async function request(
     headers[CSRF_HEADER] = "1";
   }
   if (body !== undefined) {
-    headers["Content-Type"] = "application/json";
+    headers["Content-Type"] = body instanceof RawBody ? body.contentType : "application/json";
   }
   const ifMatch = options?.ifMatch;
   if (ifMatch !== undefined && ifMatch !== null && ifMatch !== "") {
@@ -169,7 +186,7 @@ async function request(
     credentials: "same-origin",
     ...(body === undefined
       ? {}
-      : { body: body instanceof RawJsonBody ? body.text : JSON.stringify(body) }),
+      : { body: body instanceof RawBody ? body.text : JSON.stringify(body) }),
   });
 
   const text = await response.text();

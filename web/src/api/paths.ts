@@ -11,6 +11,7 @@ export const API_PATHS = {
   fleetHealth: "/_fleet/health",
   session: "/session",
   frontDoorRoutes: "/front-door/routes",
+  specsCompile: "/specs/compile",
 } as const satisfies Record<string, ApiPath>;
 
 /** Path builders for the templated routes, so a port is interpolated in exactly one place. */
@@ -128,3 +129,18 @@ export const fleetOpPath = (opId: string): string =>
   `/_fleet/ops/${encodeURIComponent(opId)}`;
 export const frontDoorRoutePath = (routeId: string): string =>
   `/front-door/routes/${encodeURIComponent(routeId)}`;
+
+/**
+ * `POST /specs/compile?port=<port>[&name=<name>]` — the one-shot OpenAPI compile (D-72).
+ *
+ * `port` is always present because the route requires it: there is no stored record to infer a
+ * binding from, and a compiled imposter with no port is one the very next `POST /imposters` would
+ * refuse. `name` is left off entirely when blank — the contract reads absent and empty the same,
+ * and sending `name=` would only make a reader wonder which one was meant.
+ */
+export const compileSpecPath = (port: number, name: string): string => {
+  const trimmed = name.trim();
+  const query = new URLSearchParams({ port: String(port) });
+  if (trimmed.length > 0) query.set("name", trimmed);
+  return `${API_PATHS.specsCompile}?${query.toString()}`;
+};

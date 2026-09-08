@@ -14,7 +14,7 @@ export function RouteTableScreen(): ReactNode {
   if (table.isError) {
     return (
       <section className="screen">
-        <h1>Front-door routes</h1>
+        <h1>Router</h1>
         <ErrorNote error={table.error} context="Could not read the fleet's route table" />
       </section>
     );
@@ -23,9 +23,9 @@ export function RouteTableScreen(): ReactNode {
   return (
     <section className="screen">
       <header className="screen-head">
-        <h1>Front-door routes</h1>
+        <h1>Router</h1>
         <p className="scope-label">
-          Listed in the order the front door evaluates them, which is computed from the routes
+          Listed in the order the router evaluates them, which is computed from the routes
           themselves — not the order they were authored in.
         </p>
       </header>
@@ -291,7 +291,7 @@ function Editor({ loaded }: { loaded: Route[] }): ReactNode {
 
       {draft.length === 0 ? (
         <Empty
-          title="This fleet has no front-door routes"
+          title="This fleet has no routes"
           body="Every request reaches its imposter by port until a route is added here."
         />
       ) : null}
@@ -504,7 +504,7 @@ function FrontDoorNotes(): ReactNode {
       <Card title="Why one port is enough">
         <p>
           Dispatch targets the imposter <em>object</em>, not its socket. An imposter whose own bind
-          failed on one node is still served there through the front door — and behind a managed
+          failed on one node is still served there through the router — and behind a managed
           load balancer this is the only data port a Service has to expose.
         </p>
       </Card>
@@ -606,7 +606,7 @@ function RouteTester({ routes }: { routes: readonly Route[] }): ReactNode {
           </ol>
         )}
         <p className="hint" data-testid="probe-hint">
-          Evaluated by this console against the table above — the front door has no probe endpoint
+          Evaluated by this console against the table above — the router has no probe endpoint
           to ask, so this is a reading of the same rules rather than its verdict.
         </p>
       </section>

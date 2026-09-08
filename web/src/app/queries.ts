@@ -3,6 +3,7 @@ import type { UseMutationResult, UseQueryResult } from "@tanstack/react-query";
 
 import {
   ApiError,
+  RawBody,
   RawJsonBody,
   type RevisionedRead,
   type SendResult,
@@ -15,6 +16,7 @@ import { type CommitOutcome, applied, settle } from "../features/writes/commit.t
 import { keyedAttempt } from "../features/writes/idempotency.ts";
 import {
   API_PATHS,
+  compileSpecPath,
   frontDoorRoutePath,
   imposterPath,
   lifecyclePath,
@@ -34,6 +36,7 @@ import {
   tryImposterPath,
 } from "../api/paths.ts";
 import type { components } from "../api/schema.ts";
+import type { SpecCompileResult, SpecContentType } from "../features/import/openapi.ts";
 import { type RecordedRequest, readLog } from "../features/requests/source.ts";
 import {
   type FlowStateRead,
@@ -604,6 +607,41 @@ export function useImportAddImposter(): UseMutationResult<
       return outcome;
     },
     onSettled: () => client.invalidateQueries({ queryKey: ["imposters"] }),
+  });
+}
+
+/** What the OpenAPI import sends to the compiler: the document as written, and where it should bind. */
+export type CompileSpecInput = {
+  text: string;
+  contentType: SpecContentType;
+  port: number;
+  name: string;
+};
+
+/**
+ * Compile an OpenAPI document into an imposter — `POST /specs/compile` (D-72, #553).
+ *
+ * **Not a write, and deliberately not keyed or settled like one.** The route stores nothing: no
+ * `ControlOp` is minted, no record kept, no applied state read. It answers the compiled imposter
+ * and the operation index synchronously, so it cannot park — `applied()` asserts that, and would
+ * throw rather than hand back a value if the contract ever changed under us. It declares no
+ * `Idempotency-Key` either, and none is sent: a repeated compile is a second read of a pure
+ * function, not a second op (see `UNDECLARED` in `features/writes/idempotency.ts`).
+ *
+ * The imposter reaches the fleet only through the ordinary `useImportAddImposter` — the same
+ * `POST /imposters`, key and settle discipline every other create takes. Nothing is invalidated
+ * here because nothing changed.
+ */
+export function useCompileSpec(): UseMutationResult<SpecCompileResult, Error, CompileSpecInput> {
+  return useMutation({
+    mutationFn: async ({ text, contentType, port, name }) =>
+      applied(
+        await apiSend<SpecCompileResult>(
+          "POST",
+          compileSpecPath(port, name),
+          new RawBody(text, contentType),
+        ),
+      ),
   });
 }
 
