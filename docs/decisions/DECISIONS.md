@@ -720,10 +720,11 @@ are in spec; the scenario bounds leadership transitions by `C6_MAX_LEADER_TRANSI
 from the ~5 s gauge resolution), never by a fixed count.
 
 **Amendment (D-71, 2026-09-07, #548):** the `rift_cluster_members` gauge that supplied the samples
-is retired with the operator observability pack. The harness now samples `current_leader` from
-`GET /_fleet/members` at `C6_LEADER_SAMPLE_INTERVAL`, deliberately the same ~5 s cadence the gauge
-was resampled at, so the derivation of `C6_MAX_LEADER_TRANSITIONS` is unchanged. The bound is a
-rate over that sampling window, exactly as before; only the sample's source moved.
+is retired with the operator observability pack. The harness now samples **which node claims
+leadership** — `is_leader` on `GET /_fleet/members`, read through `claims_leadership` — at
+`C6_LEADER_SAMPLE_INTERVAL`, deliberately the same ~5 s cadence the gauge was resampled at, so the
+derivation of `C6_MAX_LEADER_TRANSITIONS` is unchanged. The bound is a rate over that sampling
+window, exactly as before; only the sample's source moved.
 
 *Rejected:* widening the election timeout so a count bound holds — the timers stay fixed in
 `raft/node.rs`; making them a `NodeConfig` knob needs its own design pass and has no operator

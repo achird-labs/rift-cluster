@@ -809,6 +809,103 @@ fn both_tiers_refuse_a_run_that_tested_nothing() {
     }
 }
 
+/// The two scripts that verify the shipped compose manifests must have a CI
+/// invoker, and it must run **both** of them.
+///
+/// `deploy/compose/verify.sh` proves the cluster forms; `deploy/compose/smoke.sh`
+/// (RFC-007 §5) proves it works. Neither is a `cargo test` — both need a
+/// container runtime — so nothing in the Rust suite runs them, and a script with
+/// no invoker cannot go red however broken it is. That is not hypothetical: #562
+/// retired the job that ran `verify.sh` **and** deleted the guard test that
+/// pinned the invoker, in the same commit that rewrote the script's assertions,
+/// and the whole `deploy/` surface went a release cycle verified only by hand.
+///
+/// Pinned the same way `the_chaos_runner_expands_its_scenarios_as_an_array` pins
+/// the chaos runner: read the workflow text and assert the load-bearing literals.
+/// A plain `#[test]`, not a container-gated scenario — the failure it guards
+/// against is a workflow edit, so it must run on every PR, including the ones the
+/// chaos tier's path filter skips.
+#[test]
+fn the_compose_verification_scripts_have_a_ci_invoker() {
+    let ci = read_workflow("ci.yml");
+    let job = workflow_job(&ci, "compose-smoke");
+
+    for script in ["deploy/compose/verify.sh", "deploy/compose/smoke.sh"] {
+        assert!(
+            job.contains(script),
+            "the compose-smoke job does not invoke {script}. Both halves are \
+             load-bearing: verify.sh proves the manifests form a cluster, smoke.sh \
+             proves the core's promises hold on it. Running one is not running the \
+             other."
+        );
+    }
+
+    // The same ephemeral-range hazard `ci_reserves_every_published_port_that_
+    // linux_could_hand_out` covers for the chaos tier, for the ports THIS lane
+    // publishes: `docker-compose.yml`'s 39090 and `smoke.overlay.yml`'s rift-4
+    // block. Those two files are outside `compose_files()` — that helper feeds
+    // the harness's own port barrier, which knows nothing about the smoke overlay
+    // — so the set is read here rather than reused.
+    const EPHEMERAL: std::ops::RangeInclusive<u16> = 32768..=60999;
+    let compose_dir =
+        std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../../deploy/compose"));
+    let mut vulnerable: Vec<u16> = ["docker-compose.yml", "smoke.overlay.yml"]
+        .iter()
+        .flat_map(|name| host_ports_in(&read_compose(&compose_dir.join(name))))
+        .filter(|port| EPHEMERAL.contains(port))
+        .collect();
+    vulnerable.sort_unstable();
+    vulnerable.dedup();
+    assert!(
+        !vulnerable.is_empty(),
+        "scraped no ephemeral-range host ports out of the compose files the lane \
+         stands up — the scraper is broken, not the topology"
+    );
+
+    let sets = reserved_port_sets(job);
+    assert!(
+        !sets.is_empty(),
+        "the compose-smoke job reserves no ports from the ephemeral range, so an \
+         outbound connection on the runner can hold one of {vulnerable:?} and \
+         `compose up` fails to bind it — issue #117, one lane over"
+    );
+    for reserved in &sets {
+        for port in &vulnerable {
+            assert!(
+                reserved.contains(port),
+                "the compose-smoke job has a reservation that omits {port}, which \
+                 the compose fleets publish and Linux can hand out as an ephemeral \
+                 source port"
+            );
+        }
+    }
+}
+
+/// One job's body out of a workflow: everything under `  <name>:` up to the next
+/// line at exactly two spaces of indent, which is where the next job (or its
+/// leading comment block) begins.
+///
+/// Bounded rather than "the rest of the file" on purpose: an unbounded tail lets
+/// a *later* job's steps satisfy an assertion about this one, which is a guard
+/// that passes for the wrong reason — and the wrong reason here is another lane
+/// happening to reserve some ports.
+fn workflow_job<'a>(workflow: &'a str, name: &str) -> &'a str {
+    let header = format!("\n  {name}:\n");
+    let start = workflow
+        .find(&header)
+        .unwrap_or_else(|| panic!("the workflow has no `{name}:` job"))
+        + header.len();
+    let body = &workflow[start..];
+    let mut offset = 0usize;
+    for line in body.split_inclusive('\n') {
+        if line.starts_with("  ") && !line.starts_with("   ") {
+            return &body[..offset];
+        }
+        offset += line.len();
+    }
+    body
+}
+
 fn read_workflow(name: &str) -> String {
     let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../.github/workflows/").to_owned() + name;
     std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path}: {e}"))
@@ -1914,19 +2011,30 @@ async fn test_reconcile_preserves_state() {
 
     for node in &NODES {
         // Read off `bind_failures` on `/_fleet/members` (#369): this node's own map of
-        // port → reason, `{}` on a healthy node. Absence is still the "no failures" answer,
-        // as it was when this read a `GaugeVec` that published no series for a healthy
-        // port: the field is `null` when the node's bind status could not be determined at
-        // all (`bind_status_unavailable`), which is not a bind failure and not what this
-        // scenario is about, so only a non-empty map fails it. The read itself failing is
-        // a harness fault, never a clean pass.
+        // port → reason, `{}` on a healthy node.
+        //
+        // Absence fails closed. `null` is `BindFields::unknown` / `LocalBindState::
+        // Unavailable` — "this node's bind status could not be determined at all", which
+        // `bind_status_unavailable` discriminates — and that is *unknown*, not *nothing
+        // failed*. Treating it as healthy is the reassuring-answer shape the producer went
+        // out of its way not to emit: a node whose local engine had gone away would clear
+        // this assertion while holding no listener at all, which is the very condition the
+        // scenario is here to notice. The read itself failing is a harness fault, and
+        // panics for the same reason rather than passing.
         let body = fleet_members(node.admin)
             .await
             .unwrap_or_else(|e| panic!("{}: /_fleet/members did not answer: {e}", node.name));
+        let failures = body["bind_failures"].as_object().unwrap_or_else(|| {
+            panic!(
+                "{}: /_fleet/members carries no `bind_failures` object \
+                 (bind_status_unavailable = {}). `null` means this node could not determine \
+                 its own bind status, not that nothing failed — a node with no local engine \
+                 must fail here, not read as healthy. Body: {body}",
+                node.name, body["bind_status_unavailable"]
+            )
+        });
         assert!(
-            body["bind_failures"]
-                .as_object()
-                .is_none_or(serde_json::Map::is_empty),
+            failures.is_empty(),
             "{} reported a bind failure: {}",
             node.name,
             body["bind_failures"]
