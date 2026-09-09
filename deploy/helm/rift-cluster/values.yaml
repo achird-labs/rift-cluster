@@ -123,7 +123,14 @@ metrics:
     labels: {}
 
 sources:
-  # Rendered into `RIFT_IMPOSTERS`. A declarative imposter source the fleet pulls at startup.
+  # Rendered into `RIFT_IMPOSTERS` (the `--imposters` flag). A **one-shot** bootstrap: the leader
+  # resolves each URI once at startup through upstream's own `SourceRegistry` (`file:` and
+  # `http(s):` only) and submits each document as an ordinary `PutImposter`. Nothing is polled,
+  # nothing is tracked, and the fleet keeps no record of where an imposter came from — the tracking
+  # source records and the `git+`/`s3:`/`registry:` providers were removed by D-72 (#549), which is
+  # why the retired schemes are refused by name at startup rather than silently unresolved.
+  #
+  # The key keeps the name `sources` for chart compatibility; it is not a source subsystem.
   imposters: ""
 
 # Appended verbatim to the container's env. Anything set here wins over nothing — the chart does not
