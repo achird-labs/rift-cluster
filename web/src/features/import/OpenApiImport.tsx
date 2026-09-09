@@ -1,12 +1,13 @@
-import { type ChangeEvent, type ReactNode, useState } from "react";
+import { type ChangeEvent, type ReactNode, useMemo, useState } from "react";
 
 import { useCompileSpec, useImportAddImposter } from "../../app/queries.ts";
-import { ErrorNote, UnconfirmedNote } from "../../components/primitives.tsx";
+import { ErrorNote, UnconfirmedNote, describe } from "../../components/primitives.tsx";
 import { useToast } from "../../components/toast.tsx";
 import {
   type CompileSummary,
   type SpecCompileResult,
   compileFailureText,
+  fileProblem,
   parsePort,
   preflight,
   specContentType,
@@ -36,6 +37,7 @@ export function OpenApiImport({ onClose }: { onClose: () => void }): ReactNode {
   const [name, setName] = useState("");
   const [compiled, setCompiled] = useState<SpecCompileResult | null>(null);
   const [unconfirmed, setUnconfirmed] = useState<string | null>(null);
+  const [fileRefusal, setFileRefusal] = useState<string | null>(null);
 
   const compile = useCompileSpec();
   const add = useImportAddImposter();
@@ -43,20 +45,48 @@ export function OpenApiImport({ onClose }: { onClose: () => void }): ReactNode {
 
   const busy = compile.isPending || add.isPending;
   const parsedPort = parsePort(port);
-  const documentProblem = preflight(text);
+  // Memoised on the text because it encodes the whole document to count its bytes, and this runs
+  // on every keystroke of the port and name fields as well as the textarea's own.
+  const documentProblem = useMemo(() => preflight(text), [text]);
   const portProblem =
     port.trim().length === 0 || parsedPort !== null
       ? null
       : "Port must be a whole number between 1 and 65535.";
   const canCompile = documentProblem === null && parsedPort !== null && !busy;
 
+  /**
+   * Choosing a file, in the one order that cannot lie about what is on screen.
+   *
+   * The size is checked **before** the read, off `File.size`, so an oversize document is refused
+   * without the browser pulling it into memory first. The read itself is caught, and `filename`
+   * and `text` are set together and only on success: setting the name first and awaiting the text
+   * left the *previous* document on screen labelled with the new file's name whenever the read
+   * failed — a rejected `file.text()` (a file moved or unreadable since the picker listed it) then
+   * compiled the old bytes under the new name with nothing on screen saying so.
+   */
   async function handleFile(event: ChangeEvent<HTMLInputElement>): Promise<void> {
     const file = event.target.files?.[0];
     // Cleared unconditionally, so choosing the same file again after an edit still fires a change.
     event.target.value = "";
     if (file === undefined) return;
+    setFileRefusal(null);
+
+    const tooBig = fileProblem(file.name, file.size);
+    if (tooBig !== null) {
+      setFileRefusal(tooBig);
+      return;
+    }
+
+    let contents: string;
+    try {
+      contents = await file.text();
+    } catch (error) {
+      setFileRefusal(`${file.name} could not be read: ${describe(error)}`);
+      return;
+    }
+
     setFilename(file.name);
-    setText(await file.text());
+    setText(contents);
     compile.reset();
   }
 
@@ -64,6 +94,7 @@ export function OpenApiImport({ onClose }: { onClose: () => void }): ReactNode {
     setText(next);
     // A pasted document has no filename; a file's name stops describing text that was then edited.
     setFilename(undefined);
+    setFileRefusal(null);
     compile.reset();
   }
 
@@ -109,12 +140,13 @@ export function OpenApiImport({ onClose }: { onClose: () => void }): ReactNode {
         className="confirm wizard"
         role="dialog"
         aria-modal="true"
-        aria-label="Import OpenAPI"
+        aria-label="Import from OpenAPI spec"
         data-testid="openapi-import"
       >
         <header className="wizard-head">
           <div>
-            <h2>Import OpenAPI</h2>
+            {/* The same words as the button that opened it — one name for one feature. */}
+            <h2>Import from OpenAPI spec</h2>
             <p className="muted">
               POST /specs/compile, then POST /imposters &mdash; the same replicated create
             </p>
@@ -138,6 +170,11 @@ export function OpenApiImport({ onClose }: { onClose: () => void }): ReactNode {
             <ReviewStep summary={summary} />
           )}
 
+          {fileRefusal === null ? null : (
+            <p className="error" role="alert" data-testid="openapi-file-error">
+              {fileRefusal}
+            </p>
+          )}
           {compile.isError ? (
             <p className="error" role="alert" data-testid="openapi-compile-error">
               {compileFailureText(compile.error)}

@@ -3,6 +3,7 @@ import { screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
+import { MAX_SPEC_BYTES } from "../features/import/openapi.ts";
 import { Imposters } from "../screens/Imposters.tsx";
 import { renderInApp, stubFetch } from "./harness.tsx";
 
@@ -109,7 +110,9 @@ describe("importing an OpenAPI document", () => {
     const { requests } = stubFetch({
       ...LISTED,
       "/specs/compile": { json: COMPILED },
-      "/imposters ": { json: COMPILED.imposter },
+      // Method-keyed: `/imposters` is both the listing this screen reads and the create this
+      // dialog writes, and the create is the one being modelled here.
+      "POST /imposters": { json: COMPILED.imposter },
     });
     renderInApp(<Imposters />);
     const user = userEvent.setup();
@@ -138,10 +141,76 @@ describe("importing an OpenAPI document", () => {
     await waitFor(() => expect(screen.queryByTestId("openapi-import")).toBeNull());
   });
 
+  it("polls a parked create to its commit before saying it is done", async () => {
+    // `--cluster-admin-async` answers `202` the moment the write is parked. The dialog must not
+    // call that done: `settle()` polls the op ids the body carries until one of them is terminal,
+    // and only an `applied` op closes the dialog. Nothing else here exercises `pollCommit`.
+    const { requests } = stubFetch({
+      ...LISTED,
+      "/specs/compile": { json: COMPILED },
+      "POST /imposters": { status: 202, json: { opIds: ["op-77"] } },
+      "/_fleet/ops/op-77": { json: { opId: "op-77", state: "applied", revision: 42 } },
+    });
+    renderInApp(<Imposters />);
+    const user = userEvent.setup();
+
+    await openWithDocument(user, PETSTORE_YAML, "4545");
+    await user.click(screen.getByTestId("openapi-compile"));
+    await screen.findByTestId("openapi-review");
+    await user.click(screen.getByTestId("openapi-create"));
+
+    // The op the `202` named was actually followed — a dialog that closed without this would be
+    // reporting a write it never watched land.
+    await waitFor(() =>
+      expect(requests.some((r) => r.path === "/_fleet/ops/op-77" && r.method === "GET")).toBe(true),
+    );
+    await waitFor(() => expect(screen.queryByTestId("openapi-import")).toBeNull());
+    expect(screen.queryByTestId("write-unconfirmed")).toBeNull();
+  });
+
+  it("says a parked create is unconfirmed when the op cannot be read, and stays open", async () => {
+    // `GET /_fleet/ops/{id}` answers `404` for an op this node cannot resolve, and that is not
+    // evidence the write did not land. The dialog says "accepted, not yet confirmed" in those
+    // words and stays open, rather than toasting a create nobody observed or claiming a failure.
+    stubFetch({
+      ...LISTED,
+      "/specs/compile": { json: COMPILED },
+      "POST /imposters": { status: 202, json: { opIds: ["op-88"] } },
+      "/_fleet/ops/op-88": { status: 404 },
+    });
+    renderInApp(<Imposters />);
+    const user = userEvent.setup();
+
+    await openWithDocument(user, PETSTORE_YAML, "4545");
+    await user.click(screen.getByTestId("openapi-compile"));
+    await screen.findByTestId("openapi-review");
+    await user.click(screen.getByTestId("openapi-create"));
+
+    const note = await screen.findByTestId("write-unconfirmed");
+    expect(note.textContent).toMatch(/accepted, not yet confirmed/i);
+    // Still open, and the create button is spent: pressing it again would be a second write for a
+    // first one whose outcome is unknown.
+    expect(screen.getByTestId("openapi-import")).toBeTruthy();
+    expect((screen.getByTestId("openapi-create") as HTMLButtonElement).disabled).toBe(true);
+  });
+
   it("shows the compiler's 400 in its own words and stays on the document", async () => {
     stubFetch({
       ...LISTED,
-      "/specs/compile": { status: 400, json: "external $ref not supported: ./common.yaml" },
+      "/specs/compile": {
+        status: 400,
+        // The refusal as the admin plane actually sends one — the declared `Error` envelope, not
+        // a bare string. The dialog must show the sentence, not the JSON around it.
+        json: {
+          errors: [
+            {
+              code: "400",
+              type: "bad_data",
+              message: "external $ref not supported: ./common.yaml",
+            },
+          ],
+        },
+      },
     });
     renderInApp(<Imposters />);
     const user = userEvent.setup();
@@ -150,7 +219,9 @@ describe("importing an OpenAPI document", () => {
     await user.click(screen.getByTestId("openapi-compile"));
 
     const alert = await screen.findByTestId("openapi-compile-error");
-    expect(alert.textContent).toContain("external $ref not supported: ./common.yaml");
+    expect(alert.textContent).toBe("external $ref not supported: ./common.yaml");
+    // Unwrapped, not the envelope: no `errors`, no `type`, no braces in front of the diagnosis.
+    expect(alert.textContent).not.toMatch(/errors|bad_data|[{}]/);
     // Still on the first step, document intact, so the operator can fix and retry.
     expect(screen.queryByTestId("openapi-review")).toBeNull();
     expect((screen.getByTestId("openapi-text") as HTMLTextAreaElement).value).toBe(PETSTORE_YAML);
@@ -205,6 +276,57 @@ describe("importing an OpenAPI document", () => {
       return found;
     });
     expect(compile?.headers["content-type"]).toBe("application/yaml");
+  });
+
+  it("refuses an oversize file on its size alone, without reading it", async () => {
+    // The route caps the body at 4 MiB and `File.size` is that same byte count, known before the
+    // file is opened — so the refusal must come first. `text()` is rigged to throw: if the dialog
+    // reads before it checks, this fails instead of quietly pulling a huge file into memory.
+    const { requests } = stubFetch({ ...LISTED, "/specs/compile": { json: COMPILED } });
+    renderInApp(<Imposters />);
+    const user = userEvent.setup();
+
+    await user.click(await screen.findByTestId("open-openapi-import"));
+    await user.click(screen.getByTestId("openapi-text"));
+    await user.paste(PETSTORE_YAML);
+
+    const huge = new File(["x"], "huge.yaml", { type: "" });
+    Object.defineProperty(huge, "size", { value: MAX_SPEC_BYTES + 1 });
+    Object.defineProperty(huge, "text", {
+      value: () => Promise.reject(new Error("must not be read")),
+    });
+    await user.upload(screen.getByTestId("openapi-file"), huge);
+
+    const refusal = await screen.findByTestId("openapi-file-error");
+    expect(refusal.textContent).toMatch(/huge\.yaml/);
+    expect(refusal.textContent).toMatch(/4\.0 MiB/);
+    // Nothing was sent, and the document already in the box is untouched.
+    expect(requests.some((r) => r.path.startsWith("/specs/compile"))).toBe(false);
+    expect((screen.getByTestId("openapi-text") as HTMLTextAreaElement).value).toBe(PETSTORE_YAML);
+  });
+
+  it("keeps the document it has when a file cannot be read, and says the read failed", async () => {
+    // The bug this pins: `setFilename(file.name); setText(await file.text())` set the name first,
+    // so a rejected read left the *previous* document on screen under the new file's name — and
+    // pressing Compile then sent the old bytes with nothing saying so.
+    stubFetch({ ...LISTED, "/specs/compile": { json: COMPILED } });
+    renderInApp(<Imposters />);
+    const user = userEvent.setup();
+
+    await user.click(await screen.findByTestId("open-openapi-import"));
+    await user.click(screen.getByTestId("openapi-text"));
+    await user.paste(PETSTORE_YAML);
+
+    const unreadable = new File(["…"], "moved.yaml", { type: "" });
+    Object.defineProperty(unreadable, "text", {
+      value: () => Promise.reject(new Error("NotReadableError: the file moved")),
+    });
+    await user.upload(screen.getByTestId("openapi-file"), unreadable);
+
+    const refusal = await screen.findByTestId("openapi-file-error");
+    expect(refusal.textContent).toMatch(/moved\.yaml/);
+    expect(refusal.textContent).toMatch(/NotReadableError/);
+    expect((screen.getByTestId("openapi-text") as HTMLTextAreaElement).value).toBe(PETSTORE_YAML);
   });
 
   it("says the document is compiled, not stored", async () => {

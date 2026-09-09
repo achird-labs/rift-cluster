@@ -357,14 +357,18 @@ export function Imposters(): ReactNode {
               by `POST /specs/compile`, which stores nothing (D-72), then created through the same
               `POST /imposters` as everything else. Beside Import rather than folded into it: that
               panel takes this console's own export format, and a box that accepted both would have
-              to guess which one it was looking at. */}
+              to guess which one it was looking at.
+
+              Named so it is not a prefix of the button beside it: "Import" and "Import OpenAPI"
+              give two controls in one toolbar accessible names one of which contains the other,
+              and a speech-input user saying "click Import" then addresses an ambiguous pair. */}
           <button
             className="btn"
             type="button"
             data-testid="open-openapi-import"
             onClick={() => setImportingSpec(true)}
           >
-            Import OpenAPI
+            Import from OpenAPI spec
           </button>
           <button
             className="btn primary"

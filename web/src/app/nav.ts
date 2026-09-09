@@ -109,3 +109,24 @@ export const NAV: readonly NavEntry[] = [
 export function liveEntries(): NavEntry[] {
   return [...NAV];
 }
+
+/**
+ * Whether an entry's `short` may stand in for its `label` — WCAG 2.5.3, Label in Name.
+ *
+ * The bar prints `short` and names the control with `label`, so a `short` that is not contained in
+ * `label` produces a link whose visible text is not in its accessible name: "click Fleet" then
+ * addresses nothing, for every speech-input user.
+ *
+ * Case-insensitively, which is the criterion rather than a loosening of it — speech input matches
+ * without regard to case, so demanding an exact substring would reject a label that satisfies
+ * 2.5.3 and push the fix toward a lowercased word in the bar.
+ *
+ * A named predicate rather than a loop body in the test, because **no entry carries a `short`
+ * today**: a rule expressed only as `for (…) if (short === undefined) continue` passes on an empty
+ * set and would keep passing after it stopped being true. This can be checked against a fixture,
+ * and is, in `nav.test.ts`.
+ */
+export function shortLabelStandsIn(entry: { label: string; short?: ShortLabel }): boolean {
+  if (entry.short === undefined) return true;
+  return entry.short.length > 0 && entry.label.toLowerCase().includes(entry.short.toLowerCase());
+}

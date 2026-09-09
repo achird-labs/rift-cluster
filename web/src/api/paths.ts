@@ -137,10 +137,15 @@ export const frontDoorRoutePath = (routeId: string): string =>
  * binding from, and a compiled imposter with no port is one the very next `POST /imposters` would
  * refuse. `name` is left off entirely when blank — the contract reads absent and empty the same,
  * and sending `name=` would only make a reader wonder which one was meant.
+ *
+ * `name` is **percent-encoded** with `encodeURIComponent`, which is what the route decodes
+ * (RFC 3986 — `admin_front.rs::percent_decode`). Not `URLSearchParams`: that emits
+ * `x-www-form-urlencoded`, where a space is `+`, and a server decoding by RFC 3986 would then name
+ * the imposter `Pet+Store`. `encodeURIComponent` never emits a bare `+` — a space is `%20` and a
+ * literal plus is `%2B` — so the two halves agree on every byte.
  */
 export const compileSpecPath = (port: number, name: string): string => {
   const trimmed = name.trim();
-  const query = new URLSearchParams({ port: String(port) });
-  if (trimmed.length > 0) query.set("name", trimmed);
-  return `${API_PATHS.specsCompile}?${query.toString()}`;
+  const base = `${API_PATHS.specsCompile}?port=${String(port)}`;
+  return trimmed.length > 0 ? `${base}&name=${encodeURIComponent(trimmed)}` : base;
 };

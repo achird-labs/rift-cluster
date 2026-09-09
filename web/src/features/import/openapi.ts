@@ -1,5 +1,6 @@
 import { ApiError } from "../../api/client.ts";
 import type { components } from "../../api/schema.ts";
+import { describe } from "../../components/primitives.tsx";
 
 /**
  * The one-shot OpenAPI import (D-72, RFC-007 §3.1) — the pure half.
@@ -10,9 +11,10 @@ import type { components } from "../../api/schema.ts";
  * imposter reaches the log only when the operator takes the second step and the console
  * `POST /imposters` it through the same write path every other create takes.
  *
- * Free of React, like `features/imposters/portable.ts`: which media type a document is, what a
- * port field means, and what the compiler's answer amounts to are all worth deciding and testing
- * without a dialog attached.
+ * No components and no DOM, like `features/imposters/portable.ts`: which media type a document is,
+ * what a port field means, and what the compiler's answer amounts to are all worth deciding and
+ * testing without a dialog attached. (It borrows `describe` from `primitives.tsx` for the status
+ * sentences, exactly as `features/imposters/bulk.ts` does, so the console has one voice for a 401.)
  */
 
 export type SpecCompileResult = components["schemas"]["SpecCompileResult"];
@@ -72,6 +74,21 @@ export function preflight(text: string): string | null {
   return null;
 }
 
+/**
+ * Why a chosen file is refused before a byte of it is read, or `null` when it is worth reading.
+ *
+ * `File.size` is exactly the byte count the route caps, and the browser knows it without opening
+ * the file — so a 300 MB document is refused for free, instead of after being pulled into a string
+ * the dialog would immediately throw away. `preflight` would reach the same verdict; it just has
+ * to have the text first.
+ */
+export function fileProblem(name: string, bytes: number): string | null {
+  if (bytes > MAX_SPEC_BYTES) {
+    return `${name} is ${formatBytes(bytes)}; the fleet accepts at most ${formatBytes(MAX_SPEC_BYTES)}.`;
+  }
+  return null;
+}
+
 function formatBytes(bytes: number): string {
   if (bytes >= 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MiB`;
   if (bytes >= 1024) return `${(bytes / 1024).toFixed(0)} KiB`;
@@ -110,23 +127,58 @@ export function summarize(result: SpecCompileResult): CompileSummary {
 }
 
 /**
+ * The one sentence a refusal body actually carries, or `null` when the body is not one.
+ *
+ * Every refusal on this admin plane is the declared `Error` envelope —
+ * `{"errors":[{"code","type","message"}]}` — and `message` is the whole diagnosis. Rendering the
+ * envelope instead would put JSON punctuation on screen in front of the sentence the operator
+ * needs, on the one surface whose error text *is* the feature.
+ *
+ * Every read is a check rather than a cast, and a body that does not parse or does not have the
+ * shape returns `null` so the caller can fall back to the raw text: a route that one day answers
+ * `text/plain` must not have its refusal swallowed into "the fleet refused the document".
+ */
+function envelopeMessage(body: string): string | null {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(body);
+  } catch {
+    // A domain-optional parse: plenty of things are not JSON, and the caller shows the raw body.
+    return null;
+  }
+  const errors = (parsed as { errors?: unknown } | null)?.errors;
+  if (!Array.isArray(errors)) return null;
+  const message = (errors[0] as { message?: unknown } | undefined)?.message;
+  return typeof message === "string" && message.trim().length > 0 ? message.trim() : null;
+}
+
+/**
  * The sentence a failed compile shows.
  *
- * The compiler's refusals are the route's `400` verbatim, and that text is the diagnosis — an
- * unsupported version, the external `$ref` it will not follow, where the parse broke — so it is
- * shown as the server wrote it. `413` is the one status whose body may say nothing useful, so it
- * gets the console's own sentence with the server's appended when there is one. Anything else is
- * whatever the error says about itself.
+ * The compiler's refusals are the route's `400`, and that text is the diagnosis — an unsupported
+ * version, the external `$ref` it will not follow, where the parse broke — so it is shown as the
+ * server wrote it, unwrapped from the `Error` envelope it arrives in. `413` is the one status
+ * whose body may say nothing useful, so it gets the console's own sentence with the server's
+ * appended when there is one.
+ *
+ * `401`, `403` and `503` are **not** about the document at all — a lapsed session, a refusing
+ * front, a node that is not ready — and their envelope text says nothing an operator can act on.
+ * Those go to `describe`, so this dialog says "sign in again" in the same words as every other
+ * screen rather than inventing a second vocabulary for the same three facts.
  */
 export function compileFailureText(error: unknown): string {
   if (error instanceof ApiError) {
+    if (error.status === 401 || error.status === 403 || error.status === 503) {
+      return describe(error);
+    }
     const body = error.body.trim();
+    const detail = envelopeMessage(body) ?? body;
     if (error.status === 413) {
-      return body.length > 0
-        ? `The document is too large for the fleet to compile: ${body}`
+      return detail.length > 0
+        ? `The document is too large for the fleet to compile: ${detail}`
         : "The document is too large for the fleet to compile (the limit is 4 MiB).";
     }
-    return body.length > 0 ? body : `The fleet refused the document (${String(error.status)}).`;
+    return detail.length > 0 ? detail : `The fleet refused the document (${String(error.status)}).`;
   }
-  return error instanceof Error ? error.message : String(error);
+  return describe(error);
 }

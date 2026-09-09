@@ -3411,7 +3411,11 @@ export interface operations {
             query: {
                 /** @description The port the compiled imposter binds. Required, for the reason in the description — a portless imposter cannot replicate. */
                 port: number;
-                /** @description Name for the compiled imposter. Absent — or empty, which reads the same — leaves the field off the compiled config entirely. */
+                /**
+                 * @description Name for the compiled imposter. Absent — or empty, which reads the same — leaves the field off the compiled config entirely.
+                 *
+                 *     **Percent-encoded** (RFC 3986 §2.1, as `encodeURIComponent` produces): `%XX` decodes to that byte and nothing else is rewritten — a `+` is a plus, not a space — so an imposter called `Pet Store` is sent as `name=Pet%20Store`, one called `C++` as `name=C%2B%2B` (or `name=C++`), and one called `a&b` as `name=a%26b`; `&`, `=` and `%` cannot cross a query string any other way. An escape the server cannot read, or decoded bytes that are not UTF-8, is a `400` naming this parameter — never a silently repaired name. `port` is not decoded: it is decimal digits.
+                 */
                 name?: string;
             };
             header?: {

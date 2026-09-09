@@ -624,10 +624,12 @@ pub(crate) fn classify(method: &Method, path: &str) -> Option<Terminated> {
 /// `=value` yields `Some("")`, because presence and absence are different requests to every
 /// caller here.
 ///
-/// No percent-decoding, deliberately mirroring upstream's own `query_pairs` key semantics: this
-/// and the proxy a request can fall through to must agree byte-for-byte about what the query
-/// string says. Nothing this reads ever needs escaping — the one caller is `/specs/compile`'s
-/// `?port=`/`?name=`, decimal digits and a bare imposter name.
+/// No percent-decoding **here**, deliberately mirroring upstream's own `query_pairs` key
+/// semantics: this and the proxy a request can fall through to must agree byte-for-byte about
+/// what the query string says. Decoding is the *caller's* to do, per parameter, because only the
+/// caller knows what its value is made of — `/specs/compile`'s `?port=` is decimal digits and
+/// wants none, while its `?name=` is free operator text and is passed through
+/// [`percent_decode`] at its read site.
 fn query_param<'q>(query: Option<&'q str>, name: &str) -> Option<&'q str> {
     query
         .unwrap_or_default()
@@ -637,6 +639,54 @@ fn query_param<'q>(query: Option<&'q str>, name: &str) -> Option<&'q str> {
             _ if pair == name => Some(""),
             _ => None,
         })
+}
+
+/// One hex digit's value, or `None` for a byte that is not one.
+///
+/// Stricter than `u8::from_str_radix` on purpose: that accepts a leading sign, so `%+f` would
+/// decode to `0x0f` instead of being refused as the malformed escape it is.
+fn hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+/// Percent-decode one query **value** (RFC 3986 §2.1): `%XX` is that byte, everything else — a
+/// `+` included — is itself. `None` when an escape is malformed or the decoded bytes are not
+/// UTF-8, both of which the caller answers as a `400` naming the parameter.
+///
+/// RFC 3986 and nothing more, deliberately. The `application/x-www-form-urlencoded` variant
+/// (`+` for a space) is what `URLSearchParams` emits, and reading it would make `C++` — a name an
+/// operator can type — arrive as `C  `. The console encodes with `encodeURIComponent`, which
+/// never emits a bare `+` and escapes a literal one as `%2B`, so the two halves of the contract
+/// agree: a space is `%20`, a `+` is `+` or `%2B`, and `&`, `=` and `%` — which cannot cross a
+/// query string unescaped at all — are `%26`, `%3D` and `%25`. Reading the value raw named an
+/// imposter literally `Pet%20Store`, and `a&b` did not even survive [`query_param`]'s `&` split.
+///
+/// `String::from_utf8(…).ok()` is a domain-optional parse, not a swallow: invalid UTF-8 is not a
+/// name, and the `None` becomes the caller's own `400`.
+fn percent_decode(raw: &str) -> Option<String> {
+    let bytes = raw.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while let Some(&byte) = bytes.get(i) {
+        match byte {
+            b'%' => {
+                let high = hex_nibble(*bytes.get(i + 1)?)?;
+                let low = hex_nibble(*bytes.get(i + 2)?)?;
+                out.push((high << 4) | low);
+                i += 3;
+            }
+            other => {
+                out.push(other);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8(out).ok()
 }
 
 async fn handle(state: Arc<FrontState>, req: Request<Incoming>) -> Response<FrontBody> {
@@ -1787,6 +1837,9 @@ struct ReplaceStubsBody {
 /// (`validate_replicable_config`: an auto-assigned port cannot replicate). Answering with a
 /// portless document would hand the caller something the very next call refuses.
 ///
+/// **`name` is percent-encoded** (RFC 3986), and decoded here — see the read below. `port` is
+/// not: it is decimal digits, and nothing about them needs escaping.
+///
 /// The compiler's refusals — an unsupported version, an external `$ref`, a parse failure, its own
 /// self-check — become this route's `400` verbatim. There is no separate warning channel: a
 /// document the compiler would warn about is a document it refuses, so a `200` here means the
@@ -1813,12 +1866,37 @@ async fn terminate_spec_compile(req: Request<Incoming>) -> Response<FrontBody> {
             );
         }
     };
-    // Raw, with no percent-decoding, for [`query_param`]'s own reason — and an empty `?name=`
-    // reads as absent rather than as a name of zero characters, because the compiler omits the
-    // field entirely for `None` and an empty `name` is not a thing a caller means to ask for.
-    let name = query_param(query.as_deref(), "name")
-        .filter(|value| !value.is_empty())
-        .map(str::to_owned);
+    // **Percent-decoded, unlike `port`.** A name is free operator text — spaces, `&`, `%`,
+    // non-ASCII — and `&`/`=` do not survive a query string unescaped at all, so a caller that
+    // cannot escape cannot send them. The contract therefore says this value is percent-encoded
+    // (RFC 3986: `%XX` a byte, `+` itself) and it is decoded here, at the one read that knows what
+    // the value is; `query_param` itself stays raw for the reason its own doc gives. Reading it
+    // raw named the imposter `Pet%20Store` and truncated `a&b` at the `&`.
+    //
+    // An escape the decoder cannot read, or bytes that are not UTF-8, is a `400` naming the
+    // parameter rather than a silently mangled name: this is the imposter's identity, and a
+    // lossy repair here would be discovered by whoever went looking for it later.
+    //
+    // An empty `?name=` still reads as absent rather than as a name of zero characters, because
+    // the compiler omits the field entirely for `None` and an empty name is not a thing a caller
+    // means to ask for.
+    let name = match query_param(query.as_deref(), "name") {
+        Some(raw) => match percent_decode(raw) {
+            Some(decoded) if decoded.is_empty() => None,
+            Some(decoded) => Some(decoded),
+            None => {
+                return typed_error(
+                    StatusCode::BAD_REQUEST,
+                    ErrorKind::BadData,
+                    &format!(
+                        "name {raw:?} is not percent-encoded UTF-8: the value must be \
+                         RFC 3986 percent-encoded (`%XX` for a byte; a space is `%20`)"
+                    ),
+                );
+            }
+        },
+        None => None,
+    };
 
     // Bounded before it is parsed, for the reason `rift-cluster-spec`'s own cap exists: this is
     // attacker-influenceable input. `Limited` caps the stream, so a body with no declared length
@@ -4709,13 +4787,55 @@ mod tests {
         );
         assert_eq!(query_param(Some("name=x"), "port"), None);
         assert_eq!(query_param(None, "port"), None);
-        // Raw and undecoded: the value must arrive byte-identical, or the compile names an
-        // imposter the caller never asked for.
+        // Raw and undecoded — this reader hands the bytes over exactly as they arrived, and the
+        // caller that knows what the parameter is made of decides whether to decode them.
         assert_eq!(
-            query_param(Some("name=pet-store_v2"), "name"),
-            Some("pet-store_v2"),
-            "the submitted value must survive the query string unchanged"
+            query_param(Some("name=pet+store%20v2"), "name"),
+            Some("pet+store%20v2"),
+            "the reader must not decode: `percent_decode` is the one that does"
         );
+    }
+
+    /// A query value is percent-encoded (RFC 3986), and `/specs/compile`'s `?name=` is decoded as
+    /// such — and only as such: `+` is a `+`.
+    ///
+    /// Pins the fix for the console sending an encoded name at a raw reader: `Pet Store` went out
+    /// escaped and was taken literally, and `a&b` was truncated at the `&`.
+    #[test]
+    fn a_percent_encoded_query_value_decodes_to_the_text_that_was_typed() {
+        assert_eq!(percent_decode("petstore").as_deref(), Some("petstore"));
+        assert_eq!(percent_decode("").as_deref(), Some(""));
+        // A space is `%20`, which is what `encodeURIComponent` emits.
+        assert_eq!(percent_decode("Pet%20Store").as_deref(), Some("Pet Store"));
+        // RFC 3986, not `x-www-form-urlencoded`: a `+` is a plus, whether bare or escaped. An
+        // imposter called `C++` must not come out as `C  `.
+        assert_eq!(percent_decode("C++").as_deref(), Some("C++"));
+        assert_eq!(percent_decode("C%2B%2B").as_deref(), Some("C++"));
+        assert_eq!(percent_decode("Pet+Store").as_deref(), Some("Pet+Store"));
+        // The characters that cannot cross a query string unescaped at all.
+        assert_eq!(percent_decode("a%26b").as_deref(), Some("a&b"));
+        assert_eq!(percent_decode("a%3Db").as_deref(), Some("a=b"));
+        // A literal percent is itself escaped, so `100%` round-trips rather than eating what
+        // follows it.
+        assert_eq!(percent_decode("100%25").as_deref(), Some("100%"));
+        assert_eq!(percent_decode("%25%32%30").as_deref(), Some("%20"));
+        // Multi-byte UTF-8 arrives one escape per byte.
+        assert_eq!(percent_decode("caf%C3%A9").as_deref(), Some("café"));
+        // Lower- and upper-case hex are the same escape.
+        assert_eq!(percent_decode("%c3%a9").as_deref(), Some("é"));
+
+        // Malformed escapes are refused, never repaired: the caller answers 400.
+        assert_eq!(percent_decode("%"), None, "a truncated escape");
+        assert_eq!(percent_decode("%2"), None, "a one-digit escape");
+        assert_eq!(percent_decode("%zz"), None, "not hex at all");
+        assert_eq!(
+            percent_decode("%+f"),
+            None,
+            "`from_str_radix` would read a leading sign here and decode 0x0f"
+        );
+        // A valid escape sequence whose bytes are not UTF-8 is not a name.
+        assert_eq!(percent_decode("%FF"), None, "a lone continuation byte");
+        assert_eq!(percent_decode("%C3"), None, "a truncated code point");
     }
 
     #[test]

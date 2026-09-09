@@ -83,8 +83,15 @@ export class RawBody {
  * a string would send a JSON *string*; parsing and re-stringifying it would reorder keys and drop
  * their whitespace, producing a stored stub that differs from what they typed in ways they never
  * asked for. This is the only way to say "these exact bytes are the body".
+ *
+ * Branded, because TypeScript's classes are structural: without a member of its own this type is
+ * identical to `RawBody`, and a `new RawBody(yaml, "application/yaml")` would satisfy every
+ * parameter declared `RawJsonBody` — the stub routes, whose bodies must be JSON. The brand is a
+ * compile-time fact only; nothing reads it.
  */
 export class RawJsonBody extends RawBody {
+  private declare readonly brand: "RawJsonBody";
+
   constructor(text: string) {
     super(text, "application/json");
   }

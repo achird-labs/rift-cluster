@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { ISSUE_URL, NAV, NAV_GROUPS, groupOf, liveEntries } from "./nav.ts";
+import { ISSUE_URL, NAV, NAV_GROUPS, groupOf, liveEntries, shortLabelStandsIn } from "./nav.ts";
 import { toHash } from "./routing.ts";
 
 describe("nav model", () => {
@@ -53,24 +53,31 @@ describe("nav model", () => {
     expect(positions).toEqual([...positions].sort((a, b) => a - b));
   });
 
-  it("keeps every short label a substring of the full label it stands in for", () => {
-    /*
-     * WCAG 2.5.3, Label in Name. The bar prints `short` and names the control with `label`, so a
-     * `short` that is not contained in `label` produces a link whose visible text is not in its
-     * accessible name — "click Fleet" then addresses nothing, for every speech-input user.
-     *
-     * Asserted here rather than trusted to review because the two strings live on the same object
-     * and diverge silently: shortening a label is exactly the edit that breaks this. No entry
-     * carries a `short` today; the rule is kept for the next one that does.
-     *
-     * Case-insensitively, which is the criterion rather than a loosening of it: speech input
-     * matches without regard to case, so requiring an exact substring would reject a label that
-     * satisfies 2.5.3 and push the fix toward a lowercased word in the bar.
-     */
+  /*
+   * WCAG 2.5.3, Label in Name — see `shortLabelStandsIn`'s own doc for the rule and why it is a
+   * named predicate rather than a loop body here: **no entry carries a `short` today**, so a test
+   * shaped as `for (…) if (short === undefined) continue` asserts nothing at all and would keep
+   * passing after the rule stopped holding. The fixtures below are what actually exercises it; the
+   * sweep over `NAV` is what applies it to the shipped bar.
+   */
+  it("accepts a short label the full label contains, and refuses one it does not", () => {
+    expect(shortLabelStandsIn({ label: "Cluster & fleet", short: "Fleet" })).toBe(true);
+    // Case is not the criterion: speech input matches without regard to it.
+    expect(shortLabelStandsIn({ label: "Front door routes", short: "front DOOR" })).toBe(true);
+    // No `short` at all is the compliant case — the bar prints the full label.
+    expect(shortLabelStandsIn({ label: "Router" })).toBe(true);
+
+    // The edit this rule exists to catch: a label shortened out from under its own `short`.
+    expect(shortLabelStandsIn({ label: "Router", short: "Front door" })).toBe(false);
+    // A word that only overlaps is not containment.
+    expect(shortLabelStandsIn({ label: "Cluster", short: "Cluster & fleet" })).toBe(false);
+    // An empty `short` would print nothing while claiming to stand in for something.
+    expect(shortLabelStandsIn({ label: "Router", short: "" })).toBe(false);
+  });
+
+  it("keeps every short label in the shipped bar a substring of the label it stands in for", () => {
     for (const entry of liveEntries()) {
-      if (entry.short === undefined) continue;
-      expect(entry.short.length).toBeGreaterThan(0);
-      expect(entry.label.toLowerCase()).toContain(entry.short.toLowerCase());
+      expect(shortLabelStandsIn(entry)).toBe(true);
     }
   });
 
