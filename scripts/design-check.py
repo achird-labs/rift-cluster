@@ -502,13 +502,13 @@ def check_callouts(root: Path, decisions: dict[str, Decision]) -> list[Finding]:
                 start, end = sections[sec]
                 body = (root / path).read_text(encoding="utf-8").splitlines()[start - 1 : end]
                 if not any(re.search(rf"(?:{CALLOUT_VERBS}) by[^\n]*\b{re.escape(d.id)}\b", ln, re.I) for ln in body):
-                    findings.append(Finding("error", "amendment-callout-missing", f"{d.id} amends {target}, but {path} §{sec} (lines {start}–{end}) has no '> **Amended by {d.id}**' callout", path, start))
+                    findings.append(Finding("error", "amendment-callout-missing", f"{d.id} amends {target}, but {path} §{sec} (lines {start}–{end}) carries no callout naming it — write one of '> **Amended by {d.id}**', '> **Superseded by {d.id}**', '> **Reversed by {d.id}**' or '> **Retired by {d.id}**' at the head of that section", path, start))
             elif target.startswith("docs/"):
                 p = root / target
                 if not p.exists():
                     findings.append(Finding("error", "amends-unresolved", f"{d.id} amends {target}, which does not exist", REGISTER, d.line))
                 elif not re.search(rf"(?:{CALLOUT_VERBS}) by[^\n]*\b{re.escape(d.id)}\b", p.read_text(encoding="utf-8"), re.I):
-                    findings.append(Finding("error", "amendment-callout-missing", f"{d.id} amends {target}, which has no 'Amended by {d.id}' callout", target, 1))
+                    findings.append(Finding("error", "amendment-callout-missing", f"{d.id} amends {target}, which carries no callout naming it — write one of 'Amended by {d.id}', 'Superseded by {d.id}', 'Reversed by {d.id}' or 'Retired by {d.id}'", target, 1))
     return findings
 
 

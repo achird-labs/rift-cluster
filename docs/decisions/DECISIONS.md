@@ -273,19 +273,25 @@ Upstream rift RFC-712's per-core topology runs single-threaded pinned worker run
 single owner outage would stall every connection pinned to it.
 
 ### D-15 — Embedded Raft (`openraft`) control plane over gossip
-- **Status:** active
+- **Status:** amended
 - **Decided:** 2026-07-21 · ADR-001 · #14
 - **Supersedes:** D-1, D-2
 - **Amends:** RFC-001 §7.1, RFC-001 §7.2, RFC-001 §7.4
 - **Code:** crates/rift-cluster/src/raft/node.rs, crates/rift-cluster/src/raft/store.rs
 
-Membership + imposter configs + the `enabled` bit + the route table + admin intents in one
-Raft log; **flow state stays off consensus** (D-17). (As decided, the log also carried tenancy and
-RBAC records; D-73 removed them — the claim is about *what is agreed*, and that set is now
-membership and configuration.) Putting membership itself into the log is the
+Membership + imposter configs + the `enabled` bit + tenancy/RBAC records + admin intents in one
+Raft log; **flow state stays off consensus** (D-17). Putting membership itself into the log is the
 move that pays for everything else: the roster becomes a linearizable value, so at any log index
 every node computes byte-identical membership and therefore byte-identical ownership. The settle
 delay, the generations, the epoch-mismatch retries are deleted, not mitigated.
+
+**Amendment (D-73, 2026-09-08, #550/#566):** tenancy and RBAC records are no longer among the
+log's contents — D-73 removed both, and no `ControlOp` carries either. What the log agrees today
+is membership, imposter configuration (the `enabled` bit with it), the route table and admin
+intents. The route table is named here for completeness only: it is not part of what D-15 decided
+and arrived later, as `ControlOp::PutRoutes` (D-54, D-68). The decision itself is untouched —
+membership is agreed rather than gossiped, and everything that must be byte-identical at a log
+index rides the same log.
 
 *Rejected:* bolting a barrier + persist-before-ack + intent log + dedup onto v2 gossip = four
 hand-rolled protocols atop the settle/generation machinery that only existed because membership
@@ -1335,7 +1341,7 @@ this same function, so it cannot bypass the gate.
 
 ### D-54 — Gateway addressing is the path prefix; the header and subdomain schemes are withdrawn in favour of front-door routes
 
-- **Status:** active
+- **Status:** amended
 - **Decided:** 2026-08-28 · #491
 - **Amends:** RFC-001 §6.3
 - **Implemented by:** #491
@@ -1357,18 +1363,23 @@ whose own doc reads "predicates and recorded requests see the true path unless t
 otherwise". Transparency-by-default is already the route table's rule.
 
 **Why withdrawn rather than "not yet".** Both rows are expressible *today*, per imposter, as
-operator-authored routes, and they are replicated control-plane state (`ControlOp::PutRoutes`,
-R1/R3) — a property a hard-wired scheme could not have had. All a built-in scheme would add over a
-route is the *implicit* any-port mapping — no route per imposter — and that implicit form is
-precisely what the path prefix already provides as the no-route fallback
+operator-authored routes — with two properties a hard-wired scheme could not have had: they are
+tenant-scoped (routes belong to tenants and are compiled in per `routes_installed_for`, chapter 8)
+and they are replicated control-plane state (`ControlOp::PutRoutes`, R1/R3). All a built-in scheme
+would add over a route is the *implicit* any-port mapping — no route per imposter — and that
+implicit form is precisely what the path prefix already provides as the no-route fallback
 (`gateway::dispatch_gateway_path`). A second and third implicit scheme would be three spellings of
-one thing.
+one thing, and each one is another path the tenancy rule has to account for beside the single
+fallback it has now.
 
-> The original of this paragraph claimed a second property: that routes are *tenant-scoped*,
-> "compiled in per `routes_installed_for`, chapter 8". D-73 (#550) removed the tenant dimension:
-> there is one fleet-wide route table, `routes_installed_for` no longer exists, and every stored
-> route is compiled into the listener (`raft/store.rs::desired_routes`). The withdrawal stands on
-> the replication property alone, which is the half that was doing the work.
+**Amendment (D-73, 2026-09-08, #550/#566):** the first of those two properties is gone. There is
+one fleet-wide route table, `routes_installed_for` no longer exists in the code, and every stored
+route is compiled into the listener (`crates/rift-cluster/src/raft/store.rs::desired_routes`,
+which filters nothing); chapter 8's tenancy surface is retired and the definition now lives in
+[chapter 13](../architecture/13-router.md). The withdrawal of the header and subdomain schemes
+stands on the replication property alone, which is the half that was doing the work — a
+hard-wired scheme still could not be replicated control-plane state, and the closing sentence's
+"another path the tenancy rule has to account for" is now simply another path.
 
 D-11 is untouched and is not a dependency in either direction: the plain listener *and* the route
 table are both upstream already, so nothing has to move first. (§6.3 says only that the plain
@@ -1618,7 +1629,7 @@ the fan-out alone would imply. What this entry adds is that the gap is now *repo
 assumed away.
 
 ### D-58 — The chaos tier builds its image once and runs sharded; the required check is a gate
-- **Status:** active
+- **Status:** amended
 - **Decided:** 2026-08-28
 - **Refines:** D-41
 - **Implemented by:** #516
@@ -2417,7 +2428,7 @@ freezing it.
 
 ### D-69 — A space-scoped stub is replicated config; a space teardown deletes it fleet-wide
 
-- **Status:** active
+- **Status:** amended
 - **Decided:** 2026-09-01
 - **Refines:** D-5
 - **Amends:** docs/api/openapi-ee.yaml (`addSpaceStub`), docs/architecture/11-upstream-boundary.md
@@ -2595,18 +2606,19 @@ records the same change.
 | #553 | Console trimmed | #569 (open) |
 | #554 | Design docs retired; the router named | this PR (open) |
 
-The RFC itself landed as #556 and was amended to v1.1 by #558. Three PRs outside the child list
+The RFC itself landed as #556 and was amended to v1.1 by #558. Five PRs outside the child list
 belong to the epic because they fix defects the removals exposed or the lanes they broke: #567
 (issue #565 — a committed imposter delete left the port's flow state behind), #570 (the compose
-verification lane, dropped when the observability overlay went), and #571 (the `--imposters`
-bootstrap keyed on a canonical digest, after the spec surface was reduced to one shot).
+verification lane, dropped when the observability overlay went), #571 (the `--imposters`
+bootstrap keyed on a canonical digest, after the spec surface was reduced to one shot), #572 (the
+gateway leg strips every admin credential — found reviewing #566) and #573 (the cold-start sweep
+only clears ports the sync itself dropped — found reviewing #567). RFC-007 §9 lists the same five.
 
-**Still open — finish this entry when they merge.** Four PRs were open when this entry went
-`active`: **#569** (console, issue #553), **#572** (the gateway leg strips every admin credential —
-a defect found reviewing #566), **#573** (the cold-start sweep only clears ports the sync dropped —
-a defect found reviewing #567), and the PR carrying this docs pass (issue #554). Drop each
-`(open)` mark from the `Implemented by:` line as it merges, and put that PR's number where this
-paragraph and the table say "this PR".
+**Still open — finish this entry when they merge.** Three PRs are open as this entry is written:
+**#569** (console, issue #553), **#572** (the gateway leg strips every admin credential — a defect
+found reviewing #566), and the PR carrying this docs pass (issue #554). Drop each `(open)` mark
+from the `Implemented by:` line as it merges, and put that PR's number where this paragraph and
+the table say "this PR".
 
 **Verified live, before and after.** No removal merges until the surface being removed has been
 driven on a running fleet and recorded, and every kept surface has been re-driven afterwards
@@ -2977,3 +2989,39 @@ chaos reorder scenario's `numberOfRequests == 1` assertion pins
 a reorder that rebuilt the core would read `0`. The assertion is not stronger than it was before —
 under the merge a rebuild zeroed the local shard on every node, so the counterfactual read `0` then
 too — it is simply the pin that keeps the in-place path in place.
+
+---
+
+### D-75 — The router rename is prose only: the wire path `/front-door/routes`, the `--front-door` flag, `RIFT_FRONT_DOOR` and `x-rift-front-door` keep their names
+
+- **Status:** active
+- **Decided:** 2026-09-09 · RFC-007 §6 · #554
+- **Refines:** D-71
+- **Implemented by:** #554
+- **Code:** crates/rift-cluster-server/src/admin_front.rs, crates/rift-cluster-server/src/openapi.rs, crates/rift-cluster/src/raft/store.rs, web/src/api/paths.ts, vendor/rift/crates/rift-http-proxy/src/server.rs
+
+RFC-007 §6 renamed the feature. In the reduced system it is the cluster's only data-plane
+contribution, "front door" said nothing about what it does, and so docs, console labels and CLI
+help call it the **router**. The rename stops at the prose. Every name a client types or reads
+stays: `GET`/`PUT /front-door/routes` and `DELETE /front-door/routes/{routeId}`, upstream's
+`--front-door` flag and its `RIFT_FRONT_DOOR` environment alias
+(`vendor/rift/crates/rift-http-proxy/src/server.rs:150`), and the `x-rift-front-door` response
+header. The upstream module `rift_http_proxy::front_door` is not ours to rename in any case.
+
+**Why this is a decision and not an omission.** A reader who meets "the router" in the guide and
+`/front-door/routes` on the wire will ask which one is wrong, and the answer has to be findable.
+It is deferred, not refused: renaming the path is a client migration, and the epic that reduced
+the system is not the place to charge one. Sixteen files in this repo spell the path — nine that
+serve or describe it (the terminating front, the state machine, the raft node, the composition,
+the served contract and the OpenAPI document, the console's path table, its generated schema and
+its query layer) and seven tests — and none of that is the cost. The cost is every caller outside
+the repo, who would need a deprecation window, both spellings served through it, and a reason
+better than a noun.
+
+*Rejected:* renaming the path in this PR. The epic's own rule is that a removal must not change
+what a working client sees; a rename is the same promise broken from the other direction.
+
+*Rejected:* leaving it unrecorded, as prose in RFC-007 §6. That is what #554 first did. A future
+reader hunting for why the two names disagree looks in the register, which is where this project
+says decisions live, and finds nothing — the same "decided in a thread, never written down" this
+register exists to prevent.

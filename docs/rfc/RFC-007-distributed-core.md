@@ -303,8 +303,8 @@ is the cluster's only data-plane contribution and the word should say what it do
 console labels and CLI help call it the **router**. The upstream module
 (`rift-http-proxy::front_door`) is not ours to rename, and the wire path `/front-door/routes` is
 left alone — renaming a path every client has to follow is its own decision, and #554 took it:
-**not now.** The API stopped shrinking with this epic, but the path, the `--front-door` flag, the
-`RIFT_FRONT_DOOR` environment variable and the `x-rift-front-door` response header are all client
+**not now** (**D-75**). The API stopped shrinking with this epic, but the path, the `--front-door`
+flag, the `RIFT_FRONT_DOOR` environment variable and the `x-rift-front-door` response header are all client
 contract; renaming them buys a consistent noun and costs every caller a migration. The prose is
 what confused people, and the prose is what changed.
 
@@ -353,7 +353,7 @@ mapping; when the two disagree, the register wins.
 
 | Issue | Surface | Status | PR |
 |---|---|---|---|
-| #544 | Epic | closes with #554 | — |
+| #544 | Epic | closes once its last child is merged — #553 and #554 are the two still open | — |
 | — | This RFC, and D-71 | merged | #556, amended to v1.1 by #558 |
 | #555 | In-repo core smoke check | merged | #557 |
 | #545 | Route hits | merged | #559 |
@@ -383,17 +383,13 @@ Closed as out of scope on 2026-09-06, with the reason on each: #148, #149, #151,
 
 ## Appendix A — every decision, by fate
 
-Statuses below are the register's, read at `rift-cluster@d755d2c`. The register is authoritative;
-this list is a map into it.
+Statuses below are the register's as this PR leaves it, not as it stood at the base commit — the
+same PR that writes this appendix changes four of them (D-15, D-54, D-58, D-69). The register is
+authoritative; this list is a map into it.
 
 **Kept, and untouched by this RFC** (`active`): D-3, D-7, D-8, D-9, D-10, D-11, D-13, D-14,
-D-15, D-17, D-21, D-22, D-24, D-25, D-27, D-28, D-36, D-40, D-41, D-43, D-47, D-54, D-57, D-58,
-D-59, D-60, D-61, D-62, D-63, D-64, D-65, D-66, D-67, D-69.
-
-Two of those carry a *prose* correction from this pass rather than an amendment: **D-15** (the
-Raft log's contents no longer include tenancy and RBAC records) and **D-54** (its
-"routes are tenant-scoped" clause). Neither claim's decision changed; the sentence describing it
-did.
+D-17, D-21, D-22, D-24, D-25, D-27, D-28, D-36, D-40, D-41, D-43, D-47, D-57, D-59, D-60, D-61,
+D-62, D-63, D-64, D-65, D-66, D-67.
 
 **Kept, but `amended` in the register** — the status is the register's, and for most of these the
 amendment predates this RFC:
@@ -402,9 +398,18 @@ amendment predates this RFC:
 |---|---|---|
 | D-4 | D-72 (#549/#564) — nothing content-addressed remains | yes |
 | D-5 | #565/#567 — a committed delete drops the port's flow state | yes |
+| D-15 | D-73 (#550/#566) — the Raft log no longer carries tenancy and RBAC records | yes |
 | D-42 | D-71 (#548/#562) — the gauge that supplied the election samples is gone | yes |
+| D-54 | D-73 (#550/#566) — routes are no longer tenant-scoped; the withdrawal stands on replication alone | yes |
+| D-58 | D-74 (#552/#568) — the tier builds one image, not two | yes |
 | D-69 | D-74 (#552/#568) — `ControlOp::JournalClearGen` no longer exists | yes |
 | D-6, D-16, D-20, D-26, D-33, D-35 | the 2026-08-25 verification pass | no |
+
+D-15, D-54, D-58 and D-69 are the four this PR moves. Each already described a system that had
+changed under it; #554 writes the amendment paragraph the register's own rule asks for, or keeps
+the one a child had already written, and sets the status to match rather than editing the decided
+text. D-58 and D-69 were carrying an `**Amendment (D-74, …)**` paragraph under `Status: active`,
+which the register's own "Adding or changing a decision" rule forbids.
 
 **Amend:** ~~D-68 (`installed` from the route-table endpoints only)~~ — **superseded** by D-73
 (#550) instead: with one fleet-wide route table every stored route is installed, so `installed`
@@ -426,7 +431,11 @@ went `pending` → `active` in #554, when the last removal had landed.
 
 **Documents retired by this RFC**, each carrying a `> **Retired by D-n**` callout at the section
 or at the top of the file: RFC-002 (in full, D-73), RFC-005 (in full, D-71), RFC-002 §9 (audit),
-RFC-001 §7.5.1 and §7.5.2 (§7.5.3 proxyOnce stays), RFC-001 §11.1 (metrics), RFC-004 §3.4–§3.6 and
-§6, RFC-006 §8 (MCP), `docs/architecture/07-verification-plane.md` and
-`docs/architecture/08-tenancy-security.md`. "Retired" is a defined callout verb — see the citation
-grammar in `docs/decisions/DECISIONS.md`.
+RFC-001 §7.5 with §7.5.1 and §7.5.2 (§7.5.3 proxyOnce stays), RFC-001 §8.1's monetization-boundary
+paragraph (the trait table above it stands), RFC-001 §9 (the v2 module tree), RFC-001 §10 (the
+phased plan), RFC-001 §11.1 (metrics), RFC-001 Appendix B, RFC-004 §3.4–§3.6 and §6, RFC-006 §8
+(MCP), `docs/architecture/07-verification-plane.md` and
+`docs/architecture/08-tenancy-security.md`. RFC-001's own status line and
+[`docs/architecture/README.md`](../architecture/README.md) carry the same list; all three must
+agree. "Retired" is a defined callout verb — see the citation grammar in
+`docs/decisions/DECISIONS.md`.
