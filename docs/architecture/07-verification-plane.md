@@ -15,9 +15,12 @@
 > test that needs fleet-wide verification pins a node or reads all of them (RFC-007 §3.3). If Rift
 > ever grows a shared journal, it grows it in the engine, once, for every deployment shape.
 >
-> `Rift-Cluster-Partial` survives this removal but narrows: it is stamped only on reads that
-> genuinely fan out across the fleet — `/_fleet/members`, `/_fleet/health` and the fleet spaces
-> listing — never on a requests read, which now reaches exactly one node and knows it.
+> `Rift-Cluster-Partial` survives this removal but narrows: it is stamped only on the two reads
+> that genuinely fan out across the fleet — `/_fleet/members` and `/_fleet/health` — never on a
+> requests read, which now reaches exactly one node and knows it. The spaces listing fans out too
+> and keeps reporting its own incompleteness in the body (`partial`, beside `unavailable`) — an
+> enumeration refused by policy and one shortened by a slow peer are different facts, and a boolean
+> header cannot tell them apart.
 >
 > **Where the still-true part went.** This chapter's second half was never about the journal:
 > **proxyOnce owner claims** (D-40, seams U-16/U-17) are exactly-once *recording*, arbitrated on

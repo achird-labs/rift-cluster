@@ -141,7 +141,11 @@ table in Chapter 9):
 > **Amended by D-74** (2026-09-08): verification reads are no longer cluster-merged. `GET
 > /imposters/:port/requests`, its `savedRequests` spelling and `numberOfRequests` answer for the
 > node the read reached, and the request-anatomy diagram and the local-append zone above are
-> amended with them.
+> amended with them. Two data-plane consequences ride along (D-74's amendment): each node now
+> retains upstream's `MAX_RECORDED_REQUESTS = 10_000` entries per port rather than a
+> `10_000 / voter_count` share of a merged cap, and a config-changing `PUT /imposters/:port` drops
+> that port's recorded requests on every node, because upstream's journal is a field of the
+> imposter core that a replace rebuilds — stub-level writes edit in place and keep it.
 
 `GET /imposters`, `GET .../stubs` read the local applied state machine — every
 node serves them, consistent at its applied revision, comparable fleet-wide via

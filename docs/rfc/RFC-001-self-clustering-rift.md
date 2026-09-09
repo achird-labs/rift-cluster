@@ -1421,6 +1421,13 @@ Phase 1 is not blocked by seams it doesn't need.
 | **4 — Response sequencing (strict = Redis first)** | `RedisSequencer` (strict, requires `--cluster-redis <url>`); `ClusteredSequencer` (gossip-native, experimental flag) | U-3 (+0a); **named customer request on file for gossip-native strict** | Redis mode: cyclic stub sprayed across nodes → global sequence no dup/skip incl. during single-node kill (`test_sequence_redis_strict`); gossip mode: no dup/skip while membership stable, documented reset on handoff (`test_sequence_no_dup_no_skip`, `test_sequence_handoff_reset`). Chaos: C2, C13 | feature flag off → per-node cursors (today's behavior) |
 | **5 — Proxy + proxyOnce (strict = Redis first)** | `RedisProxyStore` (strict claims); `ClusteredProxyStore` (Pending/Recorded, experimental); recordings as leader-serialized `PatchStubs` `ControlOp`s (ADR-001) | U-5 (+0a); same demand gate for gossip-native | Redis mode: 3 nodes, concurrent first-hits, 100-run soak incl. node kill → upstream called exactly once (`test_proxy_once_redis_strict`); gossip mode: exactly-once while membership stable, duplicates ≤ documented bound under owner kill, measured (`test_proxy_once_gossip_bound`); recorded stubs appear on all nodes (`test_recording_replicates`); concurrent recordings on 3 nodes, no partition → zero lost stubs (`test_recording_no_loss`). Chaos: C3, C10, C11 | feature flag off → local store (today) |
 
+> **Retired by D-74 (#552)** — the **Phase 3** row. `ClusteredJournal` and everything the row
+> names (sharded log, watermarks, pull-on-read, generation clears, the count G-counter, the vector
+> cursor) were built (#223–#225, #348) and then removed in full; its exit criteria
+> (`test_journal_merge_exact`, `test_journal_clear`, `test_count_merge`, `test_journal_cursor_merge`)
+> are permanently unallocated, as `docs/architecture/12-testing.md` records. Recorded-request
+> verification is per node: `GET .../requests` and `numberOfRequests` answer for the node reached.
+
 **Phase 1 must land and be validated with a design partner before 2–5 proceed** (also a
 kill-criteria gate, §13.3). Every phase ships behind `--cluster` +
 `--cluster-features`, and each lists its chaos scenarios (§12) as part of "green".
@@ -1679,6 +1686,11 @@ timing-sensitive — **not** claimed deterministic):
 | C13 | **Owner black-hole + 20 % stateful load** | Stateless p99 < 5 ms throughout (bridge semaphore + fast-fail); bounded rejected-op count |
 | C14 (from #9) | **Leader docker-kill mid 100-write storm** | Every write is either acked-and-present, or `503`-with-op-id and present after replay; zero duplicates; a new leader within 3 s |
 | C15 (from #9) | **`kill -9` all three nodes under load** | After restart, configs *and* parked intents are identical to the last acknowledgement — R3/R4 end to end |
+
+> **Retired by D-74 (#552)** — **C12**'s first clause, "journal clears exact (generation-based)".
+> There is no fleet-wide clear left for skew to disturb: `DELETE savedRequests` is a proxied clear
+> of the reached node's own journal, and upstream's journal never compares timestamps across
+> nodes. The HMAC-window and age-GC clauses stand.
 
 CI budget: **PR smoke** = 3 iterations of each phase-relevant scenario (~20 min,
 parallelized compose stacks); **nightly full** = 100 iterations across parallel stacks

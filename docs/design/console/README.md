@@ -167,9 +167,11 @@ same identity the fleet rail marks as self). A request log with no node on it is
 will take for the fleet's, and it is not.
 
 There is correspondingly **no partial-merge banner** on this screen, and no `Rift-Cluster-Partial`
-to render: that header is stamped only on reads that genuinely fan out (`/_fleet/members`,
-`/_fleet/health`, the fleet spaces listing). A read that reached exactly one node cannot have
-missed one.
+to render: that header is stamped on exactly two reads, `/_fleet/members` and `/_fleet/health`. A
+read that reached exactly one node cannot have missed one. The spaces listing fans out too and
+keeps reporting its own incompleteness in the body (`partial`, beside `unavailable`) — an
+enumeration refused by policy and one shortened by a slow peer are different facts, and a boolean
+header cannot tell them apart.
 
 **The console never fans out and merges client-side.** Reading all three nodes and stitching the
 answers together would be inventing a fleet journal in the browser — with no cursor that means

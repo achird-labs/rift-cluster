@@ -307,7 +307,9 @@ friends in metrics. A strict test harness asserts the absence of the last
 three; a lenient one ignores them. Both get the truth.
 
 `Rift-Cluster-Partial` is the narrowest of the five, and deliberately so since D-74 (#552): it is
-stamped only on reads that genuinely fan out across the fleet — `/_fleet/members`,
-`/_fleet/health`, the fleet spaces listing — where "I could not reach every node" is a fact about
-the answer. A read that was never a fan-out cannot be partial, so requests reads no longer carry
-it at all rather than carrying it as a permanent disclaimer.
+stamped on exactly two reads — `/_fleet/members` and `/_fleet/health` — where "I could not reach
+every node" is a fact about the answer. A read that was never a fan-out cannot be partial, so
+requests reads no longer carry it at all rather than carrying it as a permanent disclaimer. The
+spaces listing fans out too and keeps reporting its own incompleteness in the body (`partial`,
+beside `unavailable`) — an enumeration refused by policy and one shortened by a slow peer are
+different facts, and a boolean header cannot tell them apart.

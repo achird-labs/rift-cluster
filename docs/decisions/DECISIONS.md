@@ -583,6 +583,10 @@ fields with separate provenance.
 - **Decided:** 2026-08 · #362
 - **Superseded by:** D-74
 
+Superseded by D-74 (#552): the fleet-wide tail is gone with the merge it streamed. There is no
+coverage set to declare because no read speaks for more than one node; a client that wants the
+fleet's tail opens upstream's own `savedRequests/stream` on each node. Retained for history.
+
 The fleet-wide request tail carries a `port → JournalCursor` map over a coverage set capped by
 `fleet_journal_port_cap` (default 100) and reports `coverage: {covered, total, omitted}` on every
 response, so a partial view is never mistaken for the whole. A `(timestamp, tiebreak)` watermark
@@ -647,6 +651,10 @@ every touch breaks the tie so LRU holds at any rate.
 - **Decided:** 2026-08 · #223, #224 (RFC-001 §7.5.1 as built)
 - **Superseded by:** D-74
 
+Superseded by D-74 (#552): the shards, the k-way merge and the anti-entropy pull were removed
+in full. The journal is upstream Rift's own, per node, and a read answers for the node it reached.
+Retained for history.
+
 Every node appends only to its own `(port, node_id)` shard; a read k-way-merges the shards by
 recorded timestamp with `(node_id, seq)` breaking ties. Caps are writer-local with an
 `evicted_below_seq` watermark; an unreachable peer yields `Rift-Cluster-Partial`, never a stall.
@@ -657,8 +665,13 @@ another node to be recorded.
 ### ~~D-38 — Clears are generation bumps, never timestamps~~
 - **Status:** superseded
 - **Decided:** 2026-08 · #223 (RFC-001 §7.5.2 as built)
-- **Amends:** RFC-001 §7.5.2
 - **Superseded by:** D-74
+- **Amends:** RFC-001 §7.5.2
+
+Superseded by D-74 (#552): `ControlOp::JournalClearGen` and the `sm_journal_gens` table are
+gone. A clear generation is observable only through a reader that consults it, and the only
+reader was the merge; `DELETE savedRequests` is now a proxied clear of the reached node's own
+journal. Retained for history.
 
 A monotone per-port (and per-`(port, space)`) clear generation rides the Raft log as
 `ControlOp::JournalClearGen`; entries and counter slots carry their writer's generation, and the
@@ -671,8 +684,13 @@ best-effort per shard.
 ### ~~D-39 — The journal cursor is a vector, opaque by contract~~
 - **Status:** superseded
 - **Decided:** 2026-08 · #225, #348 (RFC-001 §7.5.1 as built)
-- **Amends:** RFC-001 §7.5.1
 - **Superseded by:** D-74
+- **Amends:** RFC-001 §7.5.1
+
+Superseded by D-74 (#552): with one writer per journal there is no position across writers to
+name. `?since=` is upstream's own scalar cursor again, with upstream's `x-rift-next-index` and
+`x-rift-truncated`; the `JournalCursor`/`FleetCursor` codecs went with the merge. Retained for
+history.
 
 `since` is `v1 {gen, pos: node_id → seq}`, base64url-JSON; per-shard filtering, monotone advance,
 dead shards frozen rather than rewound; a bare `u64` is read as `{this_node: seq}` for the upgrade
@@ -2710,7 +2728,7 @@ leave none.
 - **Status:** active
 - **Decided:** 2026-09-08 · RFC-007 §3.2 · #552
 - **Supersedes:** D-32, D-37, D-38, D-39
-- **Amends:** docs/architecture/05-read-path.md
+- **Amends:** docs/architecture/05-read-path.md, RFC-007 §2.1
 - **Implemented by:** #552
 - **Code:** crates/rift-cluster-server/src/admin_front.rs, crates/rift-cluster-server/src/openapi.rs, crates/rift-cluster/src/decorate.rs, crates/rift-cluster/src/control.rs, crates/rift-cluster/src/raft/store.rs, crates/rift-cluster/src/stores/mod.rs
 
@@ -2786,3 +2804,16 @@ shards, no cursor. It stays rejected because a sum is only honest if every adden
 slow peer it silently becomes a floor, and the `Rift-Cluster-Partial` bit that says so is a header
 most clients never read. A per-node count is smaller and always exactly true, and a caller that
 wants the total can compute it from `/_fleet/members` and know what it counted.
+
+**Amendment (2026-09-08, #552 review — two data-plane changes the removal carries, stated so
+they are not read as regressions):** *(a) retention.* A node used to keep `10_000 / voter_count`
+entries per port so the merged view held about 10,000; each node now keeps upstream's own
+`MAX_RECORDED_REQUESTS = 10_000` per port (`rift-mock-core/src/imposter/journal.rs`), so a
+three-node fleet retains up to three times as many entries in total and each node's read is cut
+at its own cap. *(b) a config-changing `PUT /imposters/{port}` drops that port's recorded
+requests on every node.* Upstream's journal is a field of the imposter core
+(`imposter/core/mod.rs`), and a replace builds a fresh `LocalJournal` with the new core
+(`manager.rs`, `replace_imposter`); the removed shards lived outside the core and survived a
+rebuild. The stub-level writes (`PUT .../stubs`, add/replace/delete by id) edit in place and keep
+the journal — which is what the chaos reorder scenario's `numberOfRequests == 1` assertion now
+proves, more strongly than before: a reorder that rebuilt the core would read `0`.

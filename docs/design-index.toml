@@ -122,10 +122,11 @@ code = []
 note = "Retired by D-71/D-73 (#550). Its two non-tenancy sections were moved out: the cluster port's peer secret to 03-control-plane.md, and /_fleet/*, PUT /admin/fleet/name and the console session exchange to 10-operations.md. The rest is history; describes no code."
 
 ["docs/architecture/09-durability-failure.md"]
-status = "current"
+status = "amended"
 verified_sha = "e0df0c376"
 verified_on = "2026-08-29"
 code = ["crates/rift-cluster/src/raft/store.rs", "crates/rift-cluster/src/stores/flow.rs"]
+note = "Amended in place by D-74 (#552): the journal row, the failure-matrix row and the Rift-Cluster-Partial paragraph now describe a per-node journal; verified_sha predates that edit. Re-verify against the D-74 text."
 
 ["docs/architecture/10-operations.md"]
 status = "current"

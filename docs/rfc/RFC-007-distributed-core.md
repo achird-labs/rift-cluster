@@ -62,11 +62,11 @@ Inside "cluster core", one subsystem this RFC removes is itself large:
 |---|---|---|
 | Journal shards and merge-on-read (`stores/{journal,journal_net,journal_seq}.rs`) | ~3,700 | ~4,200 in-file + `tests/fleet_journal.rs` 1,519 |
 
-**Correction (#552):** this row named `pull_on_miss.rs` when it was written, and that was wrong.
-`pull_on_miss.rs` is **config catch-up**, not journal: a `NoMatchInterceptor` that, on a genuine
-no-match, compares this node's applied index with the leader's and re-matches once if it was
-behind (D-11's read-after-write safety net, chaos scenario C16). It has nothing to do with
-recorded requests and stays. Its ~300 source lines are removed from the figures above.
+> **Amended by D-74** (#552): this row named `pull_on_miss.rs` when it was written, and that was
+> wrong. `pull_on_miss.rs` is **config catch-up**, not journal: a `NoMatchInterceptor` that, on a
+> genuine no-match, compares this node's applied index with the leader's and re-matches once if it
+> was behind (D-11's read-after-write safety net, chaos scenario C16). It has nothing to do with
+> recorded requests and stays. Its ~300 source lines are removed from the figures above.
 
 The flow-state tier (`stores/{flow,shard,flow_config,sequencer,proxy}.rs`, `raft/ring.rs`,
 `bridge.rs`; ~6,100 source, ~10,500 test) **stays** — see §3.1 and the 2026-09-06 amendment.
@@ -198,8 +198,9 @@ surface this RFC removes. It also built a flow-state tier stronger than upstream
   A test that needs fleet-wide verification pins a node or reads all of them. If Rift ever grows a
   shared journal, it grows it in the engine, once, for every deployment shape. **Landed by #552
   (D-74):** the journal is upstream's own, `numberOfRequests` is the answering node's count rather
-  than a fleet sum, and `Rift-Cluster-Partial` is stamped only on reads that genuinely fan out
-  (`/_fleet/members`, `/_fleet/health`, the spaces listing). The cost is stated in full there,
+  than a fleet sum, and `Rift-Cluster-Partial` is stamped on exactly two reads, `/_fleet/members`
+  and `/_fleet/health` — the spaces listing fans out too but keeps reporting its own incompleteness
+  in the body (`partial`, beside `unavailable`). The cost is stated in full there,
   including what it takes away: a single read that speaks for the whole fleet, and a count a
   caller could trust without knowing which nodes answered.
 - **One credential.** Everyone who can administer the fleet can administer all of it. Isolation
@@ -235,9 +236,11 @@ epic. 0 lands first so every later child has an in-repo before/after check.
 | 9 | #553 | Console trimmed to four screens | #550, #552 |
 | 10 | #554 | Design docs retired; the router named | all |
 
-Each child PR carries `Design: amended — D-71` and marks its retired decisions `superseded` with
-`Superseded by: D-71` in the same PR, so `design-check --strict` stays green at every step and the
-register never describes code that is gone.
+Each child PR registers its own decision (D-72 for #549, D-73 for #550, D-74 for #552), carries
+`Design: amended — D-n` for it, and marks the decisions it retires `superseded` with
+`Superseded by: D-n` naming that child's entry — not D-71, which records the scope and lists the
+children — in the same PR, so `design-check --strict` stays green at every step and the register
+never describes code that is gone.
 
 ## 5. Verification protocol
 
