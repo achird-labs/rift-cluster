@@ -375,7 +375,7 @@ exposed or a lane a removal broke:
 | #565 | A committed imposter delete left the port's flow state behind (D-5 amended) | merged | #567 |
 | — | The compose verification scripts lost their CI lane with the observability overlay | merged | #570 |
 | — | The `--imposters` bootstrap keyed on a canonical digest, and waits for a leader | merged | #571 |
-| — | The gateway leg strips every admin credential, and the test can fail (review of #566) | open | #572 |
+| — | The gateway leg strips every admin credential, and the test can fail (review of #566) | merged | #572 |
 | — | The cold-start sweep only clears ports the sync itself dropped (review of #567) | merged | #573 |
 
 Closed as out of scope on 2026-09-06, with the reason on each: #148, #149, #151, #279, #280,

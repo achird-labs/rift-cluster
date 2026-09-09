@@ -2588,7 +2588,7 @@ and an unknown are different claims.
 
 - **Status:** active
 - **Decided:** 2026-09-06 · RFC-007 · #544
-- **Implemented by:** #556, #557, #558, #559, #560, #562, #563, #564, #566, #567, #568, #569, #570, #571, #573; #572 (open) and this pass's own PR (open) — see "Still open" below
+- **Implemented by:** #556, #557, #558, #559, #560, #562, #563, #564, #566, #567, #568, #569, #570, #571, #572, #573; and this pass's own PR (open) — see "Still open" below
 - **Code:** crates/rift-cluster/src/control.rs, crates/rift-cluster-server/src/admin_front.rs, crates/rift-cluster/src/raft/node.rs, deploy/compose/smoke.sh
 
 RiftCluster is **a replicated fleet of Rift nodes that forms and heals itself, replicates
@@ -2649,11 +2649,9 @@ bootstrap keyed on a canonical digest, after the spec surface was reduced to one
 gateway leg strips every admin credential — found reviewing #566) and #573 (the cold-start sweep
 only clears ports the sync itself dropped — found reviewing #567). RFC-007 §9 lists the same five.
 
-**Still open — finish this entry when they merge.** Two PRs are open as this entry is written:
-**#572** (the gateway leg strips every admin credential — a defect found reviewing #566), and the
-PR carrying this docs pass (issue #554). Drop each `(open)` mark
-from the `Implemented by:` line as it merges, and put that PR's number where this paragraph and
-the table say "this PR".
+**Still open — finish this entry when it merges.** One PR is open as this entry is written: the
+PR carrying this docs pass (issue #554). Drop its `(open)` mark from the `Implemented by:` line as
+it merges, and put its number where this paragraph and the table say "this PR".
 
 **Verified live, before and after.** No removal merges until the surface being removed has been
 driven on a running fleet and recorded, and every kept surface has been re-driven afterwards
