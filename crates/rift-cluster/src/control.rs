@@ -118,21 +118,10 @@ pub enum ControlOp {
     /// tracking sources (#549, D-72).
     ///
     /// So it sits inside the same trust boundary as the state directory, which already holds all
-<<<<<<< HEAD
-    /// committed config. Rotation is the containment: writing a new key invalidates every
-    /// outstanding session at once — and with one credential it is the *only* revocation the
-    /// fleet has. Recorded in `docs/architecture/10-operations.md`.
-||||||| a6ee623
-    /// So it sits inside the same trust boundary as the state directory, which already holds every
-    /// principal's argon2 record and all committed config. Rotation is the containment: writing a
-    /// new key invalidates every outstanding session at once. Recorded in
-    /// `docs/architecture/08-tenancy-security.md`.
-=======
     /// committed config. Rotation is the containment — and since D-73 it is the *only* one:
     /// writing a new key invalidates every outstanding session at once, and there is no
     /// per-session revocation because there is no per-session server state to revoke. Recorded in
-    /// `docs/architecture/08-tenancy-security.md`.
->>>>>>> origin/master
+    /// `docs/architecture/10-operations.md`.
     SessionKeyPut {
         /// 32 random bytes, hex-encoded. Hex rather than raw so the op stays printable in a log
         /// dump and survives JSON without a base64 alphabet decision.
