@@ -367,7 +367,7 @@ mapping; when the two disagree, the register wins.
 | #553 | Console | open | #569 |
 | #554 | Docs and naming | open | this PR |
 
-Three more PRs belong to the epic without being children of it — each fixes something a removal
+Five more PRs belong to the epic without being children of it — each fixes something a removal
 exposed or a lane a removal broke:
 
 | Issue | Surface | Status | PR |
@@ -376,7 +376,7 @@ exposed or a lane a removal broke:
 | — | The compose verification scripts lost their CI lane with the observability overlay | merged | #570 |
 | — | The `--imposters` bootstrap keyed on a canonical digest, and waits for a leader | merged | #571 |
 | — | The gateway leg strips every admin credential, and the test can fail (review of #566) | open | #572 |
-| — | The cold-start sweep only clears ports the sync itself dropped (review of #567) | open | #573 |
+| — | The cold-start sweep only clears ports the sync itself dropped (review of #567) | merged | #573 |
 
 Closed as out of scope on 2026-09-06, with the reason on each: #148, #149, #151, #279, #280,
 #282, #283, #284, #289, #291, #294, #380, #448, #456, #457. Rescoped: #394.

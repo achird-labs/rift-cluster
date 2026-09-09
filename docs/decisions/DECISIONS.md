@@ -2542,7 +2542,7 @@ and an unknown are different claims.
 
 - **Status:** active
 - **Decided:** 2026-09-06 · RFC-007 · #544
-- **Implemented by:** #556, #557, #558, #559, #560, #562, #563, #564, #566, #567, #568, #570, #571; #569 (open), #572 (open), #573 (open) and this pass's own PR (open) — see "Still open" below
+- **Implemented by:** #556, #557, #558, #559, #560, #562, #563, #564, #566, #567, #568, #570, #571, #573; #569 (open), #572 (open) and this pass's own PR (open) — see "Still open" below
 - **Code:** crates/rift-cluster/src/control.rs, crates/rift-cluster-server/src/admin_front.rs, crates/rift-cluster/src/raft/node.rs, deploy/compose/smoke.sh
 
 RiftCluster is **a replicated fleet of Rift nodes that forms and heals itself, replicates
