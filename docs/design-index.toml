@@ -63,16 +63,17 @@ note = "§4, §5.3, §8.3, §8.4, §9.2 and §9.3 amended by D-73 (#550) and car
 
 ["docs/rfc/RFC-007-distributed-core.md"]
 status = "current"
-verified_sha = ""
-verified_on = ""
+verified_sha = "d755d2c9f"
+verified_on = "2026-09-09"
 code = []
-note = "Scope decision D-71: the distributed core. Progress table in §9 is updated as #544's children merge."
+note = "Scope decision D-71: the distributed core, now active. §9 carries the issue-to-PR mapping and D-71 carries the same one; when they disagree the register wins. §2 is a measurement taken on 2026-09-06 and is deliberately not re-measured."
 
 ["docs/architecture/01-overview.md"]
 status = "current"
 verified_sha = ""
 verified_on = ""
 code = []
+note = "#554 corrected the seam count (eighteen, four withdrawn) and dropped tenancy from the durability non-goal. Never read end to end against the code."
 
 ["docs/architecture/02-topology.md"]
 status = "current"
@@ -85,7 +86,7 @@ status = "current"
 verified_sha = ""
 verified_on = ""
 code = ["crates/rift-cluster/src/raft/**", "crates/rift-cluster/src/rpc/**"]
-note = "Gained chapter 8's cluster-internal security section in #550 (D-73), hence the added rpc glob."
+note = "Gained chapter 8's cluster-internal security section in #550 (D-73), hence the added rpc glob. #554 corrected what the Raft log carries (configs, the route table, admin intents — not tenancy). Never read end to end against the code."
 
 ["docs/architecture/04-write-path.md"]
 status = "current"
@@ -126,33 +127,35 @@ status = "amended"
 verified_sha = "e0df0c376"
 verified_on = "2026-08-29"
 code = ["crates/rift-cluster/src/raft/store.rs", "crates/rift-cluster/src/stores/flow.rs"]
-note = "Amended in place by D-74 (#552): the journal row, the failure-matrix row and the Rift-Cluster-Partial paragraph now describe a per-node journal. `status` is prose for a reader — check_index reads only verified_sha and code — and the standing doc-stale warning is NOT about that edit, which moved doc and code together: it is raft/store.rs and stores/flow.rs changing in #565/#567 and #563 since e0df0c376. Re-verify the whole chapter, then --mark-verified."
+note = "Amended in place by D-74 (#552): the journal row, the failure-matrix row and the Rift-Cluster-Partial paragraph now describe a per-node journal. `status` is prose for a reader — check_index reads only verified_sha and code — and the standing doc-stale warning is NOT about that edit, which moved doc and code together: it is raft/store.rs and stores/flow.rs changing in #565/#567 and #563 since e0df0c376. #554 removed tenancy and bindings from the write row, the cold-start list and the snapshot description, and pointed the isolation condition at /_cluster/health rather than a /_cluster/status that is not served. That is a targeted correction, not a whole-chapter reading: re-verify the rest, then --mark-verified."
 
 ["docs/architecture/10-operations.md"]
 status = "current"
 verified_sha = ""
 verified_on = ""
-code = ["crates/rift-cluster-server/src/cli.rs", "crates/rift-cluster-server/src/probes.rs", "crates/rift-cluster-server/src/readiness.rs", "crates/rift-cluster-server/src/fleet.rs", "crates/rift-cluster-server/src/session.rs", "deploy/**"]
-note = "Gained chapter 8's admin-credential, session-exchange and /_fleet/* sections in #550 (D-73), hence the added fleet.rs/session.rs globs."
+code = ["crates/rift-cluster-server/src/cli.rs", "crates/rift-cluster-server/src/probes.rs", "crates/rift-cluster-server/src/readiness.rs", "crates/rift-cluster-server/src/fleet.rs", "crates/rift-cluster-server/src/session.rs", "crates/rift-cluster-server/src/cluster_api.rs", "deploy/**"]
+note = "Gained chapter 8's admin-credential, session-exchange and /_fleet/* sections in #550 (D-73), hence the added fleet.rs/session.rs globs. #554 removed the /_cluster/ring and /_cluster/kv endpoint rows (designed in RFC-001 §10, a retired plan; never built, not tracked), rewrote the stuck-scenario runbook around what is served, and corrected /_cluster/status — which is not a route — to /_cluster/health. Never read end to end against the code."
 
 ["docs/architecture/11-upstream-boundary.md"]
 status = "current"
-verified_sha = "e0df0c376"
-verified_on = "2026-08-29"
+verified_sha = "d755d2c9f"
+verified_on = "2026-09-09"
 code = ["crates/rift-cluster-base/**", "Cargo.toml"]
+note = "#554 re-checked every U-n row against the code: U-9's authorizer half and U-10 became withdrawn, U-3/U-6/U-7/U-11/U-12/U-15 had dead symbols or a dead rationale corrected, and the 'all eight seams are merged' line over an eighteen-row table was replaced. The open-core close was retired — there is no paid edition."
 
 ["docs/architecture/12-testing.md"]
 status = "current"
 verified_sha = "e0df0c376"
 verified_on = "2026-08-29"
 code = ["tests/cluster-chaos/**", "crates/rift-cluster/tests/**", "crates/rift-cluster-server/tests/**"]
+note = "#554 replaced the overlay list — there is no Envoy overlay and no tenancy overlay — with the nine that exist in tests/cluster-chaos/compose/."
 
-["docs/architecture/13-front-door-and-sources.md"]
-status = "amended"
-verified_sha = "9e0433dd0"
-verified_on = "2026-08-25"
-code = []
-note = "The front-door chapter. Its sources half was retired by D-71 (#549) and its tenancy half by D-73 (#550); the file keeps its name until #554 renames it."
+["docs/architecture/13-router.md"]
+status = "current"
+verified_sha = "d755d2c9f"
+verified_on = "2026-09-09"
+code = ["crates/rift-cluster/src/control.rs", "crates/rift-cluster/src/raft/store.rs", "crates/rift-cluster-server/src/compose.rs", "crates/rift-cluster-server/src/admin_front.rs"]
+note = "Renamed from 13-front-door-and-sources.md in #554, per RFC-007 §6: the feature is the router in prose, and the wire contract (/front-door/routes, --front-door, RIFT_FRONT_DOOR, x-rift-front-door, upstream's front_door module) keeps its name. The sources half was retired by D-71 (#549) and the tenancy half by D-73 (#550). #554 moved chapter 8's routes_installed_for definition here, rewritten against desired_routes, which filters nothing."
 
 ["docs/architecture/14-cloud-deployment.md"]
 status = "current"
@@ -172,3 +175,24 @@ verified_sha = ""
 verified_on = ""
 code = ["web/src/**"]
 note = "The Administration screen and the route table's not-installed treatment are retired by D-73 (#550) and carry callouts; the prototype HTML is a design artifact and still renders them."
+
+["README.md"]
+status = "current"
+verified_sha = "d755d2c9f"
+verified_on = "2026-09-09"
+code = []
+note = "The repository's front door. Added to the index in #554, which rewrote its feature list for the distributed core (RFC-007, D-71) — per-node verification, the router, no tenancy. Nothing enforces its accuracy but a reading."
+
+["web/README.md"]
+status = "current"
+verified_sha = "d755d2c9f"
+verified_on = "2026-09-09"
+code = ["web/src/**", "web/vite.config.ts", "web/package.json"]
+note = "Rewritten in #554 for the five-screen, one-credential console: no tenant switcher, no RBAC table, no merged journal, and the real CSP (which carries wasm-unsafe-eval and style-src unsafe-inline). The route screen is still labelled Front door until #569 lands RFC-007 §6's rename."
+
+["docs/rift-cluster-server.md"]
+status = "current"
+verified_sha = ""
+verified_on = ""
+code = ["crates/rift-cluster-server/src/**", "crates/rift-cluster/src/metrics.rs"]
+note = "The operator's guide to the binary. Added to the index in #554, which corrected the /_cluster/health field names, removed the ring/kv roadmap claim, stopped duplicating the metric-family list, dropped the last RBAC action and role names, renamed the front door to the router in prose only, and added the routes it never mentioned."
