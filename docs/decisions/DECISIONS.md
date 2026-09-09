@@ -2694,3 +2694,22 @@ one fewer route and one fewer replicated record, but it puts a long-lived creden
 for the whole session, and rotation would then have no kill switch short of changing the flag on
 every node and restarting. The cookie is the only revocation this design has; removing it would
 leave none.
+
+**Amendment (2026-09-08, the #566 retrospective fix):** three operational facts the entry above
+left implicit or got wrong. *First*, "a deliberate fleet-wide log-format break" is true, but not
+for the reason given: dropping the `tenant` field does **not** make a surviving op undecodable —
+`ControlOp` sets no `deny_unknown_fields`, so an old entry's extra key is ignored. What refuses an
+old state directory is redb's per-table type check (`TableTypeMismatch` on open, because every
+key shape lost its tenant component), and that guard exists on disk only; the wire has none. So
+**a mixed-version fleet straddling this commit is unsupported** — nodes on either side would
+exchange ops that decode on both and apply against different key shapes. Upgrade every node at
+once, from a fresh `--cluster-state-dir`. *Second*, the tenancy flags are gone, not deprecated:
+`--cluster-legacy-key-is-fleet-admin` (RFC-002's one-release bridge) is no longer parsed, so a
+unit file or manifest that still passes it is **startup-breaking** — clap refuses the unknown flag
+and the node does not start. *Third*, the session cookie is `Secure`, so **console login works
+only over HTTPS** (or a `localhost` origin, the browser's one exception): over plain HTTP `POST
+/session` answers `200`, the browser discards the cookie, and every request after it is `401`.
+The raw `Authorization` key path is unaffected. Also in that fix: the `rift_session` cookie is
+stripped from the `/__rift/*` gateway leg for the same reason the key is never injected there —
+it is an admin credential the imposter must not see — and `DELETE /session` sits behind the CSRF
+header like every other cookie-borne mutation.

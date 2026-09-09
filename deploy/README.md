@@ -225,6 +225,13 @@ entirely rather than setting it to `""`. `deploy/compose/smoke.overlay.yml` is
 the worked example of the closed shape; `deploy/compose/verify.sh` and
 `verify-pulled.sh` run against the open one and need no key.
 
+One consequence of the cookie exchange is easy to miss: the cookie is set `Secure`,
+so **console login needs HTTPS** (a `localhost` origin is the browser's one
+exception). Over plain HTTP on any other origin `POST /session` answers `200`, the
+browser discards the cookie, and every request after it is `401` — terminate TLS in
+front of the admin port before pointing a browser at it. `curl` with the raw
+`Authorization` key is unaffected.
+
 ## The rule these manifests exist to encode
 
 On SIGTERM a node **fails readiness first**, keeps serving in-flight work for

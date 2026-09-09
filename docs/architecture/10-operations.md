@@ -197,7 +197,10 @@ A browser should not keep the key after login, so `POST /session` exchanges it o
 HMAC-signed cookie (`HttpOnly`, `Secure`, `SameSite=Strict`, 8-hour `Max-Age`); `DELETE /session`
 clears it. The key that signs the token is a fleet-wide control-plane record, so **every node
 verifies from its own applied state and a login is not a Raft write** — only the first mint and any
-rotation are. A cookie minted on one node is accepted by every other.
+rotation are. A cookie minted on one node is accepted by every other. Because the cookie is
+`Secure`, **console login works only over HTTPS** (or a `localhost` origin): over plain HTTP `POST
+/session` answers `200`, the browser never stores the cookie, and everything after it is `401` —
+terminate TLS in front of the admin port before pointing a browser at it.
 
 That record carries an actual secret into the replicated log — the one op that does, and
 deliberately. The distinction is what the secret means *outside* the fleet: an op naming a

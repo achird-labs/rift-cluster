@@ -538,9 +538,9 @@ impl FlowNet {
     /// applying (down, or installing a snapshot with an empty engine), and
     /// clears them with [`Self::clear_imposter_scope`].
     ///
-    /// Fleet-scoped (`f:`) and tenant-scoped (`t<tenant>:`) flows name no port
-    /// and never appear here — those namespaces are shared by construction and
-    /// outlive any one imposter (D-5 amendment).
+    /// Fleet-scoped (`f:`) flows name no port and never appear here — that
+    /// namespace is shared by construction and outlives any one imposter (D-5
+    /// amendment).
     #[must_use]
     pub fn imposter_ports_held(&self) -> std::collections::BTreeSet<u16> {
         self.shard
@@ -2045,18 +2045,34 @@ impl rift_cluster_base::seams::FlowStoreProvider for ClusteredFlowStoreProvider 
         &self,
         config: &rift_cluster_base::seams::ImposterConfig,
     ) -> Option<Arc<dyn rift_cluster_base::seams::FlowStore>> {
-        // `validate` refuses bad values pre-commit, so an Err here means a
-        // config written by a different (newer) build reached this node.
-        // Defaults + a loud log beat both a panic on the apply path and a
-        // silent fall-through to the process-local builtin.
-        let flow_config = FlowConfig::from_imposter(config).unwrap_or_else(|reason| {
-            tracing::error!(
-                port = config.port,
-                %reason,
-                "flowState carried a value this build cannot parse; using defaults"
-            );
-            FlowConfig::default()
-        });
+        // `validate` refuses bad values pre-commit, so an `Err` here is a config committed by
+        // an *older* build whose vocabulary this one no longer has — the reachable case being
+        // `"contextScope": "tenant"`, admissible before #550 and refused by name since (D-73).
+        //
+        // Two answers are wrong here, and this used to give one of them. `None` hands the
+        // imposter upstream's process-local built-in store, so fleet-wide state silently becomes
+        // per-node. `FlowConfig::default()` aliases the scope to `Imposter`, silently changing
+        // which imposters share state — the one thing the key exists to decide, and exactly the
+        // aliasing `FlowConfig::from_imposter` refuses. The seam has no error channel of its own,
+        // so the refusal travels in the only one there is: a store whose every operation fails,
+        // naming the port and the reason, so the first stub that touches flow state errors
+        // instead of running against a namespace the operator never chose. A panic is not an
+        // option either — this runs on the apply path and would wedge the replicated log.
+        let flow_config = match FlowConfig::from_imposter(config) {
+            Ok(flow_config) => flow_config,
+            Err(reason) => {
+                tracing::error!(
+                    port = config.port,
+                    %reason,
+                    "flowState carries a value this build refuses; the imposter's flow store is \
+                     unavailable until the config is rewritten"
+                );
+                return Some(Arc::new(RefusedFlowStore {
+                    port: config.port,
+                    reason,
+                }));
+            }
+        };
 
         let store = ClusteredFlowStore {
             net: Arc::clone(&self.net),
@@ -2067,9 +2083,95 @@ impl rift_cluster_base::seams::FlowStoreProvider for ClusteredFlowStoreProvider 
     }
 }
 
+/// The store [`ClusteredFlowStoreProvider::provide`] hands an imposter whose `flowState` this
+/// build cannot honour (D-73): every operation is an error naming the port and the reason.
+/// Deliberately not a no-op store — a no-op answers `Ok(None)`/`Ok(())` and lets a scenario run
+/// as though its state were being kept.
+struct RefusedFlowStore {
+    /// Upstream's `ImposterConfig::port` is optional (a port may be assigned at bind time), so
+    /// the message says so rather than inventing `0`.
+    port: Option<u16>,
+    reason: String,
+}
+
+impl RefusedFlowStore {
+    fn refuse<T>(&self) -> anyhow::Result<T> {
+        let port = self
+            .port
+            .map_or_else(|| "<unassigned>".to_owned(), |p| p.to_string());
+        Err(anyhow::anyhow!(
+            "flow state for imposter {port} is unavailable — its flowState carries a value this \
+             build refuses: {}",
+            self.reason
+        ))
+    }
+}
+
+impl rift_cluster_base::seams::FlowStore for RefusedFlowStore {
+    fn get(&self, _flow_id: &str, _key: &str) -> anyhow::Result<Option<Value>> {
+        self.refuse()
+    }
+
+    fn set(&self, _flow_id: &str, _key: &str, _value: Value) -> anyhow::Result<()> {
+        self.refuse()
+    }
+
+    fn exists(&self, _flow_id: &str, _key: &str) -> anyhow::Result<bool> {
+        self.refuse()
+    }
+
+    fn delete(&self, _flow_id: &str, _key: &str) -> anyhow::Result<()> {
+        self.refuse()
+    }
+
+    fn increment(&self, _flow_id: &str, _key: &str) -> anyhow::Result<i64> {
+        self.refuse()
+    }
+
+    fn set_ttl(&self, _flow_id: &str, _ttl_seconds: i64) -> anyhow::Result<()> {
+        self.refuse()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// D-73: a committed config declaring the `tenant` scope — admissible before #550, refused by
+    /// name since — must not be silently re-scoped. `provide` used to fall back to
+    /// `FlowConfig::default()`, i.e. `Imposter`, performing the exact aliasing
+    /// `FlowConfig::from_imposter` refuses. Now the store it hands back refuses every operation
+    /// and says why; and it *does* hand one back, because `None` would be upstream's
+    /// process-local built-in — the other silent answer.
+    #[test]
+    fn a_config_this_build_cannot_parse_gets_a_refusing_store_not_a_defaulted_one() {
+        use rift_cluster_base::seams::FlowStoreProvider as _;
+
+        let net = FlowNet::new(FlowShard::in_memory(crate::stores::ShardConfig::default()));
+        let config: rift_cluster_base::seams::ImposterConfig =
+            serde_json::from_value(serde_json::json!({
+                "port": 4545,
+                "protocol": "http",
+                "_rift": { "flowState": { "contextScope": "tenant" } },
+            }))
+            .expect("the config parses; only this module's vocabulary refuses it");
+
+        let store = ClusteredFlowStoreProvider::new(net)
+            .provide(&config)
+            .expect("a store is always provided — None would defer to the process-local builtin");
+
+        let err = store
+            .set("checkout", "step", serde_json::json!("paid"))
+            .expect_err("a write against a refused scope must fail, not land in `i4545:`");
+        let message = err.to_string();
+        assert!(message.contains("4545"), "names the port: {message}");
+        assert!(message.contains("tenant"), "names the reason: {message}");
+
+        assert!(store.get("checkout", "step").is_err(), "reads refuse too");
+        assert!(store.exists("checkout", "step").is_err());
+        assert!(store.increment("checkout", "n").is_err());
+        assert!(store.set_ttl("checkout", 60).is_err());
+    }
 
     /// `imposter_port` charges only `i<port>:` ids: the fleet (`f:`) and placeholder
     /// namespaces are excluded by construction — pinned so a future prefix cannot start

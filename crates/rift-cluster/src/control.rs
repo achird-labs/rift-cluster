@@ -50,13 +50,20 @@ pub struct ControlRequest {
 /// is gone here cannot be decoded at all: a node replaying a log that still holds
 /// an `AuditSinkPut`, `SourcePut`, `SpecPut`, `TenantPut`, `TenantDelete`,
 /// `PrincipalPut`, `PrincipalCreate`, `PrincipalDelete`, `BindingPut` or
-/// `BindingDelete` entry fails to start rather than skipping it. **#550 additionally
-/// removed the `tenant` field from every surviving variant**, which changes the
-/// encoding of ops that still exist, so this is a break for the whole log rather
-/// than for the removed variants alone. Pre-release that is the right trade, and
-/// clean removal is why it was taken; a fleet upgrading across this commit starts
-/// from a fresh `cluster-state-dir`. A *post*-release removal would have to keep
-/// the variant as an ignored arm.
+/// `BindingDelete` entry fails to start rather than skipping it. **#550 also removed
+/// the `tenant` field from every surviving variant**, and that is *not* a decoding
+/// break on its own: this enum sets no `deny_unknown_fields`, so an old entry's extra
+/// `tenant` key is dropped and the op decodes (`raft::network`'s join-reply tests pin
+/// that no `deny_unknown_fields` sneaks onto a wire shape). What actually refuses an
+/// old state directory is redb: every state-machine table's key or value type lost
+/// its tenant component, and redb answers `TableTypeMismatch` when a table is opened
+/// under a definition whose types differ from the ones it was created with. That
+/// guard exists on disk only. The wire has none — a mixed-version fleet straddling
+/// #550 would exchange ops that decode on both sides and apply against different key
+/// shapes — so **a mixed-version fleet across D-73 is unsupported**: every node
+/// upgrades at once, from a fresh `cluster-state-dir`. Pre-release that is the right
+/// trade, and clean removal is why it was taken; a *post*-release removal would have
+/// to keep the variant as an ignored arm and version the wire.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ControlOp {
     PutImposter {
@@ -99,15 +106,16 @@ pub enum ControlOp {
     ///
     /// **This op deliberately carries a secret into the replicated log — the only one that
     /// does.** It is admissible because of what the secret means outside the fleet: this key is
-    /// fleet-internal and meaningless anywhere else. It cannot be stored hashed the way a
-    /// principal's API key is (`argon2id`, RFC-002 §3.2), because verifying an HMAC needs the key
-    /// itself, not a one-way digest of it — a hash would make the cookie unverifiable by anyone,
-    /// including us. A secret with power over a *third-party* system has no op that carries it:
-    /// the credential-bearing source ops were removed with the tracking sources (#549, D-72).
+    /// fleet-internal and meaningless anywhere else. It cannot be stored hashed at all, because
+    /// verifying an HMAC needs the key itself, not a one-way digest of it — a hash would make the
+    /// cookie unverifiable by anyone, including us. A secret with power over a *third-party*
+    /// system has no op that carries it: the credential-bearing source ops were removed with the
+    /// tracking sources (#549, D-72).
     ///
-    /// So it sits inside the same trust boundary as the state directory, which already holds every
-    /// principal's argon2 record and all committed config. Rotation is the containment: writing a
-    /// new key invalidates every outstanding session at once. Recorded in
+    /// So it sits inside the same trust boundary as the state directory, which already holds all
+    /// committed config. Rotation is the containment — and since D-73 it is the *only* one:
+    /// writing a new key invalidates every outstanding session at once, and there is no
+    /// per-session revocation because there is no per-session server state to revoke. Recorded in
     /// `docs/architecture/08-tenancy-security.md`.
     SessionKeyPut {
         /// 32 random bytes, hex-encoded. Hex rather than raw so the op stays printable in a log
