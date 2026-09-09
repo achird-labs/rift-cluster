@@ -307,6 +307,53 @@ describe("upstream's scalar cursor replaces client-side slicing", () => {
   });
 
   /*
+   * The engine does not promise a cursor back. Upstream's `handle_get_requests` stamps
+   * `x-rift-next-index` only when its journal backend has stable indices, and a backend without
+   * them ignores `since` and answers the whole journal with no header at all. A screen that treated
+   * every cursored ask as a delta would append that whole journal to the rows it already holds —
+   * every row on screen, twice — with nothing in the body to say so. `resuming` is therefore
+   * derived from the answer: no cursor back means no merge, the cursor is dropped, and the next
+   * poll is a full read.
+   */
+  it("does not append a cursored answer that came back without a cursor; it re-baselines", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    const { requests } = stubFetch({
+      ...THREE_NODE,
+      [REQUESTS]: {
+        json: [recorded()],
+        headers: { "x-rift-next-index": "42" },
+      },
+      // The whole journal, and no header: what a backend without stable indices answers to
+      // `?since=`. Appended, this would put "/v1/payments/status" on screen twice.
+      [`${REQUESTS}?since=42`]: {
+        json: [recorded(), recorded({ path: "/v1/payments/second" })],
+      },
+    });
+    renderInApp(<RequestLog port={PORT} />);
+
+    expect(await screen.findByText("/v1/payments/status")).toBeTruthy();
+
+    await vi.advanceTimersByTimeAsync(REQUEST_POLL_INTERVAL_MS + 1);
+    await waitFor(() =>
+      expect(requests.some((sent) => sent.path === `${REQUESTS}?since=42`)).toBe(true),
+    );
+    // The un-cursored answer is not merged into the held rows...
+    expect(screen.getAllByText("/v1/payments/status")).toHaveLength(1);
+    expect(screen.queryByText("/v1/payments/second")).toBeNull();
+
+    // ...and the cursor is gone: the very next poll asks for the whole journal again rather than
+    // resuming from a token the engine has just shown it does not honour.
+    await vi.advanceTimersByTimeAsync(REQUEST_POLL_INTERVAL_MS + 1);
+    await waitFor(() => {
+      const uncursored = requests.filter((sent) => sent.path === REQUESTS).length;
+      expect(uncursored).toBeGreaterThan(1);
+    });
+    // Exactly one cursored ask was ever made — the drop is not "try the same token again".
+    expect(requests.filter((sent) => sent.path.includes("?since=")).length).toBe(1);
+    vi.useRealTimers();
+  });
+
+  /*
    * The cursor accumulates rows across polls, which makes "the journal got *smaller*" the case it
    * can silently get wrong — and the clear button is on this very screen.
    *
