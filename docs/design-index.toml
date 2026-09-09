@@ -171,4 +171,4 @@ status = "amended"
 verified_sha = "5c6876acf"
 verified_on = "2026-09-08"
 code = ["web/src/**"]
-note = "Rewritten for the five screens by #553 (D-71): Imposters with Import OpenAPI and Record, Requests per node, Scenarios, Router, Cluster, and the single-key login. The prototype HTML is a design artifact that predates the trim and still renders retired screens; the D-70 callout stays on the Router section."
+note = "Rewritten for the five screens by #553 (D-71): Imposters with Import from OpenAPI spec and Record, Requests per node, Scenarios, Router, Cluster, and the single-key login. The prototype HTML is a design artifact that predates the trim and still renders retired screens; the D-70 callout stays on the Router section."

@@ -309,13 +309,27 @@ describe("importing an OpenAPI document", () => {
     // The bug this pins: `setFilename(file.name); setText(await file.text())` set the name first,
     // so a rejected read left the *previous* document on screen under the new file's name — and
     // pressing Compile then sent the old bytes with nothing saying so.
-    stubFetch({ ...LISTED, "/specs/compile": { json: COMPILED } });
+    //
+    // The error text and the untouched textarea do NOT pin that ordering on their own: both hold
+    // if the `setFilename` moves back above the `await` and the `try/catch` stays, because the
+    // filename is never rendered anywhere. Its only consumer is `specContentType(text, filename)`.
+    // So the assertion that can actually fail is the *compile that follows*: a JSON document in
+    // the box, a rejecting `.yaml` file at the input, and the request must still declare
+    // `application/json`. Under the reintroduced bug the stale `.yaml` name wins the extension
+    // check and the pasted JSON goes out mislabelled, silently.
+    const petstoreJson = JSON.stringify({
+      openapi: "3.0.3",
+      info: { title: "Petstore", version: "1" },
+      paths: {},
+    });
+    const { requests } = stubFetch({ ...LISTED, "/specs/compile": { json: COMPILED } });
     renderInApp(<Imposters />);
     const user = userEvent.setup();
 
     await user.click(await screen.findByTestId("open-openapi-import"));
     await user.click(screen.getByTestId("openapi-text"));
-    await user.paste(PETSTORE_YAML);
+    await user.paste(petstoreJson);
+    await user.type(screen.getByTestId("openapi-port"), "4545");
 
     const unreadable = new File(["…"], "moved.yaml", { type: "" });
     Object.defineProperty(unreadable, "text", {
@@ -326,7 +340,17 @@ describe("importing an OpenAPI document", () => {
     const refusal = await screen.findByTestId("openapi-file-error");
     expect(refusal.textContent).toMatch(/moved\.yaml/);
     expect(refusal.textContent).toMatch(/NotReadableError/);
-    expect((screen.getByTestId("openapi-text") as HTMLTextAreaElement).value).toBe(PETSTORE_YAML);
+    expect((screen.getByTestId("openapi-text") as HTMLTextAreaElement).value).toBe(petstoreJson);
+
+    // The failed file left no trace on the document, its name included.
+    await user.click(screen.getByTestId("openapi-compile"));
+    const compile = await waitFor(() => {
+      const found = requests.find((r) => r.path.startsWith("/specs/compile"));
+      expect(found).toBeDefined();
+      return found;
+    });
+    expect(compile?.body).toBe(petstoreJson);
+    expect(compile?.headers["content-type"]).toBe("application/json");
   });
 
   it("says the document is compiled, not stored", async () => {

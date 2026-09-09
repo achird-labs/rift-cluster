@@ -81,8 +81,11 @@ describe("the compile request's query", () => {
      * These strings are the contract's two halves held together. The server read the value raw
      * until this PR, so `pet store` named an imposter literally called `pet%20store` and `a&b=c`
      * was cut at the `&` by the parameter split before the name was read at all. There is no
-     * encoding that avoids both: `&` and `=` cannot cross a query string unescaped, so the route
-     * decodes and the console encodes. `crates/rift-cluster-server/tests/spec_compile.rs`'s
+     * encoding that avoids both: an unescaped `&` cannot cross a query string at all, so the
+     * route decodes and the console encodes. (`=` and `%` are escaped along with it because one
+     * rule is easier to hold than three exceptions — a bare `=` would in fact survive the split,
+     * and a bare `%` would reach the server and be refused as a malformed escape.)
+     * `crates/rift-cluster-server/tests/spec_compile.rs`'s
      * `a_percent_encoded_name_reaches_the_compiled_imposter_verbatim` asserts the other end.
      */
     expect(compileSpecPath(4545, "pet store")).toBe("/specs/compile?port=4545&name=pet%20store");

@@ -123,7 +123,7 @@ Three rules, in priority order:
 > *Router* screen: §6 names the feature for what it does, the label and heading follow, and the API
 > path `/front-door/routes` is unchanged pending #554. The *Request log* row's "merged journal" is
 > history too: since D-74 (#552) the screen reads one node's journal and names that node. The
-> *Imposters* row gains **Import OpenAPI**, the one-shot compile of RFC-007 §3.1 —
+> *Imposters* row gains **Import from OpenAPI spec**, the one-shot compile of RFC-007 §3.1 —
 > `POST /specs/compile`, which stores nothing (D-72), then the ordinary `POST /imposters`. And
 > the paragraph below the table — *"screens whose backend has not shipped render as a named,
 > greyed nav entry"* — no longer describes anything: the roadmap chips carried screens that were

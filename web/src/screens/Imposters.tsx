@@ -359,9 +359,12 @@ export function Imposters(): ReactNode {
               panel takes this console's own export format, and a box that accepted both would have
               to guess which one it was looking at.
 
-              Named so it is not a prefix of the button beside it: "Import" and "Import OpenAPI"
-              give two controls in one toolbar accessible names one of which contains the other,
-              and a speech-input user saying "click Import" then addresses an ambiguous pair. */}
+              Named for the format it takes rather than "Import OpenAPI", because the distinction
+              a reader needs here is *which document* each button accepts, and the shorter label
+              leans on "OpenAPI" being read as a format name rather than a vendor. It buys no
+              disambiguation from its neighbour: "Import" is a prefix of this name either way, and
+              WCAG 2.5.3 (Label in Name) is satisfied by both, the accessible name being the
+              visible label in each case. */}
           <button
             className="btn"
             type="button"

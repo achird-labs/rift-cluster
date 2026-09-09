@@ -35,12 +35,13 @@ never fans out: an imposter another node has applied and this one has not would 
 the empty state distinguishes "no imposters, in this node's view" from "cannot confirm the fleet
 is empty" when the fleet rail reports a degraded read. Unknown is not zero.
 
-Four actions live in the header, because they act on the screen's subject. A fifth, **Record**, is
-on the imposter detail, because it acts on one imposter:
+Four actions live in the header, because they act on the screen's subject, and they are listed
+here in the order the header renders them (`Imposters.tsx`, left to right, the primary last). A
+fifth, **Record**, is on the imposter detail, because it acts on one imposter:
 
-- **New imposter** — a three-step wizard (identity, first stub, review). The port is a form field
-  and never auto-assigned: `createImposter` requires it because an auto-assigned port cannot
-  replicate, each node would pick its own.
+- **Export** — a dialog, because what lands in the file (replay-ready vs as-configured, proxies
+  kept or folded) needs more than a button label. A whole-set export is byte-preserving so the
+  same fleet exports to the same file (`features/imposters/portable.ts`).
 - **Import** — this console's own export format back in: a single imposter, an
   `{"imposters": [...]}` document or a bare list, with a pre-flight (which ports, which already
   exist, which repeat) and a choice between *Add* (N calls, reported per item) and *Replace all*
@@ -59,14 +60,19 @@ on the imposter detail, because it acts on one imposter:
   pasted text's, before anything is sent; the route's own `413` is still rendered as a sentence
   should it ever arrive. `?name=` is **percent-encoded** (`encodeURIComponent`, RFC 3986 — never
   `URLSearchParams`, whose `+` for a space the route would take literally) and the route decodes
-  it, which is what lets an imposter be called `Pet Store` or `a&b` at all. The dialog says in so
-  many words that the document is compiled, not stored,
+  it, which is what lets an imposter be called `Pet Store` or `a&b` at all. Decoding is also what
+  makes a control character reachable — `%0A` is a newline in a name that is then logged, rendered
+  and echoed back — so the route refuses U+0000–U+001F and U+007F with the same `400` as a
+  malformed escape. The dialog says in so many words that the document is compiled, not stored,
   because that is the one fact about the flow that the form does not make obvious. Its button is
-  named at length rather than "Import OpenAPI" so that no control's accessible name is a prefix of
-  its neighbour's (WCAG 2.5.3). Code: `web/src/features/import/`.
-- **Export** — a dialog, because what lands in the file (replay-ready vs as-configured, proxies
-  kept or folded) needs more than a button label. A whole-set export is byte-preserving so the
-  same fleet exports to the same file (`features/imposters/portable.ts`).
+  named for the format it takes rather than "Import OpenAPI" because *which document* is the
+  distinction a reader needs beside a button that takes this console's own export format; it buys
+  no disambiguation from that neighbour, whose name is a prefix of this one either way. Code:
+  `web/src/features/import/`.
+- **New imposter** — a three-step wizard (identity, first stub, review). The port is a form field
+  and never auto-assigned: `createImposter` requires it because an auto-assigned port cannot
+  replicate, each node would pick its own.
+
 …and on the imposter detail, not in this header:
 
 - **Record** — proxy-and-record against a real upstream, review the recorded stubs, and save them

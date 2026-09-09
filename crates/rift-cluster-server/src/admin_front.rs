@@ -641,6 +641,16 @@ fn query_param<'q>(query: Option<&'q str>, name: &str) -> Option<&'q str> {
         })
 }
 
+/// Whether `c` is a C0 control or `DEL` — the characters an operator never means to put in a
+/// name, and the ones a decoded `%XX` can now produce where a raw query string could not.
+///
+/// Deliberately narrower than [`char::is_control`], which also covers C1 (U+0080-U+009F): those
+/// are ordinary bytes inside legitimate UTF-8 text and this is a name filter, not a charset
+/// policy.
+fn is_c0_control(c: char) -> bool {
+    matches!(c, '\u{0}'..='\u{1F}' | '\u{7F}')
+}
+
 /// One hex digit's value, or `None` for a byte that is not one.
 ///
 /// Stricter than `u8::from_str_radix` on purpose: that accepts a leading sign, so `%+f` would
@@ -662,9 +672,15 @@ fn hex_nibble(byte: u8) -> Option<u8> {
 /// (`+` for a space) is what `URLSearchParams` emits, and reading it would make `C++` — a name an
 /// operator can type — arrive as `C  `. The console encodes with `encodeURIComponent`, which
 /// never emits a bare `+` and escapes a literal one as `%2B`, so the two halves of the contract
-/// agree: a space is `%20`, a `+` is `+` or `%2B`, and `&`, `=` and `%` — which cannot cross a
-/// query string unescaped at all — are `%26`, `%3D` and `%25`. Reading the value raw named an
-/// imposter literally `Pet%20Store`, and `a&b` did not even survive [`query_param`]'s `&` split.
+/// agree: a space is `%20`, a `+` is `+` or `%2B`, and `&`, `=` and `%` are `%26`, `%3D` and
+/// `%25`. Reading the value raw named an imposter literally `Pet%20Store`.
+///
+/// Of those three escapes only `&` is *load-bearing*: [`query_param`] splits pairs on it, so an
+/// unescaped `a&b` is truncated to `a` before this decoder is reached. A bare `=` survives —
+/// `split_once('=')` keeps everything after the **first** one, so `name=a=b` reads `a=b` — and a
+/// bare `%` crosses the wire intact; it is simply not an escape this decoder will accept, so
+/// `100%` unescaped is a `400` rather than a wrong name. The console escapes all three anyway,
+/// because one rule a caller can follow beats three exceptions it has to remember.
 ///
 /// `String::from_utf8(…).ok()` is a domain-optional parse, not a swallow: invalid UTF-8 is not a
 /// name, and the `None` becomes the caller's own `400`.
@@ -1867,8 +1883,8 @@ async fn terminate_spec_compile(req: Request<Incoming>) -> Response<FrontBody> {
         }
     };
     // **Percent-decoded, unlike `port`.** A name is free operator text — spaces, `&`, `%`,
-    // non-ASCII — and `&`/`=` do not survive a query string unescaped at all, so a caller that
-    // cannot escape cannot send them. The contract therefore says this value is percent-encoded
+    // non-ASCII — and an unescaped `&` does not survive the query string at all, because
+    // `query_param` splits pairs on it. The contract therefore says this value is percent-encoded
     // (RFC 3986: `%XX` a byte, `+` itself) and it is decoded here, at the one read that knows what
     // the value is; `query_param` itself stays raw for the reason its own doc gives. Reading it
     // raw named the imposter `Pet%20Store` and truncated `a&b` at the `&`.
@@ -1877,12 +1893,31 @@ async fn terminate_spec_compile(req: Request<Incoming>) -> Response<FrontBody> {
     // parameter rather than a silently mangled name: this is the imposter's identity, and a
     // lossy repair here would be discovered by whoever went looking for it later.
     //
+    // So is a **control character**, and that refusal exists *because* of the decoding. A raw
+    // query string cannot carry a NUL or a newline, so before the decode there was nothing to
+    // reject; `%00` and `%0A` now decode to exactly those, and this name is replicated identity —
+    // it is logged, rendered in the console, echoed in errors and read back out of `GET
+    // /imposters`. A name that can inject a line break into any of those is not a name, and the
+    // one place to say so is here, where the bytes first become text. C0 and `DEL` only: the C1
+    // range is left alone because it is legitimate UTF-8 in scripts we do not police.
+    //
     // An empty `?name=` still reads as absent rather than as a name of zero characters, because
     // the compiler omits the field entirely for `None` and an empty name is not a thing a caller
     // means to ask for.
     let name = match query_param(query.as_deref(), "name") {
         Some(raw) => match percent_decode(raw) {
             Some(decoded) if decoded.is_empty() => None,
+            Some(decoded) if decoded.chars().any(is_c0_control) => {
+                return typed_error(
+                    StatusCode::BAD_REQUEST,
+                    ErrorKind::BadData,
+                    &format!(
+                        "name {raw:?} decodes to text containing a control character: an \
+                         imposter name is identity that is logged and rendered, so U+0000-U+001F \
+                         and U+007F are refused rather than carried"
+                    ),
+                );
+            }
             Some(decoded) => Some(decoded),
             None => {
                 return typed_error(
@@ -4812,7 +4847,9 @@ mod tests {
         assert_eq!(percent_decode("C++").as_deref(), Some("C++"));
         assert_eq!(percent_decode("C%2B%2B").as_deref(), Some("C++"));
         assert_eq!(percent_decode("Pet+Store").as_deref(), Some("Pet+Store"));
-        // The characters that cannot cross a query string unescaped at all.
+        // `&` is the one that cannot cross a query string unescaped — `query_param` splits pairs
+        // on it. `=` is escaped by convention, not necessity: `split_once('=')` would deliver a
+        // bare `a=b` intact. Both decode here.
         assert_eq!(percent_decode("a%26b").as_deref(), Some("a&b"));
         assert_eq!(percent_decode("a%3Db").as_deref(), Some("a=b"));
         // A literal percent is itself escaped, so `100%` round-trips rather than eating what
@@ -4836,6 +4873,32 @@ mod tests {
         // A valid escape sequence whose bytes are not UTF-8 is not a name.
         assert_eq!(percent_decode("%FF"), None, "a lone continuation byte");
         assert_eq!(percent_decode("%C3"), None, "a truncated code point");
+    }
+
+    /// Decoding made control characters reachable, and the name read refuses them.
+    ///
+    /// The first half is the reason the second half exists: before `percent_decode`, a NUL or a
+    /// newline could not cross a query string at all, so nothing had to reject one. `%00` and
+    /// `%0A` now decode to exactly those, in a value that becomes an imposter's replicated name —
+    /// logged, rendered in the console, echoed back in errors. `terminate_spec_compile` answers a
+    /// `400` for any of them; this pins the classifier that decision reads.
+    #[test]
+    fn control_characters_are_decodable_and_therefore_refused_by_name() {
+        // Reachable — this is the fact that makes the gate necessary rather than theatrical.
+        assert_eq!(percent_decode("%00").as_deref(), Some("\0"));
+        assert_eq!(percent_decode("%0A").as_deref(), Some("\n"));
+        assert_eq!(percent_decode("a%09b").as_deref(), Some("a\tb"));
+        assert_eq!(percent_decode("%7F").as_deref(), Some("\u{7F}"));
+
+        // And classified as controls, at both ends of C0 and at DEL.
+        for c in ['\0', '\n', '\r', '\t', '\u{1F}', '\u{7F}'] {
+            assert!(is_c0_control(c), "U+{:04X} is C0 or DEL", u32::from(c));
+        }
+        // Not a charset policy: printable text, including C1 bytes inside legitimate UTF-8 and
+        // the space that `%20` decodes to, passes.
+        for c in [' ', 'a', 'é', '€', '\u{80}', '\u{9F}'] {
+            assert!(!is_c0_control(c), "U+{:04X} is not C0 or DEL", u32::from(c));
+        }
     }
 
     #[test]
