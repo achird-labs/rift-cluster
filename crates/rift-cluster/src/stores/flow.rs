@@ -1335,9 +1335,12 @@ impl FlowNet {
     ///
     /// `partial` is `true` when any peer's answer was missing (an error, a
     /// panicked task, a ring-divergence refusal, or one still outstanding when
-    /// `budget` expired) — the "never a fabricated zero" contract, and since
-    /// D-74 one of the few reads left that can honestly stamp
-    /// `Rift-Cluster-Partial` at all. A local ring that is not yet
+    /// `budget` expired) — the "never a fabricated zero" contract. It reaches
+    /// no header: since D-74 `Rift-Cluster-Partial` rides exactly two routes,
+    /// `/_fleet/members` and `/_fleet/health`, and this method has no
+    /// production caller at all (only `tests/flow_store.rs` and this module),
+    /// so the flag is a contract kept ready for a caller rather than one any
+    /// response carries today. A local ring that is not yet
     /// available (still starting, or no applied membership) answers an empty
     /// map with `partial: true` rather than a count this node cannot vouch
     /// for.

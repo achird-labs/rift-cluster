@@ -104,6 +104,22 @@ pub(crate) struct FleetBody {
     pub partial: bool,
 }
 
+/// Whether a rendered `/_fleet/*` answer may carry `Rift-Cluster-Partial` (D-74).
+///
+/// Since D-74 the header rides **exactly two** reads, `/_fleet/members` and `/_fleet/health` — the
+/// two that fold a body across peers, where a voter that did not answer leaves a row (or an
+/// addend) this node could not fill. `/_fleet/ops/{id}` is served by the same front arm but is
+/// assembled from local state alone.
+///
+/// Stated as a route predicate rather than left to [`FleetBody::partial`] alone, which is what
+/// makes "exactly two" true by construction. Today [`FleetBody::local`] hardcodes `partial: false`
+/// for [`FleetRoute::Op`], so the flag would do the job by itself — and that coincidence is the
+/// problem: an `Op` body that later learned to report partiality would widen the header's contract
+/// without anyone deciding to. Here it cannot.
+pub(crate) fn stamps_partial(route: &FleetRoute, partial: bool) -> bool {
+    partial && matches!(route, FleetRoute::Members | FleetRoute::Health)
+}
+
 impl FleetBody {
     /// A body assembled without asking anyone else, so complete by construction.
     fn local(value: serde_json::Value) -> Self {
@@ -694,5 +710,33 @@ mod tests {
         let (total, usable) = add_peer_depth(10, None);
         assert_eq!(total, 10);
         assert!(!usable);
+    }
+
+    /// Pins D-74's narrowing of `Rift-Cluster-Partial`: it may ride `/_fleet/members` and
+    /// `/_fleet/health` and nothing else.
+    ///
+    /// `Op` is asserted with `partial: true` — a value [`FleetBody::local`] cannot produce today —
+    /// deliberately. The claim is about the *route*, not about which bodies happen to set the flag,
+    /// so the assertion has to be made where the flag is set, or widening the guard would be
+    /// invisible.
+    #[test]
+    fn only_members_and_health_may_stamp_cluster_partial() {
+        assert!(stamps_partial(&FleetRoute::Members, true));
+        assert!(stamps_partial(&FleetRoute::Health, true));
+        assert!(
+            !stamps_partial(&FleetRoute::Op(uuid::Uuid::nil()), true),
+            "the op-status read is assembled from local state and may never be stamped partial"
+        );
+
+        for route in [
+            FleetRoute::Members,
+            FleetRoute::Health,
+            FleetRoute::Op(uuid::Uuid::nil()),
+        ] {
+            assert!(
+                !stamps_partial(&route, false),
+                "{route:?}: a complete answer is never stamped"
+            );
+        }
     }
 }

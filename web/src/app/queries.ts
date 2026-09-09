@@ -281,12 +281,21 @@ export function useRequestLog(port: number): UseQueryResult<RequestLogState> {
          * A cursored ask is a delta only if the engine *answered* it as one. Upstream stamps
          * `x-rift-next-index` on a read its journal backend can cursor and omits the header
          * entirely when it cannot (`handle_get_requests`: "backends without stable indices emit
-         * neither") — and such a backend ignores `since` and answers the whole journal. Nothing in
-         * the body says which of the two arrived, and appending the whole journal would duplicate
-         * every row already on screen. So `resuming` is derived from the answer, not the question:
-         * a cursored ask answered without a cursor is not merged. The rows already held stay as
-         * they are, the cursor is dropped, and the next poll is a full read that replaces them —
-         * the same re-baseline the counter below forces periodically, brought forward.
+         * neither") — and such a backend ignores `since` and answers the whole journal.
+         *
+         * There is a second header-less shape, and it is the opposite kind of answer: a *degraded*
+         * read (`read.complete === false`, `handle_get_requests`). That one honours `since` and
+         * returns a real delta, but the delta spans storage the read could not reach, so upstream
+         * withholds the cursor precisely to stop a client advancing past entries it was never
+         * served.
+         *
+         * Nothing in the body says which of the two arrived — and both must be handled the same
+         * way, for different reasons: appending a whole journal would duplicate every row on
+         * screen, and appending a partial delta would advance the view past rows it skipped. So
+         * `resuming` is derived from the answer, not the question: a cursored ask answered without
+         * a cursor is not merged. The rows already held stay as they are, the cursor is dropped,
+         * and the next poll is a full read that replaces them — the same re-baseline the counter
+         * below forces periodically, brought forward.
          */
         if (since !== null && held?.kind === "rows" && read.next === null) {
           return { ...held, cursor: null };

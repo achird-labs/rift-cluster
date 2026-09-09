@@ -4389,11 +4389,18 @@ async fn two_nodes_with_a_recording_imposter() -> RecordingFleet {
 /// Pins D-74: `numberOfRequests` is **the answering node's own count**, not a fleet sum.
 ///
 /// Three requests go through the leader's gateway and one through the follower's, so the two
-/// journals differ from each other and both differ from their sum. Before #552 the front rewrote
-/// the field by fanning out to every peer, and both nodes would have answered `4`; a per-node
-/// journal answers `3` on one and `1` on the other. The gateway leg rather than the data port, for
-/// the reason the D-69 teardown test gives: two nodes bind the same port and a direct dial names
-/// whichever won it.
+/// journals differ from each other and both differ from their sum: a per-node journal answers `3`
+/// on one and `1` on the other. Before #552 the front rewrote the field by fanning out to every
+/// peer, so both nodes answered the *same* number — which is the equality this test denies.
+///
+/// That number would not have been `4`, though it is tempting to say so. `drive_recorded`'s
+/// warm-up clear was fleet-wide under the old design, so the follower's warm-up would have emptied
+/// the leader's three entries as well and the merged count would have read `1` on both nodes. The
+/// old code fails the two per-node equalities below; it would have passed the `!= 4` line. That
+/// line is here to state D-74's contract in words, not to be the discriminator.
+///
+/// The gateway leg rather than the data port, for the reason the D-69 teardown test gives: two
+/// nodes bind the same port and a direct dial names whichever won it.
 #[tokio::test]
 async fn number_of_requests_is_the_answering_nodes_own_count_not_a_fleet_sum() {
     let RecordingFleet {
@@ -4478,11 +4485,15 @@ async fn a_proxied_clear_empties_only_the_journal_of_the_node_it_reached() {
     leader.shutdown().await;
 }
 
-/// Pins D-74's narrowing of `Rift-Cluster-Partial`: it rides exactly two reads, `/_fleet/members`
-/// and `/_fleet/health`, and is **absent** from a single-imposter read and from the spaces
-/// listing — in a fleet that has a peer, so a stamp that still existed would have a peer to be
-/// partial about. The spaces listing fans out and reports its own incompleteness in the body
-/// (`partial`, beside `unavailable`) instead, so that field is asserted present.
+/// The negative half of D-74's narrowing of `Rift-Cluster-Partial`: it is **absent** from a
+/// single-imposter read and from the spaces listing — in a fleet that has a peer, so a stamp that
+/// still existed would have a peer to be partial about. The spaces listing fans out and reports its
+/// own incompleteness in the body (`partial`, beside `unavailable`) instead, so that field is
+/// asserted present.
+///
+/// The positive half — that the two routes D-74 keeps really do stamp — is
+/// `cluster_partial_rides_members_and_health_when_a_voter_is_down` below. Absence alone would also
+/// be satisfied by a header nothing ever sets.
 #[tokio::test]
 async fn cluster_partial_is_absent_from_the_imposter_read_and_the_spaces_listing() {
     let RecordingFleet {
@@ -4522,5 +4533,60 @@ async fn cluster_partial_is_absent_from_the_imposter_read_and_the_spaces_listing
     }
 
     follower.shutdown().await;
+    leader.shutdown().await;
+}
+
+/// The positive half of D-74's narrowing of `Rift-Cluster-Partial`: `/_fleet/members` and
+/// `/_fleet/health` really are stamped when a voter cannot be reached.
+///
+/// Its sibling above asserts only the header's *absence*, which a header nothing ever sets would
+/// satisfy just as well. Both halves are needed for "exactly two routes" to mean anything: this one
+/// says the two are live, that one says the rest are not.
+///
+/// The follower is shut down and the survivor read, so each fan-out has a voter it cannot fill —
+/// `members` a row, `health` an addend of `parked_intents_fleet`. Polled rather than read once: a
+/// shutting-down peer can still accept a connection for a moment, and a fan-out that happened to
+/// succeed would answer complete, correctly.
+#[tokio::test]
+async fn cluster_partial_rides_members_and_health_when_a_voter_is_down() {
+    let RecordingFleet {
+        leader,
+        follower,
+        port: _port,
+        _state,
+    } = two_nodes_with_a_recording_imposter().await;
+    let lead_admin = leader.admin_addr().to_string();
+
+    follower.shutdown().await;
+
+    for route in ["/_fleet/members", "/_fleet/health"] {
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            let response = reqwest::get(format!("http://{lead_admin}{route}"))
+                .await
+                .expect("read the fleet route");
+            assert_eq!(
+                response.status().as_u16(),
+                200,
+                "{route}: the survivor still answers"
+            );
+            if response
+                .headers()
+                .get("rift-cluster-partial")
+                .and_then(|v| v.to_str().ok())
+                == Some("true")
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{route}: a voter is down, so this read cannot be complete — but it never stamped \
+                 `Rift-Cluster-Partial`: {:?}",
+                response.headers()
+            );
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    }
+
     leader.shutdown().await;
 }

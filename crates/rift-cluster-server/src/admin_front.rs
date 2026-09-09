@@ -710,7 +710,12 @@ async fn handle(state: Arc<FrontState>, req: Request<Incoming>) -> Response<Fron
                             // both `/_fleet/members` and `/_fleet/health`: each body is folded
                             // across peers, and a voter that did not answer leaves a row (or an
                             // addend) this node could not fill.
-                            if body.partial {
+                            //
+                            // This arm also serves `FleetRoute::Op`, so `body.partial` alone would
+                            // leave "exactly two routes" resting on `FleetBody::local`'s hardcoded
+                            // `partial: false`. `fleet::stamps_partial` names the two routes
+                            // instead, and its own test pins them.
+                            if fleet::stamps_partial(&route, body.partial) {
                                 set_header(&mut response, HEADER_PARTIAL, "true");
                             }
                             response
