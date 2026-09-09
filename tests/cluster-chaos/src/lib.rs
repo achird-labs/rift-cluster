@@ -264,7 +264,9 @@ impl Cluster {
         )
         .ok();
         wait_stack_gone();
-        wait_ports_free(PORTS_FREE_TIMEOUT)?;
+        // The base topology is all this composes (`--no-deps`, one service), so
+        // it is all this waits on — same rule as `start_stack`.
+        wait_ports_free_for(&[base_file()], PORTS_FREE_TIMEOUT)?;
         let mut args = up_args().to_vec();
         args.extend(["--no-deps", name]);
         cluster.compose(&args).context("compose up single node")?;
@@ -297,7 +299,13 @@ impl Cluster {
         .ok();
         wait_stack_gone();
         let t = record("down", t);
-        wait_ports_free(PORTS_FREE_TIMEOUT)?;
+        // Exactly what *this* stack publishes, and nothing else (#580). A port an
+        // overlay this scenario never loads cannot collide with it, so waiting on
+        // one can only stall it — and be reported against it. The teardown's own
+        // files are deliberately NOT added: `down` removes containers, which does
+        // not make their ports relevant to the `up` about to happen, and
+        // `wait_stack_gone` above already waits for every project container to go.
+        wait_ports_free_for(&cluster.files, PORTS_FREE_TIMEOUT)?;
         let t = record("ports_free", t);
         cluster.compose(up_args()).context("compose up")?;
         let t = record("up", t);
@@ -685,7 +693,55 @@ pub fn published_host_ports() -> Vec<u16> {
     ports
 }
 
-/// Block until every published host port can be bound again.
+/// The barrier over an explicit port list — for a test that owns its own port.
+///
+/// Production goes through [`wait_ports_free_for`], which is where the barrier's
+/// rationale lives. Ports supplied here carry no owner, so a bail names them
+/// bare.
+///
+/// Exists so the barrier can be tested against a port the test itself owns: a
+/// test that waited on the whole published set would fail on any machine with
+/// the `deploy/compose` demo stack up, which is a false alarm about the
+/// developer's machine rather than a fact about the barrier.
+pub fn wait_ports_free_in(ports: &[u16], timeout: Duration) -> anyhow::Result<()> {
+    let anonymous: Vec<(u16, String)> = ports.iter().map(|port| (*port, String::new())).collect();
+    wait_ports_free_owned(&anonymous, timeout)
+}
+
+/// The host ports each of `files` publishes, paired with the file that publishes
+/// it — the set a stack composed of exactly those files can actually collide on.
+///
+/// Read out of the compose files rather than declared in a table beside them.
+/// A hand-written overlay→ports map is a second source of truth that agrees with
+/// itself: an overlay gaining a `ports:` entry would be waited on by nobody, and
+/// nothing would say so.
+#[must_use]
+pub fn published_ports_of(files: &[String]) -> Vec<(u16, String)> {
+    let mut owners = Vec::new();
+    for path in files {
+        // Panics rather than skipping, matching this crate's existing compose
+        // reads. Every path here is a repo file named by `base_file()` or
+        // `compose_file()`, so an unreadable one is a broken checkout — and a
+        // skipped file would silently shrink the wait set, which is the failure
+        // this function exists to prevent.
+        let body = std::fs::read_to_string(path)
+            .unwrap_or_else(|e| panic!("read the compose file {path}: {e}"));
+        let name = std::path::Path::new(path)
+            .file_name()
+            .map_or_else(|| path.clone(), |n| n.to_string_lossy().into_owned());
+        owners.extend(
+            host_ports_in(&body)
+                .into_iter()
+                .map(|port| (port, name.clone())),
+        );
+    }
+    owners.sort_unstable();
+    owners.dedup();
+    owners
+}
+
+/// Block until every host port `files` publish can be bound again — the barrier
+/// every stack passes before it starts.
 ///
 /// [`wait_stack_gone`] waits for *containers*; this waits for the *sockets*, and
 /// they are not the same moment. Whatever still holds one — dockerd's per-port
@@ -694,6 +750,16 @@ pub fn published_host_ports() -> Vec<u16> {
 /// `failed to bind host port ... address already in use` and no indication of
 /// which port or who held it. That opaque failure is issue #117; this turns it
 /// into a named one, before the fleet is even asked to start.
+///
+/// **Scoped to the stack's own files, and there is deliberately no whole-set
+/// variant.** The barrier used to wait on every port any overlay publishes, so a
+/// port an overlay the scenario never loads could stall it — and because the wait
+/// runs before the first container starts, the bail landed on whichever scenario
+/// asked for a stack first in its shard. `c10_proxy_once_survives_owner_and_leader_kills`
+/// failed that way on `36700`, which `sequencing.overlay.yml` publishes and c10
+/// does not load, and the bare port number sent a reader looking through c10 for
+/// it. That was #580. A port this stack does not publish cannot collide with it,
+/// so waiting on one could only ever stall it.
 ///
 /// Probing means binding: there is no way to ask "is this bindable" that is not
 /// itself a bind, and a bind that succeeds is dropped immediately. That leaves a
@@ -708,42 +774,84 @@ pub fn published_host_ports() -> Vec<u16> {
 /// `TIME_WAIT`-held port succeeds, while a live listener is refused). That is
 /// the right behaviour rather than a gap — a port docker *can* take is a port
 /// this must report free, or the barrier would stall 60s after every scenario.
-pub fn wait_ports_free(timeout: Duration) -> anyhow::Result<()> {
-    wait_ports_free_in(&published_host_ports(), timeout)
+pub fn wait_ports_free_for(files: &[String], timeout: Duration) -> anyhow::Result<()> {
+    wait_ports_free_owned(&published_ports_of(files), timeout)
 }
 
-/// [`wait_ports_free`] over an explicit port list.
-///
-/// Exists so the barrier can be tested against a port the test itself owns: a
-/// test that waited on the whole published set would fail on any machine with
-/// the `deploy/compose` demo stack up, which is a false alarm about the
-/// developer's machine rather than a fact about the barrier.
-pub fn wait_ports_free_in(ports: &[u16], timeout: Duration) -> anyhow::Result<()> {
+fn wait_ports_free_owned(owners: &[(u16, String)], timeout: Duration) -> anyhow::Result<()> {
     let deadline = Instant::now() + timeout;
     loop {
         // `0.0.0.0`, matching what compose publishes on: BSD accepts a wildcard
         // bind alongside a loopback one, so probing `127.0.0.1` would report a
         // port free that docker cannot have.
-        let held: Vec<u16> = ports
+        let held: Vec<&(u16, String)> = owners
             .iter()
-            .copied()
-            .filter(|&port| std::net::TcpListener::bind(("0.0.0.0", port)).is_err())
+            .filter(|(port, _)| std::net::TcpListener::bind(("0.0.0.0", *port)).is_err())
             .collect();
 
         if held.is_empty() {
             return Ok(());
         }
         if Instant::now() >= deadline {
+            let named: Vec<String> = held
+                .iter()
+                .map(|(port, owner)| {
+                    if owner.is_empty() {
+                        port.to_string()
+                    } else {
+                        format!("{port} ({owner})")
+                    }
+                })
+                .collect();
             bail!(
-                "published host ports still bound {timeout:?} after teardown: {held:?}. \
-                 `compose up` would fail on one of these with an unattributable \
-                 'address already in use'. Find the holder with: \
+                "HARNESS: published host ports still bound {timeout:?} after teardown: {}. \
+                 This is the host, not the scenario — the wait runs before the first \
+                 container starts. `compose up` would fail on one of these with an \
+                 unattributable 'address already in use'. Find the holder with: \
                  lsof -nP -iTCP:{} -sTCP:LISTEN",
-                held[0]
+                named.join(", "),
+                held[0].0
             );
         }
         std::thread::sleep(Duration::from_millis(100));
     }
+}
+
+/// Every host port a compose file publishes, in `"HOST:CONTAINER"` order.
+///
+/// Line-oriented rather than a YAML parse: this reads one key, and pulling a
+/// YAML dependency into the harness to do it would be a dependency taken on for
+/// a guard.
+#[must_use]
+pub fn host_ports_in(compose: &str) -> Vec<u16> {
+    let mut ports = Vec::new();
+    let mut in_ports = false;
+    for line in compose.lines() {
+        let trimmed = line.trim();
+        if trimmed == "ports:" {
+            in_ports = true;
+            continue;
+        }
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        if !trimmed.starts_with('-') {
+            in_ports = false;
+            continue;
+        }
+        if !in_ports {
+            continue;
+        }
+        let spec = trimmed.trim_start_matches('-').trim();
+        let spec = spec.split('#').next().unwrap_or(spec).trim();
+        let spec = spec.trim_matches('"').trim_matches('\'');
+        if let Some((host, _container)) = spec.split_once(':')
+            && let Ok(port) = host.trim().parse::<u16>()
+        {
+            ports.push(port);
+        }
+    }
+    ports
 }
 
 /// Block until the previous stack's containers are actually gone.
@@ -1785,5 +1893,173 @@ mod tests {
         let err = append_line(&dir, "c10\tmax = 3\n");
         let _ = std::fs::remove_dir(&dir);
         assert!(err.is_err(), "opening a directory for append must fail");
+    }
+}
+
+#[cfg(test)]
+mod overlay_scoped_ports {
+    use super::*;
+
+    /// #580: a stack must wait only on the ports its own compose files publish.
+    ///
+    /// `wait_ports_free()` waits on the whole published set before every stack,
+    /// so a port belonging to an overlay this scenario never loads can stall it
+    /// — and the bail then lands on whichever scenario asks for a stack first in
+    /// its shard, which is an accident of shard order, not a fact about that
+    /// scenario. That is how `c10_proxy_once_survives_owner_and_leader_kills`
+    /// came to fail on `36700`, a port `sequencing.overlay.yml` publishes and
+    /// c10 never touches.
+    #[test]
+    fn a_stack_waits_only_on_the_ports_its_own_files_publish() {
+        let files = vec![base_file(), compose_file("front-door.overlay.yml")];
+        let ports: Vec<u16> = published_ports_of(&files)
+            .into_iter()
+            .map(|(port, _)| port)
+            .collect();
+
+        for port in FRONT_DOOR_HOST_PORTS {
+            assert!(
+                ports.contains(&port),
+                "the front-door overlay publishes {port}, so its own stack must wait on it: \
+                 {ports:?}"
+            );
+        }
+        for port in SEQUENCING_HOST_PORTS {
+            assert!(
+                !ports.contains(&port),
+                "{port} belongs to sequencing.overlay.yml, which this stack never loads — \
+                 waiting on it is how an unrelated scenario's held port stalls this one (#580)"
+            );
+        }
+        assert!(
+            ports.contains(&NODES[0].admin),
+            "the base file's own published ports must still be waited on: {ports:?}"
+        );
+    }
+
+    /// The bail has to name the overlay, not only the port. `36700` alone sent a
+    /// reader looking through c10 for a port c10 does not publish.
+    #[test]
+    fn a_held_port_is_named_with_the_overlay_that_publishes_it() {
+        let owners = published_ports_of(&[compose_file("sequencing.overlay.yml")]);
+        let (port, owner) = owners
+            .iter()
+            .find(|(port, _)| *port == SEQUENCING_HOST_PORTS[2])
+            .expect("the sequencing overlay publishes 36700");
+        assert_eq!(*port, 36700, "the port this actually bit on");
+        assert_eq!(
+            owner, "sequencing.overlay.yml",
+            "the bail must be able to name the file that publishes the port"
+        );
+    }
+
+    /// The two tests above pin `published_ports_of`; this pins that `start_stack`
+    /// actually *uses* it, on the files it is about to compose.
+    ///
+    /// Without this the fix is unguarded where it matters. Rewiring the wait back
+    /// to a fixed list — which is the shape #580 was — leaves both tests above
+    /// green, because they call the helper directly and never execute the call
+    /// site. Confirmed by mutation: replacing `cluster.files` with a hardcoded
+    /// overlay list passed the whole suite until this test existed.
+    ///
+    /// Structural because the alternative is not available: `start_stack` runs
+    /// `docker compose`, so no unit test can execute it.
+    #[test]
+    fn start_stack_waits_on_the_files_it_is_about_to_compose() {
+        const SOURCE: &str = include_str!("lib.rs");
+        let start = SOURCE
+            .find("async fn start_stack(")
+            .expect("start_stack must exist");
+        // Bounded at the next item, taking the *nearer* of the two boundaries.
+        // An unbounded scan runs off the end of the function and matches these
+        // very assertions further down the file, so deleting the wait outright
+        // would still pass — which it did, until mutation caught it. Preferring
+        // one boundary over the nearer one has the same failure mode on a delay:
+        // there is no `\n    async fn ` in this file today (every later method is
+        // `pub async fn`), so an `or_else` chain silently ran to `fn compose`.
+        let rest = &SOURCE[start..];
+        let tail = &rest[1..];
+        let end = [
+            tail.find("\n    async fn "),
+            tail.find("\n    pub async fn "),
+            tail.find("\n    fn "),
+            tail.find("\n    pub fn "),
+        ]
+        .into_iter()
+        .flatten()
+        .min()
+        .map_or(rest.len(), |at| at + 1);
+        let body = &rest[..end];
+
+        // Asserted against the call's own argument, not against text appearing
+        // anywhere before it. A preamble check passes on `let _ = &cluster.files;`
+        // beside a fixed list, and on a widening that routes through a helper —
+        // both of which are #580 again.
+        assert!(
+            body.contains("wait_ports_free_for(&cluster.files,"),
+            "start_stack must wait on exactly the files it is about to compose, as \
+             `wait_ports_free_for(&cluster.files, ..)`. Any other argument is #580: \
+             a port belonging to an overlay this scenario never loads cannot collide \
+             with it, so waiting on one can only stall it — and the bail is then \
+             reported against whichever scenario starts first in the shard. Body:\n{body}"
+        );
+    }
+
+    /// The bail itself has to name the overlay — the half of #580 an operator
+    /// actually reads.
+    ///
+    /// The test above asserts on `published_ports_of`'s *data*; this asserts on
+    /// the message, which is a different piece of code. Nothing else reaches the
+    /// named branch of the formatter: `the_port_barrier_names_the_port_that_is_
+    /// still_held` goes through `wait_ports_free_in`, which supplies empty owners
+    /// and so only ever exercises the bare-port branch. Replacing the whole
+    /// `named` block with `port.to_string()` left every other test green.
+    ///
+    /// A port this test owns, not one from a compose file: waiting on a published
+    /// port would fail on any machine with the demo stack up, which says nothing
+    /// about the barrier.
+    #[test]
+    fn the_bail_names_the_overlay_that_publishes_a_held_port() {
+        let squatter = std::net::TcpListener::bind(("0.0.0.0", 0)).expect("take a free port");
+        let port = squatter.local_addr().expect("addr").port();
+
+        let err = wait_ports_free_owned(
+            &[(port, "sequencing.overlay.yml".to_owned())],
+            Duration::from_millis(300),
+        )
+        .expect_err("a held port must fail the barrier");
+        let message = err.to_string();
+
+        assert!(
+            message.contains(&format!("{port} (sequencing.overlay.yml)")),
+            "the bail must name the overlay beside the port, not the port alone — \
+             `36700` on its own is what sent a reader looking through c10 for a port \
+             c10 never publishes: {message}"
+        );
+        assert!(
+            message.starts_with("HARNESS:"),
+            "the bail is a fact about the host, not about the scenario that happened \
+             to ask for a stack first: {message}"
+        );
+
+        drop(squatter);
+        wait_ports_free_owned(
+            &[(port, "sequencing.overlay.yml".to_owned())],
+            Duration::from_secs(5),
+        )
+        .expect("the barrier clears once the port is released");
+    }
+
+    /// The scraper feeding both of the above must not silently match nothing —
+    /// every assertion here would pass against an empty set.
+    #[test]
+    fn the_overlay_scraper_is_not_silently_empty() {
+        let all = published_ports_of(&[base_file(), overlay_file()]);
+        assert!(
+            all.len() >= NODES.len() * 3,
+            "scraped only {} ports from the base and chaos files; the scraper is \
+             broken, not the topology",
+            all.len()
+        );
     }
 }
