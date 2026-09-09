@@ -2588,7 +2588,7 @@ and an unknown are different claims.
 
 - **Status:** active
 - **Decided:** 2026-09-06 · RFC-007 · #544
-- **Implemented by:** #556, #557, #558, #559, #560, #562, #563, #564, #566, #567, #568, #569, #570, #571, #572, #573; and this pass's own PR (open) — see "Still open" below
+- **Implemented by:** #556, #557, #558, #559, #560, #562, #563, #564, #566, #567, #568, #569, #570, #571, #572, #573, #577
 - **Code:** crates/rift-cluster/src/control.rs, crates/rift-cluster-server/src/admin_front.rs, crates/rift-cluster/src/raft/node.rs, deploy/compose/smoke.sh
 
 RiftCluster is **a replicated fleet of Rift nodes that forms and heals itself, replicates
@@ -2639,7 +2639,7 @@ records the same change.
 | ~~#551~~ | ~~Clustered flow state~~ — **withdrawn**, the tier stays (see the amendment above) | — |
 | #552 | Fleet journal merge (D-74) | #568 |
 | #553 | Console trimmed | #569 (open) |
-| #554 | Design docs retired; the router named | this PR (open) |
+| #554 | Design docs retired; the router named | #577 |
 
 The RFC itself landed as #556 and was amended to v1.1 by #558. Five PRs outside the child list
 belong to the epic because they fix defects the removals exposed or the lanes they broke: #567
@@ -2649,9 +2649,7 @@ bootstrap keyed on a canonical digest, after the spec surface was reduced to one
 gateway leg strips every admin credential — found reviewing #566) and #573 (the cold-start sweep
 only clears ports the sync itself dropped — found reviewing #567). RFC-007 §9 lists the same five.
 
-**Still open — finish this entry when it merges.** One PR is open as this entry is written: the
-PR carrying this docs pass (issue #554). Drop its `(open)` mark from the `Implemented by:` line as
-it merges, and put its number where this paragraph and the table say "this PR".
+**All merged.** The last of them, #577, carried this entry itself; the numbers above are final.
 
 **Verified live, before and after.** No removal merges until the surface being removed has been
 driven on a running fleet and recorded, and every kept surface has been re-driven afterwards
@@ -3092,7 +3090,7 @@ its query layer) and seven tests — and none of that is the cost. The cost is e
 the repo, who would need a deprecation window, both spellings served through it, and a reason
 better than a noun.
 
-*Rejected:* renaming the path in this PR. The epic's own rule is that a removal must not change
+*Rejected:* renaming the path in #577. The epic's own rule is that a removal must not change
 what a working client sees; a rename is the same promise broken from the other direction.
 
 *Rejected:* leaving it unrecorded, as prose in RFC-007 §6. That is what #554 first did. A future

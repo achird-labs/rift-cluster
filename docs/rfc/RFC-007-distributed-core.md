@@ -365,7 +365,7 @@ mapping; when the two disagree, the register wins.
 | ~~#551~~ | Flow state, sequencer, proxyOnce, spaces | withdrawn 2026-09-06 — stays | — |
 | #552 | Journal merge (D-74) | merged | #568 |
 | #553 | Console | merged | #569 |
-| #554 | Docs and naming | open | this PR |
+| #554 | Docs and naming | merged | #577 |
 
 Five more PRs belong to the epic without being children of it — each fixes something a removal
 exposed or a lane a removal broke:
@@ -383,7 +383,7 @@ Closed as out of scope on 2026-09-06, with the reason on each: #148, #149, #151,
 
 ## Appendix A — every decision, by fate
 
-Statuses below are the register's as this PR leaves it, not as it stood at the base commit — the
+Statuses below are the register's as #577 left it, not as it stood at the base commit — the
 same PR that writes this appendix changes four of them (D-15, D-54, D-58, D-69). The register is
 authoritative; this list is a map into it.
 
@@ -405,7 +405,7 @@ amendment predates this RFC:
 | D-69 | D-74 (#552/#568) — `ControlOp::JournalClearGen` no longer exists | yes |
 | D-6, D-16, D-20, D-26, D-33, D-35 | the 2026-08-25 verification pass | no |
 
-D-15, D-54, D-58 and D-69 are the four this PR moves. Each already described a system that had
+D-15, D-54, D-58 and D-69 are the four #577 moved. Each already described a system that had
 changed under it; #554 writes the amendment paragraph the register's own rule asks for, or keeps
 the one a child had already written, and sets the status to match rather than editing the decided
 text. D-58 and D-69 were carrying an `**Amendment (D-74, …)**` paragraph under `Status: active`,
