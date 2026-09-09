@@ -9,7 +9,7 @@ The console is the browser face of the distributed core (RFC-007 §3.1, D-71). S
 | Mocks | **Requests** | The recorded requests of one imposter **on the node the browser reached** (D-74) | `GET/DELETE /imposters/:port/requests`, upstream's own per-node journal |
 | Mocks | **Scenarios** | Scenario states per space, a space's scoped stubs, flow-state entries; set / reset / tear down / clear | `/imposters/:port/scenarios*`, `/imposters/:port/spaces/*`, `/admin/imposters/:port/flow-state/*` |
 | Mocks | **Router** | The replicated route table, in effective order, with pre-flight validation and a tester | `GET/PUT /front-door/routes`, `DELETE /front-door/routes/:id` |
-| Fleet | **Cluster** | Members, leader, applied index, readiness, bound ports, the fleet's name | `GET /_fleet/members`, `GET /_fleet/health`, `PUT /admin/fleet/name` |
+| Fleet | **Cluster** | Members, leader, applied index, readiness, bound ports, the fleet's name — all **read-only** | `GET /_fleet/members`, `GET /_fleet/health` |
 
 Sign in is `POST /session`: the API key set by `--api-key` is exchanged for the `rift_session`
 cookie and the browser keeps no copy of the key (D-73, RFC-006 §5.3). There is one credential and
@@ -35,7 +35,8 @@ never fans out: an imposter another node has applied and this one has not would 
 the empty state distinguishes "no imposters, in this node's view" from "cannot confirm the fleet
 is empty" when the fleet rail reports a degraded read. Unknown is not zero.
 
-Five actions live in the header, because they act on the screen's subject:
+Four actions live in the header, because they act on the screen's subject. A fifth, **Record**, is
+on the imposter detail, because it acts on one imposter:
 
 - **New imposter** — a three-step wizard (identity, first stub, review). The port is a form field
   and never auto-assigned: `createImposter` requires it because an auto-assigned port cannot
@@ -44,23 +45,33 @@ Five actions live in the header, because they act on the screen's subject:
   `{"imposters": [...]}` document or a bare list, with a pre-flight (which ports, which already
   exist, which repeat) and a choice between *Add* (N calls, reported per item) and *Replace all*
   (one `PUT /imposters`, behind a typed confirmation).
-- **Import OpenAPI** — WireMock Cloud's Import button (#553). An OpenAPI 3.0 document, chosen or
-  pasted, JSON or YAML, plus a required port and an optional name. **Compile** sends it to
+- **Import from OpenAPI spec** — WireMock Cloud's Import button (#553). An OpenAPI 3.0 document,
+  chosen or pasted, JSON or YAML, plus a required port and an optional name. **Compile** sends it to
   `POST /specs/compile?port=…&name=…`, which answers the imposter it built and the operations it
   built it from and **stores nothing** (D-72): no record, no op, no applied-state read. The review
   step shows the port, the stub count and every operation with its method and path template. Only
   then does **Create imposter** send the compiled config through the ordinary create — the same
   `POST /imposters`, idempotency key and parked-write settling as everything else — so closing the
   dialog between the two steps leaves no trace anywhere. The compiler's refusals (an unsupported
-  version, an external `$ref`, a parse failure) are the route's `400`, shown verbatim; a body over
-  4 MiB is its `413`. The dialog says in so many words that the document is compiled, not stored,
-  because that is the one fact about the flow that the form does not make obvious. Code:
-  `web/src/features/import/`.
+  version, an external `$ref`, a parse failure) are the route's `400`, shown as the sentence inside
+  the `Error` envelope; `401`/`403`/`503` are not about the document and get the console's own
+  guidance instead. An oversize document is refused here, on the file's own byte count or the
+  pasted text's, before anything is sent; the route's own `413` is still rendered as a sentence
+  should it ever arrive. `?name=` is **percent-encoded** (`encodeURIComponent`, RFC 3986 — never
+  `URLSearchParams`, whose `+` for a space the route would take literally) and the route decodes
+  it, which is what lets an imposter be called `Pet Store` or `a&b` at all. The dialog says in so
+  many words that the document is compiled, not stored,
+  because that is the one fact about the flow that the form does not make obvious. Its button is
+  named at length rather than "Import OpenAPI" so that no control's accessible name is a prefix of
+  its neighbour's (WCAG 2.5.3). Code: `web/src/features/import/`.
 - **Export** — a dialog, because what lands in the file (replay-ready vs as-configured, proxies
   kept or folded) needs more than a button label. A whole-set export is byte-preserving so the
   same fleet exports to the same file (`features/imposters/portable.ts`).
-- **Record** (on the detail) — proxy-and-record against a real upstream, review the recorded
-  stubs, and save them into the imposter. The recording panel is `web/src/screens/RecordingPanel.tsx`.
+…and on the imposter detail, not in this header:
+
+- **Record** — proxy-and-record against a real upstream, review the recorded stubs, and save them
+  into the imposter. It needs an imposter to record *into*, which the list screen has not chosen
+  yet. The recording panel is `web/src/screens/RecordingPanel.tsx`.
 
 The **detail** carries the stubs (the form ⟷ raw-JSON editor, with lint-on-save and the
 `If-Match` 409 that names both edits and offers reapply-or-discard, never an auto-merge), this
@@ -77,8 +88,9 @@ carries at its top level and that matches exactly one row of its `members` array
 with no node on it is a log the reader will take for the fleet's, and it is not.
 
 There is correspondingly **no partial-merge banner** here and no `Rift-Cluster-Partial` to render:
-that header is stamped only on reads that genuinely fan out (`/_fleet/members`, `/_fleet/health`,
-the spaces listing). A read that reached exactly one node cannot have missed one.
+since D-74 the admin front stamps that header only on the two fleet reads that genuinely fan out,
+and this one reaches exactly one node, so it can have missed none. The console asks for the header
+on exactly one read — see *Where the partial header actually lands*, below.
 
 **The console never fans out and merges client-side.** Reading all three nodes and stitching the
 answers together would be inventing a fleet journal in the browser — with no cursor that means
@@ -158,9 +170,13 @@ the router has no probe endpoint to ask, and the panel says so rather than leavi
 
 Members, the leader, each voter's applied index, readiness and its pending gates, the ports each
 node actually holds the socket for, and the fleet's operator-set name. All of it is read from the
-admin port's fleet projections (`/_fleet/members`, `/_fleet/health`), which are the reads that
-genuinely fan out — so this is the one screen where `Rift-Cluster-Partial` renders, as a coverage
-note naming what did not answer.
+admin port's fleet projections (`/_fleet/members`, `/_fleet/health`), and all of it is **read-only**:
+the screen never writes. `PUT /admin/fleet/name` exists on the API and the console does not call it
+— the name is shown, and renaming a fleet is a CLI act.
+
+A voter that did not answer is `—` per row, from the projection's own `reachable`/`last_applied`
+fields, and the screen's degraded banner is `view.degraded` — a list of reasons `fleetView` derives
+from the two bodies, not a header. `Rift-Cluster-Partial` is not what draws anything here.
 
 **No trend charts.** These are point-in-time reads. A sparkline would imply history the API does
 not have, which is RFC-006 §3 rule 2 ("nothing UI-only") applied to charts. Applied-spread renders
@@ -173,6 +189,27 @@ Observing membership and changing it are different powers; the screen has the fi
 The fleet's name also sits in the top bar on every screen (#373): an operator with staging and
 production open in two tabs can otherwise tell them apart only by port, while every destructive act
 this console offers is fleet-wide.
+
+## Where the partial header actually lands
+
+The admin front stamps `Rift-Cluster-Partial` on exactly two reads, the ones that fan out to every
+voter and can miss one: `GET /_fleet/members` and `GET /_fleet/health` (D-74; the stamp is the
+`fleet::classify` branch of `admin_front.rs`, off `FleetBody::partial`, and `decorate.rs` only
+names the header). The console asks for it on **one** of them: `/_fleet/health`, through
+`apiGetDecorated` (`web/src/app/queries.ts`). That body's `parked_intents_fleet` is a **sum across
+voters**, and the header is the only thing that can say the sum is a floor. `/_fleet/members` is
+stamped too, but the console reads it with a plain `apiGet` and ignores the header: that body
+carries its coverage per row (`reachable`, a `null` `last_applied`), so the header would tell it
+nothing its own rows do not. The per-imposter spaces listing makes the same distinction in its
+*body*, as a `partial` field, because that route has no header convention to reuse. Nothing else
+in the console reads the header at all — the request log is a single node's journal (D-74) and is
+never stamped.
+
+The flag rides into `FleetView.parkedIntentsPartial`, and where it renders is the **Imposters**
+screen: under the parked-intents tile, as *"at least this many — a node did not answer"*, beside
+the two other things that tile can be (`null` — this node could not read its own queue; a plain
+number — everything answered). That is the whole surface of the header in this console. Three
+facts, three sentences, no two of them folded together.
 
 ## Rules that hold on every screen
 
@@ -212,7 +249,7 @@ light is `:root`, dark comes from `prefers-color-scheme`) and the violet `--prot
 
 ## The mockup's `OWNER` column is wrong — do not rebuild it
 
-The Aug-2026 mockup (`RiftCluster Console.dc.html`) draws an **`OWNER`** column on the imposter
+The Aug-2026 mockup (`RiftCluster Console.dc.html`, not checked in) draws an **`OWNER`** column on the imposter
 table, a **`FLOW OWNER`** row in the imposter detail rail, and a **`THIS PORT ON THE RING`** panel.
 The console shipped all three in #358. They encode an ownership that does not exist, and they have
 been **removed** rather than filled in. Registered as **D-20** in `docs/decisions/DECISIONS.md`.

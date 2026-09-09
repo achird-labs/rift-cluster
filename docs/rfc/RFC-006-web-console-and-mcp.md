@@ -117,11 +117,11 @@ Three rules, in priority order:
 > opaque vector cursor — and `Rift-Cluster-Partial` no longer rides that route at all; it rides
 > `/_fleet/members` and `/_fleet/health` only.
 
-> **Amended by D-71** (RFC-007 §3.2, #553): the console is **five screens in two groups** —
+> **Amended by RFC-007 §3.2 and §6** (#553): the console is **five screens in two groups** —
 > Mocks: *Imposters*, *Requests*, *Scenarios*, *Router*; Fleet: *Cluster* — and that is the whole
-> information architecture. The **Front-door routes** row below is the *Router* screen: RFC-007 §6
-> names the feature for what it does, the label and heading follow, and the API path
-> `/front-door/routes` is unchanged pending #554. The *Request log* row's "merged journal" is
+> information architecture, as §3.2's last row leaves it. The **Front-door routes** row below is the
+> *Router* screen: §6 names the feature for what it does, the label and heading follow, and the API
+> path `/front-door/routes` is unchanged pending #554. The *Request log* row's "merged journal" is
 > history too: since D-74 (#552) the screen reads one node's journal and names that node. The
 > *Imposters* row gains **Import OpenAPI**, the one-shot compile of RFC-007 §3.1 —
 > `POST /specs/compile`, which stores nothing (D-72), then the ordinary `POST /imposters`. And
