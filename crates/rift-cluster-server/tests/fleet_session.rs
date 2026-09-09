@@ -25,6 +25,11 @@ const SECRET: &str = "fleet-session-secret";
 /// whether or not the gate works.
 const API_KEY: &str = "fleet-session-api-key";
 
+/// A credential that is *not* this fleet's — an app under test authenticating to its own mock.
+/// Deliberately shares no prefix or suffix with [`API_KEY`], so an assertion that it survived
+/// cannot be satisfied by a partial match on the key.
+const APP_BEARER: &str = "Bearer someone-elses-token";
+
 /// A single-node fleet: the shape most of these tests need.
 fn cluster_cli(state: &TempDir, extra: &[&str]) -> EeCli {
     let mut args = vec!["--cluster-allow-solo"];
@@ -986,18 +991,41 @@ fn recorded_requests(seen: &Seen) -> Vec<serde_json::Value> {
     }
 }
 
+/// One header of a recorded request, by name, case-insensitively — the journal preserves the
+/// casing the client sent, so a `get("authorization")` would be a test that passes on the wrong
+/// spelling. `None` means the header is absent, which is what every credential assertion below
+/// is really asking.
+fn recorded_header(request: &serde_json::Value, name: &str) -> Option<String> {
+    request
+        .get("headers")?
+        .as_object()?
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case(name))
+        .map(|(_, value)| value.to_string())
+}
+
 /// `/__rift/{port}/*` is data-plane traffic and stays open on a keyed fleet — and, critically,
-/// **neither** admin credential reaches the imposter on it (D-73): the configured key is never
-/// injected on the gateway leg, and the `rift_session` cookie is stripped from `Cookie`. The
-/// gateway leg reaches the imposter, where either would land in its predicates, its recorded
-/// request log, and any proxying stub's outbound request. The console and the gateway share an
-/// origin, so the cookie case is not hypothetical: a same-site browser request to the gateway
-/// carries the live session token unless the front removes it.
+/// **no** admin credential reaches the imposter on it (D-73), by any of the three routes one
+/// could take. The gateway leg reaches the imposter, where each would land in its predicates,
+/// its recorded request log, and any proxying stub's outbound request, so this drives all three
+/// through one recording imposter:
 ///
-/// `recordRequests` is on, and the recorded request is asserted to *exist* before its headers
-/// are inspected. Upstream defaults recording off and `record_request` returns before it looks at
-/// a header, so without both of those this test passed against an empty journal whatever the
-/// front forwarded — deleting the injection guard left it green.
+/// 1. the configured key is never *injected* on this leg (the client sends nothing);
+/// 2. the `rift_session` cookie the browser attaches on its own is stripped from `Cookie` —
+///    console and gateway share an origin, so this is not hypothetical;
+/// 3. an `Authorization` the *client* sent carrying the fleet's own key is dropped. Upstream
+///    exempts `/__rift/*` from its key gate, so nothing else would stop a CI script that stamps
+///    the key onto every rift call from leaking it into an app-under-test's journal.
+///
+/// And the boundary that keeps (3) from being "drop every `Authorization`": someone else's
+/// bearer **must** survive, because an app under test authenticates to its own mock and an
+/// imposter legitimately predicates on that. A strip that took the header unconditionally would
+/// pass every assertion above and break real scenarios; this fails it.
+///
+/// `recordRequests` is on, and the recorded requests are asserted to *exist* before their
+/// headers are inspected. Upstream defaults recording off and `record_request` returns before it
+/// looks at a header, so without both of those this test passed against an empty journal
+/// whatever the front forwarded — deleting the injection guard left it green.
 #[tokio::test]
 async fn the_gateway_stays_open_and_never_carries_the_admin_key() {
     let state = TempDir::new().expect("tempdir");
@@ -1039,9 +1067,9 @@ async fn the_gateway_stays_open_and_never_carries_the_admin_key() {
     assert_eq!(login.status, 200, "{login}");
     let token = session_cookie(&login);
 
-    // No admin credential presented as one, and the browser shape: the session cookie rides in
-    // `Cookie` next to an app cookie the imposter is entitled to see. The gateway must answer
-    // regardless.
+    // Request 1 — the browser shape. No admin credential presented as one; the session cookie
+    // rides in `Cookie` next to an app cookie the imposter is entitled to see. The gateway must
+    // answer regardless.
     let seen = Seen::of(
         client
             .get(format!("http://{admin}/__rift/{port}/anything"))
@@ -1056,6 +1084,36 @@ async fn the_gateway_stays_open_and_never_carries_the_admin_key() {
         "gateway traffic must not be gated by the admin key: {seen}"
     );
 
+    // Request 2 — the CI-script shape: the caller stamps the fleet's *own* key onto every rift
+    // call, including this one. Still open (upstream exempts the prefix), and the key must not
+    // ride through.
+    let seen = Seen::of(
+        client
+            .get(format!("http://{admin}/__rift/{port}/anything"))
+            .header("authorization", API_KEY)
+            .send()
+            .await
+            .expect("gateway request carrying the fleet key"),
+    )
+    .await;
+    assert_eq!(
+        seen.status, 204,
+        "presenting the admin key must not change how the open gateway answers: {seen}"
+    );
+
+    // Request 3 — an app under test authenticating to its own mock. Not this fleet's credential,
+    // so it is none of the front's business and must arrive intact.
+    let seen = Seen::of(
+        client
+            .get(format!("http://{admin}/__rift/{port}/anything"))
+            .header("authorization", APP_BEARER)
+            .send()
+            .await
+            .expect("gateway request carrying an app's own bearer"),
+    )
+    .await;
+    assert_eq!(seen.status, 204, "{seen}");
+
     let seen = Seen::of(
         client
             .get(format!("http://{admin}/imposters/{port}/savedRequests"))
@@ -1067,42 +1125,62 @@ async fn the_gateway_stays_open_and_never_carries_the_admin_key() {
     .await;
     assert_eq!(seen.status, 200, "{seen}");
 
-    // Vacuity guard: the journal holds the one request, so the header assertions below are
-    // about a request that was actually recorded.
+    // Vacuity guard: the journal holds all three requests, so every header assertion below is
+    // about a request that was actually recorded — and each carries a `headers` object, so an
+    // absent header is absence and not a missing map.
     let recorded = recorded_requests(&seen);
     assert_eq!(
         recorded.len(),
-        1,
-        "exactly the one gateway request must have been recorded: {seen}"
+        3,
+        "exactly the three gateway requests must have been recorded: {seen}"
     );
-    let headers = recorded[0]
-        .get("headers")
-        .and_then(|h| h.as_object())
-        .unwrap_or_else(|| panic!("a recorded request carries its headers: {seen}"));
+    for (i, request) in recorded.iter().enumerate() {
+        assert!(
+            request.get("headers").and_then(|h| h.as_object()).is_some(),
+            "recorded request {i} carries its headers: {seen}"
+        );
+    }
 
-    // Neither credential's *value* anywhere in the body, and no `Authorization` header at all —
-    // the client sent none, so one appearing here could only have been injected by the front.
-    assert!(
-        !headers
-            .keys()
-            .any(|name| name.eq_ignore_ascii_case("authorization")),
-        "an Authorization header the client never sent reached the imposter: {seen}"
-    );
+    // Neither admin credential's *value* anywhere in the journal. The strongest form of the
+    // claim and the one that does not depend on a header name: it covers request 2's key even if
+    // some future rewrite moved it.
     assert!(
         !seen.body.contains(API_KEY),
-        "the admin key's value reached the imposter's recorded request: {seen}"
+        "the admin key's value reached the imposter's recorded requests: {seen}"
     );
     assert!(
         !seen.body.contains(&token),
-        "the session token reached the imposter's recorded request: {seen}"
+        "the session token reached the imposter's recorded requests: {seen}"
     );
 
-    // The app cookie survives — an imposter legitimately predicates on cookies, so the strip
-    // must take the one pair and not the header.
-    let cookie = headers
-        .iter()
-        .find(|(name, _)| name.eq_ignore_ascii_case("cookie"))
-        .map(|(_, value)| value.to_string())
+    // Request 1: the client sent no `Authorization`, so one appearing here could only have been
+    // injected by the front.
+    assert_eq!(
+        recorded_header(&recorded[0], "authorization"),
+        None,
+        "an Authorization header the client never sent reached the imposter: {seen}"
+    );
+
+    // Request 2: the client *did* send one and it was the fleet's key, so the header must be
+    // gone entirely — not blanked, not rewritten.
+    assert_eq!(
+        recorded_header(&recorded[1], "authorization"),
+        None,
+        "the caller's own Authorization carried the fleet key through to the imposter: {seen}"
+    );
+
+    // Request 3: someone else's bearer is untouched. Dropping every `Authorization` would satisfy
+    // both assertions above and fail this one.
+    let app_bearer = recorded_header(&recorded[2], "authorization")
+        .unwrap_or_else(|| panic!("an app's own bearer must reach its mock: {seen}"));
+    assert!(
+        app_bearer.contains("someone-elses-token"),
+        "an app's own bearer must reach its mock intact: {app_bearer}"
+    );
+
+    // The app cookie survives on request 1 — an imposter legitimately predicates on cookies, so
+    // the strip must take the one pair and not the header.
+    let cookie = recorded_header(&recorded[0], "cookie")
         .unwrap_or_else(|| panic!("the app cookie must reach the imposter: {seen}"));
     assert!(cookie.contains("other=keep"), "{cookie}");
     assert!(

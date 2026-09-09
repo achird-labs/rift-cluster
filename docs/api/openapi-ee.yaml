@@ -52,8 +52,13 @@ info:
     `/__rift/{port}/*` is served on the admin port too, as data-plane
     gateway traffic proxied straight to the imposter on that port. It is
     deliberately outside this contract and auth-exempt — the admin key is
-    neither required on it nor forwarded to the imposter behind it — so
-    it is not documented here.
+    neither required on it nor forwarded to the imposter behind it. That
+    holds for a credential the *caller* presents, not only for one the
+    front would inject: an `Authorization` whose value is the configured
+    key is dropped before the request is proxied, as is the `rift_session`
+    cookie. Any other bearer and every other cookie ride through untouched,
+    so an app under test can still authenticate to its own mock and an
+    imposter can still predicate on that. Not documented here.
 servers:
   - url: /
 security:

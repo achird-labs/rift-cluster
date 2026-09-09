@@ -202,6 +202,18 @@ rotation are. A cookie minted on one node is accepted by every other. Because th
 /session` answers `200`, the browser never stores the cookie, and everything after it is `401` —
 terminate TLS in front of the admin port before pointing a browser at it.
 
+**Give the console its own hostname, not one that also serves imposters.** Cookies are scoped by
+host, never by port: a browser attaches `rift_session` to *any* request to the origin's hostname,
+whatever port it is on. The front strips the cookie from `/__rift/{port}/…` gateway traffic, but
+that strip only reaches requests that pass *through* the front. An imposter bound directly on its
+own port is a separate listener the front never sees — and once the admin origin is HTTPS, an
+imposter declared `"protocol": "https"` on another port of the same hostname satisfies both
+`Secure` and `SameSite=Strict`, so the browser hands it a live session token that it will record,
+predicate on, and forward through any proxying stub. There is no cookie attribute that would fix
+this (`Domain` widens scope, and no `Port` attribute exists), so it is an operational rule: the
+hostname the console is served on must not also serve imposters over HTTPS. A distinct hostname
+for the admin origin — or imposters on hostnames of their own — is the containment.
+
 That record carries an actual secret into the replicated log — the one op that does, and
 deliberately. The distinction is what the secret means *outside* the fleet: an op naming a
 credential for a third-party system would spread power that exists somewhere else, and none does;

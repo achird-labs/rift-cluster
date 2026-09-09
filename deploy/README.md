@@ -232,6 +232,14 @@ browser discards the cookie, and every request after it is `401` — terminate T
 front of the admin port before pointing a browser at it. `curl` with the raw
 `Authorization` key is unaffected.
 
+Pick that hostname so it serves **only** the admin origin. Cookies are scoped by
+host and ignore the port, so an imposter with `"protocol": "https"` on another
+port of the same hostname is same-site with the console and the browser hands it
+the live `rift_session` cookie, which it will record and predicate on. The front
+strips that cookie from `/__rift/{port}/…` traffic, but an imposter bound on its
+own port never passes through the front, and no cookie attribute can scope by
+port. Give imposters hostnames of their own.
+
 ## The rule these manifests exist to encode
 
 On SIGTERM a node **fails readiness first**, keeps serving in-flight work for

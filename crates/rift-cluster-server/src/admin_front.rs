@@ -1113,8 +1113,15 @@ fn bearer_verdict(headers: &hyper::HeaderMap, expected: &str) -> BearerVerdict {
 
 /// Constant-time equality for the admin API key, matching open-source Rift's own
 /// `api_key_matches` (`rift-http-proxy/src/admin_api/server.rs`) byte for byte — including its
-/// fail-closed arm on a blank configured key, which is what stops a whitespace-only `MB_APIKEY`
-/// from authenticating a request that carried no header at all (it reaches here as `""`).
+/// fail-closed arm on a blank configured key.
+///
+/// That arm no longer has the job it once did on the bearer path: since [`bearer_verdict`]
+/// branches on *presence*, a request with no `Authorization` at all returns `Absent` and never
+/// reaches here, so there is no `""`-versus-`""` coincidence left to refuse. It still earns its
+/// keep, on the other two callers — `session_login` compares the *presented* key against a
+/// whitespace-only `MB_APIKEY` and must refuse rather than mint a cookie for it, and
+/// [`strip_admin_bearer`] must not treat a blank configured key as matching every blank header
+/// it sees.
 ///
 /// A plain `!=` short-circuits at the first differing byte, letting a network attacker recover
 /// the key from response-timing differences. The length check inside `ct_eq` is not secret.
@@ -1151,6 +1158,11 @@ fn resolve_cookie(node: &RaftNode, req: &Request<Incoming>) -> Result<bool, Resp
 
 /// The `rift_session` cookie's raw value, if the request carries one. No percent-decoding: the
 /// token alphabet (base64url plus `.`) never needs it.
+///
+/// `get`, not `get_all` — deliberately asymmetric with [`strip_session_cookie`], which sweeps
+/// every `Cookie` header. Each is wrong in the safe direction for its own job: reading only the
+/// first header can miss a token and *deny* a session, while stripping only the first could miss
+/// one and *leak* it. Do not "fix" the asymmetry by narrowing the strip.
 fn session_cookie(req: &Request<Incoming>) -> Option<String> {
     let raw = req.headers().get(hyper::header::COOKIE)?.to_str().ok()?;
     raw.split(';').find_map(|pair| {
@@ -1294,6 +1306,12 @@ async fn session_login(state: &Arc<FrontState>, req: Request<Incoming>) -> Respo
 /// page could otherwise forge, and a forced logout is a denial of service on the operator, small
 /// but real. The console's client stamps the header on every mutation already, so nothing there
 /// changes; a curl user adds `-H 'x-rift-csrf: 1'`.
+///
+/// The gate is unconditional, including on a fleet with no `--api-key`: `DELETE /session` is
+/// `403` without the header on an open plane too, where there is no session to forge a logout
+/// of. That is deliberate rather than overlooked — the alternative is a route whose contract
+/// changes shape with a flag, and the header costs a caller one line — but it does mean an
+/// open-plane `curl -X DELETE .../session` needs the header just like a keyed one.
 fn session_logout(req: &Request<Incoming>) -> Response<FrontBody> {
     if let Err(refused) = csrf_gate(req) {
         return refused;
@@ -1961,9 +1979,11 @@ enum ProxyLeg {
     /// `/__rift/{port}/*` data-plane gateway traffic (RFC-002 §7's open plane). Upstream exempts
     /// this prefix from its own key gate for the reason the credential must not be injected here
     /// either: the request is forwarded to the imposter, where an `Authorization` header would
-    /// land in its predicates and its recorded request log. The same reasoning strips the
-    /// `rift_session` cookie from this leg ([`strip_session_cookie`]) — a second admin
-    /// credential, arriving in a header the browser attaches on its own.
+    /// land in its predicates and its recorded request log. Not injecting one is only half of
+    /// it, though — the *caller's* credentials must not ride the leg either, so this leg strips
+    /// both of them: the fleet's own key when the client presented it
+    /// ([`strip_admin_bearer`]), and the `rift_session` cookie the browser attaches on its own
+    /// ([`strip_session_cookie`]).
     Gateway,
 }
 
@@ -2006,7 +2026,7 @@ async fn proxy(
     // Never on the gateway leg: `/__rift/*` is forwarded to the imposter, and an admin
     // credential landing in an app-under-test's predicates and request log is precisely why
     // upstream exempts that prefix from its own key gate. The gateway leg has the opposite
-    // duty — see `strip_session_cookie`.
+    // duty — see `strip_admin_bearer` and `strip_session_cookie`.
     match leg {
         ProxyLeg::Admin => match state.api_key.as_deref().map(HeaderValue::from_str) {
             Some(Ok(mut value)) => {
@@ -2029,7 +2049,10 @@ async fn proxy(
                 parts.headers.remove(hyper::header::AUTHORIZATION);
             }
         },
-        ProxyLeg::Gateway => strip_session_cookie(&mut parts.headers),
+        ProxyLeg::Gateway => {
+            strip_admin_bearer(&mut parts.headers, state.api_key.as_deref());
+            strip_session_cookie(&mut parts.headers);
+        }
     }
     match state.proxy.request(Request::from_parts(parts, body)).await {
         // The response body streams through as-is — buffering here would break
@@ -2040,6 +2063,45 @@ async fn proxy(
             ErrorKind::Unavailable,
             &format!("local admin backend unreachable: {e}"),
         ),
+    }
+}
+
+/// Remove an `Authorization` header that carries the fleet's configured admin key, and only
+/// that one, before the gateway leg reaches an imposter (D-73).
+///
+/// Not injecting the key is only half of "no admin credential reaches a mock". Upstream exempts
+/// `/__rift/*` from its own key gate, so a header the *client* sent was forwarded verbatim — and
+/// a CI script or `curl` alias that stamps `Authorization: <the fleet key>` onto every rift call
+/// would land the fleet's admin key in the imposter's `savedRequests`, its predicates, and any
+/// proxying stub's outbound request. Exactly the leak [`strip_session_cookie`] closes, one
+/// header over.
+///
+/// **Only the fleet's own key goes.** An app under test legitimately sends its own bearer to its
+/// mock and an imposter legitimately predicates on it, so every other value is forwarded
+/// untouched. The comparison is [`api_key_matches`]' constant-time one for the usual reason and
+/// one extra: a non-constant compare here would turn the gateway — an *unauthenticated* surface
+/// — into a timing oracle for the admin key.
+///
+/// A value that will not `to_str` cannot be the key (the key is a `&str`), so it is not the
+/// fleet's credential and is left alone; and if *any* value on the header is the key, the whole
+/// header goes, since a multi-valued `Authorization` carrying the key alongside something else
+/// is not a shape any honest client produces.
+fn strip_admin_bearer(headers: &mut hyper::HeaderMap, api_key: Option<&str>) {
+    // No configured key means there is no fleet credential for a caller to be leaking. Note
+    // `api_key_matches` would refuse a blank `expected` anyway; this is the same answer, earlier.
+    let Some(expected) = api_key else {
+        return;
+    };
+    let carries_key = headers
+        .get_all(hyper::header::AUTHORIZATION)
+        .iter()
+        .any(|value| {
+            value
+                .to_str()
+                .is_ok_and(|provided| api_key_matches(provided, expected))
+        });
+    if carries_key {
+        headers.remove(hyper::header::AUTHORIZATION);
     }
 }
 
@@ -2067,10 +2129,17 @@ fn strip_session_cookie(headers: &mut hyper::HeaderMap) {
                 .split(';')
                 .map(str::trim)
                 .filter(|pair| {
-                    !pair.is_empty()
-                        && pair
-                            .split_once('=')
-                            .is_none_or(|(name, _)| name.trim() != SESSION_COOKIE_NAME)
+                    // A cookie-string is a sequence of `name=value` pairs (RFC 6265 §4.2.1), so
+                    // a segment carrying no `=` is not a cookie at all — and the only way to
+                    // produce one is a `;` inside a value: `rift_session=aa;bb` splits into the
+                    // token's pair and a bare `bb`, which an earlier `is_none_or` here forwarded
+                    // as a surviving fragment of the token's own header. RFC 6265 forbids `;` in
+                    // a value and this fleet's tokens are base64url plus `.`, so it is not
+                    // reachable with a server-minted cookie — but this function's contract is
+                    // exhaustion, not luck, and a nameless segment names nothing an imposter
+                    // could predicate on.
+                    pair.split_once('=')
+                        .is_some_and(|(name, _)| name.trim() != SESSION_COOKIE_NAME)
                 })
                 .collect();
             if remaining.is_empty() {
@@ -5261,6 +5330,83 @@ mod tests {
         );
         strip_session_cookie(&mut headers);
         assert_eq!(cookies_of(&headers), vec!["k=v"]);
+    }
+
+    /// A `;` inside the token's value splits it into the pair and a nameless remainder, which an
+    /// earlier `is_none_or` forwarded as a surviving fragment of the very header being stripped.
+    /// Not reachable with a server-minted token (RFC 6265 forbids `;` in a value, and this
+    /// fleet's tokens are base64url plus `.`), but the function's contract is exhaustion.
+    #[test]
+    fn strip_session_cookie_keeps_no_fragment_of_a_semicolon_bearing_value() {
+        let mut headers = cookie_headers(&["rift_session=aa;bb"]);
+        strip_session_cookie(&mut headers);
+        assert!(
+            headers.get(hyper::header::COOKIE).is_none(),
+            "no piece of the token's own header may survive it: {:?}",
+            cookies_of(&headers)
+        );
+
+        // A nameless segment is dropped, but the real cookies beside it are not.
+        let mut headers = cookie_headers(&["a=1; loose; b=2"]);
+        strip_session_cookie(&mut headers);
+        assert_eq!(cookies_of(&headers), vec!["a=1; b=2"]);
+    }
+
+    /// The other half of "no admin credential reaches an imposter" (D-73): an `Authorization`
+    /// the *client* sent is dropped when — and only when — its value is the fleet's own key.
+    #[test]
+    fn strip_admin_bearer_takes_the_fleet_key_and_nothing_else() {
+        let bearer = |value: &'static str| {
+            let mut headers = hyper::HeaderMap::new();
+            headers.insert(
+                hyper::header::AUTHORIZATION,
+                HeaderValue::from_static(value),
+            );
+            headers
+        };
+
+        let mut headers = bearer("the-fleet-key");
+        strip_admin_bearer(&mut headers, Some("the-fleet-key"));
+        assert!(
+            headers.get(hyper::header::AUTHORIZATION).is_none(),
+            "the fleet's own key must not ride the gateway leg"
+        );
+
+        // An app under test authenticating to its own mock. None of the front's business.
+        let mut headers = bearer("Bearer someone-elses-token");
+        strip_admin_bearer(&mut headers, Some("the-fleet-key"));
+        assert_eq!(
+            headers
+                .get(hyper::header::AUTHORIZATION)
+                .and_then(|v| v.to_str().ok()),
+            Some("Bearer someone-elses-token"),
+        );
+
+        // A near miss is not the key. The compare is exact, not a prefix.
+        let mut headers = bearer("the-fleet-key-2");
+        strip_admin_bearer(&mut headers, Some("the-fleet-key"));
+        assert!(headers.get(hyper::header::AUTHORIZATION).is_some());
+
+        // Open plane: no configured key, so there is no fleet credential to be leaking, and a
+        // blank one must not match every blank header either.
+        let mut headers = bearer("whatever");
+        strip_admin_bearer(&mut headers, None);
+        assert!(headers.get(hyper::header::AUTHORIZATION).is_some());
+        let mut headers = bearer("");
+        strip_admin_bearer(&mut headers, Some("   "));
+        assert!(
+            headers.get(hyper::header::AUTHORIZATION).is_some(),
+            "a whitespace-only configured key matches nothing, so nothing is stripped"
+        );
+
+        // Multi-valued: if any value is the key, the whole header goes.
+        let mut headers = bearer("Bearer app");
+        headers.append(
+            hyper::header::AUTHORIZATION,
+            HeaderValue::from_static("the-fleet-key"),
+        );
+        strip_admin_bearer(&mut headers, Some("the-fleet-key"));
+        assert!(headers.get(hyper::header::AUTHORIZATION).is_none());
     }
 
     /// Issue #359. The two-segment space read is the only shape that carries an owner.

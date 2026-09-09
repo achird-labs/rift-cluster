@@ -2713,3 +2713,25 @@ The raw `Authorization` key path is unaffected. Also in that fix: the `rift_sess
 stripped from the `/__rift/*` gateway leg for the same reason the key is never injected there —
 it is an admin credential the imposter must not see — and `DELETE /session` sits behind the CSRF
 header like every other cookie-borne mutation.
+
+**Amendment, continued (2026-09-09, that fix's review):** two more facts about which credentials
+reach a mock. *Fourth*, "the key is never injected on the gateway leg" was never the whole rule,
+because a caller can present the key itself: upstream exempts `/__rift/*` from its own key gate,
+so an `Authorization` header the *client* sent — a CI script or `curl` alias that stamps the
+fleet key onto every rift call — was forwarded verbatim into the imposter's `savedRequests`, its
+predicates, and any proxying stub's outbound request. The gateway leg now **drops an
+`Authorization` whose value is the configured key** (constant-time compare, so an unauthenticated
+surface does not become a timing oracle for it) and forwards every other bearer untouched, since
+an app under test legitimately authenticates to its own mock. Two behaviour notes follow: a
+gateway request presenting the fleet key now reaches the imposter with no `Authorization` at all,
+and — from the same fix's `bearer_verdict` change — a *present but empty or unreadable*
+`Authorization` on an admin route is a refusal (`401`) rather than an absence that lets a cookie
+on the same request authenticate it. No first-party client is affected; the console is
+cookie-only. *Fifth*, the cookie strip has a reach the operator must supply the rest of:
+**cookies are host-scoped, never port-scoped**, and the strip only runs on requests that pass
+through the admin front. An imposter bound on its own port is a listener the front never sees, so
+once the admin origin is HTTPS an imposter declared `"protocol": "https"` on another port of the
+same hostname satisfies both `Secure` and `SameSite=Strict` and is handed a live session token.
+No cookie attribute fixes this — `Domain` only widens scope and there is no `Port` attribute — so
+it is a deployment rule: **the hostname serving the console must not also serve HTTPS imposters**
+(`docs/architecture/10-operations.md` §`POST /session`).
