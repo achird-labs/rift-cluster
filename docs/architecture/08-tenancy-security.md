@@ -17,7 +17,11 @@
 >   `--cluster-insecure` acknowledgment, version skew) → [Chapter 3 — Control
 >   Plane](03-control-plane.md), beside the RPCs it protects;
 > - **`/_fleet/*`, `PUT /admin/fleet/name` and the console session exchange** → [Chapter 10 —
->   Operations](10-operations.md), rewritten for one credential.
+>   Operations](10-operations.md), rewritten for one credential;
+> - **which routes the listener compiles** — the paragraph below on `desired_routes`,
+>   `routes_installed_for` and the `installed` flag was the only prose definition of that rule →
+>   [Chapter 13 — The Router](13-router.md), "What is stored is what dispatches", rewritten
+>   against the current function, which filters nothing (#554).
 >
 > The rest is kept as the record of what was designed and shipped, and of why it was withdrawn:
 > tenancy was the largest surface in the system and the one that leaked into core correctness —

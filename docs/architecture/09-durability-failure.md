@@ -98,8 +98,8 @@ paths. So the status distinguishes isolation from a fault on the FSM paths, and
 on the template and script paths the message and the `isolated` field remain the
 signals.
 
-The condition is the `isolated` field of `/_cluster/status`, `/_cluster/health`
-and `/_fleet/health` — `true` while this node cannot see the quorum, `false`
+The condition is the `isolated` field of `/_cluster/health` and `/_fleet/health`
+— `true` while this node cannot see the quorum, `false`
 otherwise (#470). Every reader gets the same sample of the same rule:
 `StatusReport::isolated` and `RaftNode::is_isolated` both evaluate
 `isolated_from`, so two readings of one safety condition cannot drift apart. The
@@ -114,7 +114,7 @@ read it are asserting.
 
 | Operation | Authority | Unreachable ⇒ default | Rationale |
 |---|---|---|---|
-| Admin write (config, tenancy, enable) | Raft quorum | `503` + `Retry-After` + **op-id, durably parked, auto-replayed** | R4: refused ≠ lost |
+| Admin write (config, routes, enable) | Raft quorum | `503` + `Retry-After` + **op-id, durably parked, auto-replayed** | R4: refused ≠ lost |
 | Scenario match-gate read | flow owner | fast-fail `503` | A stale read here = silently wrong stub |
 | Scenario CAS / flow-KV write | flow owner | fast-fail `503` | Single-writer or nothing |
 | Script flow-KV read (`strong`, default) | flow owner | `503` | Scripts drive responses off this |
@@ -211,7 +211,7 @@ rules for, this design makes structurally unrepresentable — the one lost-updat
 class remaining is the flagged, opt-in `local` modes.
 
 **Full-cluster restart (deploy, power event).** Chapter 3's cold start: redb →
-group re-forms → replay. Configs, tenancy, intents: intact (R3). Flow state:
+group re-forms → replay. Configs, routes, intents: intact (R3). Flow state:
 per its durability level. Recorded requests: gone on every node (matrix above). A CI run interrupted
 mid-flight resumes against identical mocks with identical scenario states (at
 `sync`/`async`), which is precisely the "always-on shared environment" promise.
@@ -225,8 +225,8 @@ majority of voters** is the honest limit of a self-contained cluster: configs
 survive only as `--datadir` exports/backups (Chapter 10's backup runbook);
 this is stated rather than hedged.
 
-That catch-up moves the *whole* state machine — imposter configs, tenancy,
-bindings, dedup — and it costs roughly 4× its size on the wire, because snapshot
+That catch-up moves the *whole* state machine — imposter configs, the route
+table, dedup — and it costs roughly 4× its size on the wire, because snapshot
 chunks ride the JSON cluster port as byte
 arrays. The transfer is bounded **per chunk**, not per snapshot: a chunk that
 misses its deadline abandons the entire transfer back to offset 0, so the bounds
@@ -253,7 +253,7 @@ of state stores **1.00×** its raw bytes, and one holding 16 MiB likewise **1.00
 | 16 MiB | 12.3 s | **8.8 s** |
 
 Those figures were measured against a state machine that could reach tens of MiB. It no longer can:
-the state machine holds imposter configs, tenancy and dedup — small JSON, all of it — so a snapshot
+the state machine holds imposter configs, the route table and dedup — small JSON, all of it — so a snapshot
 is bounded by how many imposters a fleet runs, not by an upload quota (D-71, #549). The
 `InstallSnapshotRequest` path is still openraft's own, still chunked as a JSON integer array, and
 still the reason a snapshot is measured rather than assumed; what changed is that nothing puts MiB

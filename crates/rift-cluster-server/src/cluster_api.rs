@@ -385,8 +385,9 @@ pub(crate) fn health_body(node: &RaftNode, readiness: &Readiness) -> serde_json:
         "ready": readiness.state().is_ready(),
         "state": readiness.state().as_str(),
         "pending_gates": readiness.pending(),
-        // Same rule as `StatusReport::isolated` (#470), via the same `isolated_from`: an operator
-        // comparing `/_cluster/status` against this field must never be shown two different answers.
+        // Same rule as `StatusReport::isolated` (#470), via the same `isolated_from`: every
+        // reader of the isolation condition — this field, `/_fleet/health`, the join lifecycle —
+        // must be shown the same answer, so there is one predicate and no second definition.
         "isolated": node.is_isolated(),
         // This node's own parked-write backlog (issue #360): writes it accepted under
         // `--cluster-admin-async` and has not replayed. A magnitude, so a number.

@@ -1,48 +1,91 @@
 # `web/` — the Rift console
 
-The single-page app the cluster binary serves at `GET /console`. Vite + React +
+The single-page app the cluster binary serves at `/console/`. Vite + React +
 TypeScript + TanStack Query, with a TypeScript client generated from the
-published OpenAPI contract.
+published OpenAPI contract, Monaco bundled rather than fetched, and an optional
+wasm `rift-lint` pane.
 
-C3 (#186) delivered the pipeline; **C4 (#187) delivers the first screens** — the
-app shell, the tenant switcher, a read-only imposter list and detail with
-enable/disable, and the cluster/fleet view. C5–C7 (#188–#190) follow.
+It shows **one fleet, to one administrator**. Since #550 (D-73) there is a single
+credential and a single identity behind it: no tenants, no principals, no roles,
+no capability table. Every screen shows everything and every control is offered
+unconditionally.
 
 ## Layout
 
 ```
-src/api/       schema.ts (generated, committed) · client.ts (the only fetch) · paths.ts
-src/app/       Shell · session · rbac · nav · routing · queries · contract · fleetView
-src/screens/   Login · Imposters · ImposterDetail · Fleet · RequestLog · Routes · Admin
-src/features/  requests/source.ts (the #147 seam) · routes/order.ts (front-door ordering)
-               admin/{roles,key}.ts (RFC-002 admin plane)
-src/components/primitives (Status, Truncated, Ident, ErrorNote)
+src/api/         schema.ts (generated, committed) · client.ts (the only fetch) · paths.ts
+src/app/         Shell · session · SignOut · nav · routing · queries · query · contract · fleetView · pending
+src/screens/     Login · Imposters · ImposterDetail · Fleet · RequestLog · Routes · Scenarios · StubEditor · RecordingPanel
+src/features/    imposters/ · recording/ · requests/ · routes/ · scenarios/ · stubs/ · writes/
+src/components/  primitives · CodeEditor · imposterList · imposterFields · detailRail · fleetRail · exportDialog · toast · pending
+src/fonts/       self-hosted IBM Plex faces
+e2e/             Playwright specs and their committed visual baselines
 ```
 
-Six modules carry the decisions worth knowing before changing anything:
+## Screens
+
+Five navigation entries, in two groups, and nothing greyed out — `plannedEntries()`
+is empty (`specs` was the last one, and #549 removed the stored-spec surface). The
+mechanism is kept: an empty roadmap is a state, not a reason to delete the shape.
+
+| Group | Label | Route | Screen |
+|---|---|---|---|
+| Mocks | Imposters | `#/imposters` | `Imposters.tsx` |
+| Mocks | Front door routes | `#/routes` | `Routes.tsx` |
+| Mocks | Flow state & scenarios | `#/scenarios[/:port[/:flowId]]` | `Scenarios.tsx` |
+| Mocks | Requests | `#/requests[/:port]` | `RequestLog.tsx` |
+| Fleet | Cluster & fleet | `#/cluster` | `Fleet.tsx` |
+
+Plus one screen reached by drill-down rather than the nav: `#/imposters/:port`
+(`ImposterDetail.tsx`), which hosts the stub editor and the recording panel.
+
+> The route-table screen is still labelled "Front door" here. RFC-007 §6 renames
+> the feature to the **router** in prose, console labels and CLI help; #553 is the
+> issue and #569 the PR that does it in this package. The wire path
+> `/front-door/routes` does not change.
+
+Routing is **hash-based**: `/console/` is served by `rust-embed` with an SPA
+fallback, and a hash never reaches the server. An unknown hash falls back to
+`#/imposters` rather than a 404 — there is no server round trip that could
+legitimately produce one. Screen state (filters, sort) rides in a query string
+*after* the hash via `useHashQuery` + `replaceState`, so it is not part of
+`Route` and does not push history entries.
+
+## Authentication — one credential, one identity
+
+`Login.tsx` takes an API key and calls `POST /session`, which returns an
+`HttpOnly` `rift_session` cookie. The key lives in component state and nowhere
+else — never `localStorage`, never `sessionStorage`, never a URL — and is cleared
+on success and on failure alike.
+
+`SignOut.tsx` calls `DELETE /session`, and that is load-bearing rather than
+decorative: no script can clear an `HttpOnly` cookie, so the server has to send
+the clearing `Set-Cookie` itself.
+
+`useSession()` (`app/session.tsx`) probes with `GET /_fleet/health` — the cheapest
+read behind the authentication gate — and `App.tsx` branches on it: pending → a
+signing-in state, `401` → the login screen, any other error → "Could not reach the
+admin front", otherwise the shell. There is no principal to name, no role to hold
+and no tenant to select, so the probe asks only *are these credentials good*.
+
+Transport rules live in `api/client.ts`: `credentials: "same-origin"`, the
+`X-Rift-CSRF` header on every mutation, `If-Match` where a write is
+revision-guarded, and `Idempotency-Key` where it is retryable.
+
+## Modules that carry a decision
 
 - **`app/contract.ts`** — the single declaration of *which* schema fields any
   screen renders. Keys are typed as `keyof` the generated schema type with its
-  index signature stripped, so a field the contract does not publish fails
-  `tsc`. This is RFC-006 §11's "every displayed field is traceable to a schema'd
-  endpoint" made mechanical rather than aspirational. It is why the prototype's
-  `numberOfRequests` chart is **not** here: that value reaches the body only
-  through `Imposter`'s non-exhaustive index signature. Its home is the request
-  log (#189).
-- **`app/rbac.ts`** — a hand transcription of
-  `crates/rift-cluster-server/src/authz.rs::role_allows`, with a test that
-  mirrors the table. It decides which controls are *drawn*. RFC-006 §3 rule 3
-  still holds: hiding is UX, the API is the boundary, and a hidden button is
-  never the only thing preventing a call. Note `LifecycleToggle` is an
-  **Operator** grant — gating enable/disable on "is an editor" would hide a
-  control Operator is entitled to.
-- **`app/fleetView.ts`** — derives the degraded/partial label from `/_fleet/*`.
-  Three states, kept distinct: read it, never asked, asked and failed.
-  `not-asked` claims **neither** partial nor complete — the projection is
-  fleet-scoped, so most principals are simply refused it and treating that
-  absence as evidence would put a permanent warning on a healthy console. But
-  `unavailable` must not fold into it: a FleetAdmin whose read failed has *lost*
-  the signal, which is a different thing from never having been entitled to it.
+  index signature stripped, so a field the contract does not publish fails `tsc`.
+  This is RFC-006 §11's "every displayed field is traceable to a schema'd
+  endpoint" made mechanical rather than aspirational.
+
+- **`app/fleetView.ts`** — derives the degraded label from `/_fleet/*`.
+  `Degradation` is `"not-ready" | "draining" | "isolated" | "no-leader" |
+  "evicted"`. Three read states are kept distinct: read it, never asked, asked and
+  failed. `not-asked` claims **neither** partial nor complete, and `unavailable`
+  must not fold into it — a read that failed has *lost* the signal, which is not
+  the same as never having asked for it.
 
   Note what is deliberately **not** a degradation: `voters ⊄ ring.members`. Both
   arrive from the same `membership_config.voter_ids()` — `members_body` sends it
@@ -52,32 +95,31 @@ Six modules carry the decisions worth knowing before changing anything:
   sub-second read skew as a persistent fleet degradation. What *is* checked, and
   has no other tell, is `node_id ∉ voters`: a node evicted from the membership
   while still running looks healthy by every other measure.
-- **`app/query.ts`** — the polling contract (RFC-006 §6). 5s, and
-  `refetchIntervalInBackground: false` so a forgotten tab stops asking. That one
-  is verified by counting fetches across a real `visibilitychange`, not by
-  asserting the option is set. The request log overrides the cadence only
-  (`REQUEST_POLL_INTERVAL_MS`, 2s) — it is the screen someone watches while
+
+  `nodeId` stays a **string** all the way through. It is a `u64` on the wire and
+  `Number(id)` would silently round the large ones.
+
+- **`app/query.ts`** — the polling contract (RFC-006 §6). `POLL_INTERVAL_MS` is
+  5 s with `refetchIntervalInBackground: false`, so a forgotten tab stops asking;
+  that one is verified by counting fetches across a real `visibilitychange`, not
+  by asserting the option is set. The request log overrides the cadence only
+  (`REQUEST_POLL_INTERVAL_MS`, 2 s) — it is the screen someone watches while
   re-running a test — and keeps the same hidden-tab pause.
-- **`features/requests/source.ts`** — the request log's data source, and **the
-  convergence seam for #147 H**. The screen renders only through `Coverage` and
-  `Page`; today's implementation reads one node's journal and says so. When the
-  merged journal (#147 B) and cursors (#147 D) land, slice H implements the same
-  shapes with `{ kind: "fleet" }`, the per-node banner disappears on its own, and
-  no presentation code changes.
+  `retryTransportFailures` declines to retry any 4xx.
 
-  Two distinctions here are load-bearing rather than stylistic. `unrepresented:
-  null` means **could not be determined**, never zero — `/_fleet/*` is
-  fleet-scoped, so most principals cannot learn how many nodes exist, and
-  reporting "0 others" to them would assert something nothing supports. And
-  `LogState` keeps *unknown* apart from *empty*: a node that could not answer has
-  an unknown journal, and rendering it as an empty table tells an operator their
-  system under test never called the mock.
+- **`features/requests/source.ts`** — the request log's data source, **per node,
+  full stop**. D-74 (#552) removed the fleet journal merge: `GET
+  /imposters/:port/requests` answers for the node the browser reached, and the
+  `Coverage` / `unrepresented` machinery that existed to describe a partial merge
+  is gone with it. `LogState` is `rows` or `unknown`, and the remaining
+  distinction is load-bearing: a node that could not answer has an *unknown*
+  journal, and rendering that as an empty table tells an operator their system
+  under test never called the mock.
 
-  v1 pages client-side. That bounds the DOM, which is what a busy imposter
-  threatens; it does **not** bound the response — the node still serves its whole
-  journal in one body. Closing that needs the server's `?since=` cursor and
-  `x-rift-next-index` header, which is the same seam #147 D widens, so paging is
-  expressed as a `Cursor` rather than an array slice inlined in the screen.
+  `page()` is a **display** pager over accumulated rows; the network request is
+  bounded by the server's own `?since=` cursor and `x-rift-next-index` header,
+  which are upstream's, scalar, and shipped.
+
 - **`features/requests/diagnostics.ts`** — why a recorded request was served by
   the stub it was, or by nothing (#208). A pure presenter: `describeOutcome`
   turns the journal's `matchOutcome` into sentences and `RequestLog.tsx` only
@@ -97,6 +139,7 @@ Six modules carry the decisions worth knowing before changing anything:
   rather than checking them, and this one is recorded from whatever called the
   mock, so every unexpected shape lands on `unreadable` instead of throwing
   inside the screen an operator opened to diagnose something else.
+
 - **`features/routes/order.ts`** — `effectiveOrder` and `validateTable`, ported
   from `vendor/rift/.../front_door/route_table.rs`. Ported rather than fetched
   because there is no endpoint that answers either question about a draft that
@@ -112,64 +155,65 @@ Six modules carry the decisions worth knowing before changing anything:
   is **order-sensitive**, so sorting the clauses before comparing reported an
   `AmbiguousMatch` the fleet would never raise.
 
-- **`features/admin/*`** — the RFC-002 admin plane, where the failure mode is
-  *softening* rather than crashing, so three rules are encoded rather than left
-  to reviewers:
+  **The route schema is snake_case, and it is the one place in this contract that
+  is.** `Route`, `RouteMatch` and `RouteTarget` (`front_door/route_table.rs`)
+  carry no `serde(rename_all)`, so the wire is `path_prefix`, `strip_prefix`,
+  `set_host` — as `crates/rift-cluster-server/tests/front_door.rs` has always
+  asserted. The hand-authored contract declared them camelCase, and the symptom
+  was not a type error but a screen that silently read `undefined` for every path
+  prefix, ranked routes in an order the router does not use, and called two
+  distinct routes ambiguous. If you add a route field, check the Rust struct
+  rather than assuming the house camelCase.
 
-  **A minted key exists for one moment.** `POST …/principals` returns `apiKey` in
-  its `201` and the fleet keeps only an argon2id hash. `useCreatePrincipal` hands
-  the raw key to the caller **out of band** and resolves to the *stripped*
-  record, so it never enters React Query at all. Sanitising in `onSuccess` is not
-  enough — `useMutation` keeps its own copy of the resolved value in the
-  MutationCache, which `setQueryData` cannot reach and which stays readable from
-  the client (and Devtools) for `gcTime`. There is no reveal-later affordance
-  because there is nothing to reveal.
-
-  **A 404 must stay a 404** (RFC-002 §8.4). A cross-tenant probe is
-  byte-identical to a probe of nothing, so the not-found branch renders the
-  whole screen — no header, no tab nav — because anything else would have to
-  encode the tenant to stay useful. The copy contains no "access"/"permission"/
-  "forbidden"/"denied", which is the vocabulary a 404 exists to deny. A genuine
-  `403` (bound to the tenant, insufficient role) is a *different, honest* fact and
-  keeps its own branch — `rbac.rs::in_tenant_insufficient_role_is_403_not_404`
-  pins that distinction server-side, and collapsing it here would hide an
-  actionable answer.
-
-  **`cluster.admin` is separate from `tenant.manage`.** The tenancy routes split
-  across the two: listing and minting principals are `TenantManage`, but the whole
-  `/admin/tenants` CRUD *and* `PrincipalPut`/`PrincipalDelete` are `ClusterAdmin`.
-  Gating everything on `tenant.manage` drew a tenant-admin buttons that answer 403
-  or 404 every time. `CAPABILITY_MATRIX` is *derived* from `rbac.ts::roleAllows`
-  rather than transcribed again — two copies of a security table drift.
-
-  Two wire facts that cost a debugging cycle each if assumed: **`outcome` is the
-  bare lowercase string `"applied"`**, never `{"Applied": null}` (`ControlOutcome`
-  is `snake_case` with a unit variant); and **principal ids go in the path raw**,
-  because ids are `key:<sha256-hex>` and the server matches the unnormalised path
-  — percent-encoding the colon makes every revocation a 404.
-
-  **The route schema is snake_case, and it is the one place in this contract
-  that is.** `Route`, `RouteMatch` and `RouteTarget`
-  (`front_door/route_table.rs`) carry no `serde(rename_all)`, so the wire is
-  `path_prefix`, `strip_prefix`, `set_host` — as
-  `crates/rift-cluster-server/tests/front_door.rs` has always asserted. The
-  hand-authored contract declared them camelCase, and this slice was the first
-  code to depend on it; the symptom was not a type error but a screen that
-  silently read `undefined` for every path prefix, so it ranked routes in an
-  order the front door does not use and called two distinct routes ambiguous.
-  Corrected in `openapi-ee.yaml` — if you add a front-door field, check the Rust
-  struct rather than assuming the house camelCase.
+- **`features/writes/commit.ts`** — one wire fact that costs a debugging cycle if
+  assumed: `ControlOutcome` serializes as the bare lowercase string `"applied"`,
+  never `{"Applied": null}` (it is `snake_case` with a unit variant). Parked
+  writes (`202`) are polled through `/_fleet/ops/{opId}`.
 
 ## Testing
 
-`pnpm test` runs vitest. Node is the default environment; component tests opt
-into jsdom with a `/** @vitest-environment jsdom */` docblock — not the other
-way round, because under jsdom `import.meta.url` is an `http:` URL and the two
-tests that read repository files could not resolve them.
+`pnpm test` runs vitest over 48 test files. Node is the default environment;
+component tests opt into jsdom with a `/** @vitest-environment jsdom */`
+docblock — not the other way round, because under jsdom `import.meta.url` is an
+`http:` URL and the two tests that read repository files could not resolve them.
 
 `src/__tests__/harness.tsx` renders through the **real** `createQueryClient()`.
 A test-local client with polling and retries disabled would pass while the
 shipped configuration polled a hidden tab forever.
+
+Three guard suites are worth knowing before adding a dependency:
+`contract-traceability.test.ts` (every displayed field traces to the contract;
+`fetch` is called from nowhere but `api/client.ts`; no `dangerouslySetInnerHTML`),
+`bundle-offline.test.ts` (no emitted asset loads from another origin, no package
+CDN string in the shipped bytes, Monaco from the bundle), and
+`vite-config.test.ts` (the dev proxy covers every path the contract publishes).
+
+End-to-end is Playwright against **the binary serving `/console/`**, not the Vite
+dev server:
+
+```sh
+pnpm run e2e          # smoke · visual · a11y, plus interaction and oracle specs
+pnpm run e2e:ui
+pnpm run e2e:update   # regenerate visual baselines locally
+```
+
+The `pnpm` commands run from `web/`. The hand-driving helper does not — it lives at
+the repository root, so run it from there:
+
+```sh
+scripts/e2e-console.sh up     # a seeded node on :3525 for hand-driving
+scripts/e2e-console.sh down
+```
+
+`e2e/README.md` describes the three layers. `smoke.spec.ts` fails any test that
+produced a console error or an unhandled rejection; `visual.spec.ts` compares
+against committed baselines in `e2e/visual.spec.ts-snapshots/`; `a11y.spec.ts`
+runs axe per screen and fails on `serious`/`critical` only.
+
+In CI, new visual baselines need the **`update-baselines`** label on the PR:
+`.github/workflows/console-baselines.yml` regenerates them, pushes the images,
+and then removes the label, so a later push cannot silently re-accept a real
+regression.
 
 ## Lint
 
@@ -190,13 +234,16 @@ to a running node:
 
 ```sh
 pnpm install
-pnpm dev                                         # → http://127.0.0.1:2525
-RIFT_ADMIN_URL=http://localhost:12525 pnpm dev   # → the compose stack's node 1
+pnpm dev                                         # Vite's default, http://localhost:5173/console/
+RIFT_ADMIN_URL=http://localhost:12525 pnpm dev   # proxy to the compose stack's node 1
 ```
 
-The proxy table lives in `vite.config.ts` and is **tested**: a contract path
-that no prefix covers fails `pnpm test`, because the alternative is a 404 in the
-browser that reads like a server bug.
+`DEV_ADMIN_URL` defaults to `http://127.0.0.1:2525` — that is the **admin front
+being proxied to**, not the dev server's own address. The proxy table
+(`ADMIN_PROXY_PREFIXES` and `ADMIN_PROXY_EXACT`) lives in `vite.config.ts` and is
+**tested**: a contract path that no prefix covers fails `pnpm test`, because the
+alternative is a 404 in the browser that reads like a server bug. `"/"` is turned
+into an anchored regex so Vite does not forward `/console/` itself.
 
 ## The generated client
 
@@ -207,21 +254,24 @@ browser that reads like a server bug.
 pnpm run generate:client
 ```
 
-CI regenerates it and fails on any diff, so it cannot silently go stale. Do not
-hand-edit it — edit the contract.
+CI regenerates it and fails on any diff — and, before that, asserts the file is
+*tracked* (`git ls-files --error-unmatch`), because an untracked `schema.ts`
+would make `git diff` compare against nothing and the gate would pass on a file
+nobody wrote. Do not hand-edit it; edit the contract.
 
-`src/api/client.ts` is the thin wrapper around it, and carries the three things
-the schema cannot express: the session cookie rides along, mutations carry the
-`X-Rift-CSRF` header (RFC-006 §5.3), and a non-2xx becomes a thrown `ApiError`
-rather than a value a screen renders as a result.
+`src/api/client.ts` is the thin wrapper around it and carries what the schema
+cannot express: the session cookie rides along, mutations carry `X-Rift-CSRF`
+(RFC-006 §5.3), and a non-2xx becomes a thrown `ApiError` rather than a value a
+screen renders as a result. `src/api/paths.ts` types every route as `keyof paths`,
+so a path the contract does not publish fails `tsc`.
 
 ## Constraints you cannot design around
 
 Everything here is embedded into the binary and served under a strict CSP
-(RFC-006 §9.1):
+(`crates/rift-cluster-server/src/console.rs`):
 
 ```
-default-src 'self'; script-src 'self'; connect-src 'self'; frame-ancestors 'none'
+default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; connect-src 'self'; frame-ancestors 'none'
 ```
 
 Which means, concretely:
@@ -233,32 +283,37 @@ Which means, concretely:
   ever loads from another origin. Adding a face means adding a file there — a
   `<link>` to fonts.googleapis.com is not a shortcut, it is a broken console on
   an air-gapped network.
-- **Build-time CSS only.** Tailwind, CSS Modules and Vanilla Extract emit a
-  static stylesheet and are fine. Runtime CSS-in-JS (emotion,
-  styled-components) injects `<style>` at runtime; with no `style-src` declared
-  it falls back to `default-src 'self'` and is **blocked**. Adding
-  `'unsafe-inline'` to work around it would undo part of §9.1's argument — treat
-  that as a design change needing review, not a fix.
+- **`'wasm-unsafe-eval'` is on `script-src` for one reason**: browsers gate
+  `WebAssembly` compilation behind it once any `script-src` is declared, and the
+  bundled `rift-lint` pane needs it. It permits no inline script.
+- **`'unsafe-inline'` is on `style-src` only**, added in C5 (#188) because
+  Monaco's standalone editor injects a `<style>` element at runtime. Runtime
+  CSS-in-JS is therefore not *blocked* any more — but it is still not wanted, and
+  widening `script-src` would undo part of §9.1's argument. Treat that as a design
+  change needing review, not a fix.
 - **No inline scripts**, including anything a build plugin might inline.
 
 These are enforced, not just documented: `crates/rift-cluster-server/tests/console.rs`
-asserts the *served* page declares no off-origin subresource, no inline
-`<script>`, and no markup-level style. A library that violates any of them turns
-that test red rather than turning the console blank in a browser.
+asserts the *served* page declares no off-origin subresource and no inline
+`<script>`. A library that violates any of them turns that test red rather than
+turning the console blank in a browser.
 
-**Animation libraries still need a spike.** CSP governs markup-level styles but
-not CSSOM property assignment, so a library that animates via
-`element.style.foo = …` (Framer Motion among them) may well be fine — but that
-has not been demonstrated, because this scaffold ships no animation library to
-demonstrate it with. Whoever adds one in C4/C5 owns that spike; the test above
-is what will answer it.
+CSP governs markup-level styles but not CSSOM property assignment, so a library
+that animates via `element.style.foo = …` may well be fine — but nothing here
+demonstrates it, because the console ships no animation library. Whoever adds one
+owns that spike; the test above is what will answer it.
 
 ## Build
 
 ```sh
-pnpm build     # → dist/, which the release lane embeds via rust-embed
+pnpm build     # tsc --noEmit && vite build → dist/, which the release lane embeds
 ```
 
 `dist/` is **not** committed (RFC-006 §7 rejected that as option B). The release
-lane builds it before `cargo build --release --features console`; that ordering
-is not optional, because the assets are embedded at compile time.
+lane builds it before `cargo build --release --features console`; that ordering is
+not optional, because the assets are embedded at compile time. `web/public/` — the
+wasm linter, produced by `wasm-pack` in the release lane — is copied into `dist/`
+by the same `pnpm build`, which is why the wasm step has to precede it. In a plain
+dev checkout `web/public/` does not exist and the lint pane resolves to
+`"unavailable"`, a sentence, rather than to an empty finding list that would read
+as "your stub is clean".

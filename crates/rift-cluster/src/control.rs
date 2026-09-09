@@ -121,7 +121,7 @@ pub enum ControlOp {
     /// committed config. Rotation is the containment — and since D-73 it is the *only* one:
     /// writing a new key invalidates every outstanding session at once, and there is no
     /// per-session revocation because there is no per-session server state to revoke. Recorded in
-    /// `docs/architecture/08-tenancy-security.md`.
+    /// `docs/architecture/10-operations.md`.
     SessionKeyPut {
         /// 32 random bytes, hex-encoded. Hex rather than raw so the op stays printable in a log
         /// dump and survives JSON without a base64 alphabet decision.

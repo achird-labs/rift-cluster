@@ -96,7 +96,7 @@ const ISOLATION_WINDOW_MS: u64 = 3 * ELECTION_TIMEOUT_MAX_MS;
 ///   contact with the quorum.
 ///
 /// Extracted from [`RaftNode::is_isolated`] by #470: the condition became observable (the
-/// `isolated` field of `/_cluster/status`) at the same time it was already load-bearing for
+/// `isolated` field of `/_cluster/health`) at the same time it was already load-bearing for
 /// D-17 and D-40, and two readings of one safety rule is one more than a rule can safely have.
 #[must_use]
 fn isolated_from(
@@ -264,7 +264,7 @@ pub struct StatusReport {
     /// enforces, via the same [`isolated_from`].
     ///
     /// Carried on the report rather than left to a second `is_isolated()` call so that every
-    /// reader of one report — `/_cluster/status`, `/_cluster/health` (#470) — describes *one*
+    /// reader of one report — `/_cluster/health`, `/_fleet/health` (#470) — describes *one*
     /// sample. Two calls a few microseconds apart can straddle an election and disagree, which on a
     /// safety-critical condition is the one thing an operator must not be shown.
     pub isolated: bool,

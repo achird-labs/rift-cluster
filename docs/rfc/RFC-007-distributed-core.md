@@ -2,12 +2,12 @@
 
 | | |
 |---|---|
-| **Status** | v1.1 — decided as **D-71**; removals in progress. **Amended 2026-09-06:** the cluster-wide flow-state tier stays (§3.1); #551 withdrawn |
+| **Status** | v1.2 — decided as **D-71**, now `active`: every removal has landed (§9). **Amended 2026-09-06:** the cluster-wide flow-state tier stays (§3.1); #551 withdrawn. **2026-09-09 (#554):** §2.4, §2.6, §3.1, §3.2 and Appendix A brought to the code that now exists |
 | **Tracking issue** | [achird-labs/rift-cluster#544](https://github.com/achird-labs/rift-cluster/issues/544) (epic) |
 | **Canonical location** | `rift-cluster:docs/rfc/RFC-007-distributed-core.md` |
 | **Depends on** | **ADR-001** (the Raft control plane stays exactly as decided) |
 | **Retires, as its children land** | RFC-002 (tenancy and RBAC), RFC-005 (data sources and state), RFC-001 §7.5 and phase 4, RFC-004 §3.4–§3.6, RFC-006 §8 |
-| **Ground truth** | `rift-cluster@5c8dbfb`, `vendor/rift@de0ab0f` (v0.17.0-42); live fleet baseline 57/57 on 2026-09-06 |
+| **Ground truth** | as written, `rift-cluster@5c8dbfb`, `vendor/rift@de0ab0f` (v0.17.0-42); live fleet baseline 57/57 on 2026-09-06. §2 is that measurement and is not re-measured; everything from §3 down describes the tree at `rift-cluster@d755d2c` |
 | **Author** | Mohsen Zainalpour |
 | **Date** | 2026-09-06 |
 
@@ -97,23 +97,33 @@ lines across five tabs (tenants, principals, bindings, audit, audit sink). The S
 
 ### 2.4 What is broken, and where
 
-- The only open issue labelled `bug` is **#537**: space-scoped stubs answer `201`, are node-local,
-  and are erased by the next reconcile. It sits in the flow-state and spaces surface, which stays —
-  so it is a core bug to fix (PR #541), not a surface to remove.
-- **D-68** exists because only the *default* tenant's route table is ever compiled into the
-  listener; a tenant's `PUT` is stored, replicated, read back, and never dispatches. Tenancy
-  leaked into router correctness, and the fix so far is to say so in the response.
-- The audit projection has a documented hole: reads that mutate (scenario reset, journal clear,
-  flow-state clear) never become control ops and never reach it
-  (`docs/architecture/08-tenancy-security.md`, "a known gap, not an oversight").
-- The journal cursor carries a generation it does not act on
-  (`docs/architecture/07-verification-plane.md`); a clear mid-walk neither rewinds nor
-  re-delivers.
-- The flow-state chapter still says no clustered sequencer exists, contradicting **D-47**, which
-  is active and shipped. RFC-001 §7.1's supersession banner names a bootstrap flag and an identity
-  scheme the control-plane chapter contradicts.
+This is the state on 2026-09-06, the day the RFC was written. Every item is now closed; the
+disposition is recorded beside each because *how* a defect closed is the argument for the
+narrowing.
 
-None of these is in membership, replication or routing. Those surfaces passed 57 of 57 live
+- The only open issue labelled `bug` was **#537**: space-scoped stubs answered `201`, were
+  node-local, and were erased by the next reconcile. It sat in the flow-state and spaces surface,
+  which stays — so it was a core bug to fix, not a surface to remove. **Fixed by #541 (D-69):** the
+  `POST` terminates as an ordinary `ControlOp::PatchStubs` and the teardown commits
+  `StubEdit::DeleteBySpace`.
+- **D-68** existed because only the *default* tenant's route table was ever compiled into the
+  listener; a tenant's `PUT` was stored, replicated, read back, and never dispatched. Tenancy had
+  leaked into router correctness, and the fix at the time was to say so in the response.
+  **Dissolved by #566 (D-73):** with one fleet-wide table there is nothing to filter and nobody to
+  shadow, so `desired_routes` compiles every stored route and the `installed` flag went with the
+  tenant dimension that was its only input.
+- The audit projection had a documented hole: reads that mutate (scenario reset, journal clear,
+  flow-state clear) never became control ops and never reached it. **Removed by #563:** there is no
+  projection, and the Raft log plus a `tracing` line at apply is the trail.
+- The journal cursor carried a generation it did not act on; a clear mid-walk neither rewound nor
+  re-delivered. **Removed by #568 (D-74):** the journal is upstream's own, per node, and the cursor
+  headers on the wire are upstream's own scalars.
+- The flow-state chapter said no clustered sequencer existed, contradicting **D-47**, which is
+  active and shipped; RFC-001 §7.1's supersession banner named a bootstrap flag and an identity
+  scheme the control-plane chapter contradicted. Both are corrections to prose, and this pass
+  (#554) is where they land.
+
+None of these was in membership, replication or routing. Those surfaces passed 57 of 57 live
 assertions on the day this was written (§5.1).
 
 ### 2.5 What WireMock Cloud shows its users
@@ -138,11 +148,15 @@ shot. Git integration exists for OpenAPI specs only.
 
 Read at `vendor/rift@de0ab0f`:
 
-- **The front door is upstream's** (U-11, `rift-http-proxy::front_door`): the listener, the
-  route table compiler and the `RouteObserver`. The cluster contributes replication of the table
-  (`ControlOp::PutRoutes`) and its installation on every node.
-- **Imposter sources are upstream's** (U-12, `rift-http-proxy::sources`): `file:` and `https:`
-  ship there; the cluster's `git+`, `s3:` and `registry:` providers attach through the seam.
+- **The router's listener is upstream's** (U-11, `rift-http-proxy::front_door`): the listener and
+  the route table compiler. The cluster contributes replication of the table
+  (`ControlOp::PutRoutes`) and its installation on every node. (Upstream also offers a
+  `RouteObserver` counting hook; the cluster used it for per-route hits and, since #559, consumes
+  it nowhere.)
+- **Imposter sources are upstream's** (U-12, `rift-http-proxy::sources`): `file:` and `http(s):`
+  ship there. The cluster used to attach `git+`, `s3:` and `registry:` providers through the seam;
+  #564 (D-72) removed them, and `--imposters` is now a one-shot bootstrap over upstream's own
+  `SourceRegistry` that refuses the retired schemes by name.
 - **Flow state is upstream's.** The scenario FSM, the flow KV and `_rift.flowState` live behind
   `rift-mock-core::extensions::flow_state::FlowStore`. The in-memory backend is per node;
   `rift-store-redis` attaches through `FlowStoreBackendFactory` and is selected per imposter with
@@ -168,7 +182,7 @@ surface this RFC removes. It also built a flow-state tier stronger than upstream
 | Bootstrap, seeds, join, leave, `departed`, voter floor, promotion sweep | `raft/{node,network,identity}.rs`, `config.rs`, D-21, D-25, D-26, D-27, D-28, D-59 | A fleet that cannot form and heal is not a fleet |
 | Raft log and snapshots on `redb` | `raft/store.rs`, D-15, D-16, D-24 | The one source of truth for configuration |
 | Replicated imposters, stubs, route table; `op_id` dedup; read-after-write barrier; `Rift-Cluster-Revision` | `control.rs`, `admin_front.rs`, `compose.rs`, D-5 | R1–R4 for configuration |
-| The router: replicated route table installed on every node, in-process dispatch to the local imposter, `installed` reported | upstream U-11 + `control.rs` (`routes_installed_for`), D-11, D-54, D-68 | A request reaching any node reaches the right imposter |
+| The router: one fleet-wide route table, every stored route compiled into the listener on every node, in-process dispatch to the local imposter | upstream U-11 + `control.rs` (`ControlOp::PutRoutes`), `raft/store.rs` (`desired_routes`), `compose.rs` (`bind_front_door`), D-11, D-54, D-73 | A request reaching any node reaches the right imposter |
 | Cluster-wide flow state: owner-authoritative scenarios and flow KV on the HRW ring, fencing, the durable flow shard, the sequencer, proxyOnce claims, spaces | `stores/{flow,shard,flow_config,sequencer,proxy}.rs`, `raft/ring.rs`, `bridge.rs`, D-3, D-7–D-10, D-13, D-17, D-20, D-36, D-40, D-47, D-57, D-63, D-65, D-66 | A stateful mock behaves as one across the fleet, with no external store. **Kept on 2026-09-06 after review** — Rift's own Redis-backed flow store is not the model this project wants for distributed state |
 | Admin API and console for imposters and stubs; recording; one-shot OpenAPI import (compile → `PUT /imposters`) | `admin_front.rs`, `crates/rift-cluster-spec`, console Imposters/detail/editor | What a user does with a mock server |
 | Readiness and liveness probes, `/_fleet/*`, `/_cluster/*`, the Fleet screen | `probes.rs`, `readiness.rs`, `fleet.rs`, `cluster_api.rs`, D-22, D-61 | Operating the fleet |
@@ -233,7 +247,7 @@ epic. 0 lands first so every later child has an in-repo before/after check.
 | 6 | #550 | Tenancy, RBAC, principals | #546, #549 |
 | 7 | ~~#551~~ | ~~Clustered flow state~~ — withdrawn, stays | — |
 | 8 | #552 | Fleet journal merge | (#550) |
-| 9 | #553 | Console trimmed to four screens | #550, #552 |
+| 9 | #553 | Console trimmed to five screens | #550, #552 |
 | 10 | #554 | Design docs retired; the router named | all |
 
 Each child PR registers its own decision (D-72 for #549, D-73 for #550, D-74 for #552), carries
@@ -288,8 +302,11 @@ The feature has been called the "front door" since upstream issue #19. In the re
 is the cluster's only data-plane contribution and the word should say what it does. Docs,
 console labels and CLI help call it the **router**. The upstream module
 (`rift-http-proxy::front_door`) is not ours to rename, and the wire path `/front-door/routes` is
-left alone in this pass — renaming a path every client has to follow is its own decision, to be
-taken once the API has stopped shrinking (#554).
+left alone — renaming a path every client has to follow is its own decision, and #554 took it:
+**not now** (**D-75**). The API stopped shrinking with this epic, but the path, the `--front-door`
+flag, the `RIFT_FRONT_DOOR` environment variable and the `x-rift-front-door` response header are all client
+contract; renaming them buys a consistent noun and costs every caller a migration. The prose is
+what confused people, and the prose is what changed.
 
 ## 7. Explicit non-goals
 
@@ -331,31 +348,68 @@ taken once the API has stopped shrinking (#554).
 
 ## 9. Progress
 
-Updated as PRs merge. Status is one of `open`, `in progress`, `merged`.
+Updated as PRs merge. Status is one of `open`, `in progress`, `merged`. D-71 carries the same
+mapping; when the two disagree, the register wins.
 
 | Issue | Surface | Status | PR |
 |---|---|---|---|
-| #544 | Epic | open | — |
-| #555 | In-repo core smoke check | open | — |
-| #545 | Route hits | in progress | — |
-| #546 | Audit | open | — |
-| #547 | MCP | open | — |
-| #548 | Metrics and observability | open | — |
-| #549 | Sources, datasets, specs, blobs | in progress | — |
-| #550 | Tenancy and RBAC | in progress | — |
+| #544 | Epic | closes once its last child is merged — #553 and #554 are the two still open | — |
+| — | This RFC, and D-71 | merged | #556, amended to v1.1 by #558 |
+| #555 | In-repo core smoke check | merged | #557 |
+| #545 | Route hits | merged | #559 |
+| #546 | Audit log, export loop, sink | merged | #563 |
+| #547 | MCP server | merged | #560 |
+| #548 | Metrics and observability | merged | #562 |
+| #549 | Sources, datasets, specs, blobs (D-72) | merged | #564 |
+| #550 | Tenancy and RBAC (D-73) | merged | #566 |
 | ~~#551~~ | Flow state, sequencer, proxyOnce, spaces | withdrawn 2026-09-06 — stays | — |
-| #552 | Journal merge | in progress | — |
-| #553 | Console | in progress | — |
-| #554 | Docs and naming | open | — |
+| #552 | Journal merge (D-74) | merged | #568 |
+| #553 | Console | merged | #569 |
+| #554 | Docs and naming | open | this PR |
+
+Five more PRs belong to the epic without being children of it — each fixes something a removal
+exposed or a lane a removal broke:
+
+| Issue | Surface | Status | PR |
+|---|---|---|---|
+| #565 | A committed imposter delete left the port's flow state behind (D-5 amended) | merged | #567 |
+| — | The compose verification scripts lost their CI lane with the observability overlay | merged | #570 |
+| — | The `--imposters` bootstrap keyed on a canonical digest, and waits for a leader | merged | #571 |
+| — | The gateway leg strips every admin credential, and the test can fail (review of #566) | merged | #572 |
+| — | The cold-start sweep only clears ports the sync itself dropped (review of #567) | merged | #573 |
 
 Closed as out of scope on 2026-09-06, with the reason on each: #148, #149, #151, #279, #280,
 #282, #283, #284, #289, #291, #294, #380, #448, #456, #457. Rescoped: #394.
 
 ## Appendix A — every decision, by fate
 
-**Keep (unchanged):** D-3, D-4, D-5, D-6, D-7, D-8, D-9, D-10, D-11, D-13, D-14, D-15, D-16,
-D-17, D-20, D-21, D-22, D-24, D-25, D-26, D-27, D-28, D-33, D-35, D-36, D-40, D-41, D-42, D-43,
-D-47, D-54, D-57, D-58, D-59, D-60, D-61, D-62, D-63, D-64, D-65, D-66, D-67.
+Statuses below are the register's as this PR leaves it, not as it stood at the base commit — the
+same PR that writes this appendix changes four of them (D-15, D-54, D-58, D-69). The register is
+authoritative; this list is a map into it.
+
+**Kept, and untouched by this RFC** (`active`): D-3, D-7, D-8, D-9, D-10, D-11, D-13, D-14,
+D-17, D-21, D-22, D-24, D-25, D-27, D-28, D-36, D-40, D-41, D-43, D-47, D-57, D-59, D-60, D-61,
+D-62, D-63, D-64, D-65, D-66, D-67.
+
+**Kept, but `amended` in the register** — the status is the register's, and for most of these the
+amendment predates this RFC:
+
+| Decision | Amended by | This epic? |
+|---|---|---|
+| D-4 | D-72 (#549/#564) — nothing content-addressed remains | yes |
+| D-5 | #565/#567 — a committed delete drops the port's flow state | yes |
+| D-15 | D-73 (#550/#566) — the Raft log no longer carries tenancy and RBAC records | yes |
+| D-42 | D-71 (#548/#562) — the gauge that supplied the election samples is gone | yes |
+| D-54 | D-73 (#550/#566) — routes are no longer tenant-scoped; the withdrawal stands on replication alone | yes |
+| D-58 | D-74 (#552/#568) — the tier builds one image, not two | yes |
+| D-69 | D-74 (#552/#568) — `ControlOp::JournalClearGen` no longer exists | yes |
+| D-6, D-16, D-20, D-26, D-33, D-35 | the 2026-08-25 verification pass | no |
+
+D-15, D-54, D-58 and D-69 are the four this PR moves. Each already described a system that had
+changed under it; #554 writes the amendment paragraph the register's own rule asks for, or keeps
+the one a child had already written, and sets the status to match rather than editing the decided
+text. D-58 and D-69 were carrying an `**Amendment (D-74, …)**` paragraph under `Status: active`,
+which the register's own "Adding or changing a decision" rule forbids.
 
 **Amend:** ~~D-68 (`installed` from the route-table endpoints only)~~ — **superseded** by D-73
 (#550) instead: with one fleet-wide route table every stored route is installed, so `installed`
@@ -363,11 +417,25 @@ would be a constant `true` and is removed from both endpoints.
 
 **Supersede, by the child that removes the code:**
 
-| Child | Decisions |
-|---|---|
-| #545 | D-70 |
-| #549 | D-18, D-19, D-23, D-29, D-30, D-31, D-34, D-48, D-49, D-50, D-51, D-52, D-53, D-55, D-56 |
-| #550 | D-44, D-45, D-46, D-68 |
-| #552 | D-32, D-37, D-38, D-39 |
+| Child | PR | Decisions |
+|---|---|---|
+| #545 | #559 | D-70 (superseded by D-71 directly — this child registered no decision of its own) |
+| #549 | #564 | D-18, D-19, D-23, D-29, D-30, D-31, D-34, D-48, D-49, D-50, D-51, D-52, D-53, D-55, D-56 — all by **D-72** |
+| #550 | #566 | D-44, D-45, D-46, D-68 — all by **D-73** |
+| #552 | #568 | D-32, D-37, D-38, D-39 — all by **D-74** |
 
-Already superseded before this RFC: D-1, D-2, D-12. D-69 (space stubs replicate, #541) landed after v1 and is unaffected.
+Already superseded before this RFC: D-1, D-2, D-12.
+
+**New, and registered by this RFC's children:** D-72 (#549), D-73 (#550), D-74 (#552). D-71 itself
+went `pending` → `active` in #554, when the last removal had landed.
+
+**Documents retired by this RFC**, each carrying a `> **Retired by D-n**` callout at the section
+or at the top of the file: RFC-002 (in full, D-73), RFC-005 (in full, D-71), RFC-002 §9 (audit),
+RFC-001 §7.5 with §7.5.1 and §7.5.2 (§7.5.3 proxyOnce stays), RFC-001 §8.1's monetization-boundary
+paragraph (the trait table above it stands), RFC-001 §9 (the v2 module tree), RFC-001 §10 (the
+phased plan), RFC-001 §11.1 (metrics), RFC-001 Appendix B, RFC-004 §3.4–§3.6 and §6, RFC-006 §8
+(MCP), `docs/architecture/07-verification-plane.md` and
+`docs/architecture/08-tenancy-security.md`. RFC-001's own status line and
+[`docs/architecture/README.md`](../architecture/README.md) carry the same list; all three must
+agree. "Retired" is a defined callout verb — see the citation grammar in
+`docs/decisions/DECISIONS.md`.

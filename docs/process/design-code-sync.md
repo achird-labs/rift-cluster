@@ -35,7 +35,7 @@ lower — in an issue thread, a review, a session — *is not made* until it is 
 | Check | Level | Meaning |
 |---|---|---|
 | every `D-n`, `RFC-00N §x.y`, `ADR-00N`, `U-n`, `docs/…md` cited anywhere resolves | error | a citation that resolves to nothing is a claim with no referent |
-| every `Amends:` in the register has an `Amended by D-n` callout in the amended section | error | the spec must announce, *at the section a reader lands on*, that it no longer holds |
+| every `Amends:` in the register has an `Amended by D-n` callout in the amended section | error | the spec must announce, *at the section a reader lands on*, that it no longer holds. Four callouts are defined — `Amended by`, `Superseded by`, `Reversed by`, `Retired by` — and the checker reads only those. What each one means is the table under "Callout verbs" in [`docs/decisions/DECISIONS.md`](../decisions/DECISIONS.md) |
 | register entries are well-formed (status, supersedes ↔ superseded-by, code anchors exist) | error | |
 | code cites a `superseded` decision | warning | the code may still do the old thing — look |
 | an active decision is cited from no code | warning | either unbuilt, or built without saying so |

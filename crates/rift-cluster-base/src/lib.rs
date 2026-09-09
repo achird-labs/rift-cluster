@@ -94,8 +94,14 @@ pub mod seams {
     /// The built-in gate is one global api key, so success yields *access*, not
     /// an identity — every caller is equivalent. [`AdminAuthorizer`] is
     /// consulted **after** the route is parsed, so a decision can see the
-    /// action, the port, the space and the parsed path params. Two parts of the
-    /// upstream contract the cluster RBAC layer (#161) is built on:
+    /// action, the port, the space and the parsed path params.
+    ///
+    /// **The cluster registers nothing behind this seam** (#566, D-73). It existed to give the
+    /// clustered admin front a second, tenant-aware gate behind upstream's own; with one
+    /// credential there is one gate, and it is upstream's `--api-key` compare — see
+    /// `compose.rs`, which says so at the point where the builder does not call
+    /// `.admin_authorizer(...)`. What follows is the upstream contract, kept because the seam is
+    /// still upstream's and a future consumer would need it:
     ///
     /// - **Ordering.** The api-key check runs before the route is parsed, so
     ///   `Deny` renders `403` and a bad key renders `401`. Two limits worth
@@ -114,16 +120,16 @@ pub mod seams {
     /// [`with_principal_scope`] is how an allowed principal reaches
     /// [`EventContext`]: upstream sets a task-local around the request rather
     /// than threading a principal parameter through every mutating manager
-    /// method.
+    /// method. The cluster opens no such scope: `ControlRequest.principal` is
+    /// `None` at every production construction site, because there is no
+    /// principal to name (#566, D-73).
     ///
-    /// **It does not survive the clustered write path.** A task-local follows
-    /// the task across `.await` but not across a task boundary, and a clustered
-    /// mutation is applied by openraft's state-machine task, not by the admin
-    /// request task that opened the scope — so `current_principal()` is `None`
-    /// at every replicated emit. Clustered attribution rides
-    /// `ControlRequest.principal` in the log instead (#161 populates it, #163
-    /// reads it); this seam is the single-node/embedded path. See
-    /// `docs/architecture/08-tenancy-security.md`.
+    /// It would not have survived the clustered write path in any case. A
+    /// task-local follows the task across `.await` but not across a task
+    /// boundary, and a clustered mutation is applied by openraft's
+    /// state-machine task, not by the admin request task that opened the scope —
+    /// so `current_principal()` is `None` at every replicated emit. This seam is
+    /// the single-node/embedded path.
     pub use rift_mock_core::extensions::authz::{
         AdminAuthorizer, AllowAll, AuthzDecision, AuthzRequest, SharedAdminAuthorizer, actions,
         current_principal, with_principal_scope,
@@ -281,16 +287,18 @@ pub mod seams {
     /// access.
     pub use rift_http_proxy::config_loader::{LoadedConfig, parse_remote_document};
 
-    /// The front door's route table (issue #19 / U-11): content-based routing
+    /// The router's route table (issue #19 / U-11): content-based routing
     /// from one listener to many imposters. Upstream ships the listener, the
     /// matcher and the config-file surface; its admin CRUD was deferred, which
     /// is why the clustered admin front provides it as a replicated
     /// control-plane object (issue #131) rather than proxying to an upstream
-    /// endpoint that does not exist.
+    /// endpoint that does not exist. See `docs/architecture/13-router.md`.
     ///
-    /// [`RouteObserver`] and [`bind_front_door_with_observer`] are the counting seam (issue #368):
-    /// upstream calls the observer once per request a route claims, which is what backs the admin
-    /// plane's per-route HITS figure. Single-node Rift installs none and pays nothing for it.
+    /// [`RouteObserver`] and [`bind_front_door_with_observer`] are upstream's counting seam
+    /// (issue #368): upstream calls the observer once per request a route claims. The cluster
+    /// installed one to back a per-route HITS figure; #559 removed that figure, and
+    /// `compose.rs` binds with plain [`bind_front_door`]. The re-export stays because the seam
+    /// is still upstream's and the facade's job is to name the boundary.
     pub use rift_http_proxy::front_door::{
         CompiledRoutes, HeaderMatch, Route, RouteMatch, RouteObserver, RouteTable, RouteTableError,
         RouteTarget, RunningFrontDoor, bind_front_door, bind_front_door_with_observer,

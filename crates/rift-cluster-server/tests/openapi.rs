@@ -65,6 +65,9 @@ async fn wait_ready(server: &ComposedServer) {
 /// The `paths` count and the spot-checked entries are what stop this from passing against an empty
 /// or truncated document — a `200` carrying `{}` would otherwise look identical to success here and
 /// only fail later, inside a generated client's codegen.
+/// Pins D-75: the router rename is prose only. The served contract still publishes
+/// `/front-door/routes` under that exact spelling — a rename to `/router/routes` would be a
+/// client migration, and this assertion is what would go red if one were made silently.
 #[tokio::test]
 async fn openapi_json_endpoint_serves_the_contract() {
     let state = TempDir::new().expect("tempdir");

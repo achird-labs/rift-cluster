@@ -28,9 +28,6 @@
 //! | `rift_cluster_sequence_fallbacks_total` | C33 — owner identified by killing it ("the assertion, not the index") |
 //! | `rift_cluster_sequence_decisions_total{op,path}` | `sequencer.rs` — the D-63 RPC budget: one `next` per decision, never a `peek` |
 //!
-//! Families owned by surfaces that leave with other children of #544 (`no_principals`) stay
-//! here until those children land and go with them.
-//!
 //! They ride upstream's `/metrics` because that is where the tests already read them: the
 //! families are registered into the `prometheus` crate's *global default* registry, which the
 //! open-source metrics server serves (`collect_metrics` is a thin wrapper over
@@ -46,17 +43,6 @@ use prometheus::{
 };
 
 lazy_static! {
-    /// `rift_cluster_no_principals` — 1 when the fleet has no principal
-    /// defined at all (RFC-002 §3.4, issue #161). This is what makes the
-    /// pre-#161 open-admin-plane bypass (no `--api-key`, no principals)
-    /// visible on `/metrics` instead of a silent property of an upgraded
-    /// fleet.
-    static ref NO_PRINCIPALS: Gauge = register_gauge!(
-        "rift_cluster_no_principals",
-        "1 when the fleet has no principal defined at all"
-    )
-    .expect("rift_cluster_no_principals registers once");
-
     // -- config-sync (issue #9) ---------------------------------------------
 
     /// `rift_cluster_intents_pending` — the R4 ledger's current depth, resampled by
@@ -319,13 +305,6 @@ pub(crate) fn config_removed(port: u16) {
     let _ = CONFIG_REVISION.remove_label_values(&[&port.to_string()]);
 }
 
-/// Record whether the fleet has no principal defined at all (issue #161).
-/// Not a startup-only fact — a `PrincipalPut` can change it at any moment the
-/// fleet is running — so the composition samples it on a timer, not once.
-pub fn set_no_principals(no_principals: bool) {
-    NO_PRINCIPALS.set(f64::from(u8::from(no_principals)));
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -347,20 +326,6 @@ mod tests {
                     .any(|l| l.get_name() == key && l.get_value() == value),
             })
             .map(|metric| metric.get_gauge().get_value())
-    }
-
-    #[test]
-    fn no_principals_is_auditable_in_both_directions() {
-        set_no_principals(true);
-        assert_eq!(
-            gauge_from_registry("rift_cluster_no_principals", None),
-            Some(1.0)
-        );
-        set_no_principals(false);
-        assert_eq!(
-            gauge_from_registry("rift_cluster_no_principals", None),
-            Some(0.0)
-        );
     }
 
     /// Every family the chaos tier and the in-process tests read reaches the

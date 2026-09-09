@@ -90,8 +90,6 @@ flowchart TB
 | `GET /_cluster/members` | roster: id, address, voter/learner, Ready, applied index; plus this node's own `bound_ports` / `bind_failures` (Chapter 2 divergence) |
 | `GET /_cluster/config` | per port: revision @ every node, `converged: bool` — the CI wait target |
 | `GET /_cluster/imposters` | per-(port, node) bind status (Chapter 2 divergence) |
-| `GET /_cluster/ring?key=…` | computed owner + m_idx — "who owns this flow right now". *Designed (RFC-001 §10, phase 2); not served by this build* |
-| `GET /_cluster/kv/:flow_id` | owner value vs local replica — the *why is my scenario stuck* endpoint. *Designed (RFC-001 §10, phase 2); not served by this build* |
 | `GET /_cluster/ops/:op_id` | intent state: pending / applied / failed (Chapter 4) |
 | `GET /_cluster/health` | rolled-up diagnostics for this node; `GET /_fleet/health` is the fleet projection of the same |
 
@@ -122,8 +120,8 @@ For a partition, `rift_cluster_proxy_claims_total{outcome="refused"}` is the
 proxyOnce reading: a claim the cluster could not serialize, answered `503` and
 **not** forwarded to the upstream (D-66) — a counter of *refused requests*, so it
 measures the blast radius of a partition on proxy traffic rather than its duration.
-The condition itself is `isolated` on `GET /_cluster/status` and `GET
-/_cluster/health` (#470): `1` while this node cannot see the quorum and is refusing
+The condition itself is `isolated` on `GET /_cluster/health` and `GET
+/_fleet/health` (#470): `1` while this node cannot see the quorum and is refusing
 owner-side operations — proxyOnce claims under D-40, flow-KV owner writes and strong
 reads under D-17.
 
@@ -280,11 +278,16 @@ majority-loss recovery would have to look like.
 - **Backup**: configs are exportable at any moment via `GET /imposters`
   (Mountebank-compatible JSON) or the core `--datadir` write-through; the
   state dir itself is snapshot-friendly (redb single file, crash-consistent).
-- **Stuck scenario triage** (once `/_cluster/ring` and `/_cluster/kv` ship —
-  see the endpoint table): `/_cluster/ring?key=flow` → `/_cluster/kv/:flow`
-  → compare owner vs replica `(m_idx, v)` → the answer is one of: owner
-  isolated (heartbeat metric), adoption reset (degraded counter), or the test
-  actually didn't send the transition. Three checks, no log spelunking.
+- **Stuck scenario triage**: `GET /_cluster/health` on each node gives
+  `isolated` and the ring it is computing against (`ring.m_idx`, `ring.members`).
+  Same `m_idx` everywhere and no node isolated means the fleet agrees who owns
+  the flow, so the answer is upstream of the cluster — the transition was not
+  sent, or the predicate did not match. A disagreeing `m_idx`, or an `isolated`
+  node, is the cluster's problem and Chapter 6 has the ownership rules.
+  A per-key owner lookup (`/_cluster/ring?key=…`) and an owner-vs-replica value
+  read (`/_cluster/kv/:flow_id`) were designed in RFC-001 §10 as phase 2. That
+  phased plan is retired (D-71) and neither endpoint is built or tracked; they
+  are named here only because earlier drafts of this runbook assumed them.
 
 ## Rolling upgrades
 

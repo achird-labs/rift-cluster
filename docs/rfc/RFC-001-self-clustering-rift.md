@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | v3.2 (re-grounded at v0.15.0; control plane decided by ADR-001) — implementation-ready |
+| **Status** | v3.2 (re-grounded at v0.15.0; control plane decided by ADR-001). **Largely built, and partly retired.** RFC-007 (D-71) narrowed the project to the distributed core; §7.5 (except §7.5.3), §7.5.1, §7.5.2, §9, §10, §11.1 and Appendix B describe machinery that is gone or was never built, as does §8.1's monetization-boundary paragraph, and each carries a callout. Read the register first — where this RFC and a `D-n` disagree, the register wins |
 | **Tracking issue** | [achird-labs/rift-cluster#1](https://github.com/achird-labs/rift-cluster/issues/1) |
 | **Canonical location** | `rift-cluster:docs/rfc/RFC-001-self-clustering-rift.md` |
 | **Ground truth** | All code citations resolve against `vendor/rift` @ `aaa6042` (v0.15.0). `imposter/core.rs` was split upstream into the `imposter/core/{mod,matching,lifecycle,recording,responses,proxy}.rs` module tree and the crate renamed `rift-core` → `rift-mock-core`; line-number citations below are approximate against v0.15.0. |
@@ -533,12 +533,18 @@ fallback dispatch, §7.4.6) stay cluster.
 
 > ⚠️ **Superseded by ADR-001 (v3), decision D-15.** Membership is now a value in the **Raft log**, not gossip:
 > at any log index every node computes byte-identical membership (and therefore ownership).
-> chitchat, node incarnations, and the versioned-KV budget below are **removed**; bootstrap is
-> `--cluster-init` (not `--cluster-allow-solo`), identity is a leader-minted `u64`, and join is
+> chitchat, node incarnations, and the versioned-KV budget below are **removed**; join is
 > `add_learner` → snapshot catch-up → auto-promote to voter (< 9 voters). The lifecycle
 > *contract* (Joining→Ready gate, graceful-leave handoff, never-serve-stale) is unchanged and
 > carried by the Raft membership; only the mechanism moved. See ADR-001 §Membership and issue
 > #6. The text below is retained for the surviving contract and for context.
+>
+> This banner used to say two more things, both wrong, and #554 removed them rather than
+> softening them: bootstrap is **`--cluster-allow-solo`** and there is no `--cluster-init` flag
+> (`crates/rift-cluster-server/src/cli.rs`); and the node id is **minted by the node itself** at
+> first start from its name, not by a leader (D-26's 2026-08-25 amendment, and
+> `docs/architecture/03-control-plane.md`). A superseding banner that misdescribes what
+> superseded it is the worst kind of stale, because it is the sentence a reader trusts.
 
 - **Library:** [`chitchat`](https://github.com/quickwit-oss/chitchat) (MIT; Quickwit's
   SWIM-with-phi-accrual + versioned key-value gossip). It covers membership *and*
@@ -574,11 +580,11 @@ fallback dispatch, §7.4.6) stay cluster.
     (#120)**: the degradation choice became the per-imposter
     `flowState.readConsistency` knob, because staleness tolerance is a property of
     the *test using the imposter*, not of the node. No global flag exists.
-  - `--cluster-features <list>` — enable stateful features selectively
+  - ~~`--cluster-features <list>`~~ — enable stateful features selectively
     (`config-sync,flow-state,sequencing,journal,proxy`; default: all shipped phases).
-    This is the per-phase rollback switch (§10). **Not accepted yet**: flow state
-    (#120) ships on for every `--cluster` node, and the binary refuses flags that
-    gate nothing (see `rift-cluster-server.md` §What lands later).
+    The per-phase rollback switch for §10. **Never built**: there is no `features`
+    field in `crates/rift-cluster-server/src/cli.rs` and never was one, §10's phased
+    plan is retired (D-71), and flow state (#120) ships on for every `--cluster` node.
   - `--cluster-state-dir <path>` — persisted desired-state (default `<datadir>/_cluster`,
     or a mandatory explicit path when no datadir).
 - **Timing defaults:** gossip interval 1 s; phi-accrual failure detection target: node
@@ -992,6 +998,12 @@ binds can fail on some nodes (port taken by an unrelated process). Built (#143):
 
 ### 7.5 Mergeable state (journal, counters) & clears
 
+> **Retired by D-71** (RFC-007 §3.2, #552), except §7.5.3. There is no mergeable state left:
+> §7.5.1's journal and §7.5.2's clock-free clears were removed with the fleet journal merge
+> (**D-74**). §7.5.3 — proxyOnce owner claims — is not mergeable state at all, was misfiled here,
+> and is live: read it beside the ownership ring in
+> [`docs/architecture/06-flow-state.md`](../architecture/06-flow-state.md).
+
 #### 7.5.1 Recorded-request journal
 
 > **Retired by D-71** (RFC-007 §3.2, #552). Nothing in this section is built any more: the
@@ -1213,6 +1225,14 @@ so a minority side cannot commit at all. The *data plane* does not: for HRW-owne
 "minority" is descriptive rather than privileged, and each side simply serializes the keys
 whose owner is on that side.
 
+> **Amended by D-74** (RFC-007 §3.2, #552): the three journal rows below — append, read/count,
+> clear — no longer describe anything. There is no pull-on-read merge, no shard, no clear
+> generation and no `Rift-Cluster-Partial` on a requests read: the journal is upstream's own, per
+> node, and `GET /imposters/:port/requests` answers for the node you reached, in every partition
+> state. `Rift-Cluster-Partial` survives on `/_fleet/members` and `/_fleet/health` only. The
+> `teardown_space` row is half true: the owner KV deletes stand, the generation bump does not.
+> Every non-journal row is current.
+
 | Feature / op | Owner reachable (normal) | Owner unreachable (fast-fail on Suspect/Dead) | During partition (either side) |
 |---|---|---|---|
 | Scenario read (match gate) | Owner RPC (`for_match`); local if self | **reject**: 503 cluster/owner-unreachable; `local`: local replica, flagged degraded | Keys owned on this side: normal; other side's keys: as owner-unreachable |
@@ -1282,9 +1302,9 @@ for gate B). Summary:
 |---|---|---|
 | `FlowStore` + `compare_and_set` (`extensions::flow_state`) | itself | `ClusteredFlowStore` (owner-serialized, successor-replicated) |
 | `FlowStoreProvider` (`extensions::flow_state`) | private `create_flow_store` match (`imposter/core.rs:152`) | provider returning clustered stores |
-| `ResponseSequencer` (`behaviors::sequencer`) | `RuleCycler`/`StubState` cursor call sites | `ClusteredSequencer` (owner INCR); `RedisSequencer` |
+| `ResponseSequencer` (`behaviors::sequencer`) | `RuleCycler`/`StubState` cursor call sites | `ClusteredSequencer` alone (`crates/rift-cluster/src/stores/sequencer.rs`) — owner-routed on the HRW ring, cursors held in memory on the owner. `RedisSequencer` was never written: **D-12** proposed it and **D-47** superseded it |
 | `RequestJournal` (`imposter::journal`) | `RwLock<Vec<RecordedRequest>>` + count `AtomicU64` | none — the seam (U-4) is **withdrawn**: since D-74 (#552) the cluster registers no journal, and upstream's own per-node one serves the reads unwrapped |
-| `ProxyRecordingStore` (`recording::store`) | concrete `RecordingStore` | `ClusteredProxyStore` (owner state machine); `RedisProxyStore` |
+| `ProxyRecordingStore` (`recording::store`) | concrete `RecordingStore` | `ClusterProxyStore` alone (owner state machine — the type is spelled `Cluster`, not `Clustered`: `crates/rift-cluster/src/stores/proxy.rs`). `RedisProxyStore` was never written — **D-12** again; clustered `proxyOnce` arbitrates on the ring (**D-40**, **D-66**) |
 | `ImposterEventListener` + `apply_config` + `move_stub` + `stub_key` (`imposter::manager`, `imposter`) | `reload()` for sync purposes | config publisher + reconciler |
 | Embeddable server pieces (`rift-http-proxy`): bootstrap builder, metrics server, gateway dispatch | bin-private `main.rs` | `rift-cluster-server` composition |
 | `ResponseDecorator` + `BackendUnavailable` (`extensions::decorate`) | — (new) | stamps `Rift-Cluster-*` headers/warnings |
@@ -1294,6 +1314,16 @@ generic ("pluggable backend", "provider", "listener", "decorator") — no
 gossip/cluster/owner/CRDT vocabulary; every trait ships with a `Local` impl that is the
 *current code moved behind the trait* (behavior-preserving; hot path bench-pinned), living
 in the trait's own module; `Local` remains the default so OSS behavior is unchanged.
+
+> **Retired by D-71** (RFC-007 §3.2, #554): the paragraph below described an open-core split
+> that no longer exists — everything is Apache-2.0 and nothing is withheld
+> ([`docs/architecture/11-upstream-boundary.md`](../architecture/11-upstream-boundary.md), note of
+> 2026-08-04). Two of its specifics were also never built: there is **no Redis implementation of
+> any new trait** in `rift-cluster` (sequencing is owner-routed on the HRW ring, with in-memory
+> cursors that are neither replicated nor persisted — D-47 superseded D-12), and "cluster-merged
+> verification" was removed by **D-74**. The technical boundary — which
+> code is upstream's and which is the cluster's — is the half that survives, and chapter 11 states
+> it.
 
 **Monetization boundary (deliberate):** OSS gets the traits + `Local` impls + the existing
 `RedisFlowStore` (including its U-1 CAS — withholding an atomicity fix from an existing
@@ -1370,6 +1400,16 @@ fleet operations.
 
 ## 9. Cluster composition (`rift-cluster` repo)
 
+> **Retired by D-71** (RFC-007 §3.2, #554): the module tree below is the v2 gossip design and does
+> not describe this repository. `src/membership/` (chitchat), `src/ring.rs`'s epochs and settle
+> delay, `src/configsync/` and `src/crdt/` were all deleted by **D-15**/**D-16**, which put
+> membership and configuration on a Raft log; `ClusteredJournal` went with **D-74**; and
+> `RedisSequencer`, `RedisJournal` and `RedisProxyStore` were never written — **D-12** proposed
+> them and **D-47** superseded it. What the crates actually contain is
+> [`docs/architecture/11-upstream-boundary.md`](../architecture/11-upstream-boundary.md) §"The
+> dependency architecture", and the chapter list in
+> [`docs/architecture/README.md`](../architecture/README.md) is the map.
+
 ```
 crates/
   rift-cluster-base            # facade (exists): re-exports rift_mock_core/rift_types AND the seam traits;
@@ -1405,6 +1445,17 @@ Single-node/OSS users are unaffected: without `--cluster`, `rift-cluster-server`
 `Local` impls the core binary uses; the core `rift` binary never links `rift-cluster` at all.
 
 ## 10. Phased plan
+
+> **Retired by D-71** (RFC-007 §3.2, #554). Phases 0–2 shipped and their exit criteria are the
+> tests that still run. The rest did not happen as written: **Phase 3** (the fleet-wide journal)
+> was built and then removed by **D-74**; **Phase 4** (a Redis-backed sequencer) was superseded by
+> **D-47**, which shipped owner-routed sequencing on the HRW ring with in-memory cursors —
+> unreplicated, unpersisted, and reset by a handoff; **Phase 5**'s `RedisProxyStore` was
+> never written, and clustered proxyOnce ships on the ring (**D-40**, **D-66**); the
+> `--cluster-features` flag named below does not exist and never did. `/_cluster/ring` and
+> `/_cluster/kv`, listed under Phase 2, are not served —
+> [`docs/architecture/10-operations.md`](../architecture/10-operations.md) says so at the runbook
+> that used to assume them. RFC-007 §9 is the plan that is actually being executed.
 
 Ordering rationale (review cycle 1): verification (now Phase 3) ships before sequencing —
 it is the stateful feature users actually file bugs about; strict sequencing/proxyOnce
@@ -1535,17 +1586,18 @@ therefore strictly more informative than the 0/1 gauge it replaces.
   requires network-level isolation (private VPC/namespace, WireGuard/mesh). mTLS between
   nodes is a Phase-2+ hardening item, not a Phase-1 blocker.
 - `--cluster-insecure` (explicit) is the only way to run without a secret; it logs a
-  startup warning and sets `rift_cluster_insecure 1`.
+  startup warning. (It was to set a `rift_cluster_insecure` gauge as well; no such metric was
+  ever registered, and the operator metrics product it would have belonged to was retired by
+  D-71 (#548). The startup warning is the whole signal.)
 - Admin API auth is unchanged (existing `--api-key`); `/_cluster/*` requires the cluster
   secret's derived bearer or the admin api-key. `/readyz`/`/healthz` are unauthenticated
   by design (probe targets, no state exposure).
-- **Principals, tenants and RBAC are
-  [RFC-002](RFC-002-multi-tenancy-and-rbac.md)** (#17), which replaces the single
-  global bearer above with a per-principal authorizer (upstream seam U-9) and adds
-  the audit stream. It lands as Phase T, parallel to Phases 2–3, and its records ride
-  this RFC's control plane — authorization data has to be strongly consistent, which
-  is one of the reasons ADR-001 matters beyond durability. Until then, `--api-key`
-  is the whole of client-facing authz and this section is accurate as written.
+- **`--api-key` is the whole of client-facing authz**, permanently. RFC-002 proposed replacing
+  the single global bearer with a per-principal authorizer (upstream seam U-9) and an audit
+  stream; it was built, and then removed in full by **D-73** (#550) — one credential, one
+  identity, `POST /session` exchanging the key for the console's cookie. RFC-002 is superseded
+  and U-9's authorizer half is withdrawn. The last sentence of this bullet used to say "until
+  then"; there is no then.
 
 ### 11.3 Performance guardrails
 
@@ -2015,6 +2067,16 @@ Redis impls of U-3/U-4/U-5, the `ResponseDecorator` impl, `/_cluster/*` endpoint
 `--cluster*` CLI, cluster-aware gateway fallback, k8s manifests, chaos harness.
 
 ## Appendix B — upstream seams (FILED AND MERGED)
+
+> **Retired by D-71** (RFC-007 §3.2, #554) as a *status* note: the paragraph below is stale in
+> three ways. **U-13** is not outstanding — it landed as rift#966/#967 and is now **withdrawn**,
+> because the stored-spec subsystem it would have enforced against was removed by **D-72**; the
+> "Phase 3 fleet-wide streaming form" it was gating was itself removed by **D-74**. **U-12** did
+> not become "sources as control-plane objects (#134)" — tracking sources were removed by D-72 and
+> the seam now carries only the one-shot `--imposters` bootstrap. **RFC-002's U-9 and U-10** are
+> withdrawn with tenancy (**D-73**). The eighteen-row table in
+> [`docs/architecture/11-upstream-boundary.md`](../architecture/11-upstream-boundary.md) is where
+> a seam's current status is defined; this appendix is provenance for the original eight.
 
 > **v3 status: Phase 0 complete.** All eight seams below shipped upstream in v0.14.0 as
 > `achird-labs/rift#311–#318` — this is now a *merged mapping*, not a to-file list:

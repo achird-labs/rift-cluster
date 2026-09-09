@@ -56,10 +56,6 @@ subtle.workspace = true
 uuid.workspace = true
 tokio-util.workspace = true
 arc-swap.workspace = true
-# Per-route dispatch counting (issue #368), on the front door's hot path. Same primitive the
-# request journal's own per-port counter uses, and non-poisoning: a counter that starts returning
-# errors because an unrelated thread panicked would be worse than the count it protects.
-parking_lot.workspace = true
 # Session-cookie signing (RFC-006 §5.3, issue #185): HMAC-SHA256 over a base64url payload.
 hmac.workspace = true
 sha2.workspace = true
@@ -86,7 +82,3 @@ reqwest.workspace = true
 # covers every one (issue #184). Dev-only: the derives are `cfg_attr(test, ...)`, so nothing here
 # reaches the shipped binary.
 strum.workspace = true
-# Reads `rift_cluster_no_principals` straight off the global registry
-# `rift_cluster::metrics` registers into — the same technique that crate's own
-# tests use, and the reason the workspace pins one `prometheus` version.
-prometheus.workspace = true
