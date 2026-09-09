@@ -483,10 +483,12 @@ A fleet-wide delete is a `ClusterAdmin` action and its audit record (§9) has
 `tenant: null` and `resource: "*"` — correct, but worth stating so the null is
 not read as a bug.
 
-> **As shipped (T1, #159).** Every `ControlOp` now carries an explicit `tenant`, so the
-> fleet-wide delete's audit row records the **real tenant** with `resource: "*"`, not
-> `tenant: null`. Pinned by `delete_all_is_audited_with_the_real_tenant_and_a_wildcard_resource`;
-> see `docs/architecture/08-tenancy-security.md`.
+> **As shipped (T1, #159), and then removed.** Every `ControlOp` carried an explicit `tenant`, so
+> the fleet-wide delete's audit row recorded the **real tenant** with `resource: "*"`, not
+> `tenant: null`; it was pinned by
+> `delete_all_is_audited_with_the_real_tenant_and_a_wildcard_resource`. The audit projection went
+> with D-71 (#546) and the tenant field with D-73 (#550), so neither the row nor the test exists —
+> do not go looking for them.
 
 *Generic justification.* Audit logging is already a listed motivation of the
 event seam; today an event says *what* changed but not *who* changed it, which
