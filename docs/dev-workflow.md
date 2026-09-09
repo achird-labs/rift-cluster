@@ -55,10 +55,12 @@ scripts/sync-upstream.sh
    upstream boundary instead of a convention nobody checks. Only `rift-cluster-base`
    itself carries the vendored path deps (declared in `[workspace.dependencies]`
    at the root).
-3. Extend the core through those seams (flow store, sequencer, journal, proxy
-   store, config reconcile + events, response decoration, server builder)
-   rather than forking logic. If a seam you need does not exist, that is an
-   upstream PR — see the cross-repo flow below — not a local fork.
+3. Extend the core through those seams (flow store, sequencer, proxy store,
+   config reconcile + events, response decoration, server builder, the route
+   table) rather than forking logic. `docs/architecture/11-upstream-boundary.md`
+   is where each `U-n` is defined and where a seam the cluster no longer
+   consumes is marked **withdrawn**. If a seam you need does not exist, that is
+   an upstream PR — see the cross-repo flow below — not a local fork.
 
 ## When a cluster feature needs a core change first (cross-repo PR)
 

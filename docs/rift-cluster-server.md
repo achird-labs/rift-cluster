@@ -499,9 +499,11 @@ the fleet has converged.
 | `GET /_cluster/members` | node id, leadership, current leader, last applied index, voters |
 | `GET /_cluster/config` | the ports this node has a committed config for |
 | `GET /_cluster/imposters` | those ports with their committed config bodies |
-| `GET /_cluster/health` | readiness state and pending gates, whether this node is an isolated owner, the ownership ring (`m_idx` + members), and this node's parked-write depth (see `FleetHealth` in `docs/api/openapi-ee.yaml` for the shape) |
+| `GET /_cluster/health` | `ready` and `state` with the gates still pending, `isolated` (this node cannot see the quorum), the ownership ring (`m_idx` + members), and `parked_intents` — this node's own backlog of accepted-but-unreplayed writes, `null` rather than `0` if the store cannot be read. See `FleetHealth` in `docs/api/openapi-ee.yaml` for the shape |
 
-`/_cluster/ring` and `/_cluster/kv` arrive with later phases.
+That is the whole cluster-port surface. RFC-001 §10 also designed a `/_cluster/ring?key=…`
+owner lookup and a `/_cluster/kv/{flow_id}` owner-versus-replica read; that phased plan is
+retired (D-71) and neither endpoint is built or tracked.
 
 **Calling them.** Every request on this port carries an HMAC over its
 timestamp, nonce, method, path and body (RFC-001 §11.2), so plain `curl` cannot
@@ -540,15 +542,18 @@ only while the whole build links **one** copy of that crate; a second one would
 carry its own registry and these families would silently reach no endpoint.
 `scripts/check-single-prometheus.sh` enforces it in CI.
 
-Config sync (issue #9): `rift_cluster_config_revision{port}` (applied revision
-per imposter — two nodes disagreeing have not converged) and
-`rift_cluster_dedup_hits_total` (ops collapsed by op-id — a replay and a retry
-proving to be one operation), plus the R4 ledger's `rift_cluster_intents_pending`
-(resampled by every replay sweep, so a restart's carried-over ledger reads true).
-The pull-on-miss net (issue #49) keeps `rift_cluster_pull_on_miss_retries_total`
-— requests sent back through the matcher once, which is what C16 reads. There is
-deliberately no `rescues_total`: the hook cannot see the retry's outcome, so such
-a counter would be a guess; use the response header below as rescue evidence.
+Thirteen families survive, and the authoritative list — each one beside the test or chaos
+scenario that reads it — is the module doc of `crates/rift-cluster/src/metrics.rs`. It is
+deliberately not duplicated here: a second partial list is how a doc starts lying about which
+series exist. Four of them come up often enough to name:
+`rift_cluster_config_revision{port}` (applied revision per imposter — two nodes disagreeing have
+not converged), `rift_cluster_dedup_hits_total` (ops collapsed by op-id — a replay and a retry
+proving to be one operation), the R4 ledger's `rift_cluster_intents_pending` (resampled by every
+replay sweep, so a restart's carried-over ledger reads true), and the pull-on-miss net's
+`rift_cluster_pull_on_miss_retries_total` (issue #49 — requests sent back through the matcher
+once, which is what C16 reads). There is deliberately no `rescues_total`: the hook cannot see the
+retry's outcome, so such a counter would be a guess; use the response header below as rescue
+evidence.
 
 ## Response headers
 
@@ -603,6 +608,23 @@ A request to a port with **no imposter at all** is still outside this net: it
 reaches no imposter handler, so there is nothing to hook. Readiness gating is
 what covers that window.
 
+## The rest of the admin surface
+
+Routes this document does not describe in a section of its own. Every one of
+them is published in `docs/api/openapi-ee.yaml`, which is the contract; this
+table exists so an operator reading here does not conclude they are absent.
+
+| Route | What it does |
+|---|---|
+| `GET /_fleet/members`, `GET /_fleet/health` | the read-only admin-port projection of `/_cluster/{members,health}`, fanned out across the fleet and stamped `Rift-Cluster-Partial` when a peer did not answer |
+| `GET /_fleet/ops/{opId}` | the state of one submitted write — pending, applied or failed; what a `202` under `--cluster-admin-async` is polled with |
+| `PUT /admin/fleet/name` | set or rename the fleet's operator-facing name; a replicated write, not a projection |
+| `POST /session`, `DELETE /session` | exchange the admin key for the console's `HttpOnly` cookie, and clear it |
+| `GET /openapi.json` | this contract, served by the binary that implements it |
+| `POST /admin/imposters/{port}/try` | send a sample request to the imposter from the admin origin and answer what it answered — the console's Send button |
+| `GET /imposters/{port}/spaces`, `DELETE /imposters/{port}/spaces/{flow}`, `POST …/spaces/{flow}/stubs` | list, tear down and add stubs to a correlated-isolation space — a flow's own state slice and its own stubs, replicated (#374, #537, D-69) |
+| `DELETE /imposters/{port}/savedProxyResponses` | terminated, not proxied: one Raft op deleting the fleet's exactly-once recording markers, so every signature records afresh on every node (#226) |
+
 ## The clustered admin write path
 
 Under `--cluster`, the public admin address is served by a thin front: the
@@ -623,7 +645,7 @@ means the write is durable on a majority and, with the default
 barrier times out the response still succeeds and names the lagging nodes in
 `Rift-Cluster-Warnings`. Every mutating response carries
 `Rift-Cluster-Revision` (`<port>@<log-index>`, or `routes@<log-index>` for a
-front-door route-table write) and
+route-table write) and
 `Rift-Cluster-Op-Id`.
 
 Acceptance is never lost (R4): every mutation is durably parked on the
@@ -738,9 +760,16 @@ Like `owner` on a space read, the decoration is additive and so a body it
 cannot parse passes through unchanged and logged, rather than failing a read
 the cluster only annotates.
 
-## The clustered front door (#131)
+## The clustered router (#131)
 
-Upstream's front door (`--front-door <ADDR>`, env `RIFT_FRONT_DOOR`; a
+The feature is called the **router** in prose (RFC-007 §6); the flag, the
+environment variable, the response header and the admin path keep their
+`front-door` spelling, because they are client contract and upstream's module
+is `rift-http-proxy::front_door`. Chapter 13 of the architecture guide
+(`docs/architecture/13-router.md`) is the design; this section is the operator's
+view.
+
+Upstream's listener (`--front-door <ADDR>`, env `RIFT_FRONT_DOOR`; a
 `HOST:PORT` or a bare port meaning every interface) resolves a request against
 a content-based route table and dispatches it to an imposter port — U-11's
 listener and matcher. Its admin CRUD was deliberately deferred upstream, so
@@ -767,7 +796,7 @@ control-plane object**, exactly like the imposter config set.
   at the same priority, `strip_prefix` requires `path_prefix`, wildcard/method/
   prefix well-formedness) before anything commits, apply is deterministic, and
   a committed write recompiles the table and hot-swaps it into every node's
-  front door — no restart, no re-read of a config file. `GET
+  listener — no restart, no re-read of a config file. `GET
   /front-door/routes` answers from the local state machine directly (there is
   no upstream endpoint to proxy to). `PutRoutes` is a whole-table replace, not
   a merge — the same all-or-nothing shape U-11's own `RouteTable::validate`
@@ -780,7 +809,7 @@ control-plane object**, exactly like the imposter config set.
   — routes have no per-record port to qualify it with, so there is no
   `If-Match` support for them either) and `Rift-Cluster-Op-Id`, and follows
   the same `--cluster-write-barrier` semantics as every other mutating route.
-- **Bind-divergence dividend (§7.4.6): built (#143).** The front door dispatches
+- **Bind-divergence dividend (§7.4.6): built (#143).** The router dispatches
   into the manager in-process (`dispatch_to_port`), so a node whose own bind
   failure left an entry in the imposter map reaches it without touching a
   socket. Under `--cluster`, `cluster_manager` sets
@@ -846,7 +875,7 @@ half-configured fleet this path exists to avoid.
 A bootstrap document may declare blocks that belong to other subsystems. An
 `intercept` block **fails the start** — the cluster refuses the TLS-MITM intercept
 listener fleet-wide, because its state is per-node and is not replicated. A
-`routes` block is **ignored, with a warning**: the front door's table is its own
+`routes` block is **ignored, with a warning**: the router's table is its own
 replicated object with its own op (`PUT /front-door/routes`, above).
 
 ## Compiling OpenAPI: `POST /specs/compile` (D-72, #549)
@@ -856,18 +885,19 @@ replicated object with its own op (`PUT /front-door/routes`, above).
 server exposes on top of it, and it is **stateless**: it compiles what you send
 and answers the result. It stores nothing.
 
-| Route | Action | What it does |
-|---|---|---|
-| `POST /specs/compile?port=<n>[&name=<s>]` | `imposter.write` (Editor+) | Body is an OpenAPI 3.0 document (JSON or YAML, UTF-8, **≤ 4 MiB**). Answers `{imposter, operations}` — the compiled imposter JSON and the compiled operation index. Commits nothing, writes no log entry, and leaves no record. |
+| Route | What it does |
+|---|---|
+| `POST /specs/compile?port=<n>[&name=<s>]` | Body is an OpenAPI 3.0 document (JSON or YAML, UTF-8, **≤ 4 MiB**). Answers `{imposter, operations}` — the compiled imposter JSON and the compiled operation index. Commits nothing, writes no log entry, and leaves no record. |
 
 - `port` is **required** — the compiled imposter needs one, and the endpoint will
   not guess.
 - `name` is optional and becomes the imposter's name.
 - A document that does not compile is refused with the compiler's own reason in
   the typed error envelope. There is no partial result.
-- It is authorized as **`ImposterWrite`** rather than a read action or an action
-  of its own: compiling is a step in writing an imposter, and the caller who may
-  not write one has no use for the output.
+- It is behind the admin key like every other route on this port. It once carried
+  a per-resource authorization action of its own (`imposter.write`, "Editor and
+  above"); D-73 (#550) left one credential and no per-resource authorization, so
+  there is nothing narrower to hold.
 
 The intended flow is two calls, and the second is an ordinary write:
 

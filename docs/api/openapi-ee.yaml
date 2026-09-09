@@ -12,8 +12,9 @@ info:
     - `ee`: terminated by this cluster layer — turned into a `ControlOp`,
       committed to the Raft log, and (for imposter/stub/route writes)
       rendered by re-reading the just-applied state through the loopback
-      admin. Tenancy and `/front-door/routes` have no upstream
-      equivalent at all and terminate here in full, reads included.
+      admin. `/front-door/routes`, `/_fleet/*`, `/session` and
+      `/specs/compile` have no upstream equivalent at all and terminate
+      here in full, reads included.
     - `upstream`: reverse-proxied byte-for-byte to the embedded engine's own
       admin API after this front's authentication/authorization gate runs.
 
@@ -62,7 +63,12 @@ tags:
   - name: imposters
     description: Imposter and stub CRUD (config-mutating routes terminate here; runtime-state reads/writes proxy to upstream).
   - name: front-door
-    description: The clustered front door's own route table (issue #131) — no upstream equivalent.
+    description: >
+      The router's own route table (issue #131) — no upstream equivalent.
+
+      The feature is called the **router** in prose (RFC-007 §6); the tag
+      and the paths keep `front-door` because they are client contract, and
+      because upstream's module is `rift-http-proxy::front_door`.
   - name: fleet
     description: >
       Fleet-level operator surface — no upstream equivalent.
@@ -74,9 +80,7 @@ tags:
       anything: the fleet's name has no cluster-port equivalent to project,
       because it is set through consensus rather than read off a node. It
       is tagged `fleet` regardless of that difference, so a consumer
-      looking for what the fleet *is* finds naming beside membership rather
-      than filed under tenancy, which administers a different thing
-      entirely.
+      looking for what the fleet *is* finds naming beside membership.
   - name: session
     description: RFC-006 §5.3 browser session exchange — no upstream equivalent.
   - name: specs
