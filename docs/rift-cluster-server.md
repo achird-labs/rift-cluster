@@ -622,7 +622,7 @@ table exists so an operator reading here does not conclude they are absent.
 | `POST /session`, `DELETE /session` | exchange the admin key for the console's `HttpOnly` cookie, and clear it |
 | `GET /openapi.json` | this contract, served by the binary that implements it |
 | `POST /admin/imposters/{port}/try` | send a sample request to the imposter from the admin origin and answer what it answered — the console's Send button |
-| `GET /imposters/{port}/spaces`, `DELETE /imposters/{port}/spaces/{flow}`, `POST …/spaces/{flow}/stubs` | list, tear down and add stubs to a correlated-isolation space — a flow's own state slice and its own stubs, replicated (#374, #537, D-69) |
+| `GET /imposters/{port}/spaces`, `DELETE /imposters/{port}/spaces/{flowId}`, `POST …/spaces/{flowId}/stubs` | list, tear down and add stubs to a correlated-isolation space — a flow's own state slice and its own stubs, replicated (#374, #537, D-69) |
 | `DELETE /imposters/{port}/savedProxyResponses` | terminated, not proxied: one Raft op deleting the fleet's exactly-once recording markers, so every signature records afresh on every node (#226) |
 
 ## The clustered admin write path
@@ -1139,28 +1139,29 @@ The console shows **the one fleet**. There is no tenant switcher and no scope
 to choose: whoever logged in holds the fleet's one credential, so every screen
 shows everything and every control is offered unconditionally (#550, D-73).
 
-Screens whose backend or slice has not shipped appear as greyed nav entries
-carrying their issue number. A visible roadmap, not a 404 and not an omission.
+A screen whose backend or slice has not shipped would appear as a greyed nav
+entry carrying its issue number — a visible roadmap, not a 404 and not an
+omission. Nothing is greyed today: `plannedEntries()` returns empty
+(`web/src/app/nav.ts`), because `specs` was the last unbuilt entry and #549
+removed the stored-spec surface it was promising. The mechanism stays for the
+next one; an empty roadmap is a state, not a reason to delete the shape.
 
 Reads poll every 5 seconds while the tab is visible and **stop while it is
 hidden** (RFC-006 §6). SSE is deferred to v2 and will carry cache invalidation
 only. A 4xx is never retried: it is a decision the fleet has already made, and
 re-asking only repeats the denial.
 
-## What lands later
+## Two flags the plan reserved and the CLI never grew
 
-One flag from the Phase-1 plan is deliberately **not** accepted yet, because
-nothing behind it exists and this codebase refuses flags that quietly do
-nothing (that is the same principle the startup guards enforce):
+`--cluster-features` was a Phase-1 placeholder for selecting a clustered
+feature set. There is no `features` field in `crates/rift-cluster-server/src/cli.rs`
+and never was one; the phased plan that reserved it is retired (D-71,
+RFC-001 §10). Flow state (#120) ships on for every `--cluster` node.
 
-- `--cluster-features` — the namespace gates nothing while the clustered
-  feature set is not selectable; flow state (#120) ships on for every
-  `--cluster` node rather than behind a feature gate.
-
-`--cluster-degraded-mode`, also once listed here, was superseded rather than
-built: the degradation choice the table reserved it for became the
-**per-imposter** `readConsistency` knob above — per-imposter because staleness
-tolerance is a property of the test using the imposter, not of the node.
+`--cluster-degraded-mode` was superseded rather than built: the degradation
+choice the table reserved it for became the **per-imposter** `readConsistency`
+knob above — per-imposter because staleness tolerance is a property of the test
+using the imposter, not of the node.
 
 See [`docs/architecture/10-operations.md`](architecture/10-operations.md) for the
 operational model this implements.

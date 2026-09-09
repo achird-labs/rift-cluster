@@ -25,8 +25,8 @@ behavior enters through generic extension seams that are upstreamed first. The
 original eight (`achird-labs/rift#311–#318`) were the pluggable flow store with
 CAS, the response sequencer, the request journal, the proxy-recording store,
 incremental config apply with change events, the embeddable server builder, and
-response decoration; there are eighteen now, and four — the journal among them —
-are upstream's still but consumed here no longer. Chapter 11 covers that
+response decoration; there are eighteen now, and five rows — the journal among
+them — are upstream's still but consumed here no longer. Chapter 11 covers that
 boundary in detail, seam by seam.
 
 ## The four load-bearing requirements

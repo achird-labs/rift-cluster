@@ -21,8 +21,9 @@ The open-source engine knows nothing about clusters. It exposes **generic
 extension seams** — traits with `Local` default implementations that preserve
 single-node behavior byte-for-byte — and the cluster crates supply
 cluster-aware implementations. The first eight (`achird-labs/rift#311–#318`) landed together and
-completed Phase 0 of the program; the table below has grown to eighteen since, and four of those
-are now **withdrawn** — merged upstream, still upstream's, no longer consumed here. A withdrawn
+completed Phase 0 of the program; the table below has grown to eighteen since, and five of those
+rows now read **withdrawn** — merged upstream, still upstream's, no longer consumed here (U-9 in
+part: its authorizer half is withdrawn, its `classify` half is not). A withdrawn
 row is kept, never deleted: `U-n` is a stable citation, and "the cluster stopped using this" is a
 fact a reader needs as much as "it uses this":
 
@@ -33,7 +34,7 @@ table is where a `U-n` is defined (`scripts/design-check.py` resolves citations 
 |---|---|---|---|---|
 | U-1 | rift#311 | `FlowStore::compare_and_set` (+`CasOutcome`) | atomic scenario transitions — also fixed an OSS race | merged (v0.14.0) |
 | U-2 | rift#312 | `FlowStoreProvider` | per-imposter `ClusteredFlowStore` injection | merged |
-| U-3 | rift#313 | `ResponseSequencer` / `SequenceKey` | owner-routed sequencing — `ClusteredSequencer` on the HRW ring, over `redb` (D-47). D-12 proposed shipping this Redis-backed first and is superseded; there is no Redis sequencer | merged |
+| U-3 | rift#313 | `ResponseSequencer` / `SequenceKey` | owner-routed sequencing — `ClusteredSequencer` on the HRW ring (D-47), holding each cursor in memory on its owner. Cursors are neither replicated nor persisted (D-8): a handoff resets them, which is the contract, not a fault. D-12 proposed shipping this Redis-backed first and is superseded; there is no Redis sequencer | merged |
 | U-4 | rift#314 | `RequestJournal` (+ cursor reads rift#603) | no longer consumed: D-74 (#552) retired the sharded journal that implemented it, and recording is upstream's own per-node journal, read unwrapped. The trait stays upstream; the cluster registers nothing behind it | **withdrawn** |
 | U-5 | rift#315 | `ProxyRecordingStore` (claim/release) | owner claim state machine — also fixed a stuck-pending OSS bug | merged |
 | U-6 | rift#316 | `apply_config` + `move_stub` (also `ImposterEvent`, `stub_key`) | incremental reconcile as the Raft apply step (D-5). `apply_config` and `move_stub` are called from the state machine; `ImposterEvent` is consumed only by this crate's tests and `stub_key` by nothing — upstream still uses both internally, and the re-exports stay as the seam's declared surface | merged |
@@ -45,7 +46,7 @@ table is where a `U-n` is defined (`scripts/design-check.py` resolves citations 
 | U-12 | — | `SourceRegistry`, `SourceRef`, `parse_uri_list`; `FileSource`/`HttpSource` built-ins (the `ImposterSource` provider trait too, now unused here) | the one-shot `--imposters <uri>` bootstrap resolves each URI through this registry at startup and submits the parsed documents as ordinary `PutImposter` ops (D-72, #549). The cluster registers no provider of its own: the `git+`/`s3:`/`registry:` providers went with the tracking sources and are refused by name at startup (`RETIRED_SOURCE_SCHEMES`) rather than silently unresolved | merged |
 | U-13 | rift#966/#967 | `ExchangeInspector` / `ExchangeInspectorProvider` (`extensions::exchange_inspector`) | request-side hook after journaling and before matching; response-side hook in the shared funnel — built for spec traffic validation (RFC-004 §6), which was never implemented; the stored-spec subsystem it would have enforced against was removed by D-72 (#549) and the re-export (#281) with it. Upstream keeps the seam | **withdrawn** |
 | U-14 | — | `extensions::template_fn` — template-function registration | never consumed; RFC-005 was retired in full (D-71, #549) and #291 closed as out of scope | **withdrawn** |
-| U-15 | — | `extensions::state_ops` — declarative state operations | `_rift.stateOps`, landed by #418. The only row with no facade re-export, and deliberately: the ops run inside the engine against the imposter's `FlowStore`, so the cluster adds no symbol and consumes the seam through JSON. What proves it is a test (`crates/rift-cluster-server/tests/state_ops_cluster.rs`), which is the right shape for a behavioural seam. RFC-005 specified it and is retired (D-71, #549); the feature is upstream's and stays | merged |
+| U-15 | — | `extensions::state_ops` — declarative state operations | `_rift.stateOps`, landed by #418. The only *merged* row with no facade re-export, and deliberately: the ops run inside the engine against the imposter's `FlowStore`, so the cluster adds no symbol and consumes the seam through JSON. What proves it is a test (`crates/rift-cluster-server/tests/state_ops_cluster.rs`), which is the right shape for a behavioural seam. (U-13 and U-14 carry no re-export either, but both are withdrawn — for them the absence records a seam the cluster never consumed, not a seam consumed through JSON.) RFC-005 specified it and is retired (D-71, #549); the feature is upstream's and stays | merged |
 | U-16 | rift#910/#911 | `ProxyRecordingStore` claim semantics revised for fleet-wide exactly-once (`StubPublication`, `publishes_stubs()`) | clustered `proxyOnce` (#226, Chapter 6) | merged |
 | U-17 | rift#990 | `ProxyStoreError::Refused(BackendUnavailable)` (+ `#[non_exhaustive]`) and the proxy-leg 503 door — a store that *arbitrates* exactly-once can refuse a claim instead of being degraded around | clustered `proxyOnce` fails closed at the client (#529, D-66; Chapter 6) | merged |
 | U-18 | rift#1012 | `admin_api::not_a_stub_reason` — the space-stub shape guard's *decision* (#336), separated from its rendering | the clustered front terminates `POST .../spaces/{flowId}/stubs` as a replicated write and applies the same rule, rather than keeping a second copy of `STUB_FIELD_NAMES` that would go stale (#537, D-69) | merged |
@@ -60,14 +61,19 @@ longer consumes it, but the seam stays upstream for whoever does. Every seam fol
 the same rules — generic names, `Local`/default-off behavior, independently
 justifiable to an OSS maintainer.
 
-Four rows read **withdrawn**: U-4 (the request journal, D-74/#552), U-9's authorizer half and
+Five rows read **withdrawn**: U-4 (the request journal, D-74/#552), U-9's authorizer half and
 U-10 (both D-73/#550), U-13 and U-14. Withdrawn means the cluster registers nothing behind the
-seam — not that the seam was a mistake. Three of the four were upstreamed for a subsystem this
-project then removed on purpose (RFC-007), and the seams are generic enough that upstream keeps
-them for whoever wants them; that they cost upstream nothing to keep is the test each was designed
-to pass. `crates/rift-cluster-base/src/lib.rs` still re-exports several of these symbols with no
-first-party consumer, because the facade's job is to name the boundary, and a compile-time marker
-there is what makes a seam's disappearance a build failure rather than a surprise.
+seam — not that the seam was a mistake. They divide in two. U-4, U-9's authorizer and U-10 were
+consumed and stopped being consumed, because RFC-007 removed the subsystem behind each: the
+journal merge, the tenant-aware admin gate, principal attribution. U-13 and U-14 were never
+consumed at all — each was upstreamed for something specified and never built (RFC-004 §6's spec
+traffic validation, RFC-005's template functions), and both specifications are now retired: §6 by
+D-71/#549, RFC-005 in full. Either way the
+seams are generic enough that upstream keeps them for whoever wants them; that they cost upstream
+nothing to keep is the test each was designed to pass. `crates/rift-cluster-base/src/lib.rs` still
+re-exports several of these symbols with no first-party consumer, because the facade's job is to
+name the boundary, and a compile-time marker there is what makes a seam's disappearance a build
+failure rather than a surprise.
 
 ## The dependency architecture
 

@@ -57,11 +57,11 @@ If you read only three chapters, read **1 (Overview)**, **4 (Write Path)**, and
 | [`docs/decisions/DECISIONS.md`](../decisions/DECISIONS.md) | **The decision register.** The only place a `D-n` is defined; it wins over everything below |
 | [RFC-007](../rfc/RFC-007-distributed-core.md) (**D-71**) | The scope: what the cluster is, and what was removed to make it that |
 | [ADR-001](../adr/ADR-001-raft-control-plane.md) (accepted) | Control-plane decision: embedded Raft (`openraft`) + `redb` |
-| [RFC-001](../rfc/RFC-001-self-clustering-rift.md) v3.2 | The original design. Largely built; §7.5.1, §7.5.2, §9, §10, §11.1 and Appendix B are retired and carry callouts |
+| [RFC-001](../rfc/RFC-001-self-clustering-rift.md) v3.2 | The original design. Largely built; §7.5 (bar §7.5.3), §7.5.1, §7.5.2, §9, §10, §11.1, Appendix B and §8.1's monetization-boundary paragraph are retired and carry callouts |
 | RFC-002, RFC-005 | Superseded in full (D-73, D-71). Read as history only |
 | This guide | Explanatory — the *why* and the *how it fits together*. Must not contradict a decision |
 | [`docs/design-index.toml`](../design-index.toml) | When each chapter was last read against the code, and by which sha |
-| `vendor/rift` @ v0.17.0 (`b0bef7d`) | Ground truth for every upstream citation |
+| `vendor/rift` @ `v0.17.0-50-gb0bef7d` | Ground truth for every upstream citation |
 
 When this guide and the register disagree, the register wins and the guide has
 a bug — fix it in the same PR, or file it.

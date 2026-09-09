@@ -195,6 +195,12 @@ dev server:
 pnpm run e2e          # smoke · visual · a11y, plus interaction and oracle specs
 pnpm run e2e:ui
 pnpm run e2e:update   # regenerate visual baselines locally
+```
+
+The `pnpm` commands run from `web/`. The hand-driving helper does not — it lives at
+the repository root, so run it from there:
+
+```sh
 scripts/e2e-console.sh up     # a seeded node on :3525 for hand-driving
 scripts/e2e-console.sh down
 ```

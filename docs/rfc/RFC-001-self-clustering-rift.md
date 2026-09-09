@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | v3.2 (re-grounded at v0.15.0; control plane decided by ADR-001). **Largely built, and partly retired.** RFC-007 (D-71) narrowed the project to the distributed core; §7.5.1, §7.5.2, §9, §10, §11.1 and Appendix B describe machinery that is gone or was never built, and each carries a callout. Read the register first — where this RFC and a `D-n` disagree, the register wins |
+| **Status** | v3.2 (re-grounded at v0.15.0; control plane decided by ADR-001). **Largely built, and partly retired.** RFC-007 (D-71) narrowed the project to the distributed core; §7.5 (except §7.5.3), §7.5.1, §7.5.2, §9, §10, §11.1 and Appendix B describe machinery that is gone or was never built, as does §8.1's monetization-boundary paragraph, and each carries a callout. Read the register first — where this RFC and a `D-n` disagree, the register wins |
 | **Tracking issue** | [achird-labs/rift-cluster#1](https://github.com/achird-labs/rift-cluster/issues/1) |
 | **Canonical location** | `rift-cluster:docs/rfc/RFC-001-self-clustering-rift.md` |
 | **Ground truth** | All code citations resolve against `vendor/rift` @ `aaa6042` (v0.15.0). `imposter/core.rs` was split upstream into the `imposter/core/{mod,matching,lifecycle,recording,responses,proxy}.rs` module tree and the crate renamed `rift-core` → `rift-mock-core`; line-number citations below are approximate against v0.15.0. |
@@ -580,11 +580,11 @@ fallback dispatch, §7.4.6) stay cluster.
     (#120)**: the degradation choice became the per-imposter
     `flowState.readConsistency` knob, because staleness tolerance is a property of
     the *test using the imposter*, not of the node. No global flag exists.
-  - `--cluster-features <list>` — enable stateful features selectively
+  - ~~`--cluster-features <list>`~~ — enable stateful features selectively
     (`config-sync,flow-state,sequencing,journal,proxy`; default: all shipped phases).
-    This is the per-phase rollback switch (§10). **Not accepted yet**: flow state
-    (#120) ships on for every `--cluster` node, and the binary refuses flags that
-    gate nothing (see `rift-cluster-server.md` §What lands later).
+    The per-phase rollback switch for §10. **Never built**: there is no `features`
+    field in `crates/rift-cluster-server/src/cli.rs` and never was one, §10's phased
+    plan is retired (D-71), and flow state (#120) ships on for every `--cluster` node.
   - `--cluster-state-dir <path>` — persisted desired-state (default `<datadir>/_cluster`,
     or a mandatory explicit path when no datadir).
 - **Timing defaults:** gossip interval 1 s; phi-accrual failure detection target: node
@@ -1302,9 +1302,9 @@ for gate B). Summary:
 |---|---|---|
 | `FlowStore` + `compare_and_set` (`extensions::flow_state`) | itself | `ClusteredFlowStore` (owner-serialized, successor-replicated) |
 | `FlowStoreProvider` (`extensions::flow_state`) | private `create_flow_store` match (`imposter/core.rs:152`) | provider returning clustered stores |
-| `ResponseSequencer` (`behaviors::sequencer`) | `RuleCycler`/`StubState` cursor call sites | `ClusteredSequencer` (owner INCR); `RedisSequencer` |
+| `ResponseSequencer` (`behaviors::sequencer`) | `RuleCycler`/`StubState` cursor call sites | `ClusteredSequencer` alone (`crates/rift-cluster/src/stores/sequencer.rs`) — owner-routed on the HRW ring, cursors held in memory on the owner. `RedisSequencer` was never written: **D-12** proposed it and **D-47** superseded it |
 | `RequestJournal` (`imposter::journal`) | `RwLock<Vec<RecordedRequest>>` + count `AtomicU64` | none — the seam (U-4) is **withdrawn**: since D-74 (#552) the cluster registers no journal, and upstream's own per-node one serves the reads unwrapped |
-| `ProxyRecordingStore` (`recording::store`) | concrete `RecordingStore` | `ClusteredProxyStore` (owner state machine); `RedisProxyStore` |
+| `ProxyRecordingStore` (`recording::store`) | concrete `RecordingStore` | `ClusterProxyStore` alone (owner state machine — the type is spelled `Cluster`, not `Clustered`: `crates/rift-cluster/src/stores/proxy.rs`). `RedisProxyStore` was never written — **D-12** again; clustered `proxyOnce` arbitrates on the ring (**D-40**, **D-66**) |
 | `ImposterEventListener` + `apply_config` + `move_stub` + `stub_key` (`imposter::manager`, `imposter`) | `reload()` for sync purposes | config publisher + reconciler |
 | Embeddable server pieces (`rift-http-proxy`): bootstrap builder, metrics server, gateway dispatch | bin-private `main.rs` | `rift-cluster-server` composition |
 | `ResponseDecorator` + `BackendUnavailable` (`extensions::decorate`) | — (new) | stamps `Rift-Cluster-*` headers/warnings |
@@ -1319,8 +1319,9 @@ in the trait's own module; `Local` remains the default so OSS behavior is unchan
 > that no longer exists — everything is Apache-2.0 and nothing is withheld
 > ([`docs/architecture/11-upstream-boundary.md`](../architecture/11-upstream-boundary.md), note of
 > 2026-08-04). Two of its specifics were also never built: there is **no Redis implementation of
-> any new trait** in `rift-cluster` (sequencing is owner-routed over `redb` — D-47 superseded
-> D-12), and "cluster-merged verification" was removed by **D-74**. The technical boundary — which
+> any new trait** in `rift-cluster` (sequencing is owner-routed on the HRW ring, with in-memory
+> cursors that are neither replicated nor persisted — D-47 superseded D-12), and "cluster-merged
+> verification" was removed by **D-74**. The technical boundary — which
 > code is upstream's and which is the cluster's — is the half that survives, and chapter 11 states
 > it.
 
@@ -1448,7 +1449,8 @@ Single-node/OSS users are unaffected: without `--cluster`, `rift-cluster-server`
 > **Retired by D-71** (RFC-007 §3.2, #554). Phases 0–2 shipped and their exit criteria are the
 > tests that still run. The rest did not happen as written: **Phase 3** (the fleet-wide journal)
 > was built and then removed by **D-74**; **Phase 4** (a Redis-backed sequencer) was superseded by
-> **D-47**, which shipped owner-routed sequencing over `redb`; **Phase 5**'s `RedisProxyStore` was
+> **D-47**, which shipped owner-routed sequencing on the HRW ring with in-memory cursors —
+> unreplicated, unpersisted, and reset by a handoff; **Phase 5**'s `RedisProxyStore` was
 > never written, and clustered proxyOnce ships on the ring (**D-40**, **D-66**); the
 > `--cluster-features` flag named below does not exist and never did. `/_cluster/ring` and
 > `/_cluster/kv`, listed under Phase 2, are not served —

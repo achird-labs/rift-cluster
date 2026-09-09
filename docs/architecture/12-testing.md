@@ -11,10 +11,11 @@ the single-node experience sacred.
 `tests/cluster-chaos/` (issue #11; its `README.md` is the harness's own
 guide): the shipped `deploy/compose/docker-compose.yml` itself, stacked with
 nine overlays (`tests/cluster-chaos/compose/*.overlay.yml`) — `toxiproxy`
-between nodes, a router listener, flow state, config catch-up on a miss, a
-squatted bind, a disabled write barrier, sequencing, a forced snapshot install,
-a proxy origin — driven by a Rust integration binary (`tests/scenarios.rs`)
-with a scenario DSL:
+between nodes *and* an Envoy front round-robining the three admin APIs behind an
+active health check (both in `chaos.overlay.yml`), a router listener, flow
+state, config catch-up on a miss, a squatted bind, a disabled write barrier,
+sequencing, a forced snapshot install, a proxy origin — driven by a Rust
+integration binary (`tests/scenarios.rs`) with a scenario DSL:
 
 ```rust
 let c = cluster.start(3).await;
