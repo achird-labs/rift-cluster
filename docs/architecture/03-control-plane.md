@@ -194,8 +194,8 @@ genuinely dead leader is still replaced once the grace expires.
 section was never about tenancy: it is the control plane's own transport, and it belongs beside
 the RPCs it protects.*
 
-The node-to-node surface (Raft RPCs, owner-forwarded ops, replication, journal
-pulls) shares one model:
+The node-to-node surface (Raft RPCs, owner-forwarded ops, flow-state
+replication) shares one model:
 
 - **A dedicated cluster port**, explicitly configured, intended for a private
   network; binding `0.0.0.0` requires an explicit acknowledgment flag. Never

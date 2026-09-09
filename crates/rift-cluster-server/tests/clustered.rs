@@ -909,21 +909,70 @@ async fn a_departed_founder_rejoins_through_the_peers_its_log_remembers() {
 /// table, so the imposter is not duplicated and the log does not grow. Asserted in this test
 /// rather than its own so the suite does not hold a second composed server open concurrently —
 /// seventeen of them exhaust the process's file descriptors on a developer machine.
+///
+/// **The fixture's shape is the test.** Two stubs, and responses carrying several headers each,
+/// because `ImposterConfig` holds headers in a `std::collections::HashMap` and std keys every map
+/// it builds with a fresh `RandomState`. A one-stub, zero-header document serializes to the same
+/// bytes on every read no matter how the digest is computed, so it would pass over a digest that
+/// is not canonical at all — which is exactly what shipped in #564. With this fixture, a
+/// non-canonical digest re-derives a different `op_id` on the second boot, the dedup table misses,
+/// and `PutImposter` re-applies — visible below as a moved `imposter_revision`.
+///
+/// **The third boot is the other direction**, and without it a digest that is simply a *constant*
+/// passes everything above: the restart assertion is that the revision does not move, which a
+/// frozen `op_id` satisfies perfectly while making the bootstrap ignore every edit forever. So
+/// the document is rewritten and the third boot must move the revision. D-72 claims both halves —
+/// "a restart collapses in the dedup table; an *edited* document hashes differently and applies" —
+/// and only the pair pins it.
 #[tokio::test]
-async fn the_imposters_flag_bootstraps_through_the_log_and_a_restart_does_not_duplicate() {
+async fn the_imposters_flag_bootstraps_a_restart_does_not_duplicate_and_an_edit_re_applies() {
     let state = TempDir::new().expect("tempdir");
     let doc = state.path().join("mocks.json");
     let port = common::ports::reserve_port();
-    std::fs::write(
-        &doc,
+    // The document, parameterised on one header value: the smallest edit an operator can make
+    // and still mean something different by it.
+    let document = |delta: &str| {
         serde_json::json!({
             "imposters": [
-                { "port": port, "protocol": "http", "name": "from-file-source" }
+                {
+                    "port": port,
+                    "protocol": "http",
+                    "name": "from-file-source",
+                    "stubs": [
+                        {
+                            "predicates": [{ "equals": { "path": "/one" } }],
+                            "responses": [{
+                                "is": {
+                                    "statusCode": 200,
+                                    "headers": {
+                                        "x-alpha": "a",
+                                        "x-bravo": "b",
+                                        "x-charlie": "c",
+                                        "x-delta": delta
+                                    }
+                                }
+                            }]
+                        },
+                        {
+                            "predicates": [{ "equals": { "path": "/two" } }],
+                            "responses": [{
+                                "is": {
+                                    "statusCode": 201,
+                                    "headers": {
+                                        "x-echo": "e",
+                                        "x-foxtrot": "f",
+                                        "x-golf": "g"
+                                    }
+                                }
+                            }]
+                        }
+                    ]
+                }
             ]
         })
-        .to_string(),
-    )
-    .expect("write the bootstrap document");
+        .to_string()
+    };
+    std::fs::write(&doc, document("d")).expect("write the bootstrap document");
 
     let uri = format!("file:{}", doc.to_string_lossy());
     let server = compose::start(cluster_cli(
@@ -974,6 +1023,33 @@ async fn the_imposters_flag_bootstraps_through_the_log_and_a_restart_does_not_du
         "a restart on an unchanged document must not rewrite the config"
     );
     restarted.shutdown().await;
+
+    // The other direction. An operator edits the document and restarts: the digest moves, the
+    // `op_id` with it, the dedup table misses and the imposter is re-applied under a new
+    // revision. A digest that never moves — a constant, or one that ignores the part of the
+    // document that changed — leaves this assertion as the only red one in the suite.
+    std::fs::write(&doc, document("EDITED")).expect("rewrite the bootstrap document");
+    let edited = compose::start(cluster_cli(
+        &state,
+        &["--cluster-allow-solo", "--imposters", &uri],
+    ))
+    .await
+    .expect("a restart on an edited document must start");
+    let node = edited.node().expect("clustered");
+    assert_eq!(
+        node.configured_ports().expect("ports"),
+        vec![port],
+        "an edit re-applies the imposter; it does not add a second one"
+    );
+    assert_ne!(
+        node.imposter_revision(port)
+            .expect("read the imposter's revision")
+            .expect("the imposter still exists"),
+        revision_after_first_boot,
+        "an edited document must hash differently and apply — a bootstrap that dedups an edit \
+         leaves the fleet frozen on whatever the first boot happened to read"
+    );
+    edited.shutdown().await;
 }
 
 /// A URI that cannot be read fails the start. An operator who passed `--imposters` asked for
@@ -1011,9 +1087,13 @@ async fn an_unreadable_imposters_uri_fails_the_start() {
 /// first use — applied to the schemes that left with it.
 #[tokio::test]
 async fn a_retired_source_scheme_is_refused_at_startup_naming_the_issue() {
+    // `S3://` is in the list because a URI scheme is case-insensitive (RFC 3986 §3.1): the
+    // operator who capitalised it made the same mistake and must get the same explanation, not
+    // the generic "no source serves this scheme" that would send them to check their spelling.
     for uri in [
         "git+https://example.invalid/repo#main:mocks.json",
         "s3://bucket/mocks.json",
+        "S3://bucket/mocks.json",
         "registry:my-mocks",
     ] {
         let state = TempDir::new().expect("tempdir");
@@ -1032,4 +1112,120 @@ async fn a_retired_source_scheme_is_refused_at_startup_naming_the_issue() {
             "the refusal must name the removal, not just the scheme: {err}"
         );
     }
+}
+
+/// A `routes` block in a bootstrap document is **refused**, not warned about.
+///
+/// The front door's route table is its own replicated object with its own op (#131), and the
+/// bootstrap does not write it. Applying the document minus the block would leave the operator
+/// with a listener they configured and never got — the same failure `intercept` is refused for,
+/// and the reason both refusals share a message shape. A start-up warning is not a channel an
+/// operator reads before sending traffic at a front door whose table is empty.
+#[tokio::test]
+async fn a_routes_block_in_a_bootstrap_document_is_refused() {
+    let state = TempDir::new().expect("tempdir");
+    let doc = state.path().join("mocks.json");
+    let port = common::ports::reserve_port();
+    std::fs::write(
+        &doc,
+        serde_json::json!({
+            "imposters": [{ "port": port, "protocol": "http", "name": "with-routes" }],
+            // Upstream's `RouteTable` shape, so this parses and reaches the refusal rather than
+            // failing as a malformed block — the refusal, not the parser, is what is pinned.
+            "routes": {
+                "routes": [{
+                    "id": "api",
+                    "match": { "host": "api.example.com" },
+                    "target": { "port": port }
+                }]
+            }
+        })
+        .to_string(),
+    )
+    .expect("write the bootstrap document");
+
+    let uri = format!("file:{}", doc.to_string_lossy());
+    let err = match compose::start(cluster_cli(
+        &state,
+        &["--cluster-allow-solo", "--imposters", &uri],
+    ))
+    .await
+    {
+        Ok(_) => panic!("a document declaring routes must not start"),
+        Err(e) => format!("{e:#}"),
+    };
+    assert!(
+        err.contains("routes"),
+        "the refusal must name the block that could not be honoured: {err}"
+    );
+    assert!(
+        err.contains("PUT /front-door/routes"),
+        "the refusal must say where routes do belong: {err}"
+    );
+}
+
+/// A **joiner** bootstraps: the node that composes with `--imposters` here is not the founder. It
+/// starts, joins through its seed, and submits into a log it does not lead — so the imposter is
+/// asserted on the **founder's** committed set, because the claim is that the joiner's bootstrap
+/// reached the log, not that it reached the joiner's own manager.
+///
+/// **This does not pin the bounded leader wait, and it is titled not to claim it.** The founder
+/// has elected long before the joiner finishes joining, so the leaderless window this scenario
+/// was written for does not reliably occur here: deleting the `await_leader` call from
+/// `bootstrap_imposters` leaves this test green (measured, 10 runs out of 10). Making that window
+/// deterministic would mean starting a joiner against a fleet that has no leader *and* can still
+/// admit it, which is not a state this harness can hold. The primitive is pinned directly, in a
+/// unit test that can put a node in exactly that state:
+/// `rift_cluster::raft::node::tests::await_leader_times_out_with_no_leader_and_returns_once_one_exists`.
+///
+/// What is left is still worth having, and nothing else covers it: a non-founder's bootstrap
+/// submitting through a leader that is a different process.
+#[tokio::test]
+async fn a_joiner_bootstraps_its_imposters_into_the_founders_log() {
+    let founder_state = TempDir::new().expect("tempdir");
+    let joiner_state = TempDir::new().expect("tempdir");
+    let founder_bind = reserve_port();
+
+    let founder = compose::start(cluster_on(
+        &founder_state,
+        &founder_bind,
+        "127.0.0.1:0",
+        &["--cluster-allow-solo"],
+    ))
+    .await
+    .expect("founder starts");
+
+    let doc = joiner_state.path().join("mocks.json");
+    let port = common::ports::reserve_port();
+    std::fs::write(
+        &doc,
+        serde_json::json!({
+            "imposters": [{ "port": port, "protocol": "http", "name": "from-the-joiner" }]
+        })
+        .to_string(),
+    )
+    .expect("write the bootstrap document");
+    let uri = format!("file:{}", doc.to_string_lossy());
+
+    let joiner = compose::start(cluster_on(
+        &joiner_state,
+        &reserve_port(),
+        "127.0.0.1:0",
+        &["--cluster-seeds", &founder_bind, "--imposters", &uri],
+    ))
+    .await
+    .expect("a joiner with --imposters must start");
+
+    let founder_node = founder.node().expect("founder is clustered").clone();
+    wait_voter_count(&founder_node, 2, "both nodes must be voters").await;
+    assert!(
+        founder_node
+            .configured_ports()
+            .expect("ports")
+            .contains(&port),
+        "the joiner's bootstrap must reach the replicated log, not just its own manager"
+    );
+
+    joiner.shutdown().await;
+    founder.shutdown().await;
 }

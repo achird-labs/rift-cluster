@@ -3,25 +3,17 @@ import { type ReactNode, useState } from "react";
 import type { components } from "../api/schema.ts";
 import {
   useClearRequests,
-  useFleetRequests,
+  useFleetView,
   useImposter,
   useImposters,
   useRequestLog,
 } from "../app/queries.ts";
 import { toHash } from "../app/routing.ts";
-import {
-  Confirm,
-  Empty,
-  ErrorNote,
-  Ident,
-  Status,
-  type Tone,
-  Truncated,
-} from "../components/primitives.tsx";
+import { Confirm, Empty, ErrorNote, Ident, Truncated } from "../components/primitives.tsx";
 import type { MatchOutcome, OutcomeView } from "../features/requests/diagnostics.ts";
 import { describeOutcome } from "../features/requests/diagnostics.ts";
 import type { RecordedRequest } from "../features/requests/source.ts";
-import { describeCoverage, headerValues, page } from "../features/requests/source.ts";
+import { headerValues, page } from "../features/requests/source.ts";
 import {
   type FieldSelection,
   defaultSelection,
@@ -36,7 +28,7 @@ type Stub = components["schemas"]["Stub"];
 const PAGE_SIZE = 50;
 
 export function RequestLog({ port }: { port: number | null }): ReactNode {
-  if (port === null) return <MergedJournal />;
+  if (port === null) return <ImposterPicker />;
   // Keyed by port so the pager offset does not survive a switch to another imposter: React would
   // otherwise reuse `Log` at the same tree position, and an imposter with traffic would render as
   // an empty table paged past its end — the same lie the unknown/empty split exists to prevent.
@@ -48,6 +40,24 @@ function Log({ port }: { port: number }): ReactNode {
   const log = useRequestLog(port);
   const clear = useClearRequests();
   const [confirming, setConfirming] = useState(false);
+
+  /*
+   * Which node these rows came from (D-74, #552).
+   *
+   * The journal is upstream's own again and strictly per node: this screen shows what the node the
+   * browser happens to be talking to recorded, and nothing about the rest of the fleet. So the
+   * screen has to *name* that node — a table of requests with no node on it reads as the fleet's,
+   * and the operator who concludes "the call never arrived" from an empty one is the exact failure
+   * this label prevents.
+   *
+   * `useFleetView`, the same cache the fleet rail and every other screen already share, so naming
+   * the node costs no extra request: the answering node's own id is the top-level `node_id` of
+   * `GET /_fleet/members`, and `fleetView` carries it through as `nodeId`. `RecordedRequest.node`
+   * would look like the more direct source and is not one — upstream's `LocalJournal` never stamps
+   * it, so it is absent on every row a live fleet serves.
+   */
+  const fleet = useFleetView();
+  const nodeId = fleet.data?.nodeId ?? null;
 
   // Same read `ImposterDetail` drives its editor from: the body carries the stub list this screen's
   // shadow warning needs, and the `Rift-Cluster-Revision` header is the `If-Match` a save is
@@ -98,8 +108,14 @@ function Log({ port }: { port: number }): ReactNode {
     <section className="screen">
       <header className="screen-head">
         <h1>Request log</h1>
-        <p className="muted">
-          Imposter <Ident>{port}</Ident>
+        {/*
+          Port and node together, because neither alone identifies what is on screen: the journal is
+          this node's own, and the same imposter on the node beside it has a different one.
+          `NodeName` renders the unread case as its own sentence rather than blanking.
+        */}
+        <p className="scope-label" data-testid="request-scope-label">
+          Imposter <Ident>{port}</Ident> &middot; the requests recorded on{" "}
+          <NodeName id={nodeId} unread={fleet.isError} />
         </p>
         <div className="spacer" />
         <button
@@ -122,13 +138,15 @@ function Log({ port }: { port: number }): ReactNode {
           title="Clear this imposter's recorded requests?"
           body={
             <>
-              This empties the recorded requests for imposter {port} <b>fleet-wide</b> — the clear
-              commits through Raft to every node, and nothing restores these rows.
+              This empties the recorded requests for imposter {port} <b>on this node only</b> — the
+              clear is proxied to this node&rsquo;s own engine (D-74), every other node keeps what it
+              recorded, and nothing restores these rows.
             </>
           }
           confirmLabel="Clear log"
-          // Fleet-wide, through Raft, and nothing restores the rows — so the port is typed rather
-          // than the dialog merely dismissed.
+          // Nothing restores the rows, so the port is typed rather than the dialog merely dismissed.
+          // Per-node rather than fleet-wide is the *lesser* scope, but a destructive act whose reach
+          // an operator has to reason about is exactly the one to slow down.
           requireTyped={String(port)}
           busy={clear.isPending}
           onCancel={() => setConfirming(false)}
@@ -139,25 +157,6 @@ function Log({ port }: { port: number }): ReactNode {
         />
       ) : null}
 
-      {/*
-       * A permanent strip, not a dismissible banner, for exactly one fact: a merge that could not
-       * reach every node before answering. It renders only in that case — a complete merge (the
-       * ordinary case) says nothing here, because a permanent label with nothing wrong to report
-       * trains operators to stop reading it before the day it matters. See `describeCoverage`.
-       */}
-      {log.isSuccess && log.data.kind === "rows" && log.data.coverage.kind === "partial" ? (
-        <div className="scope" data-testid="request-scope-label" role="status">
-          <span className="eyebrow">Scope</span>
-          <span className="pill accent">
-            <span className="g" aria-hidden="true">
-              ◈
-            </span>
-            partial merge
-          </span>
-          <span className="coverage">{describeCoverage()}</span>
-        </div>
-      ) : null}
-
       {log.isSuccess && log.data.kind === "rows" && log.data.truncated ? (
         // The honesty bit for retention racing the poll: a reader who lost entries to eviction must
         // not read a shorter table as the mock simply having received fewer calls.
@@ -166,7 +165,7 @@ function Log({ port }: { port: number }): ReactNode {
             &#9650;
           </span>
           <div>
-            Older entries were evicted before this merge could include them. Some earlier requests
+            Older entries were evicted before this read could include them. Some earlier requests
             may be missing from what is shown below.
           </div>
         </div>
@@ -252,7 +251,7 @@ function Rows({
   if (state.kind === "unknown") {
     /*
      * The distinction the issue calls the most important on this screen. An empty table here would
-     * tell an operator their system under test never called the mock, when in fact the merge simply
+     * tell an operator their system under test never called the mock, when in fact the node simply
      * could not answer.
      */
     return (
@@ -276,18 +275,18 @@ function Rows({
     return (
       <Empty
         testId="request-log-empty"
-        title="No requests recorded for this imposter"
-        body="The merge answered. Nothing has called the imposter since its log was last cleared."
+        title="No requests recorded on this node for this imposter"
+        body="This node answered. Nothing has reached this node's copy of the imposter since its log was last cleared — another node may have served the traffic you are looking for."
       />
     );
   }
 
   /*
-   * Clamp before paging. The list this pages over can shrink between ticks — a fleet-wide clear
-   * empties it outright, and the periodic re-baseline in `useRequestLog` replaces the accumulated
-   * rows with whatever the fleet still retains, which is smaller whenever retention has evicted
-   * since. Either way an offset that was valid a tick ago can point past the end, which would
-   * render an empty table for an imposter that has traffic.
+   * Clamp before paging. The list this pages over can shrink between ticks — a clear empties it
+   * outright, and the periodic re-baseline in `useRequestLog` replaces the accumulated rows with
+   * whatever the node still retains, which is smaller whenever retention has evicted since. Either
+   * way an offset that was valid a tick ago can point past the end, which would render an empty
+   * table for an imposter that has traffic.
    */
   const clamped = Math.min(offset, Math.max(0, state.rows.length - 1));
   const start = Math.floor(clamped / PAGE_SIZE) * PAGE_SIZE;
@@ -298,22 +297,15 @@ function Rows({
   return (
     <>
       <section className="card">
-        {/*
-         * The design's journal carries NODE, STATUS and LATENCY beside these. None of the three is
-         * published: a recorded request names the client it came from, the stub that answered and
-         * when, but not which node served it, what status went back, or how long it took.
-         *
-         * Said once, here, rather than as a marker in every row. A column of fourteen identical
-         * "no endpoint" chips is noise; one sentence naming what is missing is information — and it
-         * keeps the table to the columns that actually carry a reading.
-         */}
         <div className="card-head">
           <h2>Request journal</h2>
-          <span className="muted">merge-on-read across the fleet&rsquo;s writer shards</span>
-          <div className="spacer" />
-          <span className="muted">
-            node, status and latency are not recorded per request
-          </span>
+          {/*
+            The engine's own journal, read straight through (D-74). Worth saying beside the heading
+            rather than only in the scope line above, because "journal" is the word an operator
+            arrives with from a single-process Mountebank, and it means the same thing here — one
+            process's record of what reached it.
+          */}
+          <span className="muted">this node&rsquo;s own, as the engine recorded it</span>
         </div>
         <div className="scroll-x">
           <table className="dense">
@@ -383,22 +375,6 @@ function Rows({
  * its own text.
  */
 const METHOD_TONES = new Set(["get", "post", "put", "patch", "delete", "head", "options"]);
-
-/**
- * An HTTP status code, rendered through the shared `Status` (issue #364).
- *
- * Reused rather than given its own colour on purpose: `Status` carries the meaning in a glyph and
- * a value as well as a hue, because green↔red is 5.8–7.2 ΔE apart under protanopia and
- * deuteranopia. A 2xx and a 5xx distinguished only by colour would be the one pair in this table
- * an operator most needs to tell apart, and the one they might not be able to.
- */
-function statusTone(code: number): Tone {
-  if (code >= 500) return "bad";
-  if (code >= 400) return "warn";
-  // 3xx is neither success nor failure — a redirect is the mock doing as it was told.
-  if (code >= 300) return "idle";
-  return "ok";
-}
 
 function Method({ method }: { method: string | undefined }): ReactNode {
   if (method === undefined) return <span className="method">—</span>;
@@ -800,165 +776,89 @@ function formatQuery(query: Record<string, string> | undefined): string {
   return entries.map(([name, value]) => `${name}=${value}`).join("\n");
 }
 
-/** The log is per-imposter, so with no port in the hash the screen asks which one. */
 /**
- * The fleet request journal — every imposter's recorded traffic in one table.
+ * The node this screen is reading from, named — or the reason it cannot be.
  *
- * Read, not assembled: `useFleetRequests` is one call to `GET /admin/requests` (#362), which walks
- * every imposter the fleet serves and merges them server-side. This screen renders that
- * page and states what the response itself says about it — the coverage cap, and the ordering
- * guarantee the endpoint documents.
- *
- * The ordering caveat stays even though the merge is now the server's: rows are ordered by each
- * request's own recorded timestamp, which is stamped by whichever node served it. Clock skew
- * between nodes can still transpose two entries recorded milliseconds apart, so adjacent rows from
- * different imposters are "about this order" rather than a known sequence — an operator reasoning
- * about causality between two mocks needs to know that before they do it.
+ * Three states rather than a string with a fallback, for the usual reason on this screen: "reading"
+ * and "could not be read" are different facts, and collapsing either into a blank would leave the
+ * sentence above reading "the requests recorded on ." while an operator tries to work out whose
+ * traffic they are looking at. The id itself is a raft `u64` carried as a **string** all the way
+ * from the wire (`fleetView.ts` documents why), so it is rendered verbatim and never through
+ * `Number`.
  */
-function MergedJournal(): ReactNode {
-  const imposters = useImposters();
-  const named = new Map(
-    (imposters.data?.imposters ?? []).map((imposter) => [imposter.port, imposter.name] as const),
+function NodeName({ id, unread }: { id: string | null; unread: boolean }): ReactNode {
+  if (id !== null) return <Ident>{id}</Ident>;
+  return (
+    <span className="muted">
+      {unread
+        ? // Asked and refused. The rows below are still this node's, so the table is not in doubt —
+          // only the name of the node that served them.
+          "a node this console could not name — its fleet projection did not answer"
+        : "…"}
+    </span>
   );
-  const fleet = useFleetRequests();
-  const rows = fleet.data?.rows ?? [];
-  const coverage = fleet.data?.coverage ?? null;
+}
+
+/**
+ * The log is per-imposter, so with no port in the hash the screen asks which one.
+ *
+ * A chooser rather than a fleet-wide table (D-74, #552). The merged journal that used to live here
+ * was assembled by the admin front from every node's writer shard; that subsystem is gone, and the
+ * console must not put it back — a client-side union of N per-node reads, ordered by whichever
+ * returned first, would present network timing as journal order while wearing the label of one
+ * stream. A test that wants fleet-wide verification reads each node and adds up.
+ */
+function ImposterPicker(): ReactNode {
+  const imposters = useImposters();
+  /*
+   * Filtered to the rows that have a port, because a port is the whole address of a request log:
+   * `port` is optional on the contract, and a row without one cannot be linked anywhere. Dropped
+   * rather than rendered unlinked — an entry on a "choose one" list that cannot be chosen is a dead
+   * end, and the imposter table is where an imposter with a malformed body is diagnosed.
+   */
+  const listed = (imposters.data ?? []).flatMap((imposter) =>
+    imposter.port === undefined ? [] : [{ port: imposter.port, name: imposter.name }],
+  );
 
   return (
     <section className="screen">
       <header className="screen-head">
         <h1>Request log</h1>
         <p className="scope-label">
-          Every imposter&rsquo;s recorded requests, newest first.
+          Recorded requests are per imposter, and per node — choose an imposter to read the journal
+          the node serving this console holds for it.
         </p>
       </header>
 
       {imposters.isError ? (
         <ErrorNote error={imposters.error} context="Could not read the imposter list" />
       ) : null}
-      {fleet.isError ? (
-        <ErrorNote error={fleet.error} context="Could not read the fleet request journal" />
-      ) : null}
-      {imposters.isPending || fleet.isPending ? <p className="muted">Reading…</p> : null}
+      {imposters.isPending ? <p className="muted">Reading…</p> : null}
 
-      {/*
-       * The caveat rides above the table, permanently, and is not dismissible: it qualifies every
-       * row beneath it. A note that could be closed would leave an operator reading a merge as a
-       * sequence with nothing on screen to say otherwise.
-       */}
-      <div className="banner info" data-testid="merged-journal-caveat" role="status">
-        <span className="b-glyph" aria-hidden="true">
-          &#9670;
-        </span>
-        <div>
-          <strong>Ordered by recorded timestamp, not by a fleet-wide sequence.</strong>
-          <p>
-            Rows are ordered by each request&rsquo;s own recorded timestamp, stamped by whichever
-            node served it. Clock skew between nodes can still transpose two entries recorded
-            within milliseconds of each other, so two rows from <em>different</em> imposters are in
-            about this order rather than a known one — adjacent rows are not necessarily a sequence.
-          </p>
-        </div>
-      </div>
-
-      {coverage?.capped ? (
-        <div className="banner warn" data-testid="merged-journal-partial" role="status">
-          <span className="b-glyph" aria-hidden="true">
-            &#9650;
-          </span>
-          <div>
-            <strong>This is not the whole fleet.</strong>
-            <p>
-              {/*
-                Rendered only when `coverage.capped`, and the server sets that exactly when
-                `omitted` is non-empty — so there is always at least one port to name here, and
-                no empty or zero case to branch on.
-              */}
-              {coverage.omitted.length} of {coverage.total} imposters were left out of this page —
-              ports {coverage.omitted.join(", ")}. Open an imposter&rsquo;s own log for a complete
-              answer about it.
-            </p>
-          </div>
-        </div>
-      ) : null}
-
-      {rows.length === 0 && !fleet.isPending && !fleet.isError ? (
+      {imposters.isSuccess && listed.length === 0 ? (
         <Empty
-          testId="merged-journal-empty"
-          title="No requests recorded across the fleet"
-          body="Recording is off by default for imposters created outside the console. An imposter with recording off answers normally and keeps nothing."
+          testId="request-picker-empty"
+          title="No imposters to read a log for"
+          body="This node serves no imposters, so there is no recorded traffic to show."
         />
       ) : null}
 
-      {rows.length === 0 ? null : (
-        <section className="card">
-          <div className="card-head">
-            <h2>Fleet request journal</h2>
-            <span className="muted">
-              {rows.length} across {coverage?.covered.length ?? 0} imposters
-            </span>
-            <div className="spacer" />
-            <span className="muted">node, status and latency are not recorded per request</span>
-          </div>
-          <div className="scroll-x">
-            <table className="dense wide">
-              <thead>
-                <tr>
-                  <th style={{ width: "230px" }}>Timestamp</th>
-                  <th style={{ width: "110px" }}>Node</th>
-                  <th style={{ width: "150px" }}>Port</th>
-                  <th>Request</th>
-                  <th style={{ width: "110px" }}>Status</th>
-                  <th style={{ width: "150px" }}>Stub</th>
-                  <th style={{ width: "110px" }}>Latency</th>
-                </tr>
-              </thead>
-              <tbody>
-                {rows.map((row, index) => (
-                  <tr key={`${String(row.port)}-${String(index)}`} data-testid="merged-request-row">
-                    <td className="ident">{row.request.timestamp ?? "—"}</td>
-                    {/* #364. Stamped by the writer at record time, so it is the node that actually
-                        served this request — not an inference from whichever shard the merge found
-                        it in. `—` for an entry recorded before the field shipped. */}
-                    <td className="ident" data-testid="merged-cell-node">
-                      {row.request.node ?? "—"}
-                    </td>
-                    <td className="ident">
-                      <a href={toHash({ screen: "requests", port: row.port })}>
-                        {row.port}
-                      </a>
-                      <span className="muted"> {named.get(row.port) ?? ""}</span>
-                    </td>
-                    <td className="ident">
-                      <Method method={row.request.method} /> {row.request.path ?? "—"}
-                    </td>
-                    {/* #364. Absent, not zero, for an entry whose outcome was never attached —
-                        the debug path returns early, and a request journalled before an error
-                        never reaches the attach. `0 ms` is a real reading; a blank is not. */}
-                    <td className="ident" data-testid="merged-cell-status">
-                      {row.request.status === undefined ? (
-                        "—"
-                      ) : (
-                        <Status
-                          tone={statusTone(row.request.status)}
-                          label={String(row.request.status)}
-                        />
-                      )}
-                    </td>
-                    <td className="ident">
-                      <StubCell outcome={row.request.matchOutcome} />
-                    </td>
-                    <td className="ident" data-testid="merged-cell-latency">
-                      {row.request.latencyMs === undefined
-                        ? "—"
-                        : `${String(row.request.latencyMs)} ms`}
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        </section>
+      {listed.length === 0 ? null : (
+        <ul className="plain" data-testid="request-picker">
+          {listed.map((imposter) => (
+            <li key={imposter.port}>
+              {/*
+                The **port** is the link, not the name. `name` is optional on the contract, so a
+                name-linked list drops nameless imposters out of reach entirely — the exact defect
+                #321 fixed on the imposter table, and there is no reason to reintroduce it here.
+              */}
+              <a href={toHash({ screen: "requests", port: imposter.port })}>
+                <Ident>{imposter.port}</Ident>
+              </a>{" "}
+              <span className="muted">{imposter.name ?? ""}</span>
+            </li>
+          ))}
+        </ul>
       )}
     </section>
   );

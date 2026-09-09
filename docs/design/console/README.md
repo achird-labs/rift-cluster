@@ -1,111 +1,146 @@
-# Console design prototype — RFC-006 scope A
+# Console design — five screens, one key
 
-`console-prototype.html` is a **self-contained, zero-dependency** prototype of every RFC-006 §4 screen
-whose backend has shipped or is sliced.
+The console is the browser face of the distributed core (RFC-007 §3.1, D-71). Since #553 it is
+**five screens in two groups** and a sign-in that takes the fleet's one API key:
 
-> **Amended by D-73** (RFC-007 §3.2, #550): the **Administration** screen is gone, along with the
-> tenant switcher, the identity block, the role matrix and the key-shown-once panel — tenants,
-> principals, roles, bindings and quotas were removed from the fleet. The `admin` / `adminTab` /
-> `role` query parameters below and the *Administration* section further down describe a screen
-> that no longer exists and are kept as history; the prototype HTML still renders them, because it
-> is a design artifact rather than a client. The shipped console has no permission gates at all:
-> whoever logged in holds the fleet's one credential, so every control is offered.
->
-> The **not-installed treatment** for route tables is gone too, and for a reason worth reading
-> where the treatment is described (below): with one fleet-wide table every stored route is
-> installed, so the flag would be a constant.
+| Group | Screen | What it is for | Backend |
+|---|---|---|---|
+| Mocks | **Imposters** | List, create, import, export, record; per-imposter detail and the stub editor | `GET/POST/PUT/DELETE /imposters*`, `POST /specs/compile` (stateless, D-72), stub CRUD by id, `savedProxyResponses` |
+| Mocks | **Requests** | The recorded requests of one imposter **on the node the browser reached** (D-74) | `GET/DELETE /imposters/:port/requests`, upstream's own per-node journal |
+| Mocks | **Scenarios** | Scenario states per space, a space's scoped stubs, flow-state entries; set / reset / tear down / clear | `/imposters/:port/scenarios*`, `/imposters/:port/spaces/*`, `/admin/imposters/:port/flow-state/*` |
+| Mocks | **Router** | The replicated route table, in effective order, with pre-flight validation and a tester | `GET/PUT /front-door/routes`, `DELETE /front-door/routes/:id` |
+| Fleet | **Cluster** | Members, leader, applied index, readiness, bound ports, the fleet's name — all **read-only** | `GET /_fleet/members`, `GET /_fleet/health` |
 
-| Screen | Slice | Issue |
-|---|---|---|
-| Sign in — API key exchanged for a session cookie | C2 | [#185](https://github.com/achird-labs/rift-cluster/issues/185) |
-| App shell, imposters, cluster/fleet (the tenant switcher went with D-73) | C4 | [#187](https://github.com/achird-labs/rift-cluster/issues/187) |
-| Stub editor — form ⟷ JSON, lint, 409 rebase | C5 | [#188](https://github.com/achird-labs/rift-cluster/issues/188) |
-| Request log (per-node) and front-door route editor | C6 | [#189](https://github.com/achird-labs/rift-cluster/issues/189) |
-| ~~Tenants, principals, roles~~ | ~~C7~~ | removed by D-73 (#550) |
+Sign in is `POST /session`: the API key set by `--api-key` is exchanged for the `rift_session`
+cookie and the browser keeps no copy of the key (D-73, RFC-006 §5.3). There is one credential and
+one identity, so there are no permission gates anywhere in the console — whoever signed in holds
+the fleet, and every control is offered. Every mutation carries the `X-Rift-CSRF` header the
+cookie session requires (RFC-006 §9.2).
 
-Scenarios and flow state (#149), sources (#20) and specs (#148) appear as greyed nav entries carrying
-their issue number — a visible roadmap rather than a 404, which is what §4 asks for.
+The nav model is `web/src/app/nav.ts`, and `nav.test.ts` pins the five entries, their labels and
+their two groups. There is no greyed "planned" run any more: RFC-006 §4's roadmap chips carried
+screens that were promised and unbuilt, and every screen the reduced console promises is built.
 
-Open it in any browser. No build step, no server, no network access — which is deliberate: the real
-console lives under the same constraint (RFC-006 §9.1's `default-src 'self'`, air-gapped, no CDN), so
-a prototype that needed a CDN would be prototyping something we cannot ship.
+> **Amended by D-71** (RFC-007 §3.2, #553) and **D-73** (#550): this document used to describe
+> the RFC-006 §4 screen list — Administration, Sources, Specs, a fleet-merged Requests view, the
+> route table's Hits column and not-installed treatment — through a self-contained prototype,
+> `console-prototype.html`. Those screens are gone from the fleet. The prototype is kept in this
+> directory as a **design artifact, not a client**: it still renders them, and the "state explorer"
+> notes near the end of this file say how to read it. Nothing below that names them is normative.
 
-```sh
-open docs/design/console/console-prototype.html
-```
+## Imposters
 
-## It is a state explorer, not a mockup
+The list is **this node's view of replicated state**, and the scope label says so. Reading it
+never fans out: an imposter another node has applied and this one has not would not appear, and
+the empty state distinguishes "no imposters, in this node's view" from "cannot confirm the fleet
+is empty" when the fleet rail reports a degraded read. Unknown is not zero.
 
-The violet dashed strip at the top is **prototype scaffolding, not product UI**. It exists because the
-screens' hard problems are all *states*, and states are what mockups habitually omit. Four axes, and
-the state is also readable from the query string so any combination is linkable:
+Four actions live in the header, because they act on the screen's subject, and they are listed
+here in the order the header renders them (`Imposters.tsx`, left to right, the primary last). A
+fifth, **Record**, is on the imposter detail, because it acts on one imposter:
 
-| Parameter | Values |
-|---|---|
-| `screen` | `login` · `imposters` · `stub` · `requests` · `routes` · `fleet` · `admin` |
-| `role` | `fleet-admin` · `editor` · `viewer` |
-| `fleet` | `healthy` · `degraded` (one node unreachable) · `single` |
-| `data` | `normal` · `empty` · `overflow` (200 imposters, 40+ char names) |
-| `scopeNode` | `rift-1` · `rift-2` · `rift-3` (request log only) |
-| `req` | a request id, e.g. `r-8812` (request log only) |
-| `stubCase` | `simple` · `unmodelled` · `conflict` (stub editor only) |
-| `adminTab` | `tenants` · `principals` (administration only) |
+- **Export** — a dialog, because what lands in the file (replay-ready vs as-configured, proxies
+  kept or folded) needs more than a button label. A whole-set export is byte-preserving so the
+  same fleet exports to the same file (`features/imposters/portable.ts`).
+- **Import** — this console's own export format back in: a single imposter, an
+  `{"imposters": [...]}` document or a bare list, with a pre-flight (which ports, which already
+  exist, which repeat) and a choice between *Add* (N calls, reported per item) and *Replace all*
+  (one `PUT /imposters`, behind a typed confirmation).
+- **Import from OpenAPI spec** — WireMock Cloud's Import button (#553). An OpenAPI 3.0 document,
+  chosen or pasted, JSON or YAML, plus a required port and an optional name. **Compile** sends it to
+  `POST /specs/compile?port=…&name=…`, which answers the imposter it built and the operations it
+  built it from and **stores nothing** (D-72): no record, no op, no applied-state read. The review
+  step shows the port, the stub count and every operation with its method and path template. Only
+  then does **Create imposter** send the compiled config through the ordinary create — the same
+  `POST /imposters`, idempotency key and parked-write settling as everything else — so closing the
+  dialog between the two steps leaves no trace anywhere. The compiler's refusals (an unsupported
+  version, an external `$ref`, a parse failure) are the route's `400`, shown as the sentence inside
+  the `Error` envelope; `401`/`403`/`503` are not about the document and get the console's own
+  guidance instead. An oversize document is refused here, on the file's own byte count or the
+  pasted text's, before anything is sent; the route's own `413` is still rendered as a sentence
+  should it ever arrive. `?name=` is **percent-encoded** (`encodeURIComponent`, RFC 3986 — never
+  `URLSearchParams`, whose `+` for a space the route would take literally) and the route decodes
+  it, which is what lets an imposter be called `Pet Store` or `a&b` at all. Decoding is also what
+  makes a control character reachable — `%0A` is a newline in a name that is then logged, rendered
+  and echoed back — so the route refuses U+0000–U+001F and U+007F with the same `400` as a
+  malformed escape. The dialog says in so many words that the document is compiled, not stored,
+  because that is the one fact about the flow that the form does not make obvious. Its button is
+  named for the format it takes rather than "Import OpenAPI" because *which document* is the
+  distinction a reader needs beside a button that takes this console's own export format; it buys
+  no disambiguation from that neighbour, whose name is a prefix of this one either way. Code:
+  `web/src/features/import/`.
+- **New imposter** — a three-step wizard (identity, first stub, review). The port is a form field
+  and never auto-assigned: `createImposter` requires it because an auto-assigned port cannot
+  replicate, each node would pick its own.
 
-```
-console-prototype.html?screen=requests&fleet=degraded&scopeNode=rift-3
-console-prototype.html?screen=imposters&data=empty&fleet=degraded
-console-prototype.html?screen=stub&stubCase=conflict
-console-prototype.html?screen=admin&adminTab=principals
-```
+…and on the imposter detail, not in this header:
 
-## The states worth looking at first
+- **Record** — proxy-and-record against a real upstream, review the recorded stubs, and save them
+  into the imposter. It needs an imposter to record *into*, which the list screen has not chosen
+  yet. The recording panel is `web/src/screens/RecordingPanel.tsx`.
 
-These are the ones that separate an honest operator console from a plausible-looking one:
+The **detail** carries the stubs (the form ⟷ raw-JSON editor, with lint-on-save and the
+`If-Match` 409 that names both edits and offers reapply-or-discard, never an auto-merge), this
+node's recorded requests, and settings. It has **no owner column, no flow-owner row and no ring
+panel** — see *The mockup's `OWNER` column is wrong*, below.
 
-1. **`?screen=imposters&data=empty&fleet=degraded`** — a naive console says "no imposters" here and is
-   *wrong*. An imposter configured on the node that did not answer would not appear. This prototype
-   says "cannot confirm this fleet is empty" and names the coverage.
-2. **`?screen=requests&fleet=degraded&scopeNode=rift-3`** — the scoped node is unreachable. Its log is
-   **unknown**, not empty, and the screen says so in those words.
-3. **`?screen=requests&data=empty`** — the reachable-and-genuinely-empty case, for contrast with (2).
-   Two different screens, deliberately.
-4. **`?screen=fleet&fleet=degraded`** — applied-spread renders `—`, not `0`. Unknown and zero are
-   different facts, and rendering unknown as zero is how a console launders a gap into a reassuring
-   number.
-5. **`?screen=requests&req=r-8812`** — the hostile row (see below).
-6. **`?screen=imposters&role=viewer`** — write affordances gone. UX only; the API is the boundary.
-7. **`?screen=stub&stubCase=unmodelled`** — a stub using `space`, the scenario-FSM fields and
-   `behaviors.wait`. The form **refuses to open** rather than dropping keys it cannot model, because
-   the config the user saves must be the config they wrote.
-8. **`?screen=stub&stubCase=conflict`** — the `If-Match` 409. It names both edits and offers
-   reapply-or-discard; it never auto-merges.
-9. **`?screen=routes`** — the route table in **effective order**, with the tie-break chain spelled out
-   and pre-flight validation for the three errors the server actually raises.
-10. **`?screen=admin&adminTab=principals`** then *Mint principal* — the key-shown-once panel, with no
-    reveal-later action because there is nothing to reveal.
+## Requests
 
-## Front-door routes: what the editor has to get right
+**The screen names the node it is reading from, always.** Since D-74 (#552) there is no fleet
+merge to report on: `GET /imposters/:port/requests` is upstream's own per-imposter journal,
+answered by whichever node the browser reached, and `numberOfRequests` is that node's count. So
+the table is labelled with the answering node's id — the `node_id` that `GET /_fleet/members`
+carries at its top level and that matches exactly one row of its `members` array. A request log
+with no node on it is a log the reader will take for the fleet's, and it is not.
+
+There is correspondingly **no partial-merge banner** here and no `Rift-Cluster-Partial` to render:
+since D-74 the admin front stamps that header only on the two fleet reads that genuinely fan out,
+and this one reaches exactly one node, so it can have missed none. The console asks for the header
+on exactly one read — see *Where the partial header actually lands*, below.
+
+**The console never fans out and merges client-side.** Reading all three nodes and stitching the
+answers together would be inventing a fleet journal in the browser — with no cursor that means
+anything across nodes, and no way to know what it missed. A user who wants the fleet's answer reads
+each node and says so. What the screen offers is a *scope*: pick an imposter, read this node's log
+for it, and see the node's name on the result. Paging follows upstream's own `x-rift-next-index`
+cursor; `x-rift-truncated` is rendered as what it is — rows retention evicted before the reader
+got to them — never folded into "empty".
+
+An unreachable node's log is **unknown**, not empty, and the screen says so in those words.
+
+## Scenarios
+
+The console face of the flow-state tier, which RFC-007 v1.1 keeps (D-71, *the flow-state tier
+stays*): scenario states per space, a space's scoped stubs, and flow-state entries, each with its
+mutating verbs (set a state, reset, tear a space down, clear entries). Every route is upstream's
+own and contracted in `openapi-ee.yaml`; the console adds nothing UI-only.
+
+A flow has exactly one owner on the HRW ring (D-20), and this is the surface where flows are
+enumerated — so this is where ownership would be shown if it were shown anywhere. It is not on the
+imposter.
+
+## Router
+
+The screen that edits the replicated route table (`/front-door/routes`). The feature has been
+called the "front door" since upstream issue #19; RFC-007 §6 names it for what it does, and the
+console's label and heading follow. **The API path is unchanged** — renaming a path every client
+has to follow is its own decision, to be taken once the API has stopped shrinking (#554).
+
+### What the editor has to get right
 
 The route list is ordered by `RouteTable::effective_order()`, not by authoring order — priority
 descending, then host specificity (exact → one-label wildcard → no host clause), then path-prefix
-length descending, then header-clause count, then id. That order is **independent of input order**, so
-an editor showing the order you typed would be showing something that decides nothing. Disabled routes
-are excluded from dispatch and shown with `—`.
+length descending, then header-clause count, then id. That order is **independent of input order**,
+so an editor showing the order you typed would be showing something that decides nothing. Disabled
+routes are excluded from dispatch and shown with `—`. The ordering is ported to
+`web/src/features/routes/order.ts` and tested against the upstream rules there.
 
 > **Amended by D-70** (2026-09-01, #539), then **superseded by D-71** (2026-09-06, #545): D-70
 > had the not-installed fact read from the local route-table response first and the dispatch-count
-> fan-out only as a fallback. That fan-out is gone with the Hits column (RFC-007 §3.2), so the
-> screen now has exactly one source for the fact — `installed` beside the table on `GET` and
-> `PUT /front-door/routes` (D-68, amended) — and nothing to prefer between. A body that omits the
-> flag is still unknown, never `false`.
-
-**The not-installed treatment is gone (D-73, #550).** It existed because `desired_routes` compiled
-only the default tenant's routes into the shared front door, so a non-default tenant's table was
-stored state that could never take a request, and `installed: false` beside the table on `GET` and
-`PUT /front-door/routes` was how the server said so (D-68). With one fleet-wide table every stored
-route is installed: the flag would be a constant `true`, so it is removed from the contract and the
-banner, the muted rank cells, the `not installed` tie-break text and the stored-order fallback are
-all removed from the screen.
+> fan-out only as a fallback. That fan-out is gone with the Hits column (RFC-007 §3.2), and the
+> not-installed treatment itself went with tenancy (D-73, #550): with one fleet-wide table every
+> stored route is installed, so the flag would be a constant `true` and it is removed from the
+> contract and the screen alike.
 
 The rule the treatment embodied is worth keeping in view even though its subject is gone: the
 screen keyed all of it on a *positive* `installed: false`, never on a body that merely did not say,
@@ -123,81 +158,104 @@ The editor validates before the write, mirroring `RouteTable::validate` / `Route
 
 > **Route fields are snake_case.** `Route`, `RouteMatch` and `RouteTarget`
 > (`front_door/route_table.rs`) carry no `serde(rename_all)`, so the wire is `path_prefix`,
-> `strip_prefix`, `set_host` — unlike almost everything else in this admin API. The prototype in
-> this directory still shows the camelCase spellings; it predates the correction (#189) and is kept
-> as-is because it is a design artifact, not a client. `docs/api/openapi-ee.yaml` is authoritative,
-> and it was itself wrong here until #189 — when in doubt, read the Rust struct.
+> `strip_prefix`, `set_host` — unlike almost everything else in this admin API.
+> `docs/api/openapi-ee.yaml` is authoritative; when in doubt, read the Rust struct.
 
 Pre-flight matters because the server refuses the **whole table** rather than repairing part of it —
-and because `PUT /front-door/routes` replaces everything while `DELETE /front-door/routes/:id` removes
-one. A whole-table write from a long-open editor is a lost update waiting to happen, so the editor
-loads a revision, sends it back, and on a mismatch offers refresh-and-reapply instead of overwriting.
-Deleting a single route is the safe operation and should be preferred where that is what was meant.
+and because `PUT /front-door/routes` replaces everything while `DELETE /front-door/routes/:id`
+removes one. A whole-table write from a long-open editor is a lost update waiting to happen, so the
+editor loads a revision, sends it back as `If-Match`, and on a mismatch offers refresh-and-reapply
+instead of overwriting. Deleting a single route is the safe operation and is preferred where that is
+what was meant.
 
-## ~~Administration: the two behaviours not to soften~~ — removed by D-73 (#550)
+The **route tester** beside the table walks the same total order the editor computes and applies
+the clauses the same way (`features/routes/probe.ts`). Its verdict is **this console's reading**:
+the router has no probe endpoint to ask, and the panel says so rather than leaving it implied.
 
-*History. There is no Administration screen: no tenants, no principals, no roles, no minted keys.
-The fleet has one credential, set by `--api-key`, and it is never shown by the console because the
-console never holds it — `POST /session` exchanges it for a cookie at login. The paragraphs below
-described the screen that was.*
+## Cluster
 
-**A key is shown once.** The fleet stores an argon2id hash, so there is nothing to reveal later and no
-reveal action is offered — one would teach operators to expect a feature that cannot exist.
+Members, the leader, each voter's applied index, readiness and its pending gates, the ports each
+node actually holds the socket for, and the fleet's operator-set name. All of it is read from the
+admin port's fleet projections (`/_fleet/members`, `/_fleet/health`), and all of it is **read-only**:
+the screen never writes. `PUT /admin/fleet/name` exists on the API and the console does not call it
+— the name is shown, and renaming a fleet is a CLI act.
 
-The role matrix is rendered as a matrix on purpose. `authz.rs::role_allows` is written as explicit
-per-role arms precisely so a security reviewer can read the table, and the UI should have the same
-property. Note `FleetAdmin` binds only on the fleet scope `*` — so it is never offered as an
-in-tenant role. *(`authz.rs` no longer exists.)*
+A voter that did not answer is `—` per row, from the projection's own `reachable`/`last_applied`
+fields, and the screen's degraded banner is `view.degraded` — a list of reasons `fleetView` derives
+from the two bodies, not a header. `Rift-Cluster-Partial` is not what draws anything here.
 
-## Design decisions, and why
+**No trend charts.** These are point-in-time reads. A sparkline would imply history the API does
+not have, which is RFC-006 §3 rule 2 ("nothing UI-only") applied to charts. Applied-spread renders
+`—` for a node that did not answer, not `0`: unknown and zero are different facts, and rendering
+unknown as zero is how a console launders a gap into a reassuring number.
 
-**No trend charts on the fleet screen.** `/_fleet/health` and `/_fleet/members` are point-in-time
-reads. A sparkline would imply history the API does not have, which is RFC-006 §3 rule 2 ("nothing
-UI-only") applied to charts. The single chart is magnitude-by-identity over `numberOfRequests` — a
-value the imposter body genuinely carries — and it is labelled *this node, not a fleet total*.
+**No membership or snapshot controls.** See the two *do not rebuild* sections below (D-21, D-24).
+Observing membership and changing it are different powers; the screen has the first.
 
-**The request log's scope label appears only for an incomplete merge.** #147 H landed the convergence
-RFC-006 §4 promised: the screen reads the fleet's already-merged journal rather than one node's own,
-so there is no per-node fact left to keep permanently in front of the reader, and the old
-never-collapsing strip is gone with it. What survives is the one case an operator still needs told to
-them before trusting a result — the merge's own `Rift-Cluster-Partial` header, stamped when the
-fan-out could not reach every node inside its budget — and the label renders, undismissable, exactly
-then.
+The fleet's name also sits in the top bar on every screen (#373): an operator with staging and
+production open in two tabs can otherwise tell them apart only by port, while every destructive act
+this console offers is fleet-wide.
 
-**The console never fans out and merges client-side.** That would reinvent the verification plane
-without its cursors or gap repair, producing a merged view with no way to know what it missed.
+## Where the partial header actually lands
+
+The admin front stamps `Rift-Cluster-Partial` on exactly two reads, the ones that fan out to every
+voter and can miss one: `GET /_fleet/members` and `GET /_fleet/health` (D-74; the stamp is the
+`fleet::classify` branch of `admin_front.rs`, off `FleetBody::partial`, and `decorate.rs` only
+names the header). The console asks for it on **one** of them: `/_fleet/health`, through
+`apiGetDecorated` (`web/src/app/queries.ts`). That body's `parked_intents_fleet` is a **sum across
+voters**, and the header is the only thing that can say the sum is a floor. `/_fleet/members` is
+stamped too, but the console reads it with a plain `apiGet` and ignores the header: that body
+carries its coverage per row (`reachable`, a `null` `last_applied`), so the header would tell it
+nothing its own rows do not. The per-imposter spaces listing makes the same distinction in its
+*body*, as a `partial` field, because that route has no header convention to reuse. Nothing else
+in the console reads the header at all — the request log is a single node's journal (D-74) and is
+never stamped.
+
+The flag rides into `FleetView.parkedIntentsPartial`, and where it renders is the **Imposters**
+screen: under the parked-intents tile, as *"at least this many — a node did not answer"*, beside
+the two other things that tile can be (`null` — this node could not read its own queue; a plain
+number — everything answered). That is the whole surface of the header in this console. Three
+facts, three sentences, no two of them folded together.
+
+## Rules that hold on every screen
+
+**Unknown is never rendered as empty or zero.** A degraded fleet read, an unreachable node, a body
+that omits a field — each is said in words, never folded into a reassuring default.
 
 **Status is triple-encoded** — glyph shape (● ▲ ■ ○), colour, and word. This came from measurement:
-the palette validator put green↔red at ΔE 5.8–7.2 under protanopia/deuteranopia, which no hue tweak
-fixes inside a green/amber/red convention, so shape and word carry the meaning and colour reinforces
-it. The same run caught a first-draft amber at 2.24:1 against white; light-mode amber is now `#8A5A00`
-at 5.93:1. Every status colour clears 4.5:1 on both themes.
+the palette validator put green↔red at ΔE 5.8–7.2 under protanopia/deuteranopia, which no hue
+tweak fixes inside a green/amber/red convention, so shape and word carry the meaning and colour
+reinforces it. Every status colour clears 4.5:1 on both themes.
 
-**Recorded payloads render as text, never markup.** Request `r-8812` carries a `<script>` tag in its
-path and an `onerror` attribute in its user-agent **on purpose**. This is the most
+**Recorded payloads render as text, never markup.** The request log is the most
 attacker-influenced surface in the console — whatever called the mock chose the path, headers and
-body. If that row ever executes, the escaping regressed. RFC-006 §9.1 additionally requires
-`dangerouslySetInnerHTML` banned by lint in the real implementation.
+body. RFC-006 §9.1 bans `dangerouslySetInnerHTML` by lint.
 
-**Every identifier is monospace with tabular figures** — ports, revisions, node names, op-ids, applied
-indices. These are values an operator pastes into curl. `rift-tui` is the interaction precedent
-RFC-006 §4 names deliberately, and this is where that lineage shows.
+**Every identifier is monospace with tabular figures** — ports, revisions, node names, op-ids,
+applied indices. These are values an operator pastes into curl.
 
-**Typography uses system stacks, not a webfont.** The CSP blocks font CDNs and the binary must work
-air-gapped. Deliberately not Inter.
+**Every write says what it did.** A `202` is a write still committing, polled to a terminal state;
+a write the console could not watch land is reported as *unconfirmed*, in those words, never as
+saved (`features/writes/commit.ts`). Every mutating route that declares `Idempotency-Key` gets one,
+held across an unknown outcome and rotated after a definitive answer (`features/writes/idempotency.ts`).
 
-> The shipped console no longer follows this prototype here. It self-hosts IBM Plex Sans and Plex
-> Mono from `web/src/fonts/`, which answers the same constraint a different way — the faces are in
-> the bundle and served same-origin, so `default-src 'self'` and the air gap both still hold, and
-> `bundle-offline.test.ts` proves it. The prototype keeps system stacks because it is a single file
-> meant to open from disk with nothing beside it.
+**Fonts are self-hosted, not fetched.** IBM Plex Sans and Plex Mono ship from `web/src/fonts/`,
+so `default-src 'self'` and the air gap both hold; `bundle-offline.test.ts` proves it.
 
-**Desktop only** (RFC-006 §10). The narrow-window collapse here is prototype convenience, not a
-mobile layout.
+**Desktop only** (RFC-006 §10).
+
+## The token block *is* the design system
+
+The prototype's token block was adopted wholesale into `web/src/styles.css`, along with the
+component vocabulary that hangs off it (`card`, `tile`, `pill`, `banner`, `method`, `diag`,
+`tabs`, `order-rank`, `clause`, `wizard`). **Change a token in the prototype and in `styles.css`
+together**, or the prototype resumes being a design of something we do not ship. Two things did not
+carry over, both deliberate: the `:root[data-theme]` overrides (the console ships no theme toggle;
+light is `:root`, dark comes from `prefers-color-scheme`) and the violet `--proto` scaffolding.
 
 ## The mockup's `OWNER` column is wrong — do not rebuild it
 
-The Aug-2026 mockup (`RiftCluster Console.dc.html`) draws an **`OWNER`** column on the imposter
+The Aug-2026 mockup (`RiftCluster Console.dc.html`, not checked in) draws an **`OWNER`** column on the imposter
 table, a **`FLOW OWNER`** row in the imposter detail rail, and a **`THIS PORT ON THE RING`** panel.
 The console shipped all three in #358. They encode an ownership that does not exist, and they have
 been **removed** rather than filled in. Registered as **D-20** in `docs/decisions/DECISIONS.md`.
@@ -217,12 +275,7 @@ What is actually true:
   *one* owner under `Fleet` scope.
 
 Ownership therefore belongs on the **flow-state surface**, where flows are actually enumerated —
-tracked in [#359](https://github.com/achird-labs/rift-cluster/issues/359), which was itself filed
-from the mockup's framing and has been re-specified.
-
-This section exists because the mockup is still the artifact people design from, and nothing in it
-signals that these three elements are wrong. If you are porting a screen from it, this is the one
-place that says so.
+tracked in [#359](https://github.com/achird-labs/rift-cluster/issues/359).
 
 ## The mockup's `Membership` panel is wrong — do not rebuild it
 
@@ -234,8 +287,6 @@ as **D-21** in `docs/decisions/DECISIONS.md`.
 attempts to join, or a node leaves. The console is deliberately neither an admission nor an eviction
 vector.
 
-Why the distinction matters, rather than being a matter of taste:
-
 - Admission today is initiated by the **joining node**, over the signed cluster port (`join_via` →
   `/internal/v1/cluster/join` → `admit`). What can enter the fleet is therefore bounded by what an
   operator chose to *start*.
@@ -246,106 +297,75 @@ Why the distinction matters, rather than being a matter of taste:
   The voter floor that makes departure safe (#69, #71) is enforced by the node and the leader, not
   by whoever is looking at a console.
 
-Note that the *facts* [#366](https://github.com/achird-labs/rift-cluster/issues/366) asserted were
-all correct — the machinery is internal-only, there really is no admin route, the floor really is
-enforced. It was wrong about what **should** exist, which is why a premise check that only verifies
-facts will wave this class of issue through. Treat "the console cannot do X to the fleet" as a
-question about whether it *should*, not only whether it *can*.
+The *facts* [#366](https://github.com/achird-labs/rift-cluster/issues/366) asserted were all
+correct — the machinery is internal-only, there really is no admin route, the floor really is
+enforced. It was wrong about what **should** exist. Treat "the console cannot do X to the fleet" as
+a question about whether it *should*, not only whether it *can*.
 
-The read-only fleet surface is unaffected: `/_fleet/members` and the `Members` panel continue to
+The read-only fleet surface is unaffected: `/_fleet/members` and the Members panel continue to
 show membership, because observing it and changing it are different powers.
 
 ## The mockup's `Snapshots` panel is wrong — do not rebuild it
 
 Same ruling, same reason. **Trigger snapshot** and **Compact log** have been **removed** rather than
-implemented. Snapshotting and log compaction are the cluster's own business, and an operator button
-for them is not an operator's to press — not even a fleet admin's. Registered as **D-24** in
-`docs/decisions/DECISIONS.md`.
+implemented. Snapshotting and log compaction are the cluster's own business. Registered as **D-24**
+in `docs/decisions/DECISIONS.md`.
 
-Unlike the Membership panel, this one was not merely unwise: it was **redundant**. The fleet already
-does both, unprompted. `RaftNode::raft_config` (`crates/rift-cluster/src/raft/node.rs`) builds
-openraft's `Config::default()` and overrides only the election and heartbeat timings, so a shipped
-node runs with:
+Unlike the Membership panel, this one was **redundant**. `RaftNode::raft_config`
+(`crates/rift-cluster/src/raft/node.rs`) builds openraft's `Config::default()` and overrides only
+the election and heartbeat timings, so a shipped node runs with `snapshot_policy =
+LogsSinceLast(5000)` and `max_in_snapshot_log_to_keep = 1000` — both automatic. The single override,
+`NodeConfig::snapshot_log_entries` behind the hidden `--cluster-snapshot-log-entries`, exists so the
+chaos tier can exercise the snapshot wire path (#183) and still means `LogsSinceLast(n)`, never a
+manual posture. Both paths are pinned by tests named in the register entry.
 
-- `snapshot_policy = LogsSinceLast(5000)` — a snapshot every 5000 entries since the last, automatic;
-- `max_in_snapshot_log_to_keep = 1000` — logs a snapshot already covers are purged automatically.
-
-The single override is `NodeConfig::snapshot_log_entries`, reachable through a **hidden** flag —
-`--cluster-snapshot-log-entries`, env `RIFT_CLUSTER_SNAPSHOT_LOG_ENTRIES` — that exists so the
-container chaos tier can exercise the snapshot wire path at all (#183). It is `hide = true`, unset
-on every shipped path, and its own doc says a fleet that sets it "is trading away log retention for
-nothing". Note that setting it does **not** reach a manual posture either: `Some(n)` means
-`LogsSinceLast(n)`, still automatic, and it additionally forces `max_in_snapshot_log_to_keep = 0`.
-Both paths are covered — `a_shipped_fleet_snapshots_and_purges_without_being_asked` for the default,
-`the_snapshot_knob_sets_the_policy_and_purges_immediately` for the override.
-
-The first of those is deliberately a *different* claim from the older
-`raft_config_default_leaves_the_snapshot_knobs_untouched`: that one says "we do not override
-openraft", which would still pass if a future openraft defaulted to `SnapshotPolicy::Never` — a mode
-that waits for a manual trigger nothing here calls, letting the log grow without bound.
-
-Worth noting so it is not re-litigated: openraft *does* expose both operations, and they *are*
-distinct (`trigger().snapshot()` and `trigger().purge_log(upto)`). The panel was buildable. It is
-declined anyway.
-
-The panel's third of the `fleet-ops` row, **`Durability & write path`**, survives — it is the only
-one of the three that asked to *read* rather than to *act*, and reading back what a node is
-configured to do changes nothing. Tracked as
-[#394](https://github.com/achird-labs/rift-cluster/issues/394).
+openraft *does* expose both operations (`trigger().snapshot()` and `trigger().purge_log(upto)`). The
+panel was buildable. It is declined anyway. The panel's third, **`Durability & write path`**,
+survives as a read and is tracked in [#394](https://github.com/achird-labs/rift-cluster/issues/394).
 
 ## The pattern across all three corrections
 
 `OWNER` (#359), `Membership` (#366) and `Snapshots` (#365) were each specified against machinery
 that was described **accurately**. Every API named exists; every constraint cited is real. A design
-review that checks whether the facts are right approves all three.
-
-The question that catches them is different, and it is worth asking of every panel in this mockup
-before porting it:
+review that checks whether the facts are right approves all three. The question that catches them:
 
 > Not "can the console do this?" but "**should** it?"
 
 A design document can be internally coherent, correct about every API it names, and still describe a
-product that should not exist.
+product that should not exist. The same question retired Administration, Sources, Specs, the
+merged Requests view and the Hits column in RFC-007.
 
-## What this prototype is not
+## The prototype, as history
 
-- Not the component architecture. It is one file of vanilla JS; the real thing is React + TanStack
-  Query with a client generated from `openapi-ee.yaml` (#184).
-- Not a data contract. Field names here are indicative; the schema in #184 is authoritative.
+`console-prototype.html` is the self-contained, zero-dependency prototype the shipped console was
+built from. It predates RFC-007 and still renders screens the fleet no longer has (Administration
+with its tenant switcher, role matrix and key-shown-once panel; Sources; the merged Requests view;
+the route table's Hits and not-installed treatment); it also still shows camelCase route fields,
+which were corrected to snake_case in #189. It is kept because it is a **state explorer**, and
+states are what mockups habitually omit. The violet strip at the top is scaffolding, and the state is
+readable from the query string:
 
-## The token block *is* the design system now
+| Parameter | Values |
+|---|---|
+| `screen` | `login` · `imposters` · `stub` · `requests` · `routes` · `fleet` · `admin` (history) |
+| `fleet` | `healthy` · `degraded` (one node unreachable) · `single` |
+| `data` | `normal` · `empty` · `overflow` (200 imposters, 40+ char names) |
+| `scopeNode` | `rift-1` · `rift-2` · `rift-3` (request log only) |
+| `req` | a request id, e.g. `r-8812` (request log only) |
+| `stubCase` | `simple` · `unmodelled` · `conflict` (stub editor only) |
+| `role`, `adminTab` | history — there are no roles and no Administration screen |
 
-This section used to say the palette was "a starting palette that has been contrast-validated, not
-a finished system". That stopped being true: nothing else was ever specified, the console shipped
-C4–C7 against an unrelated set of nine ad-hoc greys, and the two had visibly diverged — 27 tokens
-here against 9 there, sharing three names and not one value.
-
-So the token block was adopted wholesale into `web/src/styles.css`, along with the component
-vocabulary that hangs off it (`card`, `tile`, `pill`, `banner`, `method`, `diag`, `key-once`,
-`tabs`, `order-rank`, `clause`). **Change a token here and in `styles.css` together**, or this file
-resumes being a prototype of something we do not ship.
-
-Two things did not carry over, both deliberate:
-
-- The `:root[data-theme]` overrides. They exist here because the prototype has a theme toggle; the
-  console ships none, and a selector for a control that does not exist reads as a missing feature.
-  Light is `:root`, dark comes from `prefers-color-scheme`, as it does here.
-- The violet `--proto` pair and everything wearing it — the control strip and the notes footer.
-  That is prototype scaffolding, and it says so above.
-
-## Regenerating raster screenshots
-
-None are committed: headless Chrome would not produce them in the environment this was authored in
-(it launched the full browser stack and never wrote the file). If you want PNGs alongside this,
-the intended command is:
+The states still worth opening, because each separates an honest operator console from a plausible
+one: `?screen=imposters&data=empty&fleet=degraded` (cannot confirm empty),
+`?screen=requests&fleet=degraded&scopeNode=rift-3` (a node's log is unknown, not empty),
+`?screen=fleet&fleet=degraded` (`—`, not `0`), `?screen=requests&req=r-8812` (the hostile row
+that must render as text), `?screen=stub&stubCase=unmodelled` (the form refuses to open rather than
+drop keys), `?screen=stub&stubCase=conflict` (the 409 names both edits).
 
 ```sh
-"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" \
-  --headless=new --disable-gpu --user-data-dir="$(mktemp -d)" \
-  --window-size=1500,1100 --force-device-scale-factor=2 --hide-scrollbars \
-  --screenshot=shots/requests-degraded.png \
-  "file://$PWD/docs/design/console/console-prototype.html?screen=requests&fleet=degraded&scopeNode=rift-3"
+open docs/design/console/console-prototype.html
 ```
 
-The interactive file is the better artefact regardless — a screenshot of a state explorer loses the
-thing that makes it useful.
+It is not the component architecture (the real thing is React + TanStack Query with a client
+generated from `openapi-ee.yaml`) and not a data contract (the schema is authoritative). No raster
+screenshots are committed; the interactive file is the better artefact regardless.

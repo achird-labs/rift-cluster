@@ -31,7 +31,7 @@ table is where a `U-n` is defined (`scripts/design-check.py` resolves citations 
 | U-1 | rift#311 | `FlowStore::compare_and_set` (+`CasOutcome`) | atomic scenario transitions — also fixed an OSS race | merged (v0.14.0) |
 | U-2 | rift#312 | `FlowStoreProvider` | per-imposter `ClusteredFlowStore` injection | merged |
 | U-3 | rift#313 | `ResponseSequencer` / `SequenceKey` | owner/Redis sequencing (Phase 4, D-12) | merged |
-| U-4 | rift#314 | `RequestJournal` (+ cursor reads rift#603) | sharded CRDT journal, vector cursors (Ch.7) | merged |
+| U-4 | rift#314 | `RequestJournal` (+ cursor reads rift#603) | no longer consumed: D-74 (#552) retired the sharded journal that implemented it, and recording is upstream's own per-node journal, read unwrapped. The trait stays upstream; the cluster registers nothing behind it | **withdrawn** |
 | U-5 | rift#315 | `ProxyRecordingStore` (claim/release) | owner claim state machine — also fixed a stuck-pending OSS bug | merged |
 | U-6 | rift#316 | `apply_config` + `ImposterEvent` + `stub_key` + `move_stub` | incremental reconcile as the Raft apply step (D-5) | merged |
 | U-7 | rift#317 | `ServerBuilder` / `run_metrics_server` / `dispatch_to_port` (+ `handle_imposter_request`, re-exported for #344) | `rift-cluster-server` composes instead of forking `main` (D-11) | merged |
@@ -40,19 +40,20 @@ table is where a `U-n` is defined (`scripts/design-check.py` resolves citations 
 | U-10 | rift#855 | `EventContext` on `ImposterEventListener` (principal-on-events) | event attribution; upstream surface, unused by the cluster since D-73 (#550) left it one identity | merged |
 | U-11 | — | `front_door::{RouteTable, bind_front_door, RouteObserver}` (route table + listener) | single-port content routing (#19, Chapter 13); the admin CRUD is a replicated control-plane object here (#131) | merged |
 | U-12 | — | `ImposterSource` provider trait, `SourceRegistry`, `parse_remote_document`; `FileSource`/`HttpSource` built-ins | the one-shot `--imposters <uri>` bootstrap resolves each URI through this registry at startup and submits the parsed documents as ordinary `PutImposter` ops (D-71, #549); the cluster registers no provider of its own | merged |
-| U-13 | rift#966/#967 | `ExchangeInspector` / `ExchangeInspectorProvider` (`extensions::exchange_inspector`) | request-side hook after journaling and before matching; response-side hook in the shared funnel — spec traffic validation (RFC-004 §6); re-exported by #281 | merged |
+| U-13 | rift#966/#967 | `ExchangeInspector` / `ExchangeInspectorProvider` (`extensions::exchange_inspector`) | request-side hook after journaling and before matching; response-side hook in the shared funnel — built for spec traffic validation (RFC-004 §6), which was never implemented; the stored-spec subsystem it would have enforced against was removed by D-72 (#549) and the re-export (#281) with it. Upstream keeps the seam | **withdrawn** |
 | U-14 | — | `extensions::template_fn` — template-function registration | never consumed; RFC-005 was retired in full (D-71, #549) and #291 closed as out of scope | **withdrawn** |
 | U-15 | — | `extensions::state_ops` — declarative state operations | `_rift.stateOps` (RFC-005 §3.7, §6.1); landed by #418 | merged |
-| U-16 | rift#910/#911 | `ProxyRecordingStore` claim semantics revised for fleet-wide exactly-once (`StubPublication`, `publishes_stubs()`) | clustered `proxyOnce` (#226, Chapter 7) | merged |
-| U-17 | rift#990 | `ProxyStoreError::Refused(BackendUnavailable)` (+ `#[non_exhaustive]`) and the proxy-leg 503 door — a store that *arbitrates* exactly-once can refuse a claim instead of being degraded around | clustered `proxyOnce` fails closed at the client (#529, D-66) | merged |
+| U-16 | rift#910/#911 | `ProxyRecordingStore` claim semantics revised for fleet-wide exactly-once (`StubPublication`, `publishes_stubs()`) | clustered `proxyOnce` (#226, Chapter 6) | merged |
+| U-17 | rift#990 | `ProxyStoreError::Refused(BackendUnavailable)` (+ `#[non_exhaustive]`) and the proxy-leg 503 door — a store that *arbitrates* exactly-once can refuse a claim instead of being degraded around | clustered `proxyOnce` fails closed at the client (#529, D-66; Chapter 6) | merged |
 | U-18 | rift#1012 | `admin_api::not_a_stub_reason` — the space-stub shape guard's *decision* (#336), separated from its rendering | the clustered front terminates `POST .../spaces/{flowId}/stubs` as a replicated write and applies the same rule, rather than keeping a second copy of `STUB_FIELD_NAMES` that would go stale (#537, D-69) | merged |
 
 The pattern in U-8 deserves a sentence: cluster backends *annotate* the
 request task-locally ("degraded: kv-adopt", "revision: 421"), and a
 cluster decorator translates annotations into response headers. The OSS
 handlers never learn cluster vocabulary — which is what keeps the seams
-honestly generic and upstreamable. U-13 is the first seam that can act on an
-in-flight exchange rather than only observe or decorate it. Every seam follows
+honestly generic and upstreamable. U-13 was the first seam that could act on an
+in-flight exchange rather than only observe or decorate it; the cluster no
+longer consumes it, but the seam stays upstream for whoever does. Every seam follows
 the same rules — generic names, `Local`/default-off behavior, independently
 justifiable to an OSS maintainer.
 
@@ -152,9 +153,10 @@ where code *belongs*, not about what is withheld.
 
 Everything in `rift-cluster` and `rift-cluster-server`: the Raft control plane and
 its storage, the ownership ring and fencing, HMAC RPC, the flow-state durable
-tier, the sharded journal and vector cursors, the proxyOnce owner machine,
+tier, the proxyOnce owner machine,
 the admin front and its one-key gate, `/_cluster/*`, the chaos harness and k8s
-manifests. The
+manifests. Recorded requests are **not** in that list: since D-74 (#552) the journal is upstream's
+own, per node, consumed as it ships. The
 Redis-strict backends of D-12 are demand-gated and none is built: the cluster
 crates contain no Redis implementation of any seam — the durable tier is redb
 (D-16), and the only Redis `FlowStore` anywhere is upstream's own (D-6).
@@ -165,7 +167,6 @@ Redis in days, and the existing OSS Redis flow store already covers
 multi-instance scenario state for teams that accept a Redis dependency. What
 is genuinely hard to reproduce is the *system*: zero-dependency
 self-clustering with a durable, linearizable control plane; correctness under
-partition with an honest, tested degradation contract; cluster-merged
-verification; fleet operations. That is a product, not a patch — and pricing
+partition with an honest, tested degradation contract; fleet operations. That is a product, not a patch — and pricing
 follows the product, with the core single node remaining genuinely excellent so
 the funnel stays honest.

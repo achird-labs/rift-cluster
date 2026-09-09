@@ -45,8 +45,8 @@ export function Fleet(): ReactNode {
         <h1>Cluster &amp; fleet</h1>
         <p className="scope-label" data-testid="fleet-scope-label">
           {/* `/_fleet/*` is one node answering about itself. Presenting it as the fleet's own state
-              would be the UI equivalent of a vacuous test — and there is no fleet-wide read to
-              replace it with until the verification plane's merged journal lands (#147). */}
+              would be the UI equivalent of a vacuous test, and there is no fleet-wide read to
+              replace it with. */}
           This node&rsquo;s view of the fleet, read from this node only. Not a fleet-wide
           aggregate; another node may see a different membership.
         </p>

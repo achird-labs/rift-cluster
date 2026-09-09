@@ -58,18 +58,42 @@ export type RequestOptions = {
 };
 
 /**
- * A body the caller has already serialized, sent verbatim.
+ * A body the caller has already serialized, sent verbatim under the media type it names.
+ *
+ * Exists for the one route whose body is not JSON the console assembled: `POST /specs/compile`
+ * takes an OpenAPI document as the operator wrote it — JSON or YAML — and the server sniffs the
+ * bytes rather than trusting the header, so the media type here is declarative. It is still sent
+ * truthfully: a YAML body labelled `application/json` would be a lie a proxy or a log reader has
+ * no way to see through.
+ */
+export class RawBody {
+  readonly text: string;
+  readonly contentType: string;
+
+  constructor(text: string, contentType: string) {
+    this.text = text;
+    this.contentType = contentType;
+  }
+}
+
+/**
+ * A JSON body the caller has already serialized, sent verbatim.
  *
  * The raw-JSON stub editor saves the operator's own text. Handing that text to `JSON.stringify` as
  * a string would send a JSON *string*; parsing and re-stringifying it would reorder keys and drop
  * their whitespace, producing a stored stub that differs from what they typed in ways they never
  * asked for. This is the only way to say "these exact bytes are the body".
+ *
+ * Branded, because TypeScript's classes are structural: without a member of its own this type is
+ * identical to `RawBody`, and a `new RawBody(yaml, "application/yaml")` would satisfy every
+ * parameter declared `RawJsonBody` — the stub routes, whose bodies must be JSON. The brand is a
+ * compile-time fact only; nothing reads it.
  */
-export class RawJsonBody {
-  readonly text: string;
+export class RawJsonBody extends RawBody {
+  private declare readonly brand: "RawJsonBody";
 
   constructor(text: string) {
-    this.text = text;
+    super(text, "application/json");
   }
 }
 
@@ -148,7 +172,7 @@ async function request(
     headers[CSRF_HEADER] = "1";
   }
   if (body !== undefined) {
-    headers["Content-Type"] = "application/json";
+    headers["Content-Type"] = body instanceof RawBody ? body.contentType : "application/json";
   }
   const ifMatch = options?.ifMatch;
   if (ifMatch !== undefined && ifMatch !== null && ifMatch !== "") {
@@ -169,7 +193,7 @@ async function request(
     credentials: "same-origin",
     ...(body === undefined
       ? {}
-      : { body: body instanceof RawJsonBody ? body.text : JSON.stringify(body) }),
+      : { body: body instanceof RawBody ? body.text : JSON.stringify(body) }),
   });
 
   const text = await response.text();
@@ -260,50 +284,60 @@ export async function apiGetWithRevision<T = unknown>(
 }
 
 /**
- * The three headers a merge-on-read fan-out stamps on a fleet journal read (#147 D/H, #225):
- * `admin_front.rs::terminate_read_saved_requests` and `decorate.rs`'s `HEADER_*` constants are the
- * source of truth for the names and the additive-only convention documented on `MergedRead`.
+ * The three response headers a read can carry facts on, from **two different sources** since D-74
+ * (#552).
+ *
+ * `Rift-Cluster-Partial` is the cluster's own, stamped on exactly two reads — `/_fleet/members`
+ * and `/_fleet/health`. (The spaces listing fans out too but keeps reporting its own
+ * incompleteness in the body, as `partial` beside `unavailable`.) The other two are **upstream's**,
+ * emitted by the embedded engine on its own journal reads and carrying its own scalar index; the
+ * cluster proxies them verbatim and never parses them.
+ *
+ * They share a type because they share a mechanism — a fact the body cannot carry, read off the
+ * response — not because any one read carries all three. A journal read is never partial (it fans
+ * out to nobody), and a fleet fan-out offers no cursor.
  */
 export const PARTIAL_HEADER = "Rift-Cluster-Partial";
 export const NEXT_INDEX_HEADER = "x-rift-next-index";
 export const TRUNCATED_HEADER = "x-rift-truncated";
 
-/** A read of a fleet-wide merge, plus the three facts only the response headers carry. */
-export type MergedRead<T> = {
+/** A read's body plus whichever of the three header-only facts came with it. */
+export type DecoratedRead<T> = {
   data: T;
   /**
    * From `Rift-Cluster-Partial`. The header is additive-only — stamped `true` or not stamped at
    * all, never `false` — because upstream's own clients already test against that shape, so
-   * presence is the whole signal: a merge that reached every node in its budget carries no header.
+   * presence is the whole signal: a fan-out that reached every node in its budget carries no header.
    */
   partial: boolean;
   /**
-   * From `x-rift-next-index`, the opaque vector token for the next `?since=` poll, verbatim.
-   * `null` when the response carried none — a real answer meaning "no cursor offered", never a
-   * fabricated default a caller could mistake for "resume from the start".
+   * From `x-rift-next-index`, upstream's own token for the next `?since=` poll, verbatim. `null`
+   * when the response carried none — a real answer meaning "no cursor offered", never a fabricated
+   * default a caller could mistake for "resume from the start".
    */
   next: string | null;
   /**
    * From `x-rift-truncated`, additive-only like `partial`: retention evicted entries the reader's
-   * cursor had not reached yet, so the merge this response describes is missing rows a slower poll
+   * cursor had not reached yet, so the answer this response describes is missing rows a faster poll
    * would have caught in time.
    */
   truncated: boolean;
 };
 
 /**
- * `apiGet`, plus the three merge-only facts a fleet-wide journal read stamps as headers rather than
- * folding into the body — the body stays the same bare `RecordedRequest[]` a single node always
- * served, so an older client (or a proxy that strips unknown headers) still gets a readable answer,
- * just without the coverage and paging information this type exists to carry.
+ * `apiGet`, plus the facts a read stamps as headers rather than folding into the body — the body
+ * stays exactly what upstream's own client would receive, so an older client (or a proxy that
+ * strips unknown headers) still gets a readable answer, just without the paging and coverage
+ * information this type exists to carry.
  *
  * Beside `apiGetWithRevision` rather than folded into `apiGet` for the same reason that one is: the
- * one caller that needs merge facts (`useRequestLog`) is not the ninety that just want a body.
+ * two callers that need a header fact (`useRequestLog`, `useFleetView`) are not the ninety that
+ * just want a body.
  */
-export async function apiGetMerged<T = unknown>(
+export async function apiGetDecorated<T = unknown>(
   path: ApiPath | (string & {}),
   options?: RequestOptions,
-): Promise<MergedRead<T>> {
+): Promise<DecoratedRead<T>> {
   const { response, body } = await request("GET", path, undefined, options);
   return {
     data: body as T,

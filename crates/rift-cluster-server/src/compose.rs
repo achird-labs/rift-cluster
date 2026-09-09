@@ -16,14 +16,13 @@ use std::time::{Duration, Instant};
 use anyhow::Context;
 use arc_swap::ArcSwap;
 use rift_cluster::stores::{
-    ClusterJournal, ClusterProxyStore, ClusteredFlowStoreProvider, ClusteredSequencer,
-    DEFAULT_ANTI_ENTROPY_INTERVAL, FlowBindConfig, FlowNet, FlowShard, JournalNet, ProxyBindConfig,
-    ProxyNet, SequencingRegistry, ShardConfig, flow_routes, journal_routes, proxy_routes,
-    seq_routes, spawn_anti_entropy,
+    ClusterProxyStore, ClusteredFlowStoreProvider, ClusteredSequencer, FlowBindConfig, FlowNet,
+    FlowShard, ProxyBindConfig, ProxyNet, SequencingRegistry, ShardConfig, flow_routes,
+    proxy_routes, seq_routes,
 };
 use rift_cluster::{
-    Authority, ClusterDecorator, ControlOp, ControlOutcome, ControlRequest, LeaveOutcome,
-    NodeConfig, NodeError, NodeIdentity, PullOnMissInterceptor, RaftNode, metrics,
+    Authority, ClusterDecorator, ControlOp, ControlOutcome, ControlRequest, LeaderWait,
+    LeaveOutcome, NodeConfig, NodeError, NodeIdentity, PullOnMissInterceptor, RaftNode, metrics,
 };
 use rift_cluster_base::seams::{
     CompiledRoutes, FileSource, HttpSource, ImposterConfig, ImposterManager, OutboundTls,
@@ -517,41 +516,6 @@ pub async fn start_with_runtimes(
         }
     };
     let flow_net = FlowNet::new(flow_shard);
-    // This node's writer shard of the fleet request journal (issue #222), constructed
-    // beside `flow_net` for the same reason: the manager needs it now, and the node whose
-    // membership sizes its shard cap does not exist yet.
-    //
-    // The node *id* is passed now rather than bound later, because the manager begins
-    // serving during node startup — catch-up replay drives imposters before
-    // `start_with_front_door_routes` returns. An entry recorded in that window must
-    // already carry this writer's real id: `(node_id, seq, clear_gen)` is the key #223
-    // merges on, and a placeholder there is wrong data, not a late label.
-    // Built with the state directory, not bare: the shard's seq counter is the one piece
-    // of journal state that must outlive a crash (issue #351). Entries stay volatile --
-    // that is Ch.7's decision and is unchanged -- but `node_id` is stable across restarts,
-    // so a counter restarting at 0 would re-issue `(node_id, seq)` keys the fleet still
-    // holds in its replica caches and still addresses with live cursors.
-    let request_journal = match ClusterJournal::with_state_dir(identity.node_id(), &state_dir) {
-        Ok(journal) => journal,
-        Err(e) => {
-            // Shutdown-then-return, not `?`: `ProbeListener` has no `Drop`, and dropping
-            // its `JoinHandle` does not abort the task -- only `shutdown()` does, which is
-            // what actually releases the port. A bare `?` here would leave the probe
-            // listener bound and `/readyz` answering after the start failed. The binary
-            // would get away with it (process exit frees the port), but the test suites
-            // drive `start_with_runtimes` in-process, where the listener outlives the
-            // error. Every other fallible step in this window does the same.
-            probes.shutdown().await;
-            return Err(anyhow::Error::new(e).context(format!(
-                "reading the journal seq floors from {}",
-                state_dir.display()
-            )));
-        }
-    };
-    // The front door's half of the fleet request journal (issue #223): wraps the same
-    // `request_journal` the manager writes through, so the merge-on-read the front serves and the
-    // writer shard the manager appends to can never be two different journals under the hood.
-    let journal_net = JournalNet::new(Arc::clone(&request_journal));
 
     // The proxy-claim subsystem (#226): created before the manager for the same reason
     // `flow_net` is — the manager build takes the store handle, and the node binds in later.
@@ -569,7 +533,6 @@ pub async fn start_with_runtimes(
         accept_runtimes,
         Arc::clone(&pull_on_miss),
         Arc::clone(&flow_net),
-        Arc::clone(&request_journal),
         Arc::clone(&proxy_net),
         Arc::clone(&sequencer),
     ) {
@@ -615,30 +578,24 @@ pub async fn start_with_runtimes(
             secret: cluster.secret,
             // Seeded with the flow routes: the registry ships empty and the state
             // backends register their own endpoints (its design contract), and the
-            // operator surface layers its routes on top. `journal_routes` is folded in
-            // with `merge` rather than nested in the same chain: unlike `flow_routes`
-            // and `cluster_api::routes`, it builds its own table from scratch instead of
-            // accepting a base to extend (issue #223's network layer, #147/#152's Phase 4a,
-            // predates this composition and its own signature is frozen), so this is the
-            // seam that brings the two tables together.
+            // operator surface layers its routes on top. `proxy_routes`/`seq_routes` are
+            // folded in with `merge` rather than nested in the same chain: unlike
+            // `flow_routes` and `cluster_api::routes`, each builds its own table from
+            // scratch instead of accepting a base to extend, so this is the seam that
+            // brings the tables together.
             routes: cluster_api::routes(
                 flow_routes(Arc::clone(&flow_net)),
                 slot.clone(),
                 Arc::clone(&readiness),
             )
-            .merge(journal_routes(Arc::clone(&journal_net)))
             .merge(proxy_routes(Arc::clone(&proxy_net)))
             .merge(seq_routes(Arc::clone(&sequencer))),
             engine: Some(Arc::clone(&manager)),
             snapshot_log_entries: cli.cluster.cluster_snapshot_log_entries,
         },
         Arc::clone(&front_door_routes),
-        // Bound before `Raft::new` (issue #224), the same before-construction contract as
-        // `engine`/`front_door_routes` just above: catch-up replay during a join must push
-        // clear generations into this node's own journal too, not just live commits after
-        // `start` returns.
-        Arc::clone(&request_journal),
-        // Same contract again: the modes must be current from the first applied
+        // Same before-construction contract as `engine`/`front_door_routes` just above: the
+        // modes must be current from the first applied
         // config, including the ones a join replays, or the sequencer answers an
         // `owner`-mode imposter from local cursors until the next config change.
         Arc::clone(&sequencing),
@@ -672,24 +629,6 @@ pub async fn start_with_runtimes(
         return Err(anyhow::Error::new(e).context("starting the proxy-claim bridge"));
     }
 
-    // Attach the membership the shard cap divides by. Infallible and immediate — unlike
-    // the flow bridge there is no runtime to start, so there is nothing to unwind. Until
-    // this lands the journal sizes shards as a single voter, which over-retains rather
-    // than evicting entries an early request might still be asserted on.
-    request_journal.bind(&node);
-    // The journal net's own late-bound node slot (issue #223), same "infallible and
-    // immediate" shape as the line above — `slices_for`/`merge_read`/`fleet_counts` all
-    // work with no roster to ask until this runs, exactly as `request_journal` does before
-    // its own `bind`. The anti-entropy loop goes on the ambient runtime, like the source
-    // scheduler just above (never a bare `Runtime` of its own, #120):
-    // unlike the flow bridge, this net owns no runtime of its own to spawn it on instead.
-    journal_net.bind(&node);
-    spawn_anti_entropy(
-        &journal_net,
-        &tokio::runtime::Handle::current(),
-        DEFAULT_ANTI_ENTROPY_INTERVAL,
-    );
-
     if let Err(e) = sequencer.bind(&node, rift_cluster::BridgeConfig::default()) {
         tracing::error!(error = %e, "starting the response-sequencer bridge");
     }
@@ -715,7 +654,6 @@ pub async fn start_with_runtimes(
         Arc::clone(&manager),
         front_door_routes,
         source_registry,
-        Arc::clone(&journal_net),
         Arc::clone(&flow_net),
     )
     .await
@@ -756,7 +694,6 @@ async fn attach_data_plane(
     manager: Arc<ImposterManager>,
     front_door_routes: Arc<ArcSwap<CompiledRoutes>>,
     source_registry: SourceRegistry,
-    journal_net: Arc<JournalNet>,
     flow_net: Arc<FlowNet>,
 ) -> anyhow::Result<(
     RunningServer,
@@ -775,7 +712,6 @@ async fn attach_data_plane(
     let api_key = cli.oss.api_key.clone();
     let allow_injection = cli.oss.allow_injection;
     let scripts_dir = cli.oss.scripts_dir.clone();
-    let fleet_journal_port_cap = cli.cluster.cluster_fleet_journal_port_cap;
     cli.oss.host = "127.0.0.1".to_owned();
     cli.oss.port = 0;
     // **`cli.oss.api_key` is deliberately left in place** (#550, D-73). Before tenancy was
@@ -882,9 +818,7 @@ async fn attach_data_plane(
             barrier_timeout,
             admin_async,
             readiness: Arc::clone(readiness),
-            journal_net: Arc::clone(&journal_net),
             flow_net: Arc::clone(&flow_net),
-            fleet_journal_port_cap,
         },
         node,
     )
@@ -942,7 +876,27 @@ fn build_source_registry(no_parse: bool) -> anyhow::Result<SourceRegistry> {
 /// Schemes this build once served through the cluster's own source providers, and no longer does
 /// (#549). Named in the startup refusal so an operator upgrading across this change learns what
 /// happened instead of reading "unsupported scheme" about a URI that worked yesterday.
+///
+/// Lowercase; matched case-insensitively by [`is_retired_source_scheme`], because a URI scheme is
+/// case-insensitive per RFC 3986 §3.1 and `S3://bucket/mocks.json` is the same mistake as
+/// `s3://bucket/mocks.json` — it must get the same explanation, not the generic refusal.
 const RETIRED_SOURCE_SCHEMES: &[&str] = &["git+https", "git+file", "git+ssh", "s3", "registry"];
+
+/// Whether `scheme` names one of [`RETIRED_SOURCE_SCHEMES`], ignoring case.
+fn is_retired_source_scheme(scheme: &str) -> bool {
+    RETIRED_SOURCE_SCHEMES
+        .iter()
+        .any(|retired| retired.eq_ignore_ascii_case(scheme))
+}
+
+/// How long the `--imposters` bootstrap waits for a leader before failing the start.
+///
+/// The bootstrap runs the moment the node is composed, which on a joiner is inside the window
+/// where the fleet has not finished electing — and [`RaftNode::submit`] answers `Unavailable`
+/// there rather than retrying. Sized like [`SEED_JOIN_DEADLINE`] and for the same reason: long
+/// enough to outlast a fleet cold-starting all at once, short enough that a genuinely
+/// quorum-less fleet fails the deployment instead of hanging it.
+const BOOTSTRAP_LEADER_DEADLINE: Duration = Duration::from_secs(30);
 
 /// Read every `--imposters` URI once, at startup, and submit what it declares as ordinary
 /// `PutImposter` ops (D-72, #549).
@@ -965,18 +919,38 @@ const RETIRED_SOURCE_SCHEMES: &[&str] = &["git+https", "git+file", "git+ssh", "s
 /// that *changed* hashes differently and applies, which is the behaviour an operator editing a
 /// bootstrap file expects.
 ///
+/// **Additive, never subtractive.** An imposter dropped from the document is *not* removed from
+/// the fleet on the next boot. A one-shot import has no baseline to diff against — that is
+/// exactly what the source record used to be — so "absent from this document" is
+/// indistinguishable from "created through the admin API by someone else", and deleting on that
+/// reading would let a stale bootstrap file silently unpublish a colleague's work. Deletion is an
+/// admin action: `DELETE /imposters/{port}`.
+///
 /// **Failing the start is deliberate**, as it was before: an operator who passed `--imposters`
 /// asked for those imposters to be serving, and a node that comes up healthy without them is the
-/// silent half-configured fleet this path exists to avoid.
+/// silent half-configured fleet this path exists to avoid. The one thing that is *not* treated as
+/// a failure is a fleet that has not elected yet — see [`BOOTSTRAP_LEADER_DEADLINE`].
+///
+/// **Local refusals are reported before the fleet is consulted.** A retired URI scheme, an
+/// unreadable document, an `intercept` or `routes` block, a portless imposter and a config the
+/// admission rules reject are all decidable on this node alone, so they are decided first and the
+/// leader wait happens immediately before the first `submit`. Waiting up front instead would let
+/// a fleet that has not elected mask a plain misconfiguration: the operator would spend
+/// [`BOOTSTRAP_LEADER_DEADLINE`], be told the fleet has no quorum, fix that, and only then hear
+/// about the `S3://` URI they also passed — two deploy cycles for two errors reported one at a
+/// time, cheapest last.
 async fn bootstrap_imposters(
     node: &Arc<RaftNode>,
     registry: &SourceRegistry,
     refs: &[SourceRef],
 ) -> anyhow::Result<()> {
+    // Once, before the *first* submit — not per-URI and not per-imposter. See
+    // `await_bootstrap_leader`.
+    let mut leader_awaited = false;
     for source_ref in refs {
         let uri = source_ref.uri.as_str();
         let scheme = source_ref.scheme();
-        if RETIRED_SOURCE_SCHEMES.contains(&scheme) {
+        if is_retired_source_scheme(scheme) {
             anyhow::bail!(
                 "--imposters {uri}: the `{scheme}:` scheme was removed with tracking imposter \
                  sources (#549). Fetch the document yourself and pass it as a local file \
@@ -1005,14 +979,16 @@ async fn bootstrap_imposters(
                  honour: intercept state is per-node and is not replicated"
             );
         }
-        // Routes are their own replicated object with their own op (#131). A bootstrap does not
-        // quietly rewrite the front door's table, but the operator is told their block did
-        // nothing rather than left to wonder.
+        // Routes are their own replicated object with their own op (#131), and the bootstrap does
+        // not write them. Refused for the same reason as `intercept` rather than warned about:
+        // both leave the operator with something they configured and never got, and a warning in
+        // a start-up log is not a channel an operator reads before sending traffic at a front
+        // door whose table is empty. Same message shape on purpose.
         if fetched.routes.is_some() {
-            tracing::warn!(
-                %uri,
-                "--imposters document declares a `routes` block, which the bootstrap does not \
-                 apply; replicate routes with PUT /front-door/routes"
+            anyhow::bail!(
+                "--imposters {uri} declares a `routes` block, which the bootstrap cannot honour: \
+                 the front door's route table is its own replicated object. Remove the block and \
+                 replicate the table with PUT /front-door/routes"
             );
         }
         // One digest over the whole document's config set, so every imposter it declares is
@@ -1033,6 +1009,11 @@ async fn bootstrap_imposters(
             let request = ControlRequest {
                 op_id,
                 principal: None,
+                // Terminal last-resort fallback, the same one `RaftNode::put_imposter` takes: a
+                // clock before the Unix epoch mints 0, which only makes this op read as already
+                // old to the replicated logical clock that ages the dedup table. It weakens this
+                // op's dedup TTL and nothing else — never the config, never the response — so it
+                // is not worth a panic path on a machine whose clock is that wrong.
                 issued_at_secs: std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_secs())
@@ -1048,6 +1029,10 @@ async fn bootstrap_imposters(
                 anyhow::bail!(
                     "--imposters {uri}: imposter on port {port} is not replicable: {reason}"
                 );
+            }
+            if !leader_awaited {
+                await_bootstrap_leader(node).await?;
+                leader_awaited = true;
             }
             let response = node
                 .submit(request)
@@ -1071,17 +1056,87 @@ async fn bootstrap_imposters(
     Ok(())
 }
 
+/// Wait for a leader that can accept the bootstrap's writes, or fail the start saying which of
+/// the two "no leader" facts is true.
+///
+/// [`RaftNode::submit`] forwards to the leader and answers `Unavailable` when there is none, with
+/// no retry of its own. On a joiner composed the instant it finished joining — or on any node in
+/// a fleet cold-starting together — that is routinely a sub-second window, and without this wait
+/// the bootstrap turns it into a node that refuses to boot.
+///
+/// Called once, immediately before the first `submit`, so a document this node can refuse on its
+/// own is refused without ever paying [`BOOTSTRAP_LEADER_DEADLINE`], and a fleet that never
+/// elects still fails the start by the deadline.
+///
+/// The two failures get different sentences because they are different facts:
+/// [`LeaderWait::Timeout`] is a statement about the fleet's quorum, [`LeaderWait::ShuttingDown`]
+/// only about this process. Answering "the fleet has no quorum" to a node whose own raft core has
+/// exited would send an operator to investigate a healthy fleet.
+async fn await_bootstrap_leader(node: &Arc<RaftNode>) -> anyhow::Result<()> {
+    match node.await_leader(BOOTSTRAP_LEADER_DEADLINE).await {
+        LeaderWait::Elected => Ok(()),
+        LeaderWait::Timeout => anyhow::bail!(
+            "--imposters: no leader was reachable within {}s, so the bootstrap could not submit \
+             anything. The fleet has no quorum, or this node has not joined one",
+            BOOTSTRAP_LEADER_DEADLINE.as_secs()
+        ),
+        LeaderWait::ShuttingDown => anyhow::bail!(
+            "--imposters: this node's raft core is shutting down, so the bootstrap could not \
+             submit anything. This says nothing about the rest of the fleet"
+        ),
+    }
+}
+
 /// A stable hash of one fetched document's config set — the third component of a bootstrap
 /// `op_id`.
 ///
-/// Over the *serialized configs* rather than the raw bytes: two spellings of the same document
-/// (JSON vs YAML, reordered keys, different indentation) declare the same fleet state and must
-/// not re-submit. `ImposterConfig`'s own serialization is the canonical form both sides of that
-/// comparison already agree on.
+/// **Not over the raw document bytes.** Two spellings of the same document *read from the same
+/// URI* — reordered keys, different indentation, JSON where there was YAML — declare the same
+/// fleet state and must not re-submit, and only the parsed configs can say that. Hashing what was
+/// read would make a whitespace edit a fleet-wide replace.
+///
+/// The digest is only ever *one* of the three components, so this buys less than it might read
+/// as: [`bootstrap_op_id`] hashes the URI verbatim, so `--imposters file:mocks.json` and
+/// `--imposters file:mocks.yaml` mint different `op_id`s however equal their digests, and so does
+/// the same file mounted at a different path on another node. The URI is deliberately not
+/// normalised — two URIs are two operator intentions, and quietly deciding they are one would let
+/// a node adopt a document it was never pointed at.
+///
+/// **Canonicalised through [`serde_json::Value`], which is the load-bearing part.**
+/// `ImposterConfig` transitively holds `std::collections::HashMap`s — a stub response's
+/// `headers`, a recorded response's `headers`, the `_rift.scripts` table — and upstream's
+/// `multi_value_headers::serialize` writes them in raw map iteration order. Std's `RandomState`
+/// takes a fresh hash key for *every* map it builds, so serializing the same config twice in one
+/// process, let alone on two nodes, *may* yield different bytes as soon as a map holds two
+/// entries — with exactly two the orderings coincide about half the time, and the odds of two
+/// readings agreeing collapse from there. Hashing that directly minted a new `op_id` on most
+/// reads of most documents, and D-72's idempotence — the whole
+/// reason the `op_id` is derived rather than random — never engaged: each boot re-applied
+/// `PutImposter`, which on a live port is a delete-then-recreate replace. `Value`'s map is a
+/// `BTreeMap` (serde_json's `preserve_order` feature is off across this workspace, and
+/// [`the_document_digest_is_canonical_across_map_orderings`] fails loudly if that ever changes),
+/// so round-tripping through it sorts every key exactly once, at every level.
 fn document_digest(configs: &[ImposterConfig]) -> anyhow::Result<String> {
     use sha2::{Digest as _, Sha256};
-    let encoded = serde_json::to_vec(configs)?;
-    Ok(format!("{:x}", Sha256::digest(&encoded)))
+    Ok(format!(
+        "{:x}",
+        Sha256::digest(&canonical_document_bytes(configs)?)
+    ))
+}
+
+/// The bytes [`document_digest`] hashes: the config set serialized with every map key sorted.
+///
+/// Split out so a test can assert the ordering property directly, rather than inferring it from
+/// two hex strings that happen to match.
+///
+/// **One path here is canonical only transitively.** Upstream's `behaviors_to_array` splats a
+/// stub response's `behaviors` object into a JSON *array* of one-key objects, and `to_value` will
+/// not re-sort an array — so that sequence is stable only because upstream's source for it is a
+/// `serde_json::Map`, which is a `BTreeMap` under the same `preserve_order` setting this helper
+/// relies on. If that field ever becomes a `HashMap` upstream, sorting here will not save it and
+/// the behaviors would have to be ordered explicitly.
+fn canonical_document_bytes(configs: &[ImposterConfig]) -> anyhow::Result<Vec<u8>> {
+    Ok(serde_json::to_vec(&serde_json::to_value(configs)?)?)
 }
 
 /// The `op_id` a bootstrap imposter is submitted under: a UUIDv5 over `(uri, port, digest)`.
@@ -1287,7 +1342,6 @@ fn cluster_manager(
     accept_runtimes: Vec<tokio::runtime::Handle>,
     pull_on_miss: Arc<PullOnMissInterceptor>,
     flow_net: Arc<FlowNet>,
-    request_journal: Arc<ClusterJournal>,
     proxy_net: Arc<ProxyNet>,
     sequencer: Arc<ClusteredSequencer>,
 ) -> anyhow::Result<ImposterManager> {
@@ -1358,12 +1412,6 @@ fn cluster_manager(
         // function, which is the whole off-switch. A manager-scoped *provider*
         // over one shared `FlowNet`, rather than a per-imposter store, is D-7.
         .with_flow_store_provider(Arc::new(ClusteredFlowStoreProvider::new(flow_net)))
-        // One journal shared by every imposter on this node, keyed by port — the shard
-        // a fleet-wide verification read merges (#223). Same reasoning as the flow store:
-        // a per-imposter private journal behind a round-robin LB answers `savedRequests`
-        // with whatever fraction of the traffic happened to land here, for every imposter
-        // rather than only the ones that opted in.
-        .with_request_journal(request_journal)
         // The fleet's proxyOnce exactly-once gate (#226): every imposter on a cluster node
         // claims through the HRW owner and publishes recorded stubs via consensus, so N
         // nodes make one upstream call per `(port, signature)` instead of up to N. Same
@@ -1371,7 +1419,7 @@ fn cluster_manager(
         // function, so single-node keeps the upstream per-imposter `LocalProxyStore`
         // byte-identical.
         .with_proxy_store(Arc::new(ClusterProxyStore::new(proxy_net)))
-        // Installed for every imposter, like the flow store and the journal: the
+        // Installed for every imposter, like the flow store: the
         // *mode* is per-imposter (D-10 keeps `local` the default), but which object
         // answers is not. An imposter that never opts in gets local cursors from this
         // one just as it would from upstream's `LocalSequencer` (#466, D-47).
@@ -1631,9 +1679,159 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{
-        ComposedServer, EeCli, RECONCILE_REJOIN_FALLBACK, REJOIN_ATTEMPT_INTERVAL,
+        ComposedServer, EeCli, ImposterConfig, RECONCILE_REJOIN_FALLBACK, REJOIN_ATTEMPT_INTERVAL,
+        bootstrap_op_id, canonical_document_bytes, document_digest, is_retired_source_scheme,
         rejoin_fallback_due, start,
     };
+
+    /// One imposter with a response carrying eight headers — the shape that makes map iteration
+    /// order observable in the serialized form. See
+    /// [`the_document_digest_is_canonical_across_map_orderings`].
+    const HEADER_HEAVY_DOCUMENT: &str = r#"{
+        "port": 4545,
+        "protocol": "http",
+        "name": "header-heavy",
+        "stubs": [
+            {
+                "responses": [
+                    {
+                        "is": {
+                            "statusCode": 200,
+                            "headers": {
+                                "x-a": "1",
+                                "x-b": "2",
+                                "x-c": "3",
+                                "x-d": "4",
+                                "x-e": "5",
+                                "x-f": "6",
+                                "x-g": "7",
+                                "x-h": "8"
+                            }
+                        }
+                    }
+                ]
+            }
+        ]
+    }"#;
+
+    fn header_heavy_config() -> ImposterConfig {
+        serde_json::from_str(HEADER_HEAVY_DOCUMENT).expect("the fixture parses as an imposter")
+    }
+
+    /// [`HEADER_HEAVY_DOCUMENT`] with one header *value* changed — the smallest edit an operator
+    /// can make to a bootstrap document and still mean something different by it.
+    fn edited_header_heavy_config() -> ImposterConfig {
+        let edited = HEADER_HEAVY_DOCUMENT.replace("\"x-h\": \"8\"", "\"x-h\": \"9\"");
+        assert_ne!(
+            edited, HEADER_HEAVY_DOCUMENT,
+            "the edit must actually apply, or the test that uses it proves nothing"
+        );
+        serde_json::from_str(&edited).expect("the edited fixture parses as an imposter")
+    }
+
+    /// Pins D-72's idempotence key: the bootstrap digest is over a **canonical** rendering of the
+    /// document, not over whatever byte order `HashMap` iteration happened to produce this time.
+    ///
+    /// `ImposterConfig` holds a response's headers in a `std::collections::HashMap`, and upstream
+    /// serializes them in raw iteration order. Std takes a *fresh* `RandomState` key for every
+    /// map it builds, so the two parses below iterate their eight headers in different orders on
+    /// all but one run in `8!`. Before the canonicalisation, this assertion failed on essentially
+    /// every run — and so did the fleet: each boot re-derived a new `op_id`, the dedup table saw
+    /// an op it had never seen, and `PutImposter` re-applied, which on a live port is a
+    /// delete-then-recreate. One header would have left the same broken code looking correct,
+    /// which is why the fixture carries eight.
+    ///
+    /// The second half asserts the property rather than the symptom: the canonical bytes carry
+    /// the header keys in sorted order. That is what `serde_json::Value`'s `BTreeMap` buys, and
+    /// it is the assertion that goes red if `preserve_order` is ever switched on somewhere in the
+    /// dependency graph — at which point this helper needs an explicit recursive sort instead.
+    #[test]
+    fn the_document_digest_is_canonical_across_map_orderings() {
+        let first = [header_heavy_config()];
+        let second = [header_heavy_config()];
+        assert_eq!(
+            document_digest(&first).expect("digest"),
+            document_digest(&second).expect("digest"),
+            "two readings of one document must hash the same, or every restart mints a fresh \
+             op_id and re-applies the imposter"
+        );
+        assert_eq!(
+            bootstrap_op_id(
+                "file:mocks.json",
+                4545,
+                &document_digest(&first).expect("digest")
+            ),
+            bootstrap_op_id(
+                "file:mocks.json",
+                4545,
+                &document_digest(&second).expect("digest")
+            ),
+            "the derived op_id is the dedup key; it must survive a re-read"
+        );
+
+        let canonical =
+            String::from_utf8(canonical_document_bytes(&first).expect("canonical bytes"))
+                .expect("canonical bytes are utf-8");
+        let positions: Vec<usize> = ["x-a", "x-b", "x-c", "x-d", "x-e", "x-f", "x-g", "x-h"]
+            .iter()
+            .map(|key| {
+                canonical
+                    .find(&format!("\"{key}\""))
+                    .unwrap_or_else(|| panic!("{key} is missing from {canonical}"))
+            })
+            .collect();
+        assert!(
+            positions.windows(2).all(|pair| pair[0] < pair[1]),
+            "the canonical form must sort map keys; got them at {positions:?} in {canonical}"
+        );
+    }
+
+    /// The other direction of D-72's idempotence key, and the half that
+    /// [`the_document_digest_is_canonical_across_map_orderings`] cannot see: a document that
+    /// *changed* must hash differently and re-derive a different `op_id`, so the dedup table
+    /// misses and the edit applies.
+    ///
+    /// Both directions are needed because each alone is satisfiable by a wrong implementation. A
+    /// digest that is simply a constant passes the equality half and every restart assertion in
+    /// the suite, while silently making the bootstrap ignore every edit an operator ever makes —
+    /// a fleet frozen on whatever the first boot happened to read. This is the assertion that
+    /// goes red for it.
+    #[test]
+    fn an_edited_document_hashes_differently_and_re_derives_the_op_id() {
+        let original = [header_heavy_config()];
+        let edited = [edited_header_heavy_config()];
+        assert_ne!(
+            document_digest(&original).expect("digest"),
+            document_digest(&edited).expect("digest"),
+            "an edited document must hash differently, or the bootstrap can never apply an edit"
+        );
+        assert_ne!(
+            bootstrap_op_id(
+                "file:mocks.json",
+                4545,
+                &document_digest(&original).expect("digest")
+            ),
+            bootstrap_op_id(
+                "file:mocks.json",
+                4545,
+                &document_digest(&edited).expect("digest")
+            ),
+            "the op_id is the dedup key: an edit that keeps it collapses in the dedup table and \
+             never reaches the fleet"
+        );
+    }
+
+    /// A URI scheme is case-insensitive (RFC 3986 §3.1), so `S3://…` is the same mistake as
+    /// `s3://…` and must get the same explanation — the one naming #549 — rather than the generic
+    /// "no source serves this scheme", which would send an operator to check their spelling.
+    #[test]
+    fn a_retired_scheme_is_recognised_whatever_its_case() {
+        assert!(is_retired_source_scheme("s3"));
+        assert!(is_retired_source_scheme("S3"));
+        assert!(is_retired_source_scheme("Git+HTTPS"));
+        assert!(!is_retired_source_scheme("file"));
+        assert!(!is_retired_source_scheme("https"));
+    }
 
     /// Issue #72: the rejoin fallback's timing rule.
     ///

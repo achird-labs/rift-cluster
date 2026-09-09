@@ -104,19 +104,27 @@ one down before starting the other.
 
 ## Verifying it actually works
 
+**Prerequisites:** Docker with the Compose plugin, and `jq` — every script below
+reads `/_fleet/members` through it and refuses to start without it, rather than
+comparing against empty strings and reporting a cluster that never formed.
+
 Two scripts, because "the manifests work" is two different claims.
 
 ```sh
 deploy/compose/verify.sh          # the built-from-source variant
+deploy/compose/verify.sh --no-build   # reuse an image already in the docker store
 ```
 
 Builds the image, starts three nodes, and asserts: all three report `/readyz`
-200; the cluster has **three voters and one agreed leader** (read from `GET
-/_fleet/members` on each node's admin port — a split brain fails the check rather
-than passing as "three healthy nodes", because two nodes naming different leaders
-never agree); the admin API answers on every node; the console SPA shell is
-served on every node; and the image reports its own identity, including the
-embedded upstream Rift.
+200; **every node** sees three voters, exactly one member claiming leadership and
+three reachable members (read from `GET /_fleet/members` on each node's admin
+port — a split brain fails the check rather than passing as "three healthy
+nodes", because a second member claiming `is_leader` is counted, not read past);
+every node names the same leader id; the admin API answers on every node; the
+console SPA shell is served on every node; and the image reports its own
+identity, including the embedded upstream Rift. The identity check is skipped
+under `--no-build`, where the bytes came from somewhere this script did not
+build.
 
 ```sh
 deploy/compose/smoke.sh                   # the core smoke check (RFC-007 §5)
@@ -132,6 +140,17 @@ stopped node catches up; a stopped leader is replaced and writes keep landing; a
 node joins from a seed, serves the same imposters, and leaves the voter set when
 it goes. Every removal under epic #544 runs it before and after. `--keep` leaves
 the fleet up for hand-driving; `--attach` skips the build and teardown.
+
+Both run in CI, in `ci.yml`'s **`compose-smoke`** job: it reuses the image
+`cluster-smoke-prepare` already built (D-58), so neither script pays for a build,
+and runs `verify.sh --no-build` then `smoke.sh --no-build` behind the same
+`deploy/` path filter the chaos tier uses. It is deliberately **not** a required
+check — it stands two real fleets up and carries every container-runtime flake
+that implies — but it is what makes these two scripts something that goes red on
+the PR that broke them. They had no invoker at all between #562 and this lane,
+which is the failure mode a script has that a test does not:
+`the_compose_verification_scripts_have_a_ci_invoker` in `tests/cluster-chaos`
+now fails if the job or either invocation is removed.
 
 ```sh
 deploy/compose/verify-pulled.sh --check   # static; no daemon, no pull

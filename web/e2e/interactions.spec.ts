@@ -139,7 +139,7 @@ test.describe("the stub JSON pane, in the editor the console ships", () => {
   });
 });
 
-test.describe("front-door routes: pre-flight validation", () => {
+test.describe("router: pre-flight validation", () => {
   test("refuses a duplicate id at the point of typing", async ({ page }) => {
     await signIn(page);
     await goToScreen(page, "/routes");

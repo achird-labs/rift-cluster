@@ -11,17 +11,21 @@ export const API_PATHS = {
   fleetHealth: "/_fleet/health",
   session: "/session",
   frontDoorRoutes: "/front-door/routes",
-  /**
-   * Every imposter's recorded requests, merged server-side (#362) — replaces the console's own
-   * N-way fan-out over `requestsPath(port)`. One read, one cursor, one stated coverage.
-   */
-  fleetRequests: "/admin/requests",
+  specsCompile: "/specs/compile",
 } as const satisfies Record<string, ApiPath>;
 
 /** Path builders for the templated routes, so a port is interpolated in exactly one place. */
 export const imposterPath = (port: number): string => `/imposters/${port}`;
 export const lifecyclePath = (port: number, enabled: boolean): string =>
   `/imposters/${port}/${enabled ? "enable" : "disable"}`;
+/**
+ * One imposter's recorded requests, **on the node the browser reached** (D-74, #552).
+ *
+ * Upstream's own route, proxied verbatim to the embedded engine — there is no fleet-wide spelling
+ * of this any more, and deliberately so: the request journal belongs to the engine, once, for every
+ * deployment shape (RFC-007 §3.3). `?since=` here is upstream's **scalar** index, echoed back on
+ * `x-rift-next-index`; nothing on this side parses either.
+ */
 export const requestsPath = (port: number): string => `/imposters/${port}/requests`;
 
 /** The stub collection. `POST` here appends a stub; it takes `If-Match` like the by-id writes do. */
@@ -125,3 +129,23 @@ export const fleetOpPath = (opId: string): string =>
   `/_fleet/ops/${encodeURIComponent(opId)}`;
 export const frontDoorRoutePath = (routeId: string): string =>
   `/front-door/routes/${encodeURIComponent(routeId)}`;
+
+/**
+ * `POST /specs/compile?port=<port>[&name=<name>]` — the one-shot OpenAPI compile (D-72).
+ *
+ * `port` is always present because the route requires it: there is no stored record to infer a
+ * binding from, and a compiled imposter with no port is one the very next `POST /imposters` would
+ * refuse. `name` is left off entirely when blank — the contract reads absent and empty the same,
+ * and sending `name=` would only make a reader wonder which one was meant.
+ *
+ * `name` is **percent-encoded** with `encodeURIComponent`, which is what the route decodes
+ * (RFC 3986 — `admin_front.rs::percent_decode`). Not `URLSearchParams`: that emits
+ * `x-www-form-urlencoded`, where a space is `+`, and a server decoding by RFC 3986 would then name
+ * the imposter `Pet+Store`. `encodeURIComponent` never emits a bare `+` — a space is `%20` and a
+ * literal plus is `%2B` — so the two halves agree on every byte.
+ */
+export const compileSpecPath = (port: number, name: string): string => {
+  const trimmed = name.trim();
+  const base = `${API_PATHS.specsCompile}?port=${String(port)}`;
+  return trimmed.length > 0 ? `${base}&name=${encodeURIComponent(trimmed)}` : base;
+};

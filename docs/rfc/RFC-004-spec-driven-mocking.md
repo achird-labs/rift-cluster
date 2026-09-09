@@ -39,6 +39,13 @@ Four design commitments, each argued below:
    inspector in the imposter hot path, `None`-by-default, specified in §6
    to the U-9/U-10 standard.
 
+> **Amended by D-72** (#549, restated 2026-09-08): commitment 4 is withdrawn. Traffic
+> validation went with the stored-spec subsystem, so nothing here consumes an exchange
+> inspector, and the seam re-export landed by #281 was removed. U-13 is marked **withdrawn** in
+> `docs/architecture/11-upstream-boundary.md`; upstream keeps the seam it merged. Every U-13
+> reference remaining in this RFC — §2, §3.6, §6, §7's non-goal, §9's S5/S6 and §10's second
+> open question — is the historical argument, not a live commitment.
+
 ## 2. Why — the verified gap
 
 Checked at `5b98fef` / `v0.16.0-4-g97757f0`, not assumed:
@@ -494,8 +501,9 @@ Ch. 13).
 
 - `spec_violations`: `(port, journal_index) → {ts, mode, phase, operation,
   violations[]}` — one row per violating exchange, on the node that served
-  it. Read via the cluster-merged read pattern of Ch. 7 (violations join a
-  journal that is itself per-node and merged at read time). Retention:
+  it. The cluster-merged read pattern of Ch. 7 this once named is gone (D-74,
+  #552): the journal it would join is upstream's own, per node, so a violation
+  is read from the node that recorded it. Retention:
   `--cluster-spec-violation-retention`, default 7 d, plus a per-port row
   cap (default 10 000, mirroring `MAX_RECORDED_REQUESTS`,
   `journal.rs:19`).
@@ -563,6 +571,13 @@ ordinary terminated writes. Error shapes are the typed envelope
 
 ## 6. Upstream seams needed
 
+> **Amended by D-72** (#549, restated 2026-09-08): U-13 is **withdrawn**, which leaves this
+> section with no live seam request. The subsystem it was built to enforce against — stored
+> specs and traffic validation — no longer exists, so the cluster installs no inspector and the
+> `rift_cluster_base::seams` re-export of #281 was removed with the rest. Upstream keeps
+> `exchange_inspector`; nothing here asks for it. `docs/architecture/11-upstream-boundary.md`
+> carries the same verdict, and the sketch below stays as the record of what was specified.
+
 One new seam. Drafted to the RFC-002 §6 standard: generic naming, inert by
 default, no spec/OpenAPI vocabulary crossing the boundary, independently
 justifiable to an OSS maintainer. U-14 remains free.
@@ -580,8 +595,9 @@ justifiable to an OSS maintainer. U-14 remains free.
 > the decorated serve-loop wrapper, so every path that produces a response is
 > inspected before the decorator. The request-side hook runs after journaling
 > and before matching exactly as below; a request the hook rejects is not
-> offered to the response-side hook. Nothing consumes the seam yet: S6 (#282)
-> installs the enterprise inspector.
+> offered to the response-side hook. Nothing ever consumed the seam: S6 (#282) was to install
+> the enterprise inspector and never did, and D-72 (#549) removed both the subsystem it would
+> have enforced against and this re-export. See the section callout above.
 
 ```rust
 /// What the request-side hook sees: the already-collected request, borrowed.

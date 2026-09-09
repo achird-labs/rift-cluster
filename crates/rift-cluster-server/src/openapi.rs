@@ -290,29 +290,6 @@ mod parity {
             Terminated::SetEnabled(_, false) => {
                 RouteKey::new(&Method::POST, "/imposters/{port}/disable")
             }
-            // One spelling per representative, same as the `SetEnabled` pair above — except here
-            // the two spellings are true aliases of *one* variant (`classify` cannot tell which
-            // path a `ReadSavedRequests`/`ClearSavedRequests` came from, by design: it is one
-            // handler either way), so `contract_route` can only publish one of the two real paths.
-            // `SAVED_REQUESTS_ALIAS_ROUTES` below covers the other.
-            Terminated::ReadSavedRequests(_) => {
-                RouteKey::new(&Method::GET, "/imposters/{port}/savedRequests")
-            }
-            // Only the canonical spelling has a stream (issue #348) — upstream's `stream_target`
-            // recognises exactly this one path, so unlike the read above there is no alias half
-            // for `SAVED_REQUESTS_ALIAS_ROUTES` to cover.
-            Terminated::StreamSavedRequests(_) => {
-                RouteKey::new(&Method::GET, "/imposters/{port}/savedRequests/stream")
-            }
-            // The fleet journal (issue #362). One path each, no aliases: both are EE-only surfaces
-            // this front invented, so there is no upstream spelling to mirror.
-            Terminated::ReadFleetRequests => RouteKey::new(&Method::GET, "/admin/requests"),
-            Terminated::StreamFleetRequests => {
-                RouteKey::new(&Method::GET, "/admin/requests/stream")
-            }
-            Terminated::ClearSavedRequests(_) => {
-                RouteKey::new(&Method::DELETE, "/imposters/{port}/savedRequests")
-            }
             Terminated::ClearSavedProxyResponses(_) => {
                 RouteKey::new(&Method::DELETE, "/imposters/{port}/savedProxyResponses")
             }
@@ -356,11 +333,6 @@ mod parity {
             Terminated::DeleteStubById(4545, "s-1".to_owned()),
             Terminated::SetEnabled(4545, true),
             Terminated::SetEnabled(4545, false),
-            Terminated::ReadSavedRequests(4545),
-            Terminated::StreamSavedRequests(4545),
-            Terminated::ReadFleetRequests,
-            Terminated::StreamFleetRequests,
-            Terminated::ClearSavedRequests(4545),
             Terminated::ClearSavedProxyResponses(4545),
             Terminated::SpaceTeardown(4545, "flow-1".to_owned()),
             Terminated::AddSpaceStub(4545, "flow-1".to_owned()),
@@ -373,18 +345,6 @@ mod parity {
         ]
     }
 
-    /// The `.../requests` alias half of `ReadSavedRequests`/`ClearSavedRequests` (issue #223).
-    ///
-    /// `classify` collapses both spellings onto the same `Terminated` variant — one handler, two
-    /// paths, exactly as upstream's own `router.rs` already treats them — so `contract_route` can
-    /// publish only the `savedRequests` spelling per representative. This is the other, kept as a
-    /// declared table for the same reason [`HANDLE_DIRECT_ROUTES`] is: there is no second variant
-    /// to hang a compile-time tripwire on, because there is no second variant at all.
-    const SAVED_REQUESTS_ALIAS_ROUTES: [(&str, &str); 2] = [
-        ("GET", "/imposters/{port}/requests"),
-        ("DELETE", "/imposters/{port}/requests"),
-    ];
-
     /// Every operation this crate terminates: the write surface plus the reads `handle` answers itself.
     pub(crate) fn ee_served_routes() -> BTreeSet<RouteKey> {
         terminated_representatives()
@@ -394,14 +354,6 @@ mod parity {
                 path: (*path).to_owned(),
                 method: (*method).to_owned(),
             }))
-            .chain(
-                SAVED_REQUESTS_ALIAS_ROUTES
-                    .iter()
-                    .map(|(method, path)| RouteKey {
-                        path: (*path).to_owned(),
-                        method: (*method).to_owned(),
-                    }),
-            )
             .collect()
     }
 
@@ -425,11 +377,20 @@ mod parity {
             ("GET", "/imposters/{port}/stubs"),
             ("GET", "/imposters/{port}/stubs/{stubIndex}"),
             ("GET", "/imposters/{port}/stubs/by-id/{stubId}"),
-            // NOT `savedRequests`/`requests` (GET+DELETE): issue #223 terminates the no-`since`
-            // GET as a fleet merge-on-read and the DELETE as a transitional peer fan-out — see
-            // `ee_served_routes`'s `SAVED_REQUESTS_ALIAS_ROUTES`. `?since=` still proxies, but a
-            // `RouteKey` carries no query, so that exception lives in the contract's prose, not
-            // in a second entry here.
+            // The recorded-request surface is upstream's own again (D-74, #552): the journal is
+            // per node, so every verb on both spellings proxies to this node's engine and keeps
+            // upstream's Mountebank semantics — its own scalar `x-rift-next-index` and
+            // `x-rift-truncated` on a `?since=` read included. #223 had terminated the GET as a
+            // fleet merge-on-read and the DELETE as a peer fan-out; both are gone with the merge.
+            ("GET", "/imposters/{port}/requests"),
+            ("DELETE", "/imposters/{port}/requests"),
+            ("GET", "/imposters/{port}/savedRequests"),
+            ("DELETE", "/imposters/{port}/savedRequests"),
+            // The SSE tail is proxied too, and is listed here rather than dropped: #348 had
+            // terminated it as the merge's live sibling, so leaving it out of this table while
+            // also removing it from the contract would make both sides agree about a route the
+            // front still serves — the one shape the parity oracle cannot see.
+            ("GET", "/imposters/{port}/savedRequests/stream"),
             ("POST", "/imposters/{port}/verify"),
             // `savedProxyResponses` DELETE is gone from this table (issue #226): it terminates
             // as `ControlOp::ProxyRecordedClear` — a proxied clear could never purge the
@@ -439,10 +400,10 @@ mod parity {
             ("PUT", "/imposters/{port}/scenarios/{scenarioName}/state"),
             ("POST", "/imposters/{port}/scenarios/reset"),
             ("GET", "/imposters/{port}/spaces/{flowId}"),
-            // NOT the DELETE (issue #224): the flow-state half stays proxied, but the journal
-            // half now commits `ControlOp::JournalClearGen` alongside it, so `classify` and
-            // `contract_route` both treat the whole route as terminated —
-            // `Terminated::SpaceTeardown` in `ee_served_routes` covers it.
+            // NOT the DELETE (issue #537): the flow-state half stays proxied, but the replicated
+            // space-stub delete commits alongside it, so `classify` and `contract_route` both
+            // treat the whole route as terminated — `Terminated::SpaceTeardown` in
+            // `ee_served_routes` covers it.
             ("GET", "/imposters/{port}/spaces/{flowId}/stubs"),
             // NOT the POST (issue #537): it terminates as `ControlOp::PatchStubs` so the stub
             // replicates and survives a config reconcile, where proxied it reached one node's
@@ -498,11 +459,10 @@ mod parity {
         let Ok(method) = Method::from_bytes(method.as_bytes()) else {
             return false;
         };
-        let (path, query) = match path.split_once('?') {
-            Some((path, query)) => (path, Some(query)),
-            None => (path, None),
-        };
-        classify(&method, path, query).is_some()
+        // The query is stripped rather than passed on: `classify` no longer takes one (D-74), but
+        // a caller can still hand a concrete path with one attached.
+        let path = path.split('?').next().unwrap_or(path);
+        classify(&method, path).is_some()
     }
 }
 
@@ -902,7 +862,7 @@ mod tests {
             .unwrap_or_else(|| panic!("{path} GET has no 200 response"))
     }
 
-    /// The two journal reads answer a **bare array**, and the contract has to say so.
+    /// The two recorded-request reads answer a **bare array**, and the contract has to say so.
     ///
     /// Declaring the body as a bare `type: object` is not merely imprecise: `openapi-typescript`
     /// renders it as `Record<string, never>`, so the console gets no usable type and hand-writes
@@ -1050,10 +1010,11 @@ mod tests {
     }
 
     /// The cursor headers are the endpoint's pagination contract, and their **presence** is the
-    /// protocol: `x-rift-next-index` is absent on a degraded read, and `x-rift-truncated` appears
-    /// only when it is true, so an SDK probes for the header rather than parsing a value. That is
-    /// exactly the kind of semantics a bare mention in prose loses, so this asserts a real
-    /// component description and a reference from the response that emits it.
+    /// protocol: an SDK probes for `x-rift-next-index` to learn whether cursoring is offered at
+    /// all, and `x-rift-truncated` appears only when it is true, so a client tests for the header
+    /// rather than parsing a value. Both are upstream's own, scalar and per node since D-74, and
+    /// that is exactly the kind of semantics a bare mention in prose loses — so this asserts a
+    /// real component description and a reference from the response that emits it.
     #[test]
     fn the_journal_cursor_headers_are_declared_where_they_are_emitted() {
         let doc = parsed();
@@ -1108,7 +1069,9 @@ mod tests {
         }
     }
 
-    /// The clear side of the same two paths, which is the same defect one method over.
+    /// The clear side of the same two paths, which is the same defect one method over. Both are
+    /// proxied since D-74 — the Raft-committed clear generation is gone — so what the contract has
+    /// to get right is upstream's own parameter set and status codes.
     ///
     /// `handle_clear_requests` parses `match` — and **only** `match`, never `since`, so a clear
     /// cannot be given a cursor — then delegates to `handle_get`, which is why a successful clear

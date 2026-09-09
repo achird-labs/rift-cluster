@@ -248,6 +248,47 @@ async fn a_body_over_the_cap_is_refused_with_413() {
     server.shutdown().await;
 }
 
+/// The cap is inclusive: a body of exactly `MAX_SPEC_BYTES` compiles. Beside the `+1 → 413` case
+/// so the boundary is pinned from both sides — an off-by-one in the limit reads as either test
+/// alone passing.
+///
+/// Padded with a YAML comment rather than a bigger document, so the thing being measured is the
+/// byte bound and not the compiler's appetite for operations.
+#[tokio::test]
+async fn a_body_of_exactly_the_cap_compiles() {
+    let state = TempDir::new().expect("tempdir");
+    let server = compose::start(cluster_cli(&state))
+        .await
+        .expect("solo cluster starts");
+    wait_ready(&server).await;
+    let admin = server.admin_addr();
+    let port = common::ports::reserve_port();
+
+    let padding = rift_cluster_spec::MAX_SPEC_BYTES - PETSTORE_YAML.len() - "# \n".len();
+    let at_cap = format!("{PETSTORE_YAML}# {}\n", "x".repeat(padding));
+    assert_eq!(at_cap.len(), rift_cluster_spec::MAX_SPEC_BYTES);
+
+    let response = reqwest::Client::new()
+        .post(format!("http://{admin}/specs/compile?port={port}"))
+        .header("content-type", "application/yaml")
+        .body(at_cap)
+        .send()
+        .await
+        .expect("post a body of exactly the cap");
+    assert_eq!(
+        response.status().as_u16(),
+        200,
+        "exactly MAX_SPEC_BYTES is within the cap, not over it"
+    );
+    let compiled: serde_json::Value = response.json().await.expect("the compile answers JSON");
+    assert_eq!(
+        compiled["imposter"]["port"], port,
+        "the padded document must compile to the same imposter: {compiled}"
+    );
+
+    server.shutdown().await;
+}
+
 /// JSON and YAML are both accepted — the compiler parses one superset — and both spellings of
 /// one document produce the same *contract*: the same stub ids, predicates, statuses and headers,
 /// and the same operation index.
@@ -357,6 +398,120 @@ async fn a_compile_without_a_port_is_a_400_naming_the_missing_parameter() {
         let body = response.text().await.expect("body");
         assert!(
             body.contains("port"),
+            "the refusal must name the parameter: {body}"
+        );
+    }
+
+    server.shutdown().await;
+}
+
+/// `?name=` is percent-encoded (RFC 3986), and the imposter is named exactly what the caller
+/// typed.
+///
+/// The console builds this query with `encodeURIComponent`: a space goes out as `%20`, and `&`,
+/// `=` and `%` as `%26`, `%3D`, `%25`. Of those, only `&` *must* be escaped — the parameter split
+/// eats it — while `=` and `%` are escaped by convention; all three are checked here. The front
+/// read the value raw, so `Pet Store` named an imposter literally called `Pet%20Store` and `a&b`
+/// was truncated at the `&` by the parameter split before the name was ever read. Both are checked
+/// here against the wire, because the encoding is a property of the route and not of the console
+/// that happens to call it.
+///
+/// Two cases pin what the decoding is *not*. A `+` is a plus, not a space — RFC 3986, not
+/// `x-www-form-urlencoded` — so `C++` is a name an operator can have. And the literal `%` is the
+/// case a decoder gets wrong in the other direction: `100%25` must be `100%`, not `100%25` and
+/// not an escape that eats what follows.
+///
+/// The last block pins what decoding *opened up*: `%00` and `%0A` are bytes a raw query string
+/// could not carry, and they decode to a NUL and a newline in what is then replicated identity.
+/// They are refused with the same `400` as a malformed escape.
+#[tokio::test]
+async fn a_percent_encoded_name_reaches_the_compiled_imposter_verbatim() {
+    let state = TempDir::new().expect("tempdir");
+    let server = compose::start(cluster_cli(&state))
+        .await
+        .expect("solo cluster starts");
+    wait_ready(&server).await;
+    let admin = server.admin_addr();
+    let client = reqwest::Client::new();
+
+    // (what the query carries, what the imposter must end up called)
+    for (encoded, expected) in [
+        ("Pet%20Store", "Pet Store"),
+        ("Pet+Store", "Pet+Store"),
+        ("C%2B%2B", "C++"),
+        ("a%26b", "a&b"),
+        ("a%3Db", "a=b"),
+        ("100%25", "100%"),
+        ("caf%C3%A9", "café"),
+        ("petstore", "petstore"),
+    ] {
+        let port = common::ports::reserve_port();
+        let compiled: serde_json::Value = client
+            .post(format!(
+                "http://{admin}/specs/compile?port={port}&name={encoded}"
+            ))
+            .header("content-type", "application/yaml")
+            .body(PETSTORE_YAML)
+            .send()
+            .await
+            .expect("compile")
+            .json()
+            .await
+            .expect("the compile answers JSON");
+        assert_eq!(
+            compiled["imposter"]["name"],
+            serde_json::json!(expected),
+            "?name={encoded} must name the imposter {expected:?}, not the encoding: {compiled}"
+        );
+    }
+
+    // An escape the decoder cannot read is a 400 that names the parameter, never a name silently
+    // repaired into something the operator did not type.
+    for bad in ["%", "%2", "%zz", "%FF"] {
+        let port = common::ports::reserve_port();
+        let response = client
+            .post(format!(
+                "http://{admin}/specs/compile?port={port}&name={bad}"
+            ))
+            .header("content-type", "application/yaml")
+            .body(PETSTORE_YAML)
+            .send()
+            .await
+            .expect("compile with a malformed name");
+        assert_eq!(
+            response.status().as_u16(),
+            400,
+            "?name={bad} must be refused, not decoded to something else"
+        );
+        let body = response.text().await.expect("body");
+        assert!(
+            body.contains("name"),
+            "the refusal must name the parameter: {body}"
+        );
+    }
+
+    // Decoding made C0 controls reachable for the first time — `%00` is a NUL, `%0A` a newline,
+    // `%7F` a DEL — in a value that is replicated identity: logged, rendered, echoed in errors.
+    // Same 400, same shape, as a malformed escape; never a name carrying a line break.
+    for bad in ["Pet%00Store", "a%0Ab", "tab%09name", "del%7F"] {
+        let port = common::ports::reserve_port();
+        let response = client
+            .post(format!(
+                "http://{admin}/specs/compile?port={port}&name={bad}"
+            ))
+            .header("content-type", "application/yaml")
+            .body(PETSTORE_YAML)
+            .send()
+            .await
+            .expect("compile with a control character in the name");
+        assert_eq!(
+            response.status().as_u16(),
+            400,
+            "?name={bad} decodes to a control character and must be refused"
+        );
+        let body = response.text().await.expect("body");
+        assert!(
+            body.contains("name"),
             "the refusal must name the parameter: {body}"
         );
     }

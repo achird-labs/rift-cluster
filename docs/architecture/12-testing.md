@@ -11,7 +11,7 @@ the single-node experience sacred.
 `tests/cluster-chaos/` (issue #11; its `README.md` is the harness's own
 guide): the shipped `deploy/compose/docker-compose.yml` itself, stacked with
 overlays that add an Envoy front, `toxiproxy` between nodes, a front door,
-tenancy, clock skew — driven by a Rust integration binary
+tenancy — driven by a Rust integration binary
 (`tests/scenarios.rs`) with a scenario DSL:
 
 ```rust
@@ -39,6 +39,21 @@ nightly soak (`nightly-chaos.yml`) iterates each scenario 60–100× under a 2 h
 cap. Both cadences are deliberate deviations from RFC-001 §12's 3×/100× bars,
 recorded with their reasoning in the harness README.
 
+Beside the tier, on the same path filter and the same prebuilt image, the
+**`compose-smoke`** lane runs the two scripts that verify the *shipped*
+manifests: `deploy/compose/verify.sh` (the cluster forms) and
+`deploy/compose/smoke.sh` (it works — RFC-007 §5: replication, routing,
+catch-up, failover, join/leave, flow state). Neither can be a `cargo test`,
+because both need a container runtime; the cost of that is the failure mode a
+script has and a test does not, which is having no invoker at all and therefore
+never being able to go red. That is exactly what happened when #562 retired the
+lane and deleted the guard test pinning it in one commit, so the lane is itself
+pinned — `the_compose_verification_scripts_have_a_ci_invoker` reads `ci.yml` and
+fails if the job or either invocation goes. It is not a required check: two real
+fleets carry every runtime flake `cluster-smoke` does without the sharding that
+makes that one's wall clock bearable, and its job is to be red on the PR that
+broke a manifest, not to block a merge.
+
 ## Phase exit criteria (functional)
 
 Phase 1 — membership + config-sync (the write path of Chapter 4):
@@ -57,14 +72,21 @@ Phase 2 adds the flow-state suite (`test_scenario_cluster_linear` — 10k
 round-robin transitions with zero illegal/lost updates,
 `test_scenario_handoff`, `test_flow_read_strong_default`,
 `test_flow_state_survives_full_restart`, `test_flow_state_async_loss_bound`);
-Phase 3 the journal suite (`test_journal_merge_exact`, clock-skew-immune
-`test_journal_clear`, `test_journal_cursor_merge` for vector cursors); Phases
-4–5 the strict sequencing and proxyOnce suites (`test_sequence_redis_strict`,
-`test_proxy_once_*` including the documented duplicate bound under owner
-kill). These phase-2+ names are RFC-001 §10's *planned* names and no test
-exists under them: the claims landed in the container tier as C15 (flow
-state), C28–C30 (journal — the scenarios' own doc comments name which
-`test_journal_*` claim each is "in anger") and C10–C11 (proxyOnce) below.
+Phases 4–5 the strict sequencing and proxyOnce suites
+(`test_sequence_redis_strict`, `test_proxy_once_*` including the documented
+duplicate bound under owner kill). These phase-2+ names are RFC-001 §10's
+*planned* names and no test exists under them: the claims landed in the
+container tier as C15 (flow state) and C10–C11 (proxyOnce) below. All four of
+RFC-001 §10's phase-3 journal names (`test_journal_merge_exact`,
+`test_journal_clear`, `test_count_merge`, `test_journal_cursor_merge`) are
+permanently unallocated — D-74 (#552) removed the fleet journal merge they were
+to pin, `test_count_merge`'s claim (`numberOfRequests` = N on every node) is the
+one D-74 reverses outright, and a per-node journal is upstream's own suite's
+business. What replaced them is per-node and lives in
+`crates/rift-cluster-server/tests/write_path.rs`:
+`number_of_requests_is_the_answering_nodes_own_count_not_a_fleet_sum`,
+`a_proxied_clear_empties_only_the_journal_of_the_node_it_reached` and the two
+`Rift-Cluster-Partial` pins beside them.
 The sequencing claims landed as **C33** (#476), which is the
 container-tier counterpart to the whole of `rift-cluster`'s `tests/sequencer.rs`
 gate; `test_sequence_redis_strict` itself stays unwritten, and now permanently
@@ -100,8 +122,8 @@ fail under D-15) and stay unallocated.
 | C7 ✅ | Node joins with stale/empty disk (#73: `c7_joining_node_serves_nothing_until_reconciled`) | Serves nothing until caught up; then byte-identical config |
 | C8 📋 planned (RFC-001 §12; no issue filed) | Round-robin scenario traffic, healthy fleet, no affinity | Zero stale-read matches — the owner-read guarantee under the worst LB |
 | C10 ✅ | Kill claim-owner AND config-leader at proxyOnce's two critical moments (#228: `c10_proxy_once_survives_owner_and_leader_kills`) | Duplicate upstream calls ≤ **1 + ownership changes in the phase** — the contract's own bound, not a bound derived from the outage; refusals during the outage are counted and printed as the run's artifact (D-66); **zero wedged signatures**; failed publication releases the claim; a replaying signature shows its stub on every node |
-| C11 ✅ | Concurrent proxy recording on 3 nodes (#228: `c11_concurrent_recording_loses_nothing`) | Exactly one recorded stub per proxyOnce signature fleet-wide; zero upstream calls once Recorded; proxyAlways never replays and merges every recording (an `InFlight` racer forwards-without-recording *by upstream design*, so the racing-window call count is measured, not pinned). A raced `proxyOnce` request answers `200` **or** `503` — the latter when the cluster could not serialize its claim in that instant (D-66), which under load is a normal outcome and not a failure; `proxyAlways` stays strictly `200` as the control |
-| C12 ✅ | ±5 s clock skew across nodes via `faketime.overlay.yml` (#228: `c12_clears_are_exact_under_clock_skew`) | Clears exact (generation-based, clock-free): a fast-clock clear erases fleet-wide, every post-clear append survives, racing skewed clears converge; the skew itself is proven real before any probe runs |
+| C11 ✅ | Concurrent proxy recording on 3 nodes (#228: `c11_concurrent_recording_loses_nothing`) | Exactly one recorded stub per proxyOnce signature fleet-wide; zero upstream calls once Recorded; proxyAlways never replays and merges every recording (an `InFlight` racer forwards-without-recording *by upstream design*, so the racing-window call count is measured, not pinned). "Loses nothing" is asserted **per node** since D-74 (#552): each node's own `GET /imposters/:port/requests` accounts for every request that node served, rather than the three nodes' logs being diffed against one fleet-merged answer, which no longer exists. A raced `proxyOnce` request answers `200` **or** `503` — the latter when the cluster could not serialize its claim in that instant (D-66), which under load is a normal outcome and not a failure; `proxyAlways` stays strictly `200` as the control |
+| ~~C12~~ | ±5 s clock skew across nodes, asserting that journal clears were generation-based and therefore clock-free — **removed by D-74 (#552)** with the clear generations it exercised. It was the only user of `faketime.overlay.yml` and of the `runtime-faketime` image | — |
 | C13 📋 planned (RFC-001 §12; no issue filed) | Owner black-holes while 20% of load is stateful | **Stateless p99 < 5 ms throughout** — the bridge + fast-fail firewall |
 | C14 ✅ | Kill the Raft leader during a 100-write admin storm (#11: `c14_leader_kill_keeps_every_acknowledged_write`) | Every write acked-and-present or 503-with-op-id-then-present; zero duplicates; writes resume within `WRITES_RESUME_BOUND` (measured as write availability, not off the ~5 s leader gauge) |
 | C15 ✅ | `kill -9` the entire fleet under load, restart (#11: `c15_hard_kill_of_the_whole_fleet_keeps_acknowledged_writes`; #121: `c15_flow_state_survives_a_full_cluster_restart`) | Configs/tenancy/intents identical to last ack; flow state per durability level (`sync` = exact; `async` ≤ one fsync interval) — four flows stepped across different nodes resume at exactly the next integer |
@@ -111,9 +133,7 @@ fail under D-15) and stay unallocated.
 | C19 ✅ | A `socat` sidecar squats an imposter's port inside rift-2's network namespace, confirmed held before the write (#143: `c19_front_door_routes_around_bind_divergence`) | The write is 201; config converges fleet-wide; `bind_failures` on rift-2's `GET /_fleet/members` names the squatted port; a route to the squatted port dispatches 2xx through **rift-2's own** front door, and through rift-1's |
 | ~~C24~~ · ~~C25~~ · ~~C27~~ | The RBAC ladder, key revocation across a partition, and tenancy isolation — **removed by D-73 (#550)** with the tenancy they asserted. The one claim of C27's that outlived tenancy (the data plane is never credentialed) is now `the_gateway_stays_open_and_never_carries_the_admin_key` in `tests/fleet_session.rs` | — |
 | C26 ✅ | Write imposters through every node, then lag a follower past `RIFT_CLUSTER_SNAPSHOT_LOG_ENTRIES` with fifteen more so the leader snapshots and purges, restart it (a real `install_snapshot`, asserted from `rift_cluster_snapshots_installed_total`); then full-fleet stop/start (#165/#183, re-targeted by D-71: `c26_replicated_imposters_survive_a_full_cluster_restart_by_snapshot_install`) | The restarted follower converges to the live nodes' `(port, revision, stubs)` imposter rows; after the full-fleet restart every node's rows are byte-identical to its own pre-restart ones and to every other node's |
-| C28 ✅ | SIGKILL a follower after a fleet-wide spray (#228: `c28_fleet_journal_is_exact_under_node_kill`) | Every survivor answers **exactly N** with the dead shard cache-served — honestly stamped partial while its writer is unreachable; fleet count exact throughout; on return the stamp clears with the survivors still exact — the returned node itself converges on N minus its own lost shard, unstamped (the #349 honesty gap, pinned as-is) |
-| C29 ✅ | Partition one node mid-traffic (#228: `c29_partial_reads_answer_within_budget_and_count_themselves`) | Both sides answer **within the 2 s peer budget** (measured, printed); `rift_cluster_journal_partial_reads_total` moves; heal clears the stamp and converges the sets |
-| C30 ✅ | Kill and restart a node mid-cursor-walk; overflow a shard past its cap (#228: `c30_vector_cursor_walk_survives_membership_change`) | The `?since=` walk stays gapless and duplicate-free across the kill and the return; `x-rift-truncated` appears **iff** a presented position predates a shard watermark (baseline reads never truncate) |
+| ~~C28~~ · ~~C29~~ · ~~C30~~ | Journal exactness under a node kill, partial-read latency and counting under partition, and the vector-cursor walk across a membership change — **removed by D-74 (#552)** with the fleet journal merge they asserted. A per-node journal has no merge to be exact about, no fan-out to be partial, and no vector cursor to walk | — |
 | C33 ✅ | Owner-mode sequencing sprayed round-robin across all three nodes; SIGKILL the cursor's owner (found by killing — a non-owner's death must change nothing), then restart it (#476: `c33_owner_mode_sequencing_cycles_fleet_wide_and_degrades_on_owner_kill`) | Strict `A, B, C` cycling with **zero fallbacks** on a healthy fleet; with the owner dead every response is still a 2xx and carries `rift-cluster-sequence: local-fallback`, and the **fallback counter** — not the returned index — is what moves; after the owner returns the fallbacks stop and strict cycling resumes from wherever the new cursor started (D-8 permits the reset) |
 
 C14 and C15 are the direct tests of R4 and R3; C8 is the direct test of R2's
@@ -146,8 +166,7 @@ LB-independence; C4+C5 together are R1 under adversity.
 
 Several rows above say a bound is *measured and printed* rather than asserted
 against a guessed constant — C10's duplicate-upstream ceiling, C11's racing-window
-call counts, C12's observed clock spread, C29's partitioned read latency. Those
-scenarios call `chaos_artifact!`, which does two things:
+call counts. Those scenarios call `chaos_artifact!`, which does two things:
 
 - **Prints the line.** `cluster-smoke` runs the tier with `--nocapture`, so it
   lands in the job log beside the scenario that produced it. Until #534 the flag

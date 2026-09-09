@@ -134,11 +134,51 @@ additionally drops any `i<port>:` namespace the tables no longer name, which is 
 delete committed while the node was down. Single-node Rift gets this for free by dropping the
 imposter's store instance; one shared `FlowNet` per node (D-7) has to do it explicitly. What is
 *not* cleared, by the same rule: a `PutImposter` over an existing port (a config change keeps its
-state — the first paragraph of this entry), a `fleet`-scoped (`f:`) or `tenant`-scoped
-(`t<tenant>:`) context (shared by construction, not any one imposter's to drop), and any other
-port's namespace (ports are fleet-unique across tenants, so `i<port>:` never names another
-tenant's). Sequencer cursors already go with the imposter via upstream's `reset_scope` hook (D-8,
-D-57); proxyOnce markers via the apply arm (#226).
+state — the first paragraph of this entry), the `fleet`-scoped (`f:`) context (shared by
+construction, not any one imposter's to drop), and any other port's namespace (ports are
+fleet-unique, so `i<port>:` names exactly one imposter). Sequencer cursors already go with the
+imposter via upstream's `reset_scope` hook (D-8, D-57); proxyOnce markers via the apply arm (#226).
+
+**Amendment (2026-09-09, the #567 and #573 reviews — what "deleted" means to the clear):** the rule
+above was applied to a wider set than "a deleted imposter" in two places, and — once narrowed — to
+a set that was then too narrow in a third.
+
+*The live clear is filtered against the desired set.* Upstream's `replace_imposter` tears the old
+imposter down and re-creates it; when the re-create is refused at staging, the port is reported
+`deleted` *and* `failed`. The engine is truthfully serving nothing there — but the config set still
+names the port, so this is a failed **edit** on one node, not a removal: the next successful sync
+re-creates the imposter, and nothing would have put its state back. A port the fleet still wants
+keeps its state; only a port the applied set omits is cleared.
+
+*…and unioned with the ports carrying a recorded apply failure.* That filter alone leaks. The
+refused re-create has already taken the port out of the engine's map, so when the operator gives up
+and deletes it, upstream computes the removal set (`map ∖ desired`) from a map that no longer names
+the port: nothing is reported deleted, the state kept by the paragraph above survives for the life
+of the process, and an identically re-created imposter meets yesterday's scenario — the #565 bug,
+reached through a failed edit. The per-port apply-failure map is already reaped on exactly this
+ground ("a bind-failed port that is later deleted keeps its stale entry forever"); the flow state
+leaves with it. Both halves of the union stay gated by the desired set, so a port that is merely
+failing keeps everything.
+
+*The reconcile sweep measures the tables after the sync, not the snapshot the sync was driven from,
+and reads its two sets in that order: the namespaces it holds first, the desired ports second.* The
+original claim — that no imposter can be created in the window because the node is not yet `Ready`
+— was false: the ring is Raft membership, so a restarted voter is an HRW owner the whole time it
+catches up, and `compose` binds the flow net long before it spawns the reconciler. The read that
+fed the engine sync and the sweep were a whole `apply_config` apart (seconds, on a cold start with
+listeners to bind) while the apply loop ran concurrently, so an imposter committed in between was
+alive on every node with its flow namespace swept on this one. Re-reading `sm_configs` after the
+sync closes most of that; reading it *after* the held set closes the rest. Neither read is
+instantaneous and no barrier separates them, so one of the two is necessarily the older
+observation — and it must be the accusation, never the acquittal. Apply commits `sm_configs`
+before it drives the engine, so a `PutImposter{P}` landing between the reads is durably applied and
+served fleet-wide: a desired set read *first* would convict it on a held set read second. The
+comparison is against the **tables, not the engine's imposter list** — the two differ exactly on
+ports the engine failed to stage, which by the paragraphs above keep their state. The residual,
+stated: a flow that lands for an imposter this node has not yet applied, before the desired-set
+read, is dropped. That is all of it — an imposter this node has applied by that read is in the set
+and is kept, whenever its flow arrived — and what bounds it is that `compose` reconciles only once
+`last_applied` has reached the leader's applied index: one apply round-trip, not seconds.
 
 ### D-6 — Redis impls of the new traits are cluster; existing `RedisFlowStore` (incl. U-1 CAS) stays OSS
 - **Status:** amended
@@ -578,15 +618,19 @@ it and what it saw is not. A response that flattens the two into one shape would
 node-local observation as fleet state — the past-state-as-present error. They stay separate
 fields with separate provenance.
 
-### D-32 — Fleet request tail over a capped, declared coverage set
-- **Status:** active
+### ~~D-32 — Fleet request tail over a capped, declared coverage set~~
+- **Status:** superseded
 - **Decided:** 2026-08 · #362
-- **Code:** crates/rift-cluster-server/src/admin_front.rs, crates/rift-cluster-server/src/cli.rs
+- **Superseded by:** D-74
+
+Superseded by D-74 (#552): the fleet-wide tail is gone with the merge it streamed. There is no
+coverage set to declare because no read speaks for more than one node; a client that wants the
+fleet's tail opens upstream's own `savedRequests/stream` on each node. Retained for history.
 
 The fleet-wide request tail carries a `port → JournalCursor` map over a coverage set capped by
 `fleet_journal_port_cap` (default 100) and reports `coverage: {covered, total, omitted}` on every
 response, so a partial view is never mistaken for the whole. A `(timestamp, tiebreak)` watermark
-was rejected — clocks are not ordered across nodes (Ch.7) — and a fourth, hybrid shape was
+was rejected — clocks are not ordered across nodes — and a fourth, hybrid shape was
 rejected *visibly* here so it is not rediscovered.
 
 ### D-33 — An unclustered node is indistinguishable from the open-source binary
@@ -642,10 +686,14 @@ LRU eviction keyed on a millisecond timestamp alone evicts the wrong flow when s
 within the same millisecond; a process-wide monotone sequence (`static TOUCH_SEQ`) stamped on
 every touch breaks the tie so LRU holds at any rate.
 
-### D-37 — The journal is per-writer shards, merged on read
-- **Status:** active
+### ~~D-37 — The journal is per-writer shards, merged on read~~
+- **Status:** superseded
 - **Decided:** 2026-08 · #223, #224 (RFC-001 §7.5.1 as built)
-- **Code:** crates/rift-cluster/src/stores/journal.rs, crates/rift-cluster/src/stores/journal_net.rs
+- **Superseded by:** D-74
+
+Superseded by D-74 (#552): the shards, the k-way merge and the anti-entropy pull were removed
+in full. The journal is upstream Rift's own, per node, and a read answers for the node it reached.
+Retained for history.
 
 Every node appends only to its own `(port, node_id)` shard; a read k-way-merges the shards by
 recorded timestamp with `(node_id, seq)` breaking ties. Caps are writer-local with an
@@ -654,11 +702,16 @@ recorded timestamp with `(node_id, seq)` breaking ties. Caps are writer-local wi
 *Rejected:* owner-routed or consensus-carried journaling — a mock request must never wait on
 another node to be recorded.
 
-### D-38 — Clears are generation bumps, never timestamps
-- **Status:** active
+### ~~D-38 — Clears are generation bumps, never timestamps~~
+- **Status:** superseded
 - **Decided:** 2026-08 · #223 (RFC-001 §7.5.2 as built)
+- **Superseded by:** D-74
 - **Amends:** RFC-001 §7.5.2
-- **Code:** crates/rift-cluster/src/control.rs, crates/rift-cluster/src/stores/journal.rs
+
+Superseded by D-74 (#552): `ControlOp::JournalClearGen` and the `sm_journal_gens` table are
+gone. A clear generation is observable only through a reader that consults it, and the only
+reader was the merge; `DELETE savedRequests` is now a proxied clear of the reached node's own
+journal. Retained for history.
 
 A monotone per-port (and per-`(port, space)`) clear generation rides the Raft log as
 `ControlOp::JournalClearGen`; entries and counter slots carry their writer's generation, and the
@@ -668,11 +721,16 @@ its `teardown_space` markers were never built — the generation is a committed 
 *Rejected:* timestamped deletion (clocks are not ordered across nodes); `retain` predicates stay
 best-effort per shard.
 
-### D-39 — The journal cursor is a vector, opaque by contract
-- **Status:** active
+### ~~D-39 — The journal cursor is a vector, opaque by contract~~
+- **Status:** superseded
 - **Decided:** 2026-08 · #225, #348 (RFC-001 §7.5.1 as built)
+- **Superseded by:** D-74
 - **Amends:** RFC-001 §7.5.1
-- **Code:** crates/rift-cluster/src/stores/journal.rs, crates/rift-cluster/src/stores/journal_net.rs
+
+Superseded by D-74 (#552): with one writer per journal there is no position across writers to
+name. `?since=` is upstream's own scalar cursor again, with upstream's `x-rift-next-index` and
+`x-rift-truncated`; the `JournalCursor`/`FleetCursor` codecs went with the merge. Retained for
+history.
 
 `since` is `v1 {gen, pos: node_id → seq}`, base64url-JSON; per-shard filtering, monotone advance,
 dead shards frozen rather than rewound; a bare `u64` is read as `{this_node: seq}` for the upgrade
@@ -720,10 +778,11 @@ are in spec; the scenario bounds leadership transitions by `C6_MAX_LEADER_TRANSI
 from the ~5 s gauge resolution), never by a fixed count.
 
 **Amendment (D-71, 2026-09-07, #548):** the `rift_cluster_members` gauge that supplied the samples
-is retired with the operator observability pack. The harness now samples `current_leader` from
-`GET /_fleet/members` at `C6_LEADER_SAMPLE_INTERVAL`, deliberately the same ~5 s cadence the gauge
-was resampled at, so the derivation of `C6_MAX_LEADER_TRANSITIONS` is unchanged. The bound is a
-rate over that sampling window, exactly as before; only the sample's source moved.
+is retired with the operator observability pack. The harness now samples **which node claims
+leadership** — `is_leader` on `GET /_fleet/members`, read through `claims_leadership` — at
+`C6_LEADER_SAMPLE_INTERVAL`, deliberately the same ~5 s cadence the gauge was resampled at, so the
+derivation of `C6_MAX_LEADER_TRANSITIONS` is unchanged. The bound is a rate over that sampling
+window, exactly as before; only the sample's source moved.
 
 *Rejected:* widening the election timeout so a count bound holds — the timers stay fixed in
 `raft/node.rs`; making them a `NodeConfig` knob needs its own design pass and has no operator
@@ -1567,7 +1626,7 @@ assumed away.
 - **Decided:** 2026-08-28
 - **Refines:** D-41
 - **Implemented by:** #516
-- **Code:** .github/workflows/ci.yml, scripts/chaos-shard.sh, scripts/cluster-smoke-gate.sh, tests/cluster-chaos/src/lib.rs, deploy/compose/docker-compose.yml, tests/cluster-chaos/compose/faketime.overlay.yml
+- **Code:** .github/workflows/ci.yml, scripts/chaos-shard.sh, scripts/cluster-smoke-gate.sh, tests/cluster-chaos/src/lib.rs, deploy/compose/docker-compose.yml, deploy/Dockerfile
 
 `cluster-smoke` took 35–37 min. Measured, by regressing the tier's own reported wall clock against
 its scenario count over ten runs (2026-07-23 → 2026-08-28, N from 17 to 36):
@@ -1683,6 +1742,16 @@ makes `test_cold_start` pass for the wrong reason); it trades a latency problem 
 one. Cutting scenarios or widening the path filter's skip set — D-41 already settled the
 coverage-for-latency trade at one iteration per scenario, and this entry buys the latency back
 without reopening it.
+
+**Amendment (D-74, 2026-09-08, #552):** the tier builds **one** image, not two. The second was the
+`faketime` flavor, whose `LD_PRELOAD` lied about the clock for the one scenario (C12) that proved
+journal clears consulted no timestamp; that scenario left with the clear generations it was
+proving clock-free, so the flavor, its overlay and the `runtime-faketime` Dockerfile stage went
+with it. Nothing about the decision changes — `BUILT_IMAGES` is still the declared list, and
+`compose_images_are_tagged_by_flavor` still fails a build target that arrives without a tag of its
+own, which is the invariant this entry exists to keep. `runtime` is the Dockerfile's last stage
+again, and every build site still pins `target:` anyway: the ordering is not a thing a compose
+file should have to know.
 
 ### D-59 — A voter departs by one `RemoveVoters(retain = false)`; a leaving node is never a learner
 - **Status:** active
@@ -2154,7 +2223,7 @@ literally "owner-unreachable".
 
 - **Status:** active
 - **Decided:** 2026-08-29
-- **Amends:** RFC-001 §7.6, docs/architecture/07-verification-plane.md, docs/architecture/09-durability-failure.md, docs/architecture/12-testing.md
+- **Amends:** RFC-001 §7.6, docs/architecture/06-flow-state.md, docs/architecture/09-durability-failure.md, docs/architecture/12-testing.md
 - **Refines:** D-17, D-40, D-65
 - **Implemented by:** #529 (EE), rift#990 (the U-17 seam)
 - **Code:** crates/rift-cluster/src/stores/proxy.rs, vendor/rift/crates/rift-mock-core/src/recording/proxy_store.rs
@@ -2511,10 +2580,10 @@ router routes to the local imposter, never across nodes.
 
 ### D-72 — Imposter import is one-shot: `--imposters` and `POST /specs/compile` become ordinary `PutImposter` ops; the cluster retains no source, spec or dataset
 
-- **Status:** active
+- **Status:** amended
 - **Decided:** 2026-09-07 · RFC-007 §3.2 · #549
 - **Supersedes:** D-18, D-19, D-23, D-29, D-30, D-31, D-34, D-48, D-49, D-50, D-51, D-52, D-53, D-55, D-56
-- **Amends:** RFC-004 §3.4
+- **Amends:** RFC-004 §1, RFC-004 §3.4, RFC-004 §6
 - **Implemented by:** #549
 - **Code:** crates/rift-cluster-server/src/admin_front.rs, crates/rift-cluster-server/src/compose.rs
 
@@ -2562,6 +2631,53 @@ dedup table; an *edited* document hashes differently and applies. That is what t
 `applied_digest` short circuit used to buy, obtained without a replicated record — and it is why
 the digest is over the whole document rather than per imposter: an imposter removed from the
 document must change the identity of what the document declares.
+
+**Amendment (2026-09-08, retrospective review of #564):** four clarifications, none of which
+changes what is replicated.
+
+*The digest is over a canonical rendering, not over `ImposterConfig`'s own serialization.* As
+shipped, `digest` was `sha256(serde_json::to_vec(configs))`, and `ImposterConfig` transitively
+holds `std::collections::HashMap`s (a response's `headers`, `_rift.scripts`) that upstream
+serializes in raw iteration order — a fresh `RandomState` per map, so any document with two or
+more response headers could hash differently on any read (with exactly two the orderings coincide
+about half the time, and agreement collapses from there), restarts minted new `op_id`s, and the
+idempotence described above never reliably engaged. The digest is now over the config set
+round-tripped through `serde_json::Value`, whose map is a `BTreeMap` (`preserve_order` is off
+across the workspace; a unit test on the helper fails if that changes). Raw document bytes remain
+the wrong input for the reason already given — two spellings of one document, JSON where there was
+YAML, must dedup — but that dedup holds **only within one URI**: the `op_id` hashes the URI
+verbatim, so `file:mocks.json` and `file:mocks.yaml` are two documents to the dedup table however
+equal their digests, as is one file mounted at two paths on two nodes. The URI is deliberately not
+normalised; two URIs are two operator intentions.
+
+*The whole-document digest has a blast radius, and it is accepted rather than overlooked.* Editing
+one imposter changes the digest every imposter in that document is keyed on, so all of them
+re-apply — and a re-applied `PutImposter` is a delete-then-recreate that also drops that port's
+`proxy_recorded` markers (#226), so a stub already recorded there can be recorded again. Keeping
+per-imposter digests would avoid it and give up the property above (a removed imposter would leave
+the others' identities unchanged, hiding that the document moved at all); a bootstrap document is
+edited at deploy time, so the trade goes this way.
+
+*The bootstrap waits, bounded, for a leader — immediately before its first submit, not on entry.*
+`RaftNode::submit` answers `Unavailable` at once when no leader is visible, and a joiner — or any
+node in a fleet cold-starting together — is composed inside exactly that window. The bootstrap
+waits up to `BOOTSTRAP_LEADER_DEADLINE` (30 s, the seed-join budget) for one; a fleet that never
+elects still fails the start, by the deadline and saying so, and a genuine refusal is still fatal.
+The *placement* is part of the decision: everything decidable on this node alone — a retired URI
+scheme, an unreadable document, an `intercept` or `routes` block, a portless imposter — is refused
+before the wait, so a leaderless fleet cannot mask a plain misconfiguration and cost the operator a
+second deploy cycle to hear about it.
+
+*A `routes` block is refused, like `intercept`, not warned about.* Both leave the operator with
+something they configured and never got; a start-up warning is not a channel an operator reads
+before sending traffic at a front door whose table is empty. Same message shape, pointing at
+`PUT /front-door/routes`.
+
+*And one thing the bootstrap deliberately does not do:* it never removes an imposter that was
+dropped from the document. A one-shot import has no baseline to diff against — that baseline is
+precisely the source record this decision removed — so "absent from this document" is
+indistinguishable from "created through the admin API by someone else". The import is additive;
+deletion is an admin action (`DELETE /imposters/{port}`).
 
 **Authorized as `imposter.write`.** A compile is the first half of an imposter write and the only
 reason to call it is to make one; putting it below that would let a reader have the fleet do a
@@ -2735,3 +2851,126 @@ same hostname satisfies both `Secure` and `SameSite=Strict` and is handed a live
 No cookie attribute fixes this — `Domain` only widens scope and there is no `Port` attribute — so
 it is a deployment rule: **the hostname serving the console must not also serve HTTPS imposters**
 (`docs/architecture/10-operations.md` §`POST /session`).
+
+### D-74 — Verification is per node: the request journal is upstream's own, `numberOfRequests` is the answering node's count, and `Rift-Cluster-Partial` is stamped only on reads that genuinely fan out
+
+- **Status:** amended
+- **Decided:** 2026-09-08 · RFC-007 §3.2 · #552
+- **Supersedes:** D-32, D-37, D-38, D-39
+- **Amends:** docs/architecture/05-read-path.md, RFC-007 §2.1, RFC-006 §4, RFC-001 §10, RFC-001 §12
+- **Implemented by:** #552
+- **Code:** crates/rift-cluster-server/src/admin_front.rs, crates/rift-cluster-server/src/openapi.rs, crates/rift-cluster/src/decorate.rs, crates/rift-cluster/src/control.rs, crates/rift-cluster/src/raft/store.rs, crates/rift-cluster/src/stores/mod.rs
+
+A RiftCluster node's recorded requests are **upstream Rift's own**, per node.
+`GET /imposters/:port/requests` — and its `savedRequests` spelling, its `?since=` cursor form and
+its `DELETE` — are ordinary proxied routes to the local engine, answering for the node the caller
+reached, with upstream's own scalar `x-rift-next-index` and `x-rift-truncated` and upstream's
+Mountebank semantics unchanged. A test that needs fleet-wide verification pins a node or reads all
+of them and adds up (RFC-007 §3.3).
+
+**What leaves.** The whole fleet journal: `stores/{journal,journal_net,journal_seq}.rs`, the
+per-writer `(node_id, seq, clear_gen)` shards and their `evicted_below_seq` watermarks, the k-way
+merge-on-read, the anti-entropy pull and its replica cache, the `/_cluster/journal/{since,counts}`
+RPCs, `ControlOp::JournalClearGen` with the `sm_journal_gens` table and the `journal_gens`
+snapshot field, the vector cursor and its `JournalCursor`/`FleetCursor` codecs, the merged SSE
+tail on `.../savedRequests/stream`, the fleet-wide `GET /admin/requests` and its stream with the
+declared coverage set, `--cluster-fleet-journal-port-cap`, and
+`rift_cluster_journal_partial_reads_total`. The console's Requests screen loses the merge and
+names the node it read from instead.
+
+**`numberOfRequests` is a contract change, stated as one.** On `GET /imposters` and
+`GET /imposters/{port}` it is now **the answering node's own count**. It was a fleet sum: upstream
+answered its local counter and the front rewrote it by fanning out to every peer. A client that
+wants a fleet total reads every node and sums — and then knows which nodes it counted, which the
+old answer could not tell it whenever a peer missed the budget and the sum silently became a
+floor.
+
+**`Rift-Cluster-Partial` narrows rather than leaving.** It stays on the two reads that stamp it —
+`/_fleet/members` and `/_fleet/health` — and goes from every journal site. A requests read has no
+peer to be partial about: it either answers for the node the caller reached, or it fails. The
+contract now *declares* the header on those two operations, which it never did: every `$ref` to it
+was on a journal route, so removing them would have left the component defined and referenced by
+nothing. The spaces listing fans out too and keeps reporting its own incompleteness in the body
+(`partial`, beside `unavailable`) — an enumeration refused by policy and one shortened by a slow
+peer are different facts, and a boolean header cannot tell them apart.
+`HEADER_NEXT_INDEX`/`HEADER_TRUNCATED` leave `decorate.rs` entirely; the cursor headers on the
+wire are upstream's, emitted by upstream.
+
+**A space teardown still clears that space's requests.** `DELETE /imposters/:port/spaces/:flow`
+proxies to the local engine, and upstream's own `teardown_space` calls
+`RequestJournal::clear_flow(port, space)` on the way through — so the entries go on the node that
+took the teardown, which is the node whose journal held them. The `JournalClearGen { space }` half
+this front used to commit alongside existed only to raise a *replicated* generation the merge
+consulted; with no merge there is nothing for it to be replicated for. The replicated **stub**
+half (D-69) is untouched and still required.
+
+**This is a fleet-wide log-format break**, the same one #549 (D-72) and #550 (D-73) declared and
+for the same reason: removing a `ControlOp` variant makes an old log entry undecodable, so a fleet
+upgrading across this commit starts from a fresh `--cluster-state-dir`. Snapshot *decoding* is
+deliberately tolerant of the removed `journal_gens` field — `SnapshotPayload` sets no
+`deny_unknown_fields`, so a snapshot built before this still installs and its extra key is
+dropped.
+
+**Why.** The journal was a second distributed system riding inside the first: per-writer shards, a
+k-way merge by recorded timestamp, an anti-entropy loop, generation clears committed through Raft,
+a vector cursor and a declared coverage set — about 4,000 source lines and 5,700 test lines, built
+so a test assertion could be made against any node. That is a real problem. It is Rift's to solve,
+in the engine, once, for every deployment shape — and while the cluster carried it, it doubled the
+surface of every read: two code paths for `GET /imposters/{port}/requests`, two cursor vocabularies,
+a `numberOfRequests` that meant something different depending on which node answered and how many
+peers replied in time.
+
+*Rejected:* keeping a replicated clear generation without the merged read. It is the cheapest half
+to keep — one `ControlOp`, one small redb table — and it converges a `DELETE savedRequests` across
+the fleet without any fan-out on the read path. But a clear generation is only observable through
+a reader that consults it, and the only reader was the merge. Kept alone it is a counter that
+commits, replicates, snapshots and is compared against nothing: a fleet-wide write whose effect no
+API can show, which is a worse thing to own than either the whole subsystem or none of it.
+
+*Rejected:* keeping the fleet-sum `numberOfRequests` decoration. It is the single most useful thing
+the merge produced and the cheapest to keep — one fan-out over `/_cluster/journal/counts`, no
+shards, no cursor. It stays rejected because a sum is only honest if every addend arrived: under a
+slow peer it silently becomes a floor, and the `Rift-Cluster-Partial` bit that says so is a header
+most clients never read. A per-node count is smaller and always exactly true, and a caller that
+wants the total can compute it from `/_fleet/members` and know what it counted.
+
+**Amendment (2026-09-08, #552 review — the one data-plane change the removal carries, stated so it
+is not read as a regression, plus one behaviour that only looks like one):**
+
+*(a) Retention, in both of its dimensions.* A shard used to hold
+`(fleet_capacity / voters).max(min_shard_cap).max(1)` entries per port — `max(10_000 / N, 500)` —
+so a three-voter fleet kept about 3,333 each and the merged view held about 10,000. The general
+form matters above 20 voters, where the `MIN_SHARD_CAP = 500` floor takes over and the fleet's
+total stops dividing. Each node now keeps upstream's own `MAX_RECORDED_REQUESTS = 10_000` per port
+(`rift-mock-core/src/imposter/journal.rs`), so a three-node fleet retains up to three times as many
+entries in total and each node's read is cut at its own cap.
+
+The shard also had a **second** retention dimension that upstream's journal does not:
+`DEFAULT_MAX_AGE = 600 s`, an age sweep that dropped entries older than ten minutes whether or not
+the cap was near. Upstream's `LocalJournal` evicts by count alone (`record_indexed` pops the front
+only at `MAX_RECORDED_REQUESTS`), so recorded requests are now unbounded in *time*: a long-lived
+imposter holds its last 10,000 requests however old they are, where the shard would have held none
+older than ten minutes. That, not the count, is the larger memory consequence.
+
+*(b) A wholesale replace drops the port's recorded requests — and did so before this change too.*
+Stated because it looks like a consequence of moving the journal back inside the imposter core, and
+is not. `replace_imposter` is `delete_imposter_inner` + `create_imposter_staged` (`manager.rs`), so
+the port does start on a fresh `LocalJournal` — but `delete_imposter_inner` already cleared an
+*injected* journal on the way through (`if let Some(journal) = &self.request_journal {
+journal.clear(port) }`), and the removed `ClusterJournal`'s `clear` emptied that port's entries and
+zeroed its count. A replace therefore dropped the port's recorded requests on every node under the
+merge as well. The mechanism moved; the behaviour did not.
+
+Which writes replace is worth stating exactly, because "a config-changing write" is wrong in both
+directions. `apply_config` replaces on an imposter-level field change *other than* `enabled` — an
+`enabled`-only diff toggles in place and keeps the journal (upstream #817, `manager.rs`) — and also
+on a **degenerate** stub diff, `StubReconcile::Degenerate`, which fires when
+`changed_slots * 2 > states.len() + desired.len()` (`imposter/reconcile.rs`). Since every stub route
+terminates on the front and is applied through `apply_config` on each node, a
+`DELETE /imposters/{port}/stubs/0` against a one-stub imposter is degenerate and rebuilds the core.
+Below that threshold the stub set is patched in place and the journal survives, which is what the
+chaos reorder scenario's `numberOfRequests == 1` assertion pins
+(`tests/cluster-chaos/tests/scenarios.rs`, the assertion closing `test_reconcile_reorder`):
+a reorder that rebuilt the core would read `0`. The assertion is not stronger than it was before —
+under the merge a rebuild zeroed the local shard on every node, so the counterfactual read `0` then
+too — it is simply the pin that keeps the in-place path in place.

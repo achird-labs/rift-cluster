@@ -499,7 +499,7 @@ the fleet has converged.
 | `GET /_cluster/members` | node id, leadership, current leader, last applied index, voters |
 | `GET /_cluster/config` | the ports this node has a committed config for |
 | `GET /_cluster/imposters` | those ports with their committed config bodies |
-| `GET /_cluster/health` | readiness state and pending gates, whether this node is an isolated owner, the ownership ring (`m_idx` + members), this node's parked-write depth, and `blob_fetch_stall` — non-`null` while this node's apply loop is parked on a blob no member can supply (#439; degraded, not not-ready — see `FleetHealth` in `docs/api/openapi-ee.yaml` for the shape and the reasoning) |
+| `GET /_cluster/health` | readiness state and pending gates, whether this node is an isolated owner, the ownership ring (`m_idx` + members), and this node's parked-write depth (see `FleetHealth` in `docs/api/openapi-ee.yaml` for the shape) |
 
 `/_cluster/ring` and `/_cluster/kv` arrive with later phases.
 
@@ -609,12 +609,13 @@ Under `--cluster`, the public admin address is served by a thin front: the
 config-mutating routes (`POST/PUT/DELETE /imposters`, `DELETE
 /imposters/:port`, stub CRUD, and `POST /imposters/:port/{enable,disable}`)
 become replicated control ops committed through the Raft leader — submitted on
-any node, forwarded automatically — and most everything else (reads, scenario
-state) is reverse-proxied to the local engine unchanged. The recorded-request
-journal is the one read that is neither: `GET …/savedRequests`/`…/requests`
-with no `since` is a fleet-wide merge-on-read rather than a proxy, and its
-`DELETE` best-effort fans out to every peer — see *Merge-on-read: the fleet
-request journal* below. A pause replicates and survives restarts (upstream
+any node, forwarded automatically — and everything else (reads, scenario
+state, the recorded-request journal) is reverse-proxied to the local engine
+unchanged. That includes verification: `GET …/savedRequests`/`…/requests`, its
+`?since=` cursor and its `DELETE` all answer for the node the call reached,
+and `numberOfRequests` is that node's own count (D-74, #552) — there is no
+fleet merge, no fan-out clear and no cluster header on any of them.
+A pause replicates and survives restarts (upstream
 #817): it applies in place on
 every node, so the paused imposter's scenario state is intact on resume. A 2xx from a mutating route
 means the write is durable on a majority and, with the default
@@ -692,151 +693,7 @@ A node is not Ready until its `cluster-reconciled` gate opens: its applied
 state has caught up to the leader's and its imposters are bound (or their
 failures reported on `GET /_cluster/imposters`).
 
-## Merge-on-read: the fleet request journal (issues #223, #225)
-
-Issue #222 gave every node its own writer shard of the recorded-request
-journal, keyed `(node_id, seq, clear_gen)`. This is the read half: `GET
-/imposters/:port/savedRequests` and its alias `.../requests`, **with no
-`match`**, no longer proxy to the local engine — the front
-terminates them as a fleet-wide merge instead, and `numberOfRequests` on `GET
-/imposters/:port` and the listing becomes the fleet sum rather than one
-node's slot. Both spellings also answer identically under the
-`/admin/imposters/:port/...` alias (issue #223 review): `classify` already
-gave the imposter *listing* that treatment, and the savedRequests route now
-gets it too, so a caller cannot get a different answer — cursor header
-included — by spelling the path differently.
-
-**Why terminate instead of decorating the proxied body:** the merged response's cursor is a
-different *kind* of value from upstream's, so proxying first and then
-rewriting a header upstream just set is the fragile direction, and the
-issue's acceptance criteria pin the classification flipping outright.
-
-**The mechanics.** A merge pulls this node's own shard plus every other
-roster voter's, concurrently, under a single **2 s total** budget — a slow
-peer eats into every other peer's share of that budget rather than adding to
-it. Any peer that errors, answers something unparseable, or is still
-outstanding when the budget expires stamps the response
-`Rift-Cluster-Partial: true`; a fully healthy answer carries no such header
-at all — never `false` — which is what a Ch.12 strict-mode gate asserts.
-**Partial never means a peer's entries vanished**: whatever the last
-anti-entropy pass (every 5 s by default, itself fanned out concurrently
-under its own 2 s budget) cached for that peer still merges in, so the
-header says "possibly missing something newer," not "this peer was
-skipped." Entries are ordered by each one's own recorded timestamp, never
-a node-local arrival clock — the latter would let two nodes disagree about
-the merged order, which is exactly the property the issue's acceptance
-criteria require they do not. Every peer pull failure — errored, unparseable,
-or lost to the budget — is logged at `warn` with the peer, the port and the real
-error, so an operator can tell a partition (self-healing) from a decode failure
-from version skew (will not self-heal) apart, rather than seeing only the
-aggregate partial rate. The replica cache this warms is bounded by the same per-shard cap the
-local journal enforces on itself, and folds a peer's reply in by `seq`
-rather than appending it, so it cannot grow past what a fleet's worth of
-shards should hold or double-count an entry a race redelivered.
-
-**`?since=` is a vector cursor and terminates too (issue #225).** A scalar
-cursor cannot address a multi-writer merge — whose `since` would it be? —
-which is why #223 left this half proxied. #225 answers it with a **vector
-cursor**: an opaque, versioned, base64url token encoding a position per
-writer shard plus the clear generation it was issued under. Every merged read
-returns one in `x-rift-next-index`; pass it back as `?since=` to continue.
-
-Round-trip the token verbatim — it is opaque by contract, and this node
-rejects a version it does not recognize rather than guessing. Passing it back
-resumes the walk **gaplessly and without duplicates per shard**, across
-membership changes (a departed node's position freezes rather than rewinding;
-a joining node enters at 0) and across clears (a pre-clear token
-fast-forwards past retired generations instead of replaying them).
-`x-rift-truncated: true` appears exactly when retention evicted entries the
-reader had not yet seen.
-
-A bare `u64` is still accepted, and read as this node's own shard position —
-before #225 a merged read issued no cursor at all, so any scalar a client
-holds came from a proxied per-node read of this node. This is an
-upgrade-window courtesy, not a supported shape to construct. Anything that is
-neither a token nor a `u64` answers **400**: defaulting it would either
-replay the whole journal or silently skip everything recorded since, and both
-would surface as mystery data in the client rather than an error.
-
-Because every requests-read through the front is now a merge, there is no
-longer a query string meaning "just this node". Read the node's own engine
-admin address directly if you need one shard's view.
-
-**`?match=` still proxies** (issue #223 review, B1), and #225 does not change
-that: the merge-on-read path never evaluates a match predicate at all, so
-terminating on it would silently answer with the *whole* fleet's requests
-instead of the caller's scoped subset, and would turn a malformed filter's
-upstream `400` into a `200` with everything. Proxying leaves upstream's own
-clause parser, and its existing error handling, in charge — and on that path
-the cursor headers carry upstream's own scalar index, not a vector token.
-
-**`GET .../savedRequests/stream` is a merged live tail** (issue #348). It
-terminates at the front door and answers `text/event-stream` carrying the whole
-fleet's recorded requests, not just this node's. It is the same merged walk the
-cursor read above performs, resumed on every wake instead of once: the `id:`
-line after an event is a cursor token in exactly the sense `x-rift-next-index`
-is, and reconnecting with `Last-Event-ID` resumes gaplessly and without
-duplicates per shard. You can move between polling and tailing with one token.
-
-The `hello` event carries `clusterTailLatencyMs`. Entries this node records
-appear immediately; entries from other nodes ride the anti-entropy cadence, and
-that number is the honest upper bound on how late they can be — a tail that
-asked every peer per event would multiply inter-node traffic by the number of
-connected clients. `partial` events mark every transition into and out of a
-degraded merge, and `lagged` means retention dropped entries you had not
-reached yet: reconcile by polling, the stream does not replay. `: ping` every
-15 s, as single-node.
-
-Additive differences from the single-node stream, all of them declared in
-`openapi-ee.yaml`: `hello` gains `clusterTailLatencyMs` and `cursor` and omits
-the engine's scalar `seq` (a merged stream has no single bus position); `id:`
-is the vector cursor token; `index` appears only on entries this node wrote,
-because another node's seq means nothing in this node's numbering; and
-`partial` is new.
-
-**With `?match=` the tail keeps proxying**, for the reason the read does: the
-merge path evaluates no predicates, so terminating a scoped tail would answer
-with the whole fleet's requests instead of your subset.
-
-**`GET /events` still proxies per-node.** It is upstream's own firehose,
-answered by the node it reaches; the per-port tail is what this front merges.
-
-**`DELETE savedRequests`/`.../requests` is explicitly transitional, and a
-`match`-scoped clear never fans out at all.** Without `?match=`, it clears
-this node's own journal exactly as before, then best-effort fans an
-*unconditional full* clear out to every other roster voter over the cluster
-RPC port. A peer missed by the fan-out keeps the deleted entries in its own
-shard and in this node's replica cache of it until it is retried or
-re-observed; the response is stamped partial in that case. Every receiving
-peer also drops its own replica-cache copies of `port` for every node it has
-cached (issue #223 review, B2) — clearing only *that peer's own* writer
-shard left every other node's stale, pre-clear cache of it untouched, which
-is what let a fully successful clear still resurrect the deleted entries via
-anti-entropy forever, unstamped, on every peer.
-
-**With `?match=`**, the clear stays local-only and is **never** fanned out
-(issue #223 review, B3 — a design decision, not a gap still to close): the
-wire fan-out has nowhere to carry a match predicate, so propagating a scoped
-clear as an unconditional full clear would over-delete whatever else that
-port holds on every other node. The response is stamped
-`Rift-Cluster-Partial: true` unconditionally in this case — not because a
-peer was unreachable, but because the clear itself never reached them by
-design, so a client cannot mistake a scoped, local clear for a fleet-complete
-one.
-
-Issue #224 replaces this whole mechanism
-with a Raft-committed clear that bumps a `clear_gen` the merge already
-honours (pinned at `0` today, a no-op until then) so a clear converges by
-consensus instead of a best-effort broadcast a partition can simply outlast,
-and can carry a real predicate so a scoped clear stops needing this
-local-only carve-out.
-
-**`numberOfRequests`** on `GET /imposters/:port` and the listing is rewritten
-in place from the fleet's G-counter slots (`/_cluster/journal/counts`), one
-round trip per peer for every listed port at once — the same 2 s budget and
-`Rift-Cluster-Partial` contract as the merged entries read, but no separate
-metric family: it is a body decoration on an otherwise-proxied response, not
-a termination.
+## Reading back a node's imposter body (#370)
 
 **`_rift.flowStateResolved`** on `GET /imposters/:port` (#370) carries the
 three per-imposter flow-state knobs the cluster acts on, each as
@@ -878,8 +735,8 @@ somewhere you could go and change".
 `contextScope` is deliberately absent: it is not a knob with a fleet default to
 resolve but a namespace choice, documented in the knob table above.
 Like `owner` on a space read, the decoration is additive and so a body it
-cannot parse passes through unchanged and logged, rather than failing the read
-the way the `numberOfRequests` correction does.
+cannot parse passes through unchanged and logged, rather than failing a read
+the cluster only annotates.
 
 ## The clustered front door (#131)
 
@@ -1220,17 +1077,15 @@ C4 ships the app shell, a read-only imposter list and detail with
 enable/disable, and the cluster view. Four behaviours are worth knowing as an
 operator, because each is a deliberate refusal to round a fact off:
 
-- **Everything on screen is one node's answer, except the request journal.**
-  `/imposters` is served by whichever node the browser reached, and
-  `/_fleet/*` is that node reporting on itself. The screens say so rather than
-  presenting either as fleet-wide, and there is no *client-side* fan-out and
-  merge anywhere — that would reinvent the verification plane without its
-  cursors or gap repair, producing a merged view with no way to know what it
-  missed. The one exception is server-side: issue #223 landed the merged
-  journal (see *Merge-on-read* above), so `numberOfRequests` and a
-  `savedRequests` read are already the fleet's answer, stamped
-  `Rift-Cluster-Partial` when the merge could not be sure of it — the console
-  does not need to, and must not, merge those itself.
+- **Everything on screen is one node's answer, the request journal included.**
+  `/imposters` is served by whichever node the browser reached, `/_fleet/*` is
+  that node reporting on itself, and since D-74 (#552) a `savedRequests` read
+  and `numberOfRequests` are that node's own too. The screens say so rather
+  than presenting any of it as fleet-wide, and there is no *client-side*
+  fan-out and merge anywhere — a console that stitched three nodes' logs
+  together would be inventing a fleet journal in the browser, with no way to
+  know what it missed and no cursor that means anything across nodes. The
+  Requests screen names the node it is reading from instead.
 - **An empty list is not the same claim as an empty fleet.** When the answering
   node is degraded — not ready, draining, isolated, leaderless, or **evicted
   from the voter set** — the empty state says the fleet *cannot be confirmed*

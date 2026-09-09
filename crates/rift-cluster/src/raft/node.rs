@@ -50,7 +50,6 @@ use crate::rpc::{
     RpcServerConfig, Signer, TrackedPeerHealth, Verifier,
 };
 use crate::stores::flow::FlowNet;
-use crate::stores::journal::ClusterJournal;
 
 /// Log-file name for the Raft storage inside the node's data directory.
 const RAFT_DB_FILE: &str = "raft.redb";
@@ -321,6 +320,26 @@ pub enum JoinedAs {
     /// blocking way, so it is a member and current — it just cannot say which
     /// role in its reply.
     Unknown,
+}
+
+/// How a bounded [`RaftNode::await_leader`] ended.
+///
+/// Three outcomes rather than a `bool`, because the two failures are answered
+/// differently and a caller that cannot tell them apart writes a false
+/// diagnosis: "the fleet has no quorum" is exactly wrong about a node whose own
+/// raft core has already exited. Same reasoning, and the same two openraft
+/// variants, as the `Timeout`/`ShuttingDown` split in
+/// [`RaftNode::await_local_applied`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LeaderWait {
+    /// A leader became visible inside the budget.
+    Elected,
+    /// The budget elapsed with no leader visible — the fleet has not elected
+    /// one, or this node cannot see the one it has.
+    Timeout,
+    /// This node's raft core is shutting down, so no leader will ever become
+    /// visible *here*. Says nothing about the fleet.
+    ShuttingDown,
 }
 
 /// Why an address sweep failed.
@@ -605,28 +624,24 @@ impl RaftNode {
     /// does not form or join a cluster; call [`RaftNode::cluster_init`] to
     /// bootstrap a new one or [`RaftNode::join_via`] to attach to an existing one.
     pub async fn start(config: NodeConfig) -> Result<Self, NodeError> {
-        Self::start_inner(config, None, None, None, None).await
+        Self::start_inner(config, None, None, None).await
     }
 
-    /// Like [`Self::start`], with the front door's compiled-route handle and this node's local
-    /// request journal both attached to the state machine before `Raft::new` (issue #131 for the
-    /// routes handle, #224 for the journal) — a separate constructor rather than two more
+    /// Like [`Self::start`], with the front door's compiled-route handle attached to the state
+    /// machine before `Raft::new` (issue #131) — a separate constructor rather than two more
     /// `NodeConfig` fields so every existing caller (most of which touch neither) keeps
     /// compiling untouched. Same before-construction contract as `NodeConfig::engine`: attaching
     /// here, rather than after this call returns, means catch-up replay during a join drives the
-    /// `ArcSwap` and pushes clear generations into the journal too, not just live commits
-    /// afterward.
+    /// `ArcSwap` too, not just live commits afterward.
     pub async fn start_with_front_door_routes(
         config: NodeConfig,
         front_door_routes: Arc<ArcSwap<CompiledRoutes>>,
-        journal: Arc<ClusterJournal>,
         sequencing: Arc<crate::stores::SequencingRegistry>,
         flow_net: Arc<FlowNet>,
     ) -> Result<Self, NodeError> {
         Self::start_inner(
             config,
             Some(front_door_routes),
-            Some(journal),
             Some(sequencing),
             Some(flow_net),
         )
@@ -636,7 +651,6 @@ impl RaftNode {
     async fn start_inner(
         config: NodeConfig,
         front_door_routes: Option<Arc<ArcSwap<CompiledRoutes>>>,
-        journal: Option<Arc<ClusterJournal>>,
         sequencing: Option<Arc<crate::stores::SequencingRegistry>>,
         flow_net: Option<Arc<FlowNet>>,
     ) -> Result<Self, NodeError> {
@@ -660,10 +674,6 @@ impl RaftNode {
         // and a replayed or snapshot-installed delete clears exactly like a live one.
         let state_machine = match flow_net {
             Some(flow_net) => state_machine.with_flow_net(flow_net),
-            None => state_machine,
-        };
-        let state_machine = match &journal {
-            Some(journal) => state_machine.with_journal(journal),
             None => state_machine,
         };
         // The handlers need the Raft, which needs the bound server address, which
@@ -1408,6 +1418,46 @@ impl RaftNode {
         }
     }
 
+    /// Wait, bounded, until this node can see a leader. Reports which of
+    /// [`LeaderWait`]'s three endings happened.
+    ///
+    /// [`Self::submit`] is deliberately not a retry loop: with no leader to
+    /// forward to it answers [`NodeError::Unavailable`] on the first try, which
+    /// is the right answer for a client request and the wrong one for a
+    /// *startup* write. A node that has just joined, or one booting into a
+    /// fleet still holding its first election, spends a window with
+    /// `current_leader == None` through no fault of its own — and the
+    /// `--imposters` bootstrap (D-72) makes that window a failed start. This is
+    /// the wait that closes it, and it is deliberately the only thing it does:
+    /// a write that is genuinely refused still fails loudly.
+    ///
+    /// Event-driven rather than polled — openraft wakes the metrics watch. A
+    /// leader elected and lost again before the caller's write lands is not
+    /// covered and is not meant to be: that failure is retry-worthy and the
+    /// caller reports it, where a silent re-wait here would hide a flapping
+    /// election behind a slow boot.
+    pub async fn await_leader(&self, timeout: Duration) -> LeaderWait {
+        match self
+            .raft
+            .wait(Some(timeout))
+            .metrics(
+                |metrics| metrics.current_leader.is_some(),
+                "a leader to accept a startup write",
+            )
+            .await
+        {
+            Ok(_) => LeaderWait::Elected,
+            // Both mean "no leader here", and they mean opposite things about
+            // the fleet: a timeout is a statement about quorum, a shutdown is a
+            // statement about this process only. Collapsing them would let a
+            // node draining under a rolling restart report its fleet as
+            // quorum-less. Same split, for the same reason, as
+            // `await_local_applied`.
+            Err(WaitError::Timeout(..)) => LeaderWait::Timeout,
+            Err(WaitError::ShuttingDown) => LeaderWait::ShuttingDown,
+        }
+    }
+
     /// Wait until every cluster member's applied index has reached `revision`,
     /// or `timeout` elapses — the read-after-write barrier (issue #9). Returns
     /// the ids of members that had NOT confirmed by the deadline; empty means
@@ -1829,17 +1879,6 @@ impl RaftNode {
             .map_err(|e| NodeError::Storage(e.to_string()))
     }
 
-    /// The applied clear generation for `port` (or `port`'s `space`, when given); `0` if
-    /// `ControlOp::JournalClearGen` has never committed for that key (issue #224).
-    ///
-    /// # Errors
-    /// Storage I/O.
-    pub fn journal_gen(&self, port: u16, space: Option<&str>) -> Result<u64, NodeError> {
-        self.sm_reader
-            .journal_gen(port, space)
-            .map_err(|e| NodeError::Storage(e.to_string()))
-    }
-
     /// This node's current Raft term. Test-facing: the #431 probe asserts a
     /// restarted voter's term never runs ahead of the leader's.
     #[doc(hidden)]
@@ -1945,21 +1984,6 @@ impl RaftNode {
                 metrics.millis_since_quorum_ack,
             ),
         }
-    }
-
-    /// How many voters the applied membership has.
-    ///
-    /// Cheaper than [`status`](Self::status) or [`ring`](Self::ring), which
-    /// collect the ids into a `Vec` and — in `ring`'s case — sort and dedup
-    /// them. Not allocation-free, though: openraft's `voter_ids()` builds a
-    /// `BTreeSet` internally, so callers on a per-request path (the journal's
-    /// shard cap, issue #222) must still cache the result rather than consult
-    /// this per request.
-    #[must_use]
-    pub fn voter_count(&self) -> usize {
-        let receiver = self.raft.metrics();
-        let metrics = receiver.borrow();
-        metrics.membership_config.voter_ids().count()
     }
 
     /// The ownership ring computed from this node's applied membership. Its
@@ -2386,6 +2410,50 @@ mod tests {
         assert!(
             node.status().last_applied.is_some_and(|a| a >= rev),
             "await_local_applied returned true before the apply landed"
+        );
+
+        node.shutdown().await.expect("shutdown");
+    }
+
+    /// The primitive the `--imposters` bootstrap (D-72) needs: a node composed
+    /// before its fleet has elected must be able to *wait* for a leader rather
+    /// than take `submit`'s first `Unavailable` as a reason to refuse its own
+    /// start.
+    ///
+    /// Both halves matter and they fail differently. A wait that never reports
+    /// [`LeaderWait::Timeout`] hangs a genuinely quorum-less boot forever; one
+    /// that never reports [`LeaderWait::Elected`] — reading the wrong metric,
+    /// say — fails every boot with a timeout that looks like a broken fleet. So
+    /// this asserts the uninitialized node times out *inside its own budget*,
+    /// and the initialized one returns immediately.
+    ///
+    /// Asserted on the variant, not on "not elected": a node whose raft core has
+    /// exited answers [`LeaderWait::ShuttingDown`], and the bootstrap renders
+    /// that as a different sentence because it is a different fact — nothing
+    /// about the fleet's quorum.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn await_leader_times_out_with_no_leader_and_returns_once_one_exists() {
+        let dir = TempDir::new().expect("tempdir");
+        let node = RaftNode::start(config_in(&dir, 9)).await.expect("start");
+
+        // Uninitialized: no membership, so no election can happen at all.
+        let started = tokio::time::Instant::now();
+        assert_eq!(
+            node.await_leader(Duration::from_millis(250)).await,
+            LeaderWait::Timeout,
+            "a node with no cluster to elect in must report a timeout — the diagnosis that names \
+             quorum — not hang and not `ShuttingDown`"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "await_leader overran its own timeout"
+        );
+
+        node.cluster_init().await.expect("cluster init");
+        assert_eq!(
+            node.await_leader(Duration::from_secs(5)).await,
+            LeaderWait::Elected,
+            "a node that has elected itself must see a leader"
         );
 
         node.shutdown().await.expect("shutdown");

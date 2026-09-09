@@ -60,7 +60,13 @@ Inside "cluster core", one subsystem this RFC removes is itself large:
 
 | Subsystem | Source | Test |
 |---|---|---|
-| Journal shards and merge-on-read (`stores/{journal,journal_net,journal_seq}.rs`, `pull_on_miss.rs`) | ~4,000 | ~4,200 in-file + `tests/fleet_journal.rs` 1,519 |
+| Journal shards and merge-on-read (`stores/{journal,journal_net,journal_seq}.rs`) | ~3,700 | ~4,200 in-file + `tests/fleet_journal.rs` 1,519 |
+
+> **Amended by D-74** (#552): this row named `pull_on_miss.rs` when it was written, and that was
+> wrong. `pull_on_miss.rs` is **config catch-up**, not journal: a `NoMatchInterceptor` that, on a
+> genuine no-match, compares this node's applied index with the leader's and re-matches once if it
+> was behind (D-11's read-after-write safety net, chaos scenario C16). It has nothing to do with
+> recorded requests and stays. Its ~300 source lines are removed from the figures above.
 
 The flow-state tier (`stores/{flow,shard,flow_config,sequencer,proxy}.rs`, `raft/ring.rs`,
 `bridge.rs`; ~6,100 source, ~10,500 test) **stays** — see §3.1 and the 2026-09-06 amendment.
@@ -179,8 +185,8 @@ surface this RFC removes. It also built a flow-state tier stronger than upstream
 | Cluster metric families, observability overlay, dashboards, rule tests | Upstream's metrics server, untouched; `/_fleet/members` for tests | RFC-001 metrics section retired | #548 |
 | Tracking sources (`git+`, `s3:`, `registry:`, scheduler, `auth_ref`), datasets, stored specs with drift and validation, the blob store | Upstream `file:`/`https:` sources; stateless `POST /specs/compile` | D-18, D-19, D-23, D-29, D-30, D-31, D-34, D-48, D-49, D-50, D-51, D-52, D-53, D-55, D-56; RFC-005; RFC-004 §3.4–§3.6 | #549 |
 | Tenants, principals, bindings, roles, quotas, `X-Rift-Tenant`, the tenant half of every key and of the revision header | One API key; `POST /session` exchanges it | D-44, D-45, D-46, D-68 superseded; RFC-002 superseded; chapter 08 retired — all by **D-73** | #550 |
-| Journal shards, merge-on-read, anti-entropy, generation clears, vector cursors, fleet request tail | Upstream per-node journal | D-32, D-37, D-38, D-39; RFC-001 §7.5 | #552 |
-| Console: Admin, Sources, Scenarios screens; planned Specs entry | Four screens: Imposters, Requests, Routes, Cluster | RFC-006 §4 amended | #553 |
+| Journal shards, merge-on-read, anti-entropy, generation clears, vector cursors, fleet request tail | Upstream per-node journal | D-32, D-37, D-38, D-39 superseded by **D-74**; RFC-001 §7.5.1–§7.5.2 retired (§7.5.3 proxyOnce stays); chapter 07 retired, its proxyOnce section moved to chapter 06 | #552 |
+| Console: Admin, Sources screens; planned Specs entry; the merged Requests view; the greyed roadmap run | Five screens: Imposters (with Import from OpenAPI spec), Requests, Scenarios, Router, Cluster — Scenarios stays with the flow-state tier (v1.1) | RFC-006 §4 amended | #553 |
 
 ### 3.3 The trade, stated once
 
@@ -190,7 +196,13 @@ surface this RFC removes. It also built a flow-state tier stronger than upstream
   path is the dependency the fleet exists to avoid, and the cluster's tier is the stronger one.)
 - **Verification is per node.** `GET /imposters/:port/requests` answers for the node you reached.
   A test that needs fleet-wide verification pins a node or reads all of them. If Rift ever grows a
-  shared journal, it grows it in the engine, once, for every deployment shape.
+  shared journal, it grows it in the engine, once, for every deployment shape. **Landed by #552
+  (D-74):** the journal is upstream's own, `numberOfRequests` is the answering node's count rather
+  than a fleet sum, and `Rift-Cluster-Partial` is stamped on exactly two reads, `/_fleet/members`
+  and `/_fleet/health` — the spaces listing fans out too but keeps reporting its own incompleteness
+  in the body (`partial`, beside `unavailable`). The cost is stated in full there,
+  including what it takes away: a single read that speaks for the whole fleet, and a count a
+  caller could trust without knowing which nodes answered.
 - **One credential.** Everyone who can administer the fleet can administer all of it. Isolation
   between teams is a deployment (two fleets), not a feature. **Landed by #550 (D-73):**
   `--api-key` set closes the whole admin plane, unset leaves it open, and `POST /session`
@@ -224,9 +236,11 @@ epic. 0 lands first so every later child has an in-repo before/after check.
 | 9 | #553 | Console trimmed to four screens | #550, #552 |
 | 10 | #554 | Design docs retired; the router named | all |
 
-Each child PR carries `Design: amended — D-71` and marks its retired decisions `superseded` with
-`Superseded by: D-71` in the same PR, so `design-check --strict` stays green at every step and the
-register never describes code that is gone.
+Each child PR registers its own decision (D-72 for #549, D-73 for #550, D-74 for #552), carries
+`Design: amended — D-n` for it, and marks the decisions it retires `superseded` with
+`Superseded by: D-n` naming that child's entry — not D-71, which records the scope and lists the
+children — in the same PR, so `design-check --strict` stays green at every step and the register
+never describes code that is gone.
 
 ## 5. Verification protocol
 
@@ -304,6 +318,11 @@ taken once the API has stopped shrinking (#554).
    show the node it reached and say so (#553). A picker is a later addition if anyone asks.
 3. **Is `Rift-Cluster-Partial` still needed anywhere?** Fleet reads that fan out (`/_fleet/members`)
    still are partial when a peer is down. Default: keep it on those reads only (#552).
+   **Resolved by #552 (D-74):** kept, on exactly those. The header, its OpenAPI component and the
+   Ch.12 strict-mode gate that asserts its *absence* on a healthy answer all survive; what changed
+   is the description, which no longer offers two reasons for the stamp. `HEADER_NEXT_INDEX` and
+   `HEADER_TRUNCATED` went the other way and left `decorate.rs` entirely — the cursor headers on
+   the wire are upstream's own, emitted by upstream, scalar and per node.
 4. **Should the OpenAPI compile endpoint live on the server at all, or only in the console?** A
    server endpoint lets curl users import too. Default: server endpoint, stateless (#549).
    **Resolved by #549 (D-72):** the server keeps a stateless `POST /specs/compile` that compiles
@@ -325,8 +344,8 @@ Updated as PRs merge. Status is one of `open`, `in progress`, `merged`.
 | #549 | Sources, datasets, specs, blobs | in progress | — |
 | #550 | Tenancy and RBAC | in progress | — |
 | ~~#551~~ | Flow state, sequencer, proxyOnce, spaces | withdrawn 2026-09-06 — stays | — |
-| #552 | Journal merge | open | — |
-| #553 | Console | open | — |
+| #552 | Journal merge | in progress | — |
+| #553 | Console | in progress | — |
 | #554 | Docs and naming | open | — |
 
 Closed as out of scope on 2026-09-06, with the reason on each: #148, #149, #151, #279, #280,

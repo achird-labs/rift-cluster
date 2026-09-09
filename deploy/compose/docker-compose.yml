@@ -43,9 +43,10 @@ x-node: &node
     context: ../..
     dockerfile: deploy/Dockerfile
     # Explicit because a compose build without a target builds the Dockerfile's
-    # *last* stage — and the chaos suite's `runtime-faketime` stage (issue #228)
-    # sits after this one, since it builds FROM it. Without this line, adding
-    # that stage silently flipped every node onto the clock-lying flavor.
+    # *last* stage, and which stage that is has changed under this file before:
+    # the chaos suite's `runtime-faketime` sat after `runtime` from #228 until
+    # #552 retired it, and while it did, an untargeted build here silently
+    # flipped every node onto the clock-lying flavor. Pinning costs one line.
     target: runtime
     args:
       # Set by verify.sh; empty locally just means the banner says

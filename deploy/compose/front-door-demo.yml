@@ -33,8 +33,8 @@ services:
     build:
       context: ../..
       dockerfile: deploy/Dockerfile
-      # Pinned because the Dockerfile's last stage is the chaos suite's
-      # faketime flavor (issue #228); untargeted builds would select it.
+      # Pinned so this cannot depend on which stage happens to be last in the
+      # Dockerfile — a thing that has changed under this file before (#228, #552).
       target: runtime
     environment:
       MB_CONFIGFILE: "/var/lib/rift/front-door-demo.config.json"

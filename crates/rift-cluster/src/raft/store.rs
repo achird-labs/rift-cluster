@@ -52,8 +52,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::ops::{Bound, RangeBounds};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock, Weak};
 
 use arc_swap::ArcSwap;
 use http_body_util::Full;
@@ -81,7 +81,6 @@ use crate::control::{
     StubEditScript,
 };
 use crate::stores::flow::FlowNet;
-use crate::stores::journal::ClusterJournal;
 use crate::stores::sequencer::SequencingRegistry;
 
 type StorageResult<T> = Result<T, StorageError<u64>>;
@@ -136,22 +135,13 @@ const SM_FLEET_NAME_TABLE: TableDefinition<&str, &str> = TableDefinition::new("s
 /// The single key `sm_fleet_name` uses, named rather than `()` for the same reason
 /// [`SESSION_KEY_ROW`] is: it reads like the rest of the schema.
 const FLEET_NAME_ROW: &str = "name";
-/// `(port, space-tag) -> generation` (issue #224): the applied clear-generation
-/// counters `ControlOp::JournalClearGen` bumps. A small, monotone, per-key counter table whose
-/// key is two-part: `space-tag` is
-/// [`journal_gen_space_key`]'s own encoding of `Option<&str>`, not a bare `&str`, because a
-/// port-wide clear (`None`) must never be representable the same way as a space-scoped one
-/// (`Some`) no matter what the space is named.
-const SM_JOURNAL_GENS_TABLE: TableDefinition<(u16, &str), u64> =
-    TableDefinition::new("sm_journal_gens");
-
 /// `(port, sig-hash) -> recorded-response JSON` (#226): the applied proxy-recording
 /// markers `ControlOp::ProxyRecorded` writes. A row is both facts at once: *this signature is
 /// Recorded* (the claim table any owner — including one elected after a handoff — answers
 /// `AlreadyRecorded` from), and *this is the replayable response* (`lookup()`'s durable source
 /// for a stub-less proxyOnce recording, which has no recorded stub in config to replay from).
-/// Keyed like `sm_journal_gens` minus the space tag: the sig-hash is already a fixed-alphabet
-/// hex string, so no encoding is needed to keep key families apart.
+/// The sig-hash is already a fixed-alphabet hex string, so no encoding is needed to keep key
+/// families apart.
 const SM_PROXY_RECORDED_TABLE: TableDefinition<(u16, &str), &str> =
     TableDefinition::new("sm_proxy_recorded");
 
@@ -225,27 +215,6 @@ fn place_recorded_stub(
     }
 }
 
-/// Encodes the space component of an `sm_journal_gens` key so a port-wide clear (`None`) can
-/// never be confused with a space-scoped one — including a hypothetically empty space name.
-/// `validate` already refuses `Some("")`, but this encoding does not lean on that refusal (the
-/// #224 design note this crate was told twice): every space-scoped key carries a leading `'s'`
-/// tag byte a port-wide key can never produce, because the port-wide key is the fixed one-byte
-/// string `"p"` — the two families cannot collide regardless of what a space is named.
-fn journal_gen_space_key(space: Option<&str>) -> String {
-    match space {
-        None => "p".to_owned(),
-        Some(space) => format!("s{space}"),
-    }
-}
-
-/// The inverse of [`journal_gen_space_key`]: recovers the `Option<String>` shape a snapshot
-/// payload and [`ClusterJournal::set_clear_gen`] both want from a stored key. Any key that is
-/// not the literal `"p"` sentinel is a space-scoped key with the tag stripped — `strip_prefix`
-/// returning `None` only for `"p"` itself is exactly the case that must decode to `None`.
-fn decode_journal_gen_space_key(key: &str) -> Option<String> {
-    key.strip_prefix('s').map(str::to_owned)
-}
-
 const SM_DEDUP_TABLE: TableDefinition<&str, &str> = TableDefinition::new("sm_op_dedup");
 const SM_APPLIED_TABLE: TableDefinition<(), &[u8]> = TableDefinition::new("sm_applied");
 /// Node-local durable intents (issue #9 R4): ops this node accepted but has
@@ -302,9 +271,9 @@ struct DedupEntry {
 /// heal would double-apply the intents replayed across it.
 ///
 /// **#549 removed five fields** — `sources`, `specs`, `spec_blobs`, `datasets` and
-/// `dataset_blobs` — and **#550 three more** (`tenants`, `principals`, `bindings`)
-/// along with the tables they carried, and dropped the tenant component from every
-/// surviving row shape. Unlike [`ControlOp`], where a removed variant makes an old log
+/// `dataset_blobs` — **#550 three more** (`tenants`, `principals`, `bindings`) along with
+/// the tables they carried and the tenant component of every surviving row shape, and
+/// **#552 one more** (`journal_gens`, D-74). Unlike [`ControlOp`], where a removed variant makes an old log
 /// entry undecodable, removing a field here is *backward*-compatible on its own: this
 /// struct sets no `deny_unknown_fields`, so a payload built before the removal still
 /// parses and its extra keys are dropped — but a **changed tuple arity** is not, and
@@ -355,15 +324,6 @@ struct SnapshotPayload {
     /// "unnamed" until the next rename.
     #[serde(default)]
     fleet_name: Option<String>,
-    /// `(port, space, generation)` rows of `sm_journal_gens` (issue #224).
-    /// `#[serde(default)]` for the #134/#137 reason every table above carries it: a snapshot
-    /// built before this field existed must still install, and the empty vec it decodes to means
-    /// exactly what an upgrading fleet's history actually is — no clear has ever committed. The
-    /// sharper failure than most of this table's siblings if it were ever forgotten here: a node
-    /// that joins by snapshot and reads every generation as `0` would silently resurrect entries
-    /// its peers have already agreed are cleared, the very inversion issue #224 exists to close.
-    #[serde(default)]
-    journal_gens: Vec<(u16, Option<String>, u64)>,
     /// `(port, sig-hash, recorded-response JSON)` rows of `sm_proxy_recorded` (#226).
     /// `#[serde(default)]` for the #134/#137 reason every table above carries it. The failure
     /// if it were forgotten: a node that joins by snapshot answers `Claimed` for signatures
@@ -443,7 +403,6 @@ pub async fn new<P: AsRef<Path>>(path: P) -> StorageResult<(RedbLogStore, RedbSt
         write_txn.open_table(SM_ROUTES_REVISION_TABLE).map_err(io)?;
         write_txn.open_table(SM_SESSION_KEY_TABLE).map_err(io)?;
         write_txn.open_table(SM_FLEET_NAME_TABLE).map_err(io)?;
-        write_txn.open_table(SM_JOURNAL_GENS_TABLE).map_err(io)?;
         write_txn.open_table(SM_PROXY_RECORDED_TABLE).map_err(io)?;
         write_txn.open_table(SM_DEDUP_TABLE).map_err(io)?;
         write_txn.open_table(SM_APPLIED_TABLE).map_err(io)?;
@@ -823,26 +782,6 @@ pub struct RedbStateMachine {
     /// refusal that names no single port). This is node status, not replicated
     /// state — every replica has its own bind outcomes.
     apply_failures: Arc<Mutex<BTreeMap<u16, String>>>,
-    /// This node's local request journal, late-bound (issue #224): `apply` pushes a committed
-    /// clear generation into it via [`ClusterJournal::set_clear_gen`], and `install_snapshot`
-    /// via [`ClusterJournal::reset_clear_gen`] — the monotone guard the apply path needs is
-    /// exactly the guard install must *not* have (see that method's doc) — so this replica's
-    /// own shards start dropping pre-clear entries immediately, without waiting for a caller to
-    /// read `sm_journal_gens` back out. `reconcile_engine` covers the third case, a cold start:
-    /// nothing re-delivers past `JournalClearGen` entries once openraft resumes from
-    /// `last_applied_log`, so a freshly built journal is rehydrated from `sm_journal_gens`
-    /// directly, the same way that method already rehydrates the engine and routes handle.
-    ///
-    /// `OnceLock<Weak<_>>`, mirroring `ClusterJournal`'s own late-bound `Voters::Node` slot (and
-    /// `FlowNet`'s node slot): the journal is built in `compose.rs` before the Raft node exists
-    /// (so it cannot be required at construction the way `db` is), and `Weak` for the same
-    /// reason those are — this state machine must never be the thing keeping the journal's
-    /// memory resident past shutdown. `None` in storage tests and on an embedder that never
-    /// wires one, exactly like `engine`; a dropped handle degrades the push into a benign no-op
-    /// (see the `JournalClearGen` arm of `mutate_tables`), never a panic — the generation the
-    /// fleet agrees on is durable in `sm_journal_gens` either way, and a later snapshot install
-    /// replays it into whatever journal eventually catches up.
-    journal: OnceLock<Weak<ClusterJournal>>,
 }
 
 impl std::fmt::Debug for RedbStateMachine {
@@ -850,7 +789,6 @@ impl std::fmt::Debug for RedbStateMachine {
         f.debug_struct("RedbStateMachine")
             .field("engine", &self.engine.is_some())
             .field("routes", &self.routes.is_some())
-            .field("journal", &self.journal.get().is_some())
             .field("snapshot_dir", &self.snapshot_dir)
             .finish_non_exhaustive()
     }
@@ -868,7 +806,6 @@ impl RedbStateMachine {
             flow_net: None,
             routes: None,
             apply_failures: Arc::new(Mutex::new(BTreeMap::new())),
-            journal: OnceLock::new(),
         }
     }
 
@@ -916,20 +853,6 @@ impl RedbStateMachine {
     #[must_use]
     pub fn with_routes_handle(mut self, routes: Arc<ArcSwap<CompiledRoutes>>) -> Self {
         self.routes = Some(routes);
-        self
-    }
-
-    /// Attach this node's local request journal (issue #224), so `apply`/`install_snapshot` can
-    /// push a committed clear generation into it. Same before-`Raft::new` contract as
-    /// [`Self::with_engine`] — call before this state machine is cloned into `Raft::new` and
-    /// into `sm_reader`, so both share the same bound handle from their first apply.
-    ///
-    /// Stores only a [`Weak`] (see the `journal` field's doc for why); does not need `&mut self`
-    /// because the slot binds at most once (`OnceLock::set`), the same idempotent-bind contract
-    /// `ClusterJournal::bind` itself keeps.
-    #[must_use]
-    pub fn with_journal(self, journal: &Arc<ClusterJournal>) -> Self {
-        let _ = self.journal.set(Arc::downgrade(journal));
         self
     }
 
@@ -1612,18 +1535,31 @@ impl RedbStateMachine {
     /// *new* entries onto the engine, so a restarted node must run this once to
     /// materialize what its tables already hold. A no-op without an engine;
     /// engine-side failures land in [`Self::apply_failures`] as usual.
-    ///
-    /// Also rehydrates the local [`ClusterJournal`]'s clear generations from `sm_journal_gens`
-    /// (issue #224, Blocker 2). The generation lives in two places: durably in redb, and in the
-    /// process-local journal that stamps every appended entry. A restart rebuilds only the
-    /// latter from scratch — openraft resumes replay from `last_applied_log`, so the
-    /// `JournalClearGen` entries that built the durable rows are never re-applied, and nothing
-    /// else re-primes the in-memory copy. Without this, a restarted node's `clear_gen` silently
-    /// reads back as `0` — "never cleared" — and every subsequent request it records is stamped
-    /// as pre-clear, resurrecting it fleet-wide the moment a merge runs, with no error and no
-    /// metric. A no-op without a bound journal, same as the engine drive above.
     #[allow(clippy::result_large_err)]
     pub async fn reconcile_engine(&self) -> StorageResult<()> {
+        self.reconcile_engine_interleaved(std::future::ready(()))
+            .await
+    }
+
+    /// [`Self::reconcile_engine`] with a seam inside its orphan sweep, between
+    /// the sweep's two reads. Production passes a ready future; the test that
+    /// pins the sweep's bound (#567 review) commits an imposter there, on a
+    /// second state-machine handle, exactly where the apply loop can in
+    /// `compose`. One body for both, so the ordering under test is the
+    /// ordering shipped.
+    ///
+    /// **That point, not "between the sync and the sweep" (#573 review).** The
+    /// sweep's verdict is decided by two reads — the held set and the desired
+    /// set — and a concurrent apply changes the verdict only while it sits
+    /// between them. An apply landing before the first read or after the second
+    /// is seen by both or by neither. So this is the worst case, and it is
+    /// strictly later than the old seam: a commit here is also a commit after
+    /// the engine sync, which is what the earlier placement tested.
+    #[allow(clippy::result_large_err)]
+    async fn reconcile_engine_interleaved(
+        &self,
+        between_sweep_reads: impl Future<Output = ()>,
+    ) -> StorageResult<()> {
         // Both tables read fresh, in one call: a restart's local `ImposterManager`
         // and `ArcSwap<CompiledRoutes>` both start empty (they are process-local,
         // rebuilt from persisted `sm_configs`/`sm_routes`), and a live commit only
@@ -1654,13 +1590,12 @@ impl RedbStateMachine {
             };
             (config_action, routes_action)
         };
-        // The ports the tables name, for the orphan sweep below. `None` when
-        // the config set will not parse: with no trustworthy desired set the
-        // sweep, like the engine sync, does nothing rather than guess.
-        let desired_ports: Option<BTreeSet<u16>> = match &config_action {
-            EngineAction::Sync(desired) => Some(desired.iter().filter_map(|c| c.port).collect()),
-            _ => None,
-        };
+        // Whether the sweep below follows a sync that happened. A `RefuseSync`
+        // leaves the engine holding whatever it held, and the sweep is the
+        // other half of the same reconcile: with the engine not rebuilt it
+        // does nothing either, rather than clear against a set the engine
+        // itself was not trusted with.
+        let config_synced = matches!(config_action, EngineAction::Sync(_));
         // Unattributed: this materializes a whole table on restart, not one
         // caller's write, so there is no principal to name.
         self.drive_engine(vec![
@@ -1668,38 +1603,13 @@ impl RedbStateMachine {
             AttributedAction::unattributed(routes_action),
         ])
         .await;
-        if let Some(desired_ports) = desired_ports {
-            self.sweep_orphaned_imposter_state(&desired_ports).await;
-        }
-
-        // Blocker 2: rehydrate this node's local journal from the durable generations table —
-        // see this method's doc for why nothing else does. Gated on a bound journal before
-        // opening the table at all, matching every other late-bound handle's "missing is a
-        // benign no-op" contract in this file.
-        if let Some(journal) = self.journal.get().and_then(Weak::upgrade) {
-            let read_txn = self
-                .db
-                .begin_read()
-                .map_err(|e| StorageIOError::read_state_machine(&e))?;
-            let table = read_txn
-                .open_table(SM_JOURNAL_GENS_TABLE)
-                .map_err(|e| StorageIOError::read_state_machine(&e))?;
-            for item in table
-                .iter()
-                .map_err(|e| StorageIOError::read_state_machine(&e))?
-            {
-                let (key, value) = item.map_err(|e| StorageIOError::read_state_machine(&e))?;
-                let (port, space_key) = key.value();
-                // `set_clear_gen`, not `reset_clear_gen`: this is priming a journal that starts
-                // at 0, not correcting one that may be ahead the way a snapshot install must —
-                // the monotone guard is harmless here and keeps this call sharing the apply
-                // path's contract rather than install's.
-                journal.set_clear_gen(
-                    port,
-                    decode_journal_gen_space_key(space_key).as_deref(),
-                    value.value(),
-                );
-            }
+        if config_synced {
+            self.sweep_orphaned_imposter_state(between_sweep_reads)
+                .await?;
+        } else {
+            // Still awaited on the refuse path, so an interleaving a test asks
+            // for is never silently dropped along with the sweep.
+            between_sweep_reads.await;
         }
 
         Ok(())
@@ -1792,27 +1702,6 @@ impl RedbStateMachine {
             return Ok(None);
         };
         Ok(Some(value.value().to_owned()))
-    }
-
-    /// The applied clear generation for `port` (or `port`'s `space`, when given); `0` if
-    /// `ControlOp::JournalClearGen` has never committed for that key (issue #224).
-    ///
-    /// # Errors
-    /// Storage I/O.
-    #[allow(clippy::result_large_err)]
-    pub fn journal_gen(&self, port: u16, space: Option<&str>) -> StorageResult<u64> {
-        let read_txn = self
-            .db
-            .begin_read()
-            .map_err(|e| StorageIOError::read_state_machine(&e))?;
-        let table = read_txn
-            .open_table(SM_JOURNAL_GENS_TABLE)
-            .map_err(|e| StorageIOError::read_state_machine(&e))?;
-        let space_key = journal_gen_space_key(space);
-        Ok(table
-            .get((port, space_key.as_str()))
-            .map_err(|e| StorageIOError::read_state_machine(&e))?
-            .map_or(0, |v| v.value()))
     }
 
     /// The applied proxy-recording marker for `(port, sig_hash)` (#226): the
@@ -2002,7 +1891,7 @@ impl RedbStateMachine {
         }
     }
 
-    // Six table handles plus the journal, the op and the index: every one is a distinct piece
+    // Five table handles plus the op and the index: every one is a distinct piece
     // of the apply transaction, and grouping them into a struct would only move the arity.
     #[allow(clippy::too_many_arguments)]
     // `StorageError` is openraft's, carried here because this is the apply path openraft's
@@ -2014,13 +1903,7 @@ impl RedbStateMachine {
         routes_revision: &mut Table<'_, &'static str, u64>,
         session_key: &mut Table<'_, &'static str, &'static str>,
         fleet_name: &mut Table<'_, &'static str, &'static str>,
-        journal_gens: &mut Table<'_, (u16, &'static str), u64>,
         proxy_recorded: &mut Table<'_, (u16, &'static str), &'static str>,
-        // The local journal to push a committed generation into (issue #224), resolved once by
-        // `apply` rather than upgraded per op — `None` in storage tests, on an embedder that
-        // never wires one, or when a shutdown race has already dropped it (see the `journal`
-        // field's doc on `RedbStateMachine`).
-        journal: Option<&ClusterJournal>,
         op: &ControlOp,
         index: u64,
     ) -> StorageResult<Result<Vec<EngineAction>, String>> {
@@ -2223,46 +2106,6 @@ impl RedbStateMachine {
                     .map_err(io)?;
                 Ok(Ok(Vec::new()))
             }
-            ControlOp::JournalClearGen { port, space } => {
-                // Whether an imposter exists on `port` is deliberately not checked here — see
-                // `validate`'s doc for this op. A clear is a convergence primitive, not a config
-                // write: it must succeed even against a port nothing has configured yet, the
-                // same way `ClusterJournal::set_clear_gen` creates the shard on first touch
-                // rather than refusing an unknown one.
-                let space_key = journal_gen_space_key(space.as_deref());
-                let key = (*port, space_key.as_str());
-                // Apply *increments* rather than storing a value the submitter chose (see the
-                // op's own doc on `ControlOp::JournalClearGen`): two clears racing from two
-                // different leaders both take effect, composing to +2 — harmlessly stronger than
-                // either alone, since both mean "ignore everything before me" — rather than the
-                // second silently overwriting the first with the identical number.
-                let current = journal_gens.get(key).map_err(io)?.map_or(0, |v| v.value());
-                let next = current + 1;
-                journal_gens.insert(key, next).map_err(io)?;
-                // Pushed into this replica's own local shard(s) now, not deferred to
-                // `drive_engine`: unlike an engine bind, `ClusterJournal::set_clear_gen` is an
-                // infallible in-memory `fetch_max` with nothing to retry or report a failure
-                // for, so there is no reason to give it the async, failure-tracked treatment the
-                // engine gets. A missing handle (see the field's doc) is a benign no-op — the
-                // generation this fleet agrees on is durable in `sm_journal_gens` regardless, and
-                // any journal that binds or catches up later reads it from there (a snapshot
-                // install replays every row; a late `bind` finds the redb table already correct
-                // the next time this op's effect is asked about through it).
-                if let Some(journal) = journal {
-                    journal.set_clear_gen(*port, space.as_deref(), next);
-                    // Blocker 1 (issue #224): a *port-wide* clear used to reach the engine
-                    // directly (`DELETE savedRequests` -> `ClusterJournal::clear`), which is
-                    // what zeroed `numberOfRequests`. Now that the same clear is a generation
-                    // bump committed through Raft, nothing else zeroes it — so this node zeros
-                    // its own count slot right here, on apply. A space-scoped bump must NOT do
-                    // this: `clear_flow`/`retain` deliberately preserve the count for a scoped
-                    // deletion, and a scoped `JournalClearGen` has to match that.
-                    if space.is_none() {
-                        journal.zero_count(*port);
-                    }
-                }
-                Ok(Ok(Vec::new()))
-            }
             ControlOp::ProxyRecorded {
                 port,
                 sig_hash,
@@ -2430,17 +2273,58 @@ impl RedbStateMachine {
                 }
                 match engine.apply_config(desired).await {
                     Ok(report) => {
+                        // Read before `record_report` reaps the map, because the
+                        // ports this needs are exactly the ones it is about to
+                        // drop (#573 review). See the clear below.
+                        let previously_failed = self.previously_failed_ports();
                         self.record_report(&report, &desired_ports);
                         // The delete-path half of D-5 (#565): the ports the
                         // engine actually removed — `deleted`, never
                         // `replaced`/`stub_patched`, which are config changes
                         // that keep their runtime state — lose their flow
                         // state on this node. After the engine call, so the
-                        // clear follows the removal it belongs to: a port the
-                        // engine failed to remove keeps serving, and keeps
-                        // its state, until the next sync succeeds.
-                        self.clear_imposter_state(report.deleted.iter().copied())
-                            .await;
+                        // clear follows the removal it belongs to.
+                        //
+                        // Filtered against the desired set, because `deleted`
+                        // answers a narrower question than "was this imposter
+                        // removed" (#567 review): `replace_imposter` tears the
+                        // old imposter down and then re-creates it, and when
+                        // the re-create fails it reports the port as `deleted`
+                        // *and* `failed` — truthfully, the engine is serving
+                        // nothing there. But the config set still names that
+                        // port: it is a failed **edit**, not a removal, the
+                        // next successful sync re-creates it, and nothing —
+                        // not even the reconcile sweep, which measures the same
+                        // desired set — would ever put the flow state back. So
+                        // a port the fleet still wants keeps its state, and one
+                        // node's staging failure cannot make it disagree with
+                        // its peers about the flows it owns.
+                        //
+                        // Unioned with the ports carrying a recorded apply
+                        // failure, for the other half of that filter (#573
+                        // review): a port whose re-create was refused has left
+                        // the engine's map, so when the operator then *deletes*
+                        // it, `apply_config` computes `removed_ports` from a
+                        // map that no longer names it, reports nothing deleted,
+                        // and the state the filter above deliberately kept
+                        // would survive for the life of the process — the #565
+                        // bug, reached through a failed edit. `record_report`
+                        // reaps its own stale entries for exactly this reason
+                        // ("a bind-failed port that is later deleted keeps its
+                        // stale entry forever"); the flow state has to leave
+                        // with them. The `desired_ports` filter still gates
+                        // both halves, so a port that is merely failing stays
+                        // untouched — only one the applied set has stopped
+                        // naming is cleared.
+                        self.clear_imposter_state(
+                            report
+                                .deleted
+                                .iter()
+                                .copied()
+                                .chain(previously_failed)
+                                .filter(|port| !desired_ports.contains(port)),
+                        )
+                        .await;
                     }
                     Err(e) => {
                         tracing::error!(error = %e, "engine refused the applied config set");
@@ -2552,21 +2436,24 @@ impl RedbStateMachine {
     /// Drop each port's imposter-scoped flow state on this node (#565, the D-5
     /// amendment). A no-op without a bound flow net, and per port a no-op when
     /// the shard holds nothing under it.
+    ///
+    /// The whole set goes down in one call, not one call per port: this runs
+    /// inside the Raft apply loop, and a `DeleteAll` names every imposter the
+    /// fleet has — see [`FlowNet::clear_imposter_scopes`] for what per-port
+    /// cost.
     async fn clear_imposter_state(&self, ports: impl IntoIterator<Item = u16>) {
         let Some(flow_net) = &self.flow_net else {
             return;
         };
-        for port in ports {
-            let flows = flow_net.clear_imposter_scope(port).await;
-            if flows > 0 {
-                tracing::info!(port, flows, "dropped a deleted imposter's flow state");
-            }
+        let ports: BTreeSet<u16> = ports.into_iter().collect();
+        for (port, flows) in flow_net.clear_imposter_scopes(&ports).await {
+            tracing::info!(port, flows, "dropped a deleted imposter's flow state");
         }
     }
 
     /// The reconcile-time half of #565: drop the imposter-scoped namespaces
-    /// this node's shard holds for ports the applied config set no longer
-    /// names.
+    /// this node's shard holds for ports `sm_configs` no longer names, both
+    /// sets read *after* [`Self::reconcile_engine`]'s sync.
     ///
     /// The live path clears from the engine's `deleted` report, which needs the
     /// engine to have *had* the imposter. On a cold start it did not: the engine
@@ -2578,31 +2465,101 @@ impl RedbStateMachine {
     /// before the first reconcile. Here the comparison that the engine could
     /// not make is made against the tables instead.
     ///
+    /// **Against the tables as they stand after the sync, not the snapshot the
+    /// sync was driven from (#567 review).** Those two reads are a whole
+    /// `apply_config` apart — seconds on a cold start with listeners to bind —
+    /// and the apply loop runs concurrently on its own handle with no barrier
+    /// between them. An imposter committed inside that interval is absent from
+    /// the earlier snapshot and perfectly alive, and sweeping against the
+    /// snapshot drops its flow state. Re-reading closes that window: apply
+    /// writes `sm_configs` before it drives the engine, so a port the fleet
+    /// committed before this read is in the set.
+    ///
+    /// **The held set is read first and the desired set second — that order,
+    /// not the other one (#573 review).** Neither read is instantaneous (one
+    /// clones every key in the shard, the other walks the whole config table)
+    /// and the apply loop is running between them, so one of the two is
+    /// necessarily the older observation. Held-then-desired makes the older
+    /// one the *accusation*: every port judged here was held at the earlier
+    /// instant and is acquitted by a strictly fresher `sm_configs`. The
+    /// reverse order re-opens #567 in miniature — an apply committing
+    /// `PutImposter{P}` between the reads writes `sm_configs` before it drives
+    /// the engine, so P is durably applied and served fleet-wide, this node is
+    /// an HRW owner throughout, and a desired set read before that commit
+    /// would convict a live imposter on a held set read after it.
+    ///
+    /// The tables, not the engine's `list_imposters`, deliberately: the two
+    /// differ exactly on the ports the engine could not stage — a bind failure,
+    /// a config `create_imposter_staged` refuses — and those are ports the fleet
+    /// still wants. Their state is kept for the same reason the live path
+    /// filters `deleted` against the desired set: a failed apply on one node is
+    /// not a removal, and nothing would put the state back.
+    ///
     /// Deliberately **not** run on every live sync. A live sync runs at this
     /// node's applied index, and a replica push for an imposter created at a
     /// later index — from an owner that has already applied it — can land in
     /// this shard before this node applies that entry; sweeping then would drop
-    /// a live flow's replica copy, which nothing repairs until takeover. At
-    /// reconcile the node has just caught up to the leader and is not yet
-    /// `Ready`, which is as narrow as that window gets; the residual is a copy
-    /// the owner still holds, never the authoritative one.
-    async fn sweep_orphaned_imposter_state(&self, desired_ports: &BTreeSet<u16>) {
+    /// that copy, which nothing repairs until takeover.
+    ///
+    /// The residual, stated as it is, and it is exactly one thing: a flow that
+    /// lands for an imposter this node has **not yet applied**, before the
+    /// desired-set read below. The ring is Raft membership, so a restarted
+    /// voter is an HRW owner the whole time it is catching up, and
+    /// `flow_net.bind` runs in `compose` long before `spawn_reconciler`: such a
+    /// flow *can* land in this shard as the authoritative copy, not merely a
+    /// replica, and it is then held with no config to acquit it. Readiness does
+    /// not gate that; what bounds it is that `compose` reconciles only once
+    /// `last_applied` has reached the leader's applied index, so the exposure is
+    /// the entries committed during one apply round-trip — not the seconds a
+    /// pre-sync snapshot spanned. Nothing else remains: with the read order
+    /// above, an imposter this node *has* applied by the desired-set read is in
+    /// that set and is kept, whenever its flow arrived.
+    #[allow(clippy::result_large_err)]
+    async fn sweep_orphaned_imposter_state(
+        &self,
+        between_sweep_reads: impl Future<Output = ()>,
+    ) -> StorageResult<()> {
         let Some(flow_net) = &self.flow_net else {
-            return;
+            between_sweep_reads.await;
+            return Ok(());
         };
-        let orphaned: Vec<u16> = flow_net
-            .imposter_ports_held()
+        // The accusation, read first — see the read-order paragraph above.
+        let held = flow_net.imposter_ports_held();
+        between_sweep_reads.await;
+        if held.is_empty() {
+            return Ok(());
+        }
+        // The acquittal, read second, and therefore never staler than the set
+        // it is judging.
+        let desired_ports: BTreeSet<u16> = self.configured_ports()?.into_iter().collect();
+        let orphaned: Vec<u16> = held
             .into_iter()
             .filter(|port| !desired_ports.contains(port))
             .collect();
         if orphaned.is_empty() {
-            return;
+            return Ok(());
         }
         tracing::info!(
             ports = ?orphaned,
             "reconcile found flow state for imposters that no longer exist; dropping it"
         );
         self.clear_imposter_state(orphaned).await;
+        Ok(())
+    }
+
+    /// The ports carrying an apply failure recorded *before* the report now
+    /// being folded in — the second half of the live clear's port set (#573
+    /// review), read while [`Self::record_report`] has not yet reaped them.
+    ///
+    /// Port `0` is excluded: it is the set-level slot (a whole `apply_config`
+    /// the engine refused), not a port, and there is no `i0:` namespace.
+    fn previously_failed_ports(&self) -> Vec<u16> {
+        self.apply_failures
+            .lock()
+            .keys()
+            .copied()
+            .filter(|port| *port != 0)
+            .collect()
     }
 
     /// Fold a successful sync's report into the failure map, under one lock:
@@ -2653,22 +2610,13 @@ impl RedbStateMachine {
     /// [`RaftSnapshotBuilder::build_snapshot`]'s body, off the runtime.
     ///
     /// `&self` rather than `&mut self`: it mutates no field, which is what makes the `self.clone()`
-    /// above sound — a clone shares the redb handle and the engine/journal handles, so a mutation
+    /// above sound — a clone shares the redb handle and the engine handle, so a mutation
     /// here would be lost, and there is none to lose.
     #[allow(clippy::result_large_err)]
     fn build_snapshot_blocking(&self) -> StorageResult<Snapshot<TypeConfig>> {
         let applied = self.read_applied()?;
 
-        let (
-            configs,
-            routes,
-            routes_revision,
-            session_key,
-            fleet_name,
-            journal_gens,
-            proxy_recorded,
-            dedup,
-        ) = {
+        let (configs, routes, routes_revision, session_key, fleet_name, proxy_recorded, dedup) = {
             let read_txn = self
                 .db
                 .begin_read()
@@ -2725,22 +2673,6 @@ impl RedbStateMachine {
                 .get(FLEET_NAME_ROW)
                 .map_err(|e| StorageIOError::read_state_machine(&e))?
                 .map(|v| v.value().to_owned());
-            // Travels with the snapshot for the #134/#137 reason every table above does, with the
-            // #224-specific failure if it is ever forgotten here: a node that joins by snapshot
-            // and reads every generation as `0` would resurrect entries its peers have already
-            // agreed are cleared.
-            let journal_gens_table = read_txn
-                .open_table(SM_JOURNAL_GENS_TABLE)
-                .map_err(|e| StorageIOError::read_state_machine(&e))?;
-            let mut journal_gens = Vec::new();
-            for item in journal_gens_table
-                .iter()
-                .map_err(|e| StorageIOError::read_state_machine(&e))?
-            {
-                let (key, value) = item.map_err(|e| StorageIOError::read_state_machine(&e))?;
-                let (port, space_key) = key.value();
-                journal_gens.push((port, decode_journal_gen_space_key(space_key), value.value()));
-            }
             // Travels with the snapshot for the #134/#137 reason every table above does. The
             // #226-specific failure if forgotten: a snapshot-joined node answers `Claimed`
             // for signatures the fleet already recorded — a duplicate upstream call.
@@ -2773,7 +2705,6 @@ impl RedbStateMachine {
                 routes_revision,
                 session_key,
                 fleet_name,
-                journal_gens,
                 proxy_recorded,
                 dedup,
             )
@@ -2785,7 +2716,6 @@ impl RedbStateMachine {
             routes_revision,
             session_key,
             fleet_name,
-            journal_gens,
             proxy_recorded,
             dedup,
             last_applied_log: applied.last_applied_log,
@@ -2865,19 +2795,12 @@ impl RaftStateMachine<TypeConfig> for RedbStateMachine {
             let mut fleet_name = write_txn
                 .open_table(SM_FLEET_NAME_TABLE)
                 .map_err(|e| StorageIOError::write_state_machine(&e))?;
-            let mut journal_gens = write_txn
-                .open_table(SM_JOURNAL_GENS_TABLE)
-                .map_err(|e| StorageIOError::write_state_machine(&e))?;
             let mut proxy_recorded = write_txn
                 .open_table(SM_PROXY_RECORDED_TABLE)
                 .map_err(|e| StorageIOError::write_state_machine(&e))?;
             let mut dedup = write_txn
                 .open_table(SM_DEDUP_TABLE)
                 .map_err(|e| StorageIOError::write_state_machine(&e))?;
-            // Resolved once for the whole batch, not per entry: `Weak::upgrade` is cheap but
-            // there is still no reason to pay it once per op when every op in this apply call
-            // pushes into the very same journal (issue #224).
-            let journal = self.journal.get().and_then(Weak::upgrade);
             // GC against the *replicated* logical clock (see `AppliedState`),
             // so every replica drops exactly the same entries at the same log
             // point — a local clock here would let a TTL-boundary replay
@@ -2929,9 +2852,7 @@ impl RaftStateMachine<TypeConfig> for RedbStateMachine {
                                         &mut routes_revision,
                                         &mut session_key,
                                         &mut fleet_name,
-                                        &mut journal_gens,
                                         &mut proxy_recorded,
-                                        journal.as_deref(),
                                         &request.op,
                                         log_id.index,
                                     )?,
@@ -2942,9 +2863,7 @@ impl RaftStateMachine<TypeConfig> for RedbStateMachine {
                                     &mut routes_revision,
                                     &mut session_key,
                                     &mut fleet_name,
-                                    &mut journal_gens,
                                     &mut proxy_recorded,
-                                    journal.as_deref(),
                                     &request.op,
                                     log_id.index,
                                 )?,
@@ -3266,29 +3185,9 @@ impl RedbStateMachine {
                     .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
             }
 
-            // Cleared before it is repopulated, like every table above — and the #224 reason to
-            // do it this way rather than leave stale rows behind is the sharpest of the lot: a
-            // generation this node still held from before the install could be *higher* than
-            // what the payload carries (a stale leader that clears, is partitioned, and rejoins
-            // by snapshot from a peer that never saw it), and leaving it in place would make a
-            // clear this fleet has since forgotten win over the one it actually agrees on.
-            let mut journal_gens_table = write_txn
-                .open_table(SM_JOURNAL_GENS_TABLE)
-                .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
-            journal_gens_table
-                .retain(|_, _| false)
-                .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
-            for (port, space, generation) in &payload.journal_gens {
-                let space_key = journal_gen_space_key(space.as_deref());
-                journal_gens_table
-                    .insert((*port, space_key.as_str()), *generation)
-                    .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
-            }
-
-            // Cleared before repopulating for the same stale-row reason as `journal_gens`
-            // above: a marker this node held from before the install may name a signature
-            // the fleet has since cleared, and leaving it would resurrect `AlreadyRecorded`
-            // for it.
+            // Cleared before it is repopulated, like every table above: a marker this node
+            // held from before the install may name a signature the fleet has since cleared,
+            // and leaving it would resurrect `AlreadyRecorded` for it.
             let mut proxy_recorded_table = write_txn
                 .open_table(SM_PROXY_RECORDED_TABLE)
                 .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
@@ -3331,28 +3230,6 @@ impl RedbStateMachine {
         write_txn
             .commit()
             .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
-
-        // Pushed into the local journal after the durable write, like the engine/routes
-        // convergence just below — and for the identical #134/#137 reason `journal_gens_table`
-        // above is cleared-then-repopulated rather than merged: a node joining (or rejoining
-        // after a partition) by snapshot must come back agreeing with the fleet on every
-        // generation, not just the ones its own log had already applied. A missing/dropped
-        // handle is the same benign no-op it is in `mutate_tables`'s `JournalClearGen` arm — the
-        // generations are durable in `sm_journal_gens` regardless of whether anything is
-        // listening on the other end right now.
-        if let Some(journal) = self.journal.get().and_then(Weak::upgrade) {
-            // `ClusterJournal` keys entries on `(node_id, seq, clear_gen)` — see its own module
-            // doc — so
-            // `reset_clear_gen`, not `set_clear_gen` (Non-blocker 1): the durable table was just
-            // cleared and reinserted from this exact payload, unconditionally, because a
-            // generation this node still held could be higher than what the fleet now agrees on
-            // — `set_clear_gen`'s `fetch_max` cannot lower to match, and leaving it high would
-            // let one node's forgotten-but-not-really clear silently win the fleet-wide max a
-            // merge computes, dropping every other node's entries.
-            for (port, space, generation) in &payload.journal_gens {
-                journal.reset_clear_gen(*port, space.as_deref(), *generation);
-            }
-        }
 
         // A snapshot replaces the whole applied state, so the engine and the
         // front door's compiled table both converge on it the same way apply
@@ -3432,8 +3309,7 @@ mod tests {
 
     use super::{SESSION_KEY_ROW, SM_SESSION_KEY_TABLE};
     use rift_cluster_base::seams::{
-        CompiledRoutes, ImposterConfig, ImposterManager, RecordedRequest, RequestJournal,
-        ResponseMode, Route, RouteMatch, RouteTable, RouteTarget,
+        CompiledRoutes, ImposterConfig, ImposterManager, Route, RouteMatch, RouteTable, RouteTarget,
     };
     use serde_json::json;
     use tempfile::TempDir;
@@ -3445,7 +3321,6 @@ mod tests {
     };
     use crate::raft::TypeConfig;
     use crate::stores::flow::FlowNet;
-    use crate::stores::journal::ClusterJournal;
     use crate::stores::shard::{Durability, FlowShard, ShardConfig, Versioned};
 
     struct RedbBuilder;
@@ -3598,6 +3473,41 @@ mod tests {
             op_id,
             ControlOp::PutImposter {
                 config: Box::new(config(port, stubs)),
+            },
+        )
+    }
+
+    /// A `PutImposter` whose **imposter-level** config differs: `recordRequests`
+    /// is not a stub, so upstream's diff
+    /// (`imposter_level_differs_ignoring_enabled`) takes the wholesale-replace
+    /// branch and reports the port under `ApplyReport::replaced`. D-5 names that
+    /// branch specifically; a stubs-only edit reaches `stub_patched` instead and
+    /// leaves it unexercised.
+    fn put_recording(op_id: u128, port: u16, stubs: serde_json::Value) -> ControlRequest {
+        let mut config = config(port, stubs);
+        config.record_requests = true;
+        request(
+            op_id,
+            ControlOp::PutImposter {
+                config: Box::new(config),
+            },
+        )
+    }
+
+    /// A `PutImposter` upstream accepts into the desired set and then refuses at
+    /// staging: `mutualAuth` is an imposter-level field (so the diff is a
+    /// wholesale replace) that `validate_config_set` does not look at, and
+    /// `create_imposter_staged`'s `client_auth_for` rejects on a cleartext
+    /// listener. The teardown half of the replace therefore succeeds and the
+    /// re-create fails — the shape that lands a still-desired port in
+    /// `ApplyReport::deleted`.
+    fn put_unstageable(op_id: u128, port: u16) -> ControlRequest {
+        let mut config = config(port, json!([]));
+        config.mutual_auth = true;
+        request(
+            op_id,
+            ControlOp::PutImposter {
+                config: Box::new(config),
             },
         )
     }
@@ -3937,9 +3847,11 @@ mod tests {
     /// port's imposter-scoped flow state on this node — and nothing else. A
     /// sibling port's `i<port>:` state, a fleet-scoped `f:` flow and a
     /// flow under any other prefix are not the deleted imposter's to lose.
-    /// A `PutImposter` over the same port with changed stubs is a config
-    /// change, not a delete, and keeps the state (D-5). `DeleteAll` clears
-    /// every deleted port the same way.
+    /// A `PutImposter` over the same port is a config change, not a delete,
+    /// and keeps the state (D-5) — pinned on the **wholesale-replace** branch,
+    /// the one D-5 names, which only an imposter-level change reaches (a
+    /// stubs-only edit is patched in place and never tears the imposter down).
+    /// `DeleteAll` clears every deleted port the same way.
     #[tokio::test]
     async fn a_committed_delete_drops_only_that_ports_imposter_scoped_flow_state() {
         let engine = Arc::new(ImposterManager::new());
@@ -3953,7 +3865,7 @@ mod tests {
         assert_eq!(engine.count(), 2);
 
         // What a scenario on each imposter, a fleet-scoped context and a
-        // tenant-scoped context leave in this node's shard.
+        // flow under some other prefix leave in this node's shard.
         for flow in [
             "i18094:checkout",
             "i18095:checkout",
@@ -3965,12 +3877,22 @@ mod tests {
         assert_eq!(shard.flow_count(), 4);
 
         // A config change on the port is not a delete: its state stays (D-5).
+        // `recordRequests` flips, so upstream replaces the imposter wholesale
+        // (`ApplyReport::replaced`) rather than patching stubs in place.
         sm.apply(vec![entry(
             3,
-            put(3, 18094, json!([{ "id": "a" }, { "id": "b" }])),
+            put_recording(3, 18094, json!([{ "id": "a" }])),
         )])
         .await
         .expect("apply replace");
+        assert!(
+            engine
+                .get_imposter(18094)
+                .expect("replaced imposter is served")
+                .config
+                .record_requests,
+            "the replace reached the engine: this is the wholesale-replace branch"
+        );
         assert!(
             shard.get("i18094:checkout", "checkout").is_some(),
             "a replaced imposter keeps its scenario state"
@@ -4057,6 +3979,232 @@ mod tests {
         // Idempotent: a second reconcile finds nothing orphaned.
         sm.reconcile_engine().await.expect("reconcile again");
         assert!(shard.get("i18096:checkout", "checkout").is_some());
+
+        engine.shutdown().await;
+    }
+
+    /// #567 / #573 review — the sweep's bound, pinned at its worst case. The
+    /// reconcile reads the config set, drives the engine to it (seconds, on a
+    /// cold start), then sweeps; the apply loop keeps running on its own handle
+    /// the whole time, and this node is a ring member throughout. An imposter
+    /// committed while that is going on is alive on every node, and a flow
+    /// written for it can already be in this shard. The sweep must not take
+    /// that flow.
+    ///
+    /// The interleaving point is the one that decides it: **between the sweep's
+    /// two reads**, which is where a concurrent apply can be seen by one read
+    /// and not the other. It kills both mutations of this code — reverting the
+    /// desired set to the pre-sync snapshot (#567), and reading the desired set
+    /// before the held set instead of after (#573). Either one drops
+    /// `i18099:checkout`, whose imposter is committed here and served fleet-wide.
+    #[tokio::test]
+    async fn reconcile_keeps_flow_state_of_an_imposter_committed_inside_its_sweep() {
+        let engine = Arc::new(ImposterManager::new());
+        let (_td, mut sm, shard) = fresh_sm_with_flow_net(engine.clone()).await;
+        sm.apply(vec![entry(1, put(1, 18098, json!([])))])
+            .await
+            .expect("apply put");
+        // 18099 is not committed yet; 18100 was deleted while this node was
+        // down and is the one namespace the sweep is for.
+        for flow in ["i18098:checkout", "i18099:checkout", "i18100:checkout"] {
+            seed_flow(&shard, flow).await;
+        }
+
+        // The apply loop's handle: `compose` gives openraft its own clone.
+        let mut applier = sm.clone();
+        sm.reconcile_engine_interleaved(async move {
+            applier
+                .apply(vec![entry(2, put(2, 18099, json!([])))])
+                .await
+                .expect("apply put during reconcile");
+        })
+        .await
+        .expect("reconcile");
+
+        assert_eq!(engine.count(), 2, "both committed imposters are served");
+        assert!(
+            shard.get("i18099:checkout", "checkout").is_some(),
+            "an imposter committed between the sweep's two reads is alive; its state stays"
+        );
+        assert!(
+            shard.get("i18098:checkout", "checkout").is_some(),
+            "a live imposter's state is untouched by the sweep"
+        );
+        assert!(
+            shard.get("i18100:checkout", "checkout").is_none(),
+            "the namespace of a delete this node missed is still swept"
+        );
+
+        engine.shutdown().await;
+    }
+
+    /// #567 review — `deleted` is filtered against the desired set. Upstream's
+    /// `replace_imposter` tears the old imposter down and re-creates it; when
+    /// the re-create is refused at staging the port is reported `deleted`
+    /// *and* `failed`. The fleet still wants that port — it is a failed edit,
+    /// not a removal, and the next successful sync re-creates it — so its flow
+    /// state must survive on this node exactly as it does on every node whose
+    /// engine did not fail. Without the filter, the state was gone for good:
+    /// the re-create that follows starts the imposter from nothing.
+    #[tokio::test]
+    async fn a_failed_re_create_of_a_still_desired_port_keeps_its_flow_state() {
+        let engine = Arc::new(ImposterManager::new());
+        let (_td, mut sm, shard) = fresh_sm_with_flow_net(engine.clone()).await;
+        sm.apply(vec![entry(1, put(1, 18101, json!([])))])
+            .await
+            .expect("apply put");
+        seed_flow(&shard, "i18101:checkout").await;
+
+        // `mutualAuth` on a cleartext listener: the desired set validates, the
+        // diff is imposter-level (a replace), the teardown succeeds and the
+        // staged re-create is refused.
+        sm.apply(vec![entry(2, put_unstageable(2, 18101))])
+            .await
+            .expect("apply the unstageable edit");
+        assert_eq!(engine.count(), 0, "the engine serves nothing on the port");
+        assert!(
+            sm.apply_failures().contains_key(&18101),
+            "the failed edit is an apply failure: {:?}",
+            sm.apply_failures()
+        );
+        assert!(
+            shard.get("i18101:checkout", "checkout").is_some(),
+            "a port the config set still names keeps its state through a failed re-create"
+        );
+
+        // The next good edit re-creates the imposter with its state intact.
+        sm.apply(vec![entry(3, put(3, 18101, json!([])))])
+            .await
+            .expect("apply the repair");
+        assert_eq!(engine.count(), 1);
+        assert!(sm.apply_failures().is_empty(), "{:?}", sm.apply_failures());
+        assert!(shard.get("i18101:checkout", "checkout").is_some());
+
+        // A real delete still clears it.
+        sm.apply(vec![entry(
+            4,
+            request(4, ControlOp::DeleteImposter { port: 18101 }),
+        )])
+        .await
+        .expect("apply delete");
+        assert!(shard.get("i18101:checkout", "checkout").is_none());
+
+        engine.shutdown().await;
+    }
+
+    /// #573 review — the same failed re-create, with **no repair** before the
+    /// delete. `replace_imposter`'s teardown has already dropped the port from
+    /// the engine's map, so when the operator gives up and deletes it,
+    /// `apply_config` computes its removal set (`map ∖ desired`) from a map
+    /// that no longer names the port: `report.deleted` is empty, and a clear
+    /// filtered on `deleted` alone finds nothing to do. The state the previous
+    /// test deliberately keeps would then outlive the imposter for the life of
+    /// the process, and an identically re-created imposter would meet
+    /// yesterday's scenario — the #565 bug, reached through a failed edit. So
+    /// the clear also names the ports carrying a recorded apply failure. The
+    /// still-desired failing port here is the other half of the claim: the
+    /// union is gated by the same desired-set filter, so a port that is merely
+    /// failing keeps everything.
+    #[tokio::test]
+    async fn a_delete_after_a_failed_re_create_still_drops_the_flow_state() {
+        let engine = Arc::new(ImposterManager::new());
+        let (_td, mut sm, shard) = fresh_sm_with_flow_net(engine.clone()).await;
+        sm.apply(vec![
+            entry(1, put(1, 18104, json!([]))),
+            entry(2, put(2, 18105, json!([]))),
+        ])
+        .await
+        .expect("apply puts");
+        for flow in ["i18104:checkout", "i18105:checkout", "f:checkout"] {
+            seed_flow(&shard, flow).await;
+        }
+
+        // Both ports take an edit the engine accepts into the desired set and
+        // then refuses at staging: each leaves the engine's map and each lands
+        // in `apply_failures`, with its flow state kept (the filter above).
+        sm.apply(vec![
+            entry(3, put_unstageable(3, 18104)),
+            entry(4, put_unstageable(4, 18105)),
+        ])
+        .await
+        .expect("apply the unstageable edits");
+        assert_eq!(engine.count(), 0, "the engine serves neither port");
+        assert_eq!(
+            sm.apply_failures().keys().copied().collect::<Vec<_>>(),
+            vec![18104, 18105],
+            "both edits are recorded apply failures"
+        );
+        assert!(shard.get("i18104:checkout", "checkout").is_some());
+        assert!(shard.get("i18105:checkout", "checkout").is_some());
+
+        // The operator gives up on 18104 and deletes it. The engine has nothing
+        // to remove, so this reports no deletion at all.
+        sm.apply(vec![entry(
+            5,
+            request(5, ControlOp::DeleteImposter { port: 18104 }),
+        )])
+        .await
+        .expect("apply delete");
+
+        assert!(
+            shard.get("i18104:checkout", "checkout").is_none(),
+            "a deleted port loses its flow state even though the failed edit had \
+             already taken it out of the engine's map"
+        );
+        assert!(
+            shard.get("i18105:checkout", "checkout").is_some(),
+            "a port the config set still names keeps its state, failing or not"
+        );
+        assert!(
+            shard.get("f:checkout", "checkout").is_some(),
+            "the fleet namespace names no port and is never cleared"
+        );
+
+        engine.shutdown().await;
+    }
+
+    /// #565 by way of a snapshot: an installed snapshot that omits an imposter
+    /// this node's engine is serving syncs the engine to the snapshot, which
+    /// reports the port `deleted` — and the clear follows, exactly as it does
+    /// for an applied `DeleteImposter`. What the snapshot does carry keeps its
+    /// state, and so does the fleet namespace.
+    #[tokio::test]
+    async fn an_installed_snapshot_clears_flow_state_of_imposters_it_omits() {
+        let (_td, mut leader_sm) = fresh_sm(None).await;
+        leader_sm
+            .apply(vec![entry(1, put(1, 18102, json!([])))])
+            .await
+            .expect("apply on the leader");
+        let mut builder = leader_sm.clone();
+        let Snapshot { meta, snapshot } = builder.build_snapshot().await.expect("build snapshot");
+
+        let engine = Arc::new(ImposterManager::new());
+        let (_td2, mut follower, shard) = fresh_sm_with_flow_net(engine.clone()).await;
+        follower
+            .apply(vec![
+                entry(1, put(1, 18102, json!([]))),
+                entry(2, put(2, 18103, json!([]))),
+            ])
+            .await
+            .expect("apply on the follower");
+        for flow in ["i18102:checkout", "i18103:checkout", "f:checkout"] {
+            seed_flow(&shard, flow).await;
+        }
+
+        follower
+            .install_snapshot(&meta, snapshot)
+            .await
+            .expect("install");
+        assert_eq!(engine.count(), 1, "the engine is synced to the snapshot");
+        assert!(
+            shard.get("i18103:checkout", "checkout").is_none(),
+            "an imposter the installed snapshot omits loses its flow state"
+        );
+        assert!(
+            shard.get("i18102:checkout", "checkout").is_some(),
+            "an imposter the snapshot carries keeps its flow state"
+        );
+        assert!(shard.get("f:checkout", "checkout").is_some());
 
         engine.shutdown().await;
     }
@@ -4505,127 +4653,6 @@ mod tests {
         );
     }
 
-    // -- issue #224: journal clear generations ---------------------------------
-
-    fn journal_clear(op_id: u128, port: u16, space: Option<&str>) -> ControlRequest {
-        request(
-            op_id,
-            ControlOp::JournalClearGen {
-                port,
-                space: space.map(str::to_owned),
-            },
-        )
-    }
-
-    #[tokio::test]
-    async fn applying_a_journal_clear_increments_the_generation() {
-        let (_td, mut sm) = fresh_sm(None).await;
-        let response = apply_one(&mut sm, 1, journal_clear(1, 8080, None)).await;
-        assert_eq!(response.outcome, ControlOutcome::Applied);
-        assert_eq!(sm.journal_gen(8080, None).expect("read gen"), 1);
-
-        apply_one(&mut sm, 2, journal_clear(2, 8080, None)).await;
-        assert_eq!(
-            sm.journal_gen(8080, None).expect("read gen"),
-            2,
-            "a second clear on the same port bumps again"
-        );
-    }
-
-    /// Two clears for the same port, applied in log order (as every replica
-    /// applies them), both succeed and compose to +2 — never one silently overwriting the
-    /// other with the identical value. This is the entire reason
-    /// `ControlOp::JournalClearGen` carries no number of its own: a submitted value would let
-    /// the second of two racing clears collapse onto the first instead of composing with it.
-    #[tokio::test]
-    async fn racing_journal_clears_compose_rather_than_overwrite() {
-        let (_td, mut sm) = fresh_sm(None).await;
-        let first = apply_one(&mut sm, 1, journal_clear(1, 8080, None)).await;
-        let second = apply_one(&mut sm, 2, journal_clear(2, 8080, None)).await;
-        assert_eq!(first.outcome, ControlOutcome::Applied);
-        assert_eq!(second.outcome, ControlOutcome::Applied);
-        assert_eq!(
-            sm.journal_gen(8080, None).expect("read gen"),
-            2,
-            "two racing clears must compose to +2, not collapse to the same value twice"
-        );
-    }
-
-    #[tokio::test]
-    async fn a_space_clear_leaves_the_port_generation_untouched() {
-        let (_td, mut sm) = fresh_sm(None).await;
-        apply_one(&mut sm, 1, journal_clear(1, 8080, Some("f"))).await;
-        assert_eq!(sm.journal_gen(8080, Some("f")).expect("read gen"), 1);
-        assert_eq!(
-            sm.journal_gen(8080, None).expect("read gen"),
-            0,
-            "a space-scoped clear must not bump the port-wide generation"
-        );
-        assert_eq!(
-            sm.journal_gen(8080, Some("g")).expect("read gen"),
-            0,
-            "a space-scoped clear must not bump a sibling space's generation"
-        );
-    }
-
-    #[tokio::test]
-    async fn applying_a_journal_clear_pushes_the_generation_into_the_bound_local_journal() {
-        let journal = ClusterJournal::new(1);
-        let (_td, sm) = fresh_sm(None).await;
-        let mut sm = sm.with_journal(&journal);
-        apply_one(&mut sm, 1, journal_clear(1, 8080, None)).await;
-        assert_eq!(
-            journal.read_shard_since(8080, 0).clear_gen,
-            1,
-            "apply must push the bumped generation into this node's own local journal, not \
-             just the durable table"
-        );
-    }
-
-    /// A node joining by snapshot must come back holding the same generations its peers do —
-    /// the #134/#137 lesson (a node reading a cleared entry back as if it never cleared)
-    /// applied a third time to a third table.
-    #[tokio::test]
-    async fn journal_generations_survive_a_snapshot_install() {
-        let (_td, mut sm) = fresh_sm(None).await;
-        apply_one(&mut sm, 1, journal_clear(1, 8080, None)).await;
-        apply_one(&mut sm, 2, journal_clear(2, 8080, Some("f"))).await;
-
-        let snapshot: Snapshot<TypeConfig> = sm.build_snapshot().await.expect("build snapshot");
-        let (_td2, mut restored) = fresh_sm(None).await;
-        restored
-            .install_snapshot(&snapshot.meta, snapshot.snapshot)
-            .await
-            .expect("install snapshot");
-
-        assert_eq!(
-            restored.journal_gen(8080, None).expect("read gen"),
-            1,
-            "a node joining by snapshot must not read a cleared port back as 0 — that would \
-             resurrect entries its peers already agree are cleared"
-        );
-        assert_eq!(restored.journal_gen(8080, Some("f")).expect("read gen"), 1);
-    }
-
-    /// A snapshot payload serialized before issue #224 still installs — `journal_gens` defaults
-    /// to empty, which is what "this fleet has never committed a clear" is. Mirrors
-    /// `a_pre_sources_snapshot_still_installs`/`a_pre_tenancy_snapshot_still_installs`: the same
-    /// #134/#137 lesson, paid down with the same `#[serde(default)]` discipline a third time.
-    #[tokio::test]
-    async fn a_pre_journal_gens_snapshot_still_installs() {
-        let (_td, sm) = fresh_sm(None).await;
-        let legacy = json!({
-            "configs": [],
-            "dedup": [],
-            "last_applied_log": null,
-            "last_membership": { "log_id": null, "membership": { "configs": [], "nodes": {} } },
-        });
-        let payload: super::SnapshotPayload =
-            serde_json::from_value(legacy).expect("a pre-#224 snapshot payload still decodes");
-        assert!(payload.journal_gens.is_empty());
-        assert_eq!(sm.journal_gen(8080, None).expect("read gen"), 0);
-    }
-
     // -- ProxyRecorded / ProxyRecordedClear (#226) ---------------------------------
 
     fn proxy_imposter_config(port: u16) -> ImposterConfig {
@@ -4831,177 +4858,6 @@ mod tests {
             assert!(reason.contains("no imposter"), "names the cause: {reason}");
         }
         assert!(marker(&sm, 9999, "dd44").is_none());
-    }
-
-    /// Blocker 1: before this feature, an unscoped `DELETE savedRequests` proxied to the
-    /// engine's `ClusterJournal::clear`, which zeroed the count slot behind `numberOfRequests`.
-    /// The op now commits as a generation bump instead, so nothing else zeroes it — this pins
-    /// that the apply path does the zeroing itself, for a port-wide clear.
-    #[tokio::test]
-    async fn a_port_wide_clear_resets_the_fleet_count() {
-        let journal = ClusterJournal::new(1);
-        let (_td, sm) = fresh_sm(None).await;
-        let mut sm = sm.with_journal(&journal);
-        journal.note_request(8080);
-        journal.note_request(8080);
-        assert_eq!(
-            journal.read_shard_since(8080, 0).count_slot,
-            2,
-            "counted before the clear"
-        );
-
-        apply_one(&mut sm, 1, journal_clear(1, 8080, None)).await;
-
-        assert_eq!(
-            journal.read_shard_since(8080, 0).count_slot,
-            0,
-            "a port-wide clear applying through Raft must zero this node's own count slot"
-        );
-    }
-
-    /// Blocker 1's other half: a space-scoped bump must leave the count alone, matching
-    /// `clear_flow`/`retain`'s existing contract that a scoped deletion never resets the total.
-    #[tokio::test]
-    async fn a_space_scoped_clear_leaves_the_count_alone() {
-        let journal = ClusterJournal::new(1);
-        let (_td, sm) = fresh_sm(None).await;
-        let mut sm = sm.with_journal(&journal);
-        journal.note_request(8080);
-        journal.note_request(8080);
-
-        apply_one(&mut sm, 1, journal_clear(1, 8080, Some("f"))).await;
-
-        assert_eq!(
-            journal.read_shard_since(8080, 0).count_slot,
-            2,
-            "a space-scoped bump must not touch the count slot"
-        );
-    }
-
-    /// Blocker 2: the generation lives in `sm_journal_gens` (durable) and in the process-local
-    /// journal (rebuilt from scratch on every restart). Simulates a cold start — apply clears
-    /// against an sm with no journal bound (as if this were a previous process's commits, now
-    /// only durable), then bind a *fresh* journal the way a restarted process would and run the
-    /// same reconcile the compose cold-start loop calls once caught up to the leader.
-    #[tokio::test]
-    async fn clear_generations_are_rehydrated_after_a_restart() {
-        let (_td, mut sm) = fresh_sm(None).await;
-        apply_one(&mut sm, 1, journal_clear(1, 8080, None)).await;
-        apply_one(&mut sm, 2, journal_clear(2, 8080, Some("f"))).await;
-
-        let journal = ClusterJournal::new(1);
-        let sm = sm.with_journal(&journal);
-        assert_eq!(
-            journal.read_shard_since(8080, 0).clear_gen,
-            0,
-            "a fresh journal starts at generation 0, exactly the dangerous default this test \
-             must not observe after reconcile"
-        );
-
-        sm.reconcile_engine().await.expect("reconcile");
-
-        let shard = journal.read_shard_since(8080, 0);
-        assert_eq!(
-            shard.clear_gen, 1,
-            "the port-wide generation must be rehydrated from sm_journal_gens on cold start"
-        );
-        assert_eq!(
-            shard.space_gens,
-            vec![("f".to_owned(), 1)],
-            "a space-scoped generation must be rehydrated too"
-        );
-
-        // And a fresh append is stamped with the rehydrated generation, not 0 — the whole
-        // point of rehydrating before anything else can record.
-        journal.record_indexed(
-            8080,
-            "f",
-            RecordedRequest {
-                mode: ResponseMode::Text,
-                request_from: "t".into(),
-                method: "GET".into(),
-                path: "/after-restart".into(),
-                query: Default::default(),
-                headers: Default::default(),
-                body: None,
-                timestamp: "t".into(),
-                match_outcome: None,
-                status: None,
-                latency_ms: None,
-                node: None,
-            },
-        );
-        let stamped = journal.read_shard_since(8080, 0).entries;
-        assert_eq!(stamped.len(), 1);
-        assert_eq!(
-            (stamped[0].clear_gen, stamped[0].space_gen),
-            (1, 1),
-            "a post-restart append must be stamped with the rehydrated generations, not 0"
-        );
-    }
-
-    /// Non-blocker 1: `install_snapshot` clears and reinserts `sm_journal_gens` from the
-    /// payload precisely because a generation this node still holds can be *higher* than what
-    /// the fleet now agrees on — a stale leader that cleared, was partitioned, and rejoined by
-    /// snapshot from a peer that never saw it. The live journal must follow the durable table
-    /// down too, or this node's stuck-high generation silently wins the fleet-wide max a merge
-    /// computes and drops every other node's entries.
-    #[tokio::test]
-    async fn installing_a_snapshot_lowers_a_live_generation_that_is_ahead() {
-        let (_td, mut sm) = fresh_sm(None).await;
-        apply_one(&mut sm, 1, journal_clear(1, 8080, None)).await;
-        let snapshot: Snapshot<TypeConfig> = sm.build_snapshot().await.expect("build snapshot");
-
-        let journal = ClusterJournal::new(1);
-        journal.set_clear_gen(8080, None, 99);
-        assert_eq!(journal.read_shard_since(8080, 0).clear_gen, 99);
-
-        let (_td2, restored) = fresh_sm(None).await;
-        let mut restored = restored.with_journal(&journal);
-        restored
-            .install_snapshot(&snapshot.meta, snapshot.snapshot)
-            .await
-            .expect("install snapshot");
-
-        assert_eq!(
-            journal.read_shard_since(8080, 0).clear_gen,
-            1,
-            "install_snapshot must be able to LOWER a live generation that outran the fleet's \
-             agreed value — set_clear_gen's fetch_max cannot do this"
-        );
-    }
-
-    /// Non-blocker 2: `journal_generations_survive_a_snapshot_install` above never binds a
-    /// journal (`fresh_sm(None)` both sides), so it only ever exercised the durable table — the
-    /// loop that pushes into the *live* journal never ran in any test. This sibling binds one on
-    /// both the source and the installing state machine and asserts the live journal actually
-    /// received the generations, port-wide and space-scoped.
-    #[tokio::test]
-    async fn a_snapshot_install_pushes_generations_into_the_bound_live_journal() {
-        let (_td, mut sm) = fresh_sm(None).await;
-        apply_one(&mut sm, 1, journal_clear(1, 8080, None)).await;
-        apply_one(&mut sm, 2, journal_clear(2, 8080, Some("f"))).await;
-        let snapshot: Snapshot<TypeConfig> = sm.build_snapshot().await.expect("build snapshot");
-
-        let journal = ClusterJournal::new(1);
-        let (_td2, restored) = fresh_sm(None).await;
-        let mut restored = restored.with_journal(&journal);
-        restored
-            .install_snapshot(&snapshot.meta, snapshot.snapshot)
-            .await
-            .expect("install snapshot");
-
-        let shard = journal.read_shard_since(8080, 0);
-        assert_eq!(
-            shard.clear_gen, 1,
-            "install_snapshot must push the port-wide generation into the live journal, not \
-             just the durable table"
-        );
-        assert_eq!(
-            shard.space_gens,
-            vec![("f".to_owned(), 1)],
-            "and the space-scoped generation too"
-        );
     }
 
     // -- issue #131: replicated route table ------------------------------------

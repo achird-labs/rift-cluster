@@ -41,7 +41,7 @@ import { ApiError } from "../../api/client.ts";
  * ## Send it exactly where the contract declares it (#389)
  *
  * `openapi-ee.yaml` declares `Idempotency-Key` on the routes reaching the admin front's
- * `build_and_run` — imposters, stubs, lifecycle, front-door routes, scenarios and flow state.
+ * `build_and_run` — imposters, stubs, lifecycle, the route table, scenarios and flow state.
  * Those derive their op id from the header via `base_op_id`, and those are the ones
  * {@link keyedAttempt} is for.
  *
@@ -69,6 +69,8 @@ export const UNDECLARED: Readonly<Record<string, string>> = Object.freeze({
   "POST /admin/imposters/{port}/try":
     "writes no state; a repeat is a second probe, not a second write",
   "DELETE /imposters/{port}/spaces/{flowId}": "the journal generation bump is monotone",
+  "POST /specs/compile":
+    "stores nothing (D-72); a repeat compiles the same document again and writes no op",
 });
 
 /**
