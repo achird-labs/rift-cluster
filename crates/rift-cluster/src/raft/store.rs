@@ -1618,6 +1618,20 @@ impl RedbStateMachine {
     /// metric. A no-op without a bound journal, same as the engine drive above.
     #[allow(clippy::result_large_err)]
     pub async fn reconcile_engine(&self) -> StorageResult<()> {
+        self.reconcile_engine_interleaved(std::future::ready(()))
+            .await
+    }
+
+    /// [`Self::reconcile_engine`] with a seam between its engine sync and its
+    /// orphan sweep. Production passes a ready future; the test that pins the
+    /// sweep's bound (#567 review) commits an imposter there, on a second
+    /// state-machine handle, exactly where the apply loop can in `compose`.
+    /// One body for both, so the ordering under test is the ordering shipped.
+    #[allow(clippy::result_large_err)]
+    async fn reconcile_engine_interleaved(
+        &self,
+        between_sync_and_sweep: impl Future<Output = ()>,
+    ) -> StorageResult<()> {
         // Both tables read fresh, in one call: a restart's local `ImposterManager`
         // and `ArcSwap<CompiledRoutes>` both start empty (they are process-local,
         // rebuilt from persisted `sm_configs`/`sm_routes`), and a live commit only
@@ -1648,13 +1662,12 @@ impl RedbStateMachine {
             };
             (config_action, routes_action)
         };
-        // The ports the tables name, for the orphan sweep below. `None` when
-        // the config set will not parse: with no trustworthy desired set the
-        // sweep, like the engine sync, does nothing rather than guess.
-        let desired_ports: Option<BTreeSet<u16>> = match &config_action {
-            EngineAction::Sync(desired) => Some(desired.iter().filter_map(|c| c.port).collect()),
-            _ => None,
-        };
+        // Whether the sweep below follows a sync that happened. A `RefuseSync`
+        // leaves the engine holding whatever it held, and the sweep is the
+        // other half of the same reconcile: with the engine not rebuilt it
+        // does nothing either, rather than clear against a set the engine
+        // itself was not trusted with.
+        let config_synced = matches!(config_action, EngineAction::Sync(_));
         // Unattributed: this materializes a whole table on restart, not one
         // caller's write, so there is no principal to name.
         self.drive_engine(vec![
@@ -1662,7 +1675,15 @@ impl RedbStateMachine {
             AttributedAction::unattributed(routes_action),
         ])
         .await;
-        if let Some(desired_ports) = desired_ports {
+        between_sync_and_sweep.await;
+        if config_synced {
+            // Read AFTER the sync, never reused from the snapshot taken above:
+            // that read and this point are a whole `apply_config` apart —
+            // seconds, on a cold start with listeners to bind — and the apply
+            // loop runs concurrently on its own handle. An imposter committed
+            // inside that interval is missing from the snapshot while being
+            // perfectly alive. See [`Self::sweep_orphaned_imposter_state`].
+            let desired_ports: BTreeSet<u16> = self.configured_ports()?.into_iter().collect();
             self.sweep_orphaned_imposter_state(&desired_ports).await;
         }
 
@@ -2430,11 +2451,30 @@ impl RedbStateMachine {
                         // `replaced`/`stub_patched`, which are config changes
                         // that keep their runtime state — lose their flow
                         // state on this node. After the engine call, so the
-                        // clear follows the removal it belongs to: a port the
-                        // engine failed to remove keeps serving, and keeps
-                        // its state, until the next sync succeeds.
-                        self.clear_imposter_state(report.deleted.iter().copied())
-                            .await;
+                        // clear follows the removal it belongs to.
+                        //
+                        // Filtered against the desired set, because `deleted`
+                        // answers a narrower question than "was this imposter
+                        // removed" (#567 review): `replace_imposter` tears the
+                        // old imposter down and then re-creates it, and when
+                        // the re-create fails it reports the port as `deleted`
+                        // *and* `failed` — truthfully, the engine is serving
+                        // nothing there. But the config set still names that
+                        // port: it is a failed **edit**, not a removal, the
+                        // next successful sync re-creates it, and nothing —
+                        // not even the reconcile sweep, which measures the same
+                        // desired set — would ever put the flow state back. So
+                        // a port the fleet still wants keeps its state, and one
+                        // node's staging failure cannot make it disagree with
+                        // its peers about the flows it owns.
+                        self.clear_imposter_state(
+                            report
+                                .deleted
+                                .iter()
+                                .copied()
+                                .filter(|port| !desired_ports.contains(port)),
+                        )
+                        .await;
                     }
                     Err(e) => {
                         tracing::error!(error = %e, "engine refused the applied config set");
@@ -2546,21 +2586,24 @@ impl RedbStateMachine {
     /// Drop each port's imposter-scoped flow state on this node (#565, the D-5
     /// amendment). A no-op without a bound flow net, and per port a no-op when
     /// the shard holds nothing under it.
+    ///
+    /// The whole set goes down in one call, not one call per port: this runs
+    /// inside the Raft apply loop, and a `DeleteAll` names every imposter the
+    /// fleet has — see [`FlowNet::clear_imposter_scopes`] for what per-port
+    /// cost.
     async fn clear_imposter_state(&self, ports: impl IntoIterator<Item = u16>) {
         let Some(flow_net) = &self.flow_net else {
             return;
         };
-        for port in ports {
-            let flows = flow_net.clear_imposter_scope(port).await;
-            if flows > 0 {
-                tracing::info!(port, flows, "dropped a deleted imposter's flow state");
-            }
+        let ports: BTreeSet<u16> = ports.into_iter().collect();
+        for (port, flows) in flow_net.clear_imposter_scopes(&ports).await {
+            tracing::info!(port, flows, "dropped a deleted imposter's flow state");
         }
     }
 
     /// The reconcile-time half of #565: drop the imposter-scoped namespaces
-    /// this node's shard holds for ports the applied config set no longer
-    /// names.
+    /// this node's shard holds for ports outside `desired_ports` — the ports
+    /// `sm_configs` names, read *after* [`Self::reconcile_engine`]'s sync.
     ///
     /// The live path clears from the engine's `deleted` report, which needs the
     /// engine to have *had* the imposter. On a cold start it did not: the engine
@@ -2572,14 +2615,38 @@ impl RedbStateMachine {
     /// before the first reconcile. Here the comparison that the engine could
     /// not make is made against the tables instead.
     ///
+    /// **Against the tables as they stand after the sync, not the snapshot the
+    /// sync was driven from (#567 review).** Those two reads are a whole
+    /// `apply_config` apart — seconds on a cold start with listeners to bind —
+    /// and the apply loop runs concurrently on its own handle with no barrier
+    /// between them. An imposter committed inside that interval is absent from
+    /// the earlier snapshot and perfectly alive, and sweeping against the
+    /// snapshot drops its flow state. Re-reading closes that window: apply
+    /// writes `sm_configs` before it drives the engine, so a port the fleet
+    /// committed before this read is in the set.
+    ///
+    /// The tables, not the engine's `list_imposters`, deliberately: the two
+    /// differ exactly on the ports the engine could not stage — a bind failure,
+    /// a config `create_imposter_staged` refuses — and those are ports the fleet
+    /// still wants. Their state is kept for the same reason the live path
+    /// filters `deleted` against the desired set: a failed apply on one node is
+    /// not a removal, and nothing would put the state back.
+    ///
     /// Deliberately **not** run on every live sync. A live sync runs at this
     /// node's applied index, and a replica push for an imposter created at a
     /// later index — from an owner that has already applied it — can land in
     /// this shard before this node applies that entry; sweeping then would drop
-    /// a live flow's replica copy, which nothing repairs until takeover. At
-    /// reconcile the node has just caught up to the leader and is not yet
-    /// `Ready`, which is as narrow as that window gets; the residual is a copy
-    /// the owner still holds, never the authoritative one.
+    /// that copy, which nothing repairs until takeover.
+    ///
+    /// The residual, stated as it is. The ring is Raft membership, so a
+    /// restarted voter is an HRW owner the whole time it is catching up, and
+    /// `flow_net.bind` runs in `compose` long before `spawn_reconciler`: a flow
+    /// written for an imposter this node has not yet applied *can* land in this
+    /// shard as the authoritative copy, not merely a replica, and if it lands
+    /// before this read it is dropped. Readiness does not gate that; what bounds
+    /// it is that `compose` reconciles only once `last_applied` has reached the
+    /// leader's applied index, so the exposure is the entries committed during
+    /// one apply round-trip — not the seconds a pre-sync snapshot spanned.
     async fn sweep_orphaned_imposter_state(&self, desired_ports: &BTreeSet<u16>) {
         let Some(flow_net) = &self.flow_net else {
             return;
@@ -3596,6 +3663,41 @@ mod tests {
         )
     }
 
+    /// A `PutImposter` whose **imposter-level** config differs: `recordRequests`
+    /// is not a stub, so upstream's diff
+    /// (`imposter_level_differs_ignoring_enabled`) takes the wholesale-replace
+    /// branch and reports the port under `ApplyReport::replaced`. D-5 names that
+    /// branch specifically; a stubs-only edit reaches `stub_patched` instead and
+    /// leaves it unexercised.
+    fn put_recording(op_id: u128, port: u16, stubs: serde_json::Value) -> ControlRequest {
+        let mut config = config(port, stubs);
+        config.record_requests = true;
+        request(
+            op_id,
+            ControlOp::PutImposter {
+                config: Box::new(config),
+            },
+        )
+    }
+
+    /// A `PutImposter` upstream accepts into the desired set and then refuses at
+    /// staging: `mutualAuth` is an imposter-level field (so the diff is a
+    /// wholesale replace) that `validate_config_set` does not look at, and
+    /// `create_imposter_staged`'s `client_auth_for` rejects on a cleartext
+    /// listener. The teardown half of the replace therefore succeeds and the
+    /// re-create fails — the shape that lands a still-desired port in
+    /// `ApplyReport::deleted`.
+    fn put_unstageable(op_id: u128, port: u16) -> ControlRequest {
+        let mut config = config(port, json!([]));
+        config.mutual_auth = true;
+        request(
+            op_id,
+            ControlOp::PutImposter {
+                config: Box::new(config),
+            },
+        )
+    }
+
     fn stored_stub_ids(sm: &RedbStateMachine, port: u16) -> Vec<String> {
         let body = sm
             .read_config(port)
@@ -3931,9 +4033,11 @@ mod tests {
     /// port's imposter-scoped flow state on this node — and nothing else. A
     /// sibling port's `i<port>:` state, a fleet-scoped `f:` flow and a
     /// flow under any other prefix are not the deleted imposter's to lose.
-    /// A `PutImposter` over the same port with changed stubs is a config
-    /// change, not a delete, and keeps the state (D-5). `DeleteAll` clears
-    /// every deleted port the same way.
+    /// A `PutImposter` over the same port is a config change, not a delete,
+    /// and keeps the state (D-5) — pinned on the **wholesale-replace** branch,
+    /// the one D-5 names, which only an imposter-level change reaches (a
+    /// stubs-only edit is patched in place and never tears the imposter down).
+    /// `DeleteAll` clears every deleted port the same way.
     #[tokio::test]
     async fn a_committed_delete_drops_only_that_ports_imposter_scoped_flow_state() {
         let engine = Arc::new(ImposterManager::new());
@@ -3947,7 +4051,7 @@ mod tests {
         assert_eq!(engine.count(), 2);
 
         // What a scenario on each imposter, a fleet-scoped context and a
-        // tenant-scoped context leave in this node's shard.
+        // flow under some other prefix leave in this node's shard.
         for flow in [
             "i18094:checkout",
             "i18095:checkout",
@@ -3959,12 +4063,22 @@ mod tests {
         assert_eq!(shard.flow_count(), 4);
 
         // A config change on the port is not a delete: its state stays (D-5).
+        // `recordRequests` flips, so upstream replaces the imposter wholesale
+        // (`ApplyReport::replaced`) rather than patching stubs in place.
         sm.apply(vec![entry(
             3,
-            put(3, 18094, json!([{ "id": "a" }, { "id": "b" }])),
+            put_recording(3, 18094, json!([{ "id": "a" }])),
         )])
         .await
         .expect("apply replace");
+        assert!(
+            engine
+                .get_imposter(18094)
+                .expect("replaced imposter is served")
+                .config
+                .record_requests,
+            "the replace reached the engine: this is the wholesale-replace branch"
+        );
         assert!(
             shard.get("i18094:checkout", "checkout").is_some(),
             "a replaced imposter keeps its scenario state"
@@ -4051,6 +4165,156 @@ mod tests {
         // Idempotent: a second reconcile finds nothing orphaned.
         sm.reconcile_engine().await.expect("reconcile again");
         assert!(shard.get("i18096:checkout", "checkout").is_some());
+
+        engine.shutdown().await;
+    }
+
+    /// #567 review — the sweep's bound. The reconcile reads the config set,
+    /// drives the engine to it (seconds, on a cold start), then sweeps; the
+    /// apply loop keeps running on its own handle the whole time, and this
+    /// node is a ring member throughout. An imposter committed between the
+    /// read and the sweep is alive on every node, and a flow written for it
+    /// can already be in this shard. The sweep must not take that flow: it
+    /// measures the tables as they stand *after* the sync, not the snapshot
+    /// the sync was driven from. The same interleaving on the pre-#567 sweep
+    /// dropped `i18099:checkout`.
+    #[tokio::test]
+    async fn reconcile_keeps_flow_state_of_an_imposter_committed_during_its_sync() {
+        let engine = Arc::new(ImposterManager::new());
+        let (_td, mut sm, shard) = fresh_sm_with_flow_net(engine.clone()).await;
+        sm.apply(vec![entry(1, put(1, 18098, json!([])))])
+            .await
+            .expect("apply put");
+        // 18099 is not committed yet; 18100 was deleted while this node was
+        // down and is the one namespace the sweep is for.
+        for flow in ["i18098:checkout", "i18099:checkout", "i18100:checkout"] {
+            seed_flow(&shard, flow).await;
+        }
+
+        // The apply loop's handle: `compose` gives openraft its own clone.
+        let mut applier = sm.clone();
+        sm.reconcile_engine_interleaved(async move {
+            applier
+                .apply(vec![entry(2, put(2, 18099, json!([])))])
+                .await
+                .expect("apply put during reconcile");
+        })
+        .await
+        .expect("reconcile");
+
+        assert_eq!(engine.count(), 2, "both committed imposters are served");
+        assert!(
+            shard.get("i18099:checkout", "checkout").is_some(),
+            "an imposter committed while the reconcile was syncing is alive; its state stays"
+        );
+        assert!(
+            shard.get("i18098:checkout", "checkout").is_some(),
+            "a live imposter's state is untouched by the sweep"
+        );
+        assert!(
+            shard.get("i18100:checkout", "checkout").is_none(),
+            "the namespace of a delete this node missed is still swept"
+        );
+
+        engine.shutdown().await;
+    }
+
+    /// #567 review — `deleted` is filtered against the desired set. Upstream's
+    /// `replace_imposter` tears the old imposter down and re-creates it; when
+    /// the re-create is refused at staging the port is reported `deleted`
+    /// *and* `failed`. The fleet still wants that port — it is a failed edit,
+    /// not a removal, and the next successful sync re-creates it — so its flow
+    /// state must survive on this node exactly as it does on every node whose
+    /// engine did not fail. Without the filter, the state was gone for good:
+    /// the re-create that follows starts the imposter from nothing.
+    #[tokio::test]
+    async fn a_failed_re_create_of_a_still_desired_port_keeps_its_flow_state() {
+        let engine = Arc::new(ImposterManager::new());
+        let (_td, mut sm, shard) = fresh_sm_with_flow_net(engine.clone()).await;
+        sm.apply(vec![entry(1, put(1, 18101, json!([])))])
+            .await
+            .expect("apply put");
+        seed_flow(&shard, "i18101:checkout").await;
+
+        // `mutualAuth` on a cleartext listener: the desired set validates, the
+        // diff is imposter-level (a replace), the teardown succeeds and the
+        // staged re-create is refused.
+        sm.apply(vec![entry(2, put_unstageable(2, 18101))])
+            .await
+            .expect("apply the unstageable edit");
+        assert_eq!(engine.count(), 0, "the engine serves nothing on the port");
+        assert!(
+            sm.apply_failures().contains_key(&18101),
+            "the failed edit is an apply failure: {:?}",
+            sm.apply_failures()
+        );
+        assert!(
+            shard.get("i18101:checkout", "checkout").is_some(),
+            "a port the config set still names keeps its state through a failed re-create"
+        );
+
+        // The next good edit re-creates the imposter with its state intact.
+        sm.apply(vec![entry(3, put(3, 18101, json!([])))])
+            .await
+            .expect("apply the repair");
+        assert_eq!(engine.count(), 1);
+        assert!(sm.apply_failures().is_empty(), "{:?}", sm.apply_failures());
+        assert!(shard.get("i18101:checkout", "checkout").is_some());
+
+        // A real delete still clears it.
+        sm.apply(vec![entry(
+            4,
+            request(4, ControlOp::DeleteImposter { port: 18101 }),
+        )])
+        .await
+        .expect("apply delete");
+        assert!(shard.get("i18101:checkout", "checkout").is_none());
+
+        engine.shutdown().await;
+    }
+
+    /// #565 by way of a snapshot: an installed snapshot that omits an imposter
+    /// this node's engine is serving syncs the engine to the snapshot, which
+    /// reports the port `deleted` — and the clear follows, exactly as it does
+    /// for an applied `DeleteImposter`. What the snapshot does carry keeps its
+    /// state, and so does the fleet namespace.
+    #[tokio::test]
+    async fn an_installed_snapshot_clears_flow_state_of_imposters_it_omits() {
+        let (_td, mut leader_sm) = fresh_sm(None).await;
+        leader_sm
+            .apply(vec![entry(1, put(1, 18102, json!([])))])
+            .await
+            .expect("apply on the leader");
+        let mut builder = leader_sm.clone();
+        let Snapshot { meta, snapshot } = builder.build_snapshot().await.expect("build snapshot");
+
+        let engine = Arc::new(ImposterManager::new());
+        let (_td2, mut follower, shard) = fresh_sm_with_flow_net(engine.clone()).await;
+        follower
+            .apply(vec![
+                entry(1, put(1, 18102, json!([]))),
+                entry(2, put(2, 18103, json!([]))),
+            ])
+            .await
+            .expect("apply on the follower");
+        for flow in ["i18102:checkout", "i18103:checkout", "f:checkout"] {
+            seed_flow(&shard, flow).await;
+        }
+
+        follower
+            .install_snapshot(&meta, snapshot)
+            .await
+            .expect("install");
+        assert_eq!(engine.count(), 1, "the engine is synced to the snapshot");
+        assert!(
+            shard.get("i18103:checkout", "checkout").is_none(),
+            "an imposter the installed snapshot omits loses its flow state"
+        );
+        assert!(
+            shard.get("i18102:checkout", "checkout").is_some(),
+            "an imposter the snapshot carries keeps its flow state"
+        );
+        assert!(shard.get("f:checkout", "checkout").is_some());
 
         engine.shutdown().await;
     }

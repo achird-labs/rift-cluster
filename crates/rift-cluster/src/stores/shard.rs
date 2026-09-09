@@ -243,6 +243,11 @@ struct Inner {
     /// because `close` takes `&self` (the handle is shared) and must run once.
     writer_thread: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
     config: ShardConfig,
+    /// Test-only observation hook: how many times [`FlowShard::flow_ids`] has
+    /// been called. Nothing in production reads it, and it does not exist
+    /// outside `cfg(test)`.
+    #[cfg(test)]
+    flow_ids_calls: std::sync::atomic::AtomicUsize,
 }
 
 impl FlowShard {
@@ -288,6 +293,8 @@ impl FlowShard {
             writer: parking_lot::Mutex::new(Some(tx)),
             writer_thread: std::sync::Mutex::new(Some(handle)),
             config,
+            #[cfg(test)]
+            flow_ids_calls: std::sync::atomic::AtomicUsize::new(0),
         });
 
         Ok(Self { inner })
@@ -304,6 +311,8 @@ impl FlowShard {
                 writer: parking_lot::Mutex::new(None),
                 writer_thread: std::sync::Mutex::new(None),
                 config,
+                #[cfg(test)]
+                flow_ids_calls: std::sync::atomic::AtomicUsize::new(0),
             }),
         }
     }
@@ -389,9 +398,29 @@ impl FlowShard {
 
     /// Every flow id this shard holds — the anti-entropy loop's worklist
     /// (#126). A snapshot, not a view: the loop iterates it while writes land.
+    ///
+    /// It clones every key, so a caller that needs several *sets* of ids wants
+    /// one call and a filter, not one call per set — see
+    /// [`FlowNet::clear_imposter_scopes`](crate::stores::flow::FlowNet::clear_imposter_scopes),
+    /// which runs on the Raft apply loop.
     #[must_use]
     pub fn flow_ids(&self) -> Vec<String> {
+        #[cfg(test)]
+        self.inner
+            .flow_ids_calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.inner.memory.read().keys().cloned().collect()
+    }
+
+    /// How many times [`Self::flow_ids`] has cloned the key set — the only way
+    /// a test can tell one pass over the shard from N of them, which is the
+    /// whole claim of the set-shaped imposter clear above.
+    #[cfg(test)]
+    #[must_use]
+    pub fn flow_ids_calls(&self) -> usize {
+        self.inner
+            .flow_ids_calls
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// A snapshot of every held flow's live entry count, keyed by its

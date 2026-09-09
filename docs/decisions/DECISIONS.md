@@ -134,11 +134,34 @@ additionally drops any `i<port>:` namespace the tables no longer name, which is 
 delete committed while the node was down. Single-node Rift gets this for free by dropping the
 imposter's store instance; one shared `FlowNet` per node (D-7) has to do it explicitly. What is
 *not* cleared, by the same rule: a `PutImposter` over an existing port (a config change keeps its
-state — the first paragraph of this entry), a `fleet`-scoped (`f:`) or `tenant`-scoped
-(`t<tenant>:`) context (shared by construction, not any one imposter's to drop), and any other
-port's namespace (ports are fleet-unique across tenants, so `i<port>:` never names another
-tenant's). Sequencer cursors already go with the imposter via upstream's `reset_scope` hook (D-8,
-D-57); proxyOnce markers via the apply arm (#226).
+state — the first paragraph of this entry), the `fleet`-scoped (`f:`) context (shared by
+construction, not any one imposter's to drop), and any other port's namespace (ports are
+fleet-unique, so `i<port>:` names exactly one imposter). Sequencer cursors already go with the
+imposter via upstream's `reset_scope` hook (D-8, D-57); proxyOnce markers via the apply arm (#226).
+
+**Amendment (2026-09-08, the #567 review — what "deleted" means to the clear):** two places
+where the rule above was applied to a wider set than "a deleted imposter".
+
+*The live clear is filtered against the desired set.* Upstream's `replace_imposter` tears the old
+imposter down and re-creates it; when the re-create is refused at staging, the port is reported
+`deleted` *and* `failed`. The engine is truthfully serving nothing there — but the config set still
+names the port, so this is a failed **edit** on one node, not a removal: the next successful sync
+re-creates the imposter, and nothing would have put its state back. A port the fleet still wants
+keeps its state; only a port the applied set omits is cleared.
+
+*The reconcile sweep measures the tables after the sync, not the snapshot the sync was driven
+from.* The original claim — that no imposter can be created in the window because the node is not
+yet `Ready` — was false: the ring is Raft membership, so a restarted voter is an HRW owner the whole
+time it catches up, and `compose` binds the flow net long before it spawns the reconciler. The read
+that fed the engine sync and the sweep were a whole `apply_config` apart (seconds, on a cold start
+with listeners to bind) while the apply loop ran concurrently, so an imposter committed in between
+was alive on every node with its flow namespace swept on this one. The sweep now re-reads
+`sm_configs` after the sync (apply writes the table before it drives the engine, so any port
+committed before the read is in the set), and compares against the **tables, not the engine's
+imposter list** — the two differ exactly on ports the engine failed to stage, which by the previous
+paragraph keep their state. The residual, stated: a flow that lands for an imposter this node has
+not yet applied, before that read, is dropped. What bounds it is that `compose` reconciles only
+once `last_applied` has reached the leader's applied index — one apply round-trip, not seconds.
 
 ### D-6 — Redis impls of the new traits are cluster; existing `RedisFlowStore` (incl. U-1 CAS) stays OSS
 - **Status:** amended

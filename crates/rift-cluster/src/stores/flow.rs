@@ -533,14 +533,15 @@ impl FlowNet {
     /// The ports whose imposter-scoped namespace (`i<port>:`,
     /// [`ContextScope::Imposter`]) this node's shard holds at least one flow
     /// under — owned or replicated, live or tombstoned. The reconcile-time half
-    /// of #565: the state machine compares it against the applied config set
-    /// to find the namespaces of imposters deleted while this node was not
-    /// applying (down, or installing a snapshot with an empty engine), and
-    /// clears them with [`Self::clear_imposter_scope`].
+    /// of #565: the state machine compares it against the ports `sm_configs`
+    /// names once its engine sync has run, to find the namespaces of imposters
+    /// deleted while this node was not applying (down, or installing a snapshot
+    /// with an empty engine), and clears them with
+    /// [`Self::clear_imposter_scopes`].
     ///
-    /// Fleet-scoped (`f:`) and tenant-scoped (`t<tenant>:`) flows name no port
-    /// and never appear here — those namespaces are shared by construction and
-    /// outlive any one imposter (D-5 amendment).
+    /// Fleet-scoped (`f:`) flows name no port and never appear here — that
+    /// namespace is shared by construction and outlives any one imposter (D-5
+    /// amendment).
     #[must_use]
     pub fn imposter_ports_held(&self) -> std::collections::BTreeSet<u16> {
         self.shard
@@ -550,10 +551,18 @@ impl FlowNet {
             .collect()
     }
 
-    /// Drop every flow this node holds in `port`'s imposter-scoped namespace
-    /// (#565, the D-5 amendment): an imposter's state is the imposter's, and a
-    /// deleted imposter has none. Returns how many flows were dropped; no state
-    /// is a no-op.
+    /// Drop every flow this node holds in the imposter-scoped namespace of any
+    /// port in `ports` (#565, the D-5 amendment): an imposter's state is the
+    /// imposter's, and a deleted imposter has none. Returns how many flows were
+    /// dropped per port, omitting ports that held none; an empty `ports` (or a
+    /// shard holding nothing under them) is a no-op.
+    ///
+    /// **A set, in one pass over the shard, deliberately.** The caller is the
+    /// Raft apply loop, and a `DeleteAll` names every imposter the fleet has:
+    /// per-port this cost one [`FlowShard::flow_ids`] clone of up to
+    /// `max_flows` (100k) keys *per deleted port*, on every node, at the same
+    /// log index, with apply blocked behind it. One pass and a set membership
+    /// test is the same answer for one clone.
     ///
     /// Per node and local, deliberately — not routed to an owner and not
     /// replicated. Every node applies the same committed `DeleteImposter`, so
@@ -574,14 +583,22 @@ impl FlowNet {
     /// and this is a rare admin-path write. A crash inside the fsync interval
     /// is covered by the reconcile-time sweep on restart, which finds the
     /// namespace orphaned and drops it again.
-    pub async fn clear_imposter_scope(&self, port: u16) -> usize {
-        let prefix = crate::stores::flow_config::ContextScope::Imposter.prefix_for(Some(port));
-        let mut dropped = 0;
+    pub async fn clear_imposter_scopes(
+        &self,
+        ports: &std::collections::BTreeSet<u16>,
+    ) -> std::collections::BTreeMap<u16, usize> {
+        let mut dropped = std::collections::BTreeMap::new();
+        if ports.is_empty() {
+            return dropped;
+        }
         for flow_id in self.shard.flow_ids() {
-            if !flow_id.starts_with(&prefix) {
+            let Some(port) = imposter_port(&flow_id) else {
+                continue;
+            };
+            if !ports.contains(&port) {
                 continue;
             }
-            dropped += 1;
+            *dropped.entry(port).or_insert(0) += 1;
             // The memory mirror is already dropped by the time the durable
             // write can fail, so the node serves the right answer either way;
             // the failure is named so a persistent one is not silent.
@@ -2082,6 +2099,74 @@ mod tests {
         assert_eq!(imposter_port("t6400:cart"), None);
         assert_eq!(imposter_port("t??:cart"), None);
         assert_eq!(imposter_port("i?:cart"), None);
+    }
+
+    /// `clear_imposter_scopes` is one pass over the shard for the whole port set
+    /// (#567 review): it runs on the Raft apply loop, and a `DeleteAll` names
+    /// every imposter the fleet has, so a `flow_ids` clone per port is a
+    /// `max_flows`-sized allocation per deleted port with apply blocked behind
+    /// it. Pinned by counting the clones, which is the only observable
+    /// difference between one pass and N — the dropped set is the same either
+    /// way. The count is what the mutation `for port in ports { .. flow_ids() }`
+    /// changes.
+    #[tokio::test]
+    async fn clearing_a_set_of_imposter_scopes_walks_the_shard_once() {
+        let shard = FlowShard::in_memory(crate::stores::shard::ShardConfig::default());
+        let net = FlowNet::new(shard.clone());
+        for flow in [
+            "i6400:cart",
+            "i6400:checkout",
+            "i6401:cart",
+            "i6402:cart",
+            "f:cart",
+        ] {
+            shard
+                .set(
+                    flow,
+                    "k",
+                    Versioned {
+                        m_idx: 1,
+                        v: 1,
+                        origin: 1,
+                        expires_at: 0,
+                        value: Value::Bool(true),
+                        deleted: false,
+                    },
+                    Durability::None,
+                )
+                .await
+                .expect("seed");
+        }
+        let before = shard.flow_ids_calls();
+
+        let ports = std::collections::BTreeSet::from([6400, 6402, 6403]);
+        let dropped = net.clear_imposter_scopes(&ports).await;
+
+        assert_eq!(
+            shard.flow_ids_calls() - before,
+            1,
+            "three ports, one walk of the shard"
+        );
+        assert_eq!(
+            dropped,
+            std::collections::BTreeMap::from([(6400, 2), (6402, 1)]),
+            "per-port counts; a port holding nothing is omitted, not reported as 0"
+        );
+        for gone in ["i6400:cart", "i6400:checkout", "i6402:cart"] {
+            assert!(shard.get(gone, "k").is_none(), "{gone} is cleared");
+        }
+        for kept in ["i6401:cart", "f:cart"] {
+            assert!(shard.get(kept, "k").is_some(), "{kept} is not in the set");
+        }
+
+        // The empty set is a no-op that does not even walk the shard.
+        let before = shard.flow_ids_calls();
+        assert!(
+            net.clear_imposter_scopes(&std::collections::BTreeSet::new())
+                .await
+                .is_empty()
+        );
+        assert_eq!(shard.flow_ids_calls(), before);
     }
 
     // -- issue #401: `merge_peer_counts` (the `fleet_entry_counts` peer fold) -
