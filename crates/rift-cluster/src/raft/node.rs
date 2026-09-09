@@ -1408,6 +1408,35 @@ impl RaftNode {
         }
     }
 
+    /// Wait, bounded, until this node can see a leader. Returns whether one
+    /// became visible.
+    ///
+    /// [`Self::submit`] is deliberately not a retry loop: with no leader to
+    /// forward to it answers [`NodeError::Unavailable`] on the first try, which
+    /// is the right answer for a client request and the wrong one for a
+    /// *startup* write. A node that has just joined, or one booting into a
+    /// fleet still holding its first election, spends a window with
+    /// `current_leader == None` through no fault of its own — and the
+    /// `--imposters` bootstrap (D-72) makes that window a failed start. This is
+    /// the wait that closes it, and it is deliberately the only thing it does:
+    /// a write that is genuinely refused still fails loudly.
+    ///
+    /// Event-driven rather than polled — openraft wakes the metrics watch. A
+    /// leader elected and lost again before the caller's write lands is not
+    /// covered and is not meant to be: that failure is retry-worthy and the
+    /// caller reports it, where a silent re-wait here would hide a flapping
+    /// election behind a slow boot.
+    pub async fn await_leader(&self, timeout: Duration) -> bool {
+        self.raft
+            .wait(Some(timeout))
+            .metrics(
+                |metrics| metrics.current_leader.is_some(),
+                "a leader to accept a startup write",
+            )
+            .await
+            .is_ok()
+    }
+
     /// Wait until every cluster member's applied index has reached `revision`,
     /// or `timeout` elapses — the read-after-write barrier (issue #9). Returns
     /// the ids of members that had NOT confirmed by the deadline; empty means
@@ -2386,6 +2415,42 @@ mod tests {
         assert!(
             node.status().last_applied.is_some_and(|a| a >= rev),
             "await_local_applied returned true before the apply landed"
+        );
+
+        node.shutdown().await.expect("shutdown");
+    }
+
+    /// The primitive the `--imposters` bootstrap (D-72) needs: a node composed
+    /// before its fleet has elected must be able to *wait* for a leader rather
+    /// than take `submit`'s first `Unavailable` as a reason to refuse its own
+    /// start.
+    ///
+    /// Both halves matter and they fail differently. A wait that never reports
+    /// `false` hangs a genuinely quorum-less boot forever; one that never
+    /// reports `true` — reading the wrong metric, say — fails every boot with a
+    /// timeout that looks like a broken fleet. So this asserts the uninitialized
+    /// node times out *inside its own budget*, and the initialized one returns
+    /// immediately.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn await_leader_times_out_with_no_leader_and_returns_once_one_exists() {
+        let dir = TempDir::new().expect("tempdir");
+        let node = RaftNode::start(config_in(&dir, 9)).await.expect("start");
+
+        // Uninitialized: no membership, so no election can happen at all.
+        let started = tokio::time::Instant::now();
+        assert!(
+            !node.await_leader(Duration::from_millis(250)).await,
+            "a node with no cluster to elect in must report no leader, not hang"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "await_leader overran its own timeout"
+        );
+
+        node.cluster_init().await.expect("cluster init");
+        assert!(
+            node.await_leader(Duration::from_secs(5)).await,
+            "a node that has elected itself must see a leader"
         );
 
         node.shutdown().await.expect("shutdown");

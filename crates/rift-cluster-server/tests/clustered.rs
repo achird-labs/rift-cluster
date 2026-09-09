@@ -909,6 +909,14 @@ async fn a_departed_founder_rejoins_through_the_peers_its_log_remembers() {
 /// table, so the imposter is not duplicated and the log does not grow. Asserted in this test
 /// rather than its own so the suite does not hold a second composed server open concurrently —
 /// seventeen of them exhaust the process's file descriptors on a developer machine.
+///
+/// **The fixture's shape is the test.** Two stubs, and responses carrying several headers each,
+/// because `ImposterConfig` holds headers in a `std::collections::HashMap` and std keys every map
+/// it builds with a fresh `RandomState`. A one-stub, zero-header document serializes to the same
+/// bytes on every read no matter how the digest is computed, so it would pass over a digest that
+/// is not canonical at all — which is exactly what shipped in #564. With this fixture, a
+/// non-canonical digest re-derives a different `op_id` on the second boot, the dedup table misses,
+/// and `PutImposter` re-applies — visible below as a moved `imposter_revision`.
 #[tokio::test]
 async fn the_imposters_flag_bootstraps_through_the_log_and_a_restart_does_not_duplicate() {
     let state = TempDir::new().expect("tempdir");
@@ -918,7 +926,40 @@ async fn the_imposters_flag_bootstraps_through_the_log_and_a_restart_does_not_du
         &doc,
         serde_json::json!({
             "imposters": [
-                { "port": port, "protocol": "http", "name": "from-file-source" }
+                {
+                    "port": port,
+                    "protocol": "http",
+                    "name": "from-file-source",
+                    "stubs": [
+                        {
+                            "predicates": [{ "equals": { "path": "/one" } }],
+                            "responses": [{
+                                "is": {
+                                    "statusCode": 200,
+                                    "headers": {
+                                        "x-alpha": "a",
+                                        "x-bravo": "b",
+                                        "x-charlie": "c",
+                                        "x-delta": "d"
+                                    }
+                                }
+                            }]
+                        },
+                        {
+                            "predicates": [{ "equals": { "path": "/two" } }],
+                            "responses": [{
+                                "is": {
+                                    "statusCode": 201,
+                                    "headers": {
+                                        "x-echo": "e",
+                                        "x-foxtrot": "f",
+                                        "x-golf": "g"
+                                    }
+                                }
+                            }]
+                        }
+                    ]
+                }
             ]
         })
         .to_string(),
@@ -1011,9 +1052,13 @@ async fn an_unreadable_imposters_uri_fails_the_start() {
 /// first use — applied to the schemes that left with it.
 #[tokio::test]
 async fn a_retired_source_scheme_is_refused_at_startup_naming_the_issue() {
+    // `S3://` is in the list because a URI scheme is case-insensitive (RFC 3986 §3.1): the
+    // operator who capitalised it made the same mistake and must get the same explanation, not
+    // the generic "no source serves this scheme" that would send them to check their spelling.
     for uri in [
         "git+https://example.invalid/repo#main:mocks.json",
         "s3://bucket/mocks.json",
+        "S3://bucket/mocks.json",
         "registry:my-mocks",
     ] {
         let state = TempDir::new().expect("tempdir");
@@ -1032,4 +1077,113 @@ async fn a_retired_source_scheme_is_refused_at_startup_naming_the_issue() {
             "the refusal must name the removal, not just the scheme: {err}"
         );
     }
+}
+
+/// A `routes` block in a bootstrap document is **refused**, not warned about.
+///
+/// The front door's route table is its own replicated object with its own op (#131), and the
+/// bootstrap does not write it. Applying the document minus the block would leave the operator
+/// with a listener they configured and never got — the same failure `intercept` is refused for,
+/// and the reason both refusals share a message shape. A start-up warning is not a channel an
+/// operator reads before sending traffic at a front door whose table is empty.
+#[tokio::test]
+async fn a_routes_block_in_a_bootstrap_document_is_refused() {
+    let state = TempDir::new().expect("tempdir");
+    let doc = state.path().join("mocks.json");
+    let port = common::ports::reserve_port();
+    std::fs::write(
+        &doc,
+        serde_json::json!({
+            "imposters": [{ "port": port, "protocol": "http", "name": "with-routes" }],
+            // Upstream's `RouteTable` shape, so this parses and reaches the refusal rather than
+            // failing as a malformed block — the refusal, not the parser, is what is pinned.
+            "routes": {
+                "routes": [{
+                    "id": "api",
+                    "match": { "host": "api.example.com" },
+                    "target": { "port": port }
+                }]
+            }
+        })
+        .to_string(),
+    )
+    .expect("write the bootstrap document");
+
+    let uri = format!("file:{}", doc.to_string_lossy());
+    let err = match compose::start(cluster_cli(
+        &state,
+        &["--cluster-allow-solo", "--imposters", &uri],
+    ))
+    .await
+    {
+        Ok(_) => panic!("a document declaring routes must not start"),
+        Err(e) => format!("{e:#}"),
+    };
+    assert!(
+        err.contains("routes"),
+        "the refusal must name the block that could not be honoured: {err}"
+    );
+    assert!(
+        err.contains("PUT /front-door/routes"),
+        "the refusal must say where routes do belong: {err}"
+    );
+}
+
+/// A **joiner** bootstraps. The node that composes with `--imposters` here is not the founder:
+/// it starts, joins through its seed, and only then submits — the window in which
+/// `RaftNode::submit` can find no leader to forward to and answers `Unavailable` with no retry of
+/// its own.
+///
+/// Pins the bounded leader wait. Without it the bootstrap made that window fatal and the joiner
+/// simply failed to boot, which on a fleet cold-starting all at once is a coin flip rather than a
+/// misconfiguration. The imposter is asserted on the **founder's** committed set, because the
+/// claim is that the joiner's bootstrap reached the log, not that it reached the joiner.
+#[tokio::test]
+async fn a_joiner_bootstraps_its_imposters_once_the_fleet_has_a_leader() {
+    let founder_state = TempDir::new().expect("tempdir");
+    let joiner_state = TempDir::new().expect("tempdir");
+    let founder_bind = reserve_port();
+
+    let founder = compose::start(cluster_on(
+        &founder_state,
+        &founder_bind,
+        "127.0.0.1:0",
+        &["--cluster-allow-solo"],
+    ))
+    .await
+    .expect("founder starts");
+
+    let doc = joiner_state.path().join("mocks.json");
+    let port = common::ports::reserve_port();
+    std::fs::write(
+        &doc,
+        serde_json::json!({
+            "imposters": [{ "port": port, "protocol": "http", "name": "from-the-joiner" }]
+        })
+        .to_string(),
+    )
+    .expect("write the bootstrap document");
+    let uri = format!("file:{}", doc.to_string_lossy());
+
+    let joiner = compose::start(cluster_on(
+        &joiner_state,
+        &reserve_port(),
+        "127.0.0.1:0",
+        &["--cluster-seeds", &founder_bind, "--imposters", &uri],
+    ))
+    .await
+    .expect("a joiner with --imposters must start, not fail on a leaderless window");
+
+    let founder_node = founder.node().expect("founder is clustered").clone();
+    wait_voter_count(&founder_node, 2, "both nodes must be voters").await;
+    assert!(
+        founder_node
+            .configured_ports()
+            .expect("ports")
+            .contains(&port),
+        "the joiner's bootstrap must reach the replicated log, not just its own manager"
+    );
+
+    joiner.shutdown().await;
+    founder.shutdown().await;
 }

@@ -2511,7 +2511,7 @@ router routes to the local imposter, never across nodes.
 
 ### D-72 — Imposter import is one-shot: `--imposters` and `POST /specs/compile` become ordinary `PutImposter` ops; the cluster retains no source, spec or dataset
 
-- **Status:** active
+- **Status:** amended
 - **Decided:** 2026-09-07 · RFC-007 §3.2 · #549
 - **Supersedes:** D-18, D-19, D-23, D-29, D-30, D-31, D-34, D-48, D-49, D-50, D-51, D-52, D-53, D-55, D-56
 - **Amends:** RFC-004 §3.4
@@ -2562,6 +2562,36 @@ dedup table; an *edited* document hashes differently and applies. That is what t
 `applied_digest` short circuit used to buy, obtained without a replicated record — and it is why
 the digest is over the whole document rather than per imposter: an imposter removed from the
 document must change the identity of what the document declares.
+
+**Amendment (2026-09-08, retrospective review of #564):** three clarifications, none of which
+changes what is replicated.
+
+*The digest is over a canonical rendering, not over `ImposterConfig`'s own serialization.* As
+shipped, `digest` was `sha256(serde_json::to_vec(configs))`, and `ImposterConfig` transitively
+holds `std::collections::HashMap`s (a response's `headers`, `_rift.scripts`) that upstream
+serializes in raw iteration order — a fresh `RandomState` per map, so any document with two or
+more response headers hashed differently on every read, every restart minted a new `op_id`, and
+the idempotence described above never engaged. The digest is now over the config set round-tripped
+through `serde_json::Value`, whose map is a `BTreeMap` (`preserve_order` is off across the
+workspace; a unit test on the helper fails if that changes). Raw document bytes remain the wrong
+input for the reason already given: JSON and YAML spellings of one document must dedup.
+
+*The bootstrap waits, bounded, for a leader.* `RaftNode::submit` answers `Unavailable` at once when
+no leader is visible, and a joiner — or any node in a fleet cold-starting together — is composed
+inside exactly that window. The bootstrap now waits up to `BOOTSTRAP_LEADER_DEADLINE` (30 s, the
+seed-join budget) for one before its first submit; a fleet that never elects still fails the start,
+by the deadline and saying so. A genuine refusal is still fatal.
+
+*A `routes` block is refused, like `intercept`, not warned about.* Both leave the operator with
+something they configured and never got; a start-up warning is not a channel an operator reads
+before sending traffic at a front door whose table is empty. Same message shape, pointing at
+`PUT /front-door/routes`.
+
+*And one thing the bootstrap deliberately does not do:* it never removes an imposter that was
+dropped from the document. A one-shot import has no baseline to diff against — that baseline is
+precisely the source record this decision removed — so "absent from this document" is
+indistinguishable from "created through the admin API by someone else". The import is additive;
+deletion is an admin action (`DELETE /imposters/{port}`).
 
 **Authorized as `imposter.write`.** A compile is the first half of an imposter write and the only
 reason to call it is to make one; putting it below that would let a reader have the fleet do a

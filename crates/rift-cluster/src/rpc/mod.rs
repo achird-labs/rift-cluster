@@ -99,9 +99,11 @@ pub enum RpcError {
     /// The route exists, but the specific resource it names does not (#437).
     ///
     /// Distinct from [`Self::UnknownRoute`] — "no such route" — because the
-    /// two answer different questions a caller must be able to tell apart: a
-    /// blob fetch (#439) needs "this peer lacks the blob, ask another" to
-    /// read differently from "this build has no blob route at all".
+    /// two answer different questions a caller must be able to tell apart:
+    /// "this peer does not hold the thing I named, ask another" must read
+    /// differently from "this build has no such route at all". (The first
+    /// consumer was the blob fetch, retired with D-72; the distinction
+    /// outlives it.)
     #[error("not found: {what}")]
     NotFound { what: String },
 }
