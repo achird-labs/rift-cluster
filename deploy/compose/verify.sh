@@ -17,11 +17,6 @@
 # there would cost the ten minutes that job exists to pay only once.
 set -euo pipefail
 
-# Every assertion below reads `/_fleet/members` through `jq`. Without it every
-# read yields the empty string, every comparison fails, and the script reports a
-# broken cluster — a diagnosis that would send the reader after the wrong thing.
-command -v jq >/dev/null || { echo "verify.sh requires jq" >&2; exit 2; }
-
 # Before the `cd` below, deliberately: `--help` reads this file back through
 # `$0`, and after changing directory a relatively-invoked `$0` no longer names
 # anything. `smoke.sh` parses in the same order, for the same reason.
@@ -33,6 +28,12 @@ for arg in "$@"; do
     *) echo "unknown flag: $arg" >&2; exit 2 ;;
   esac
 done
+
+# Every assertion below reads `/_fleet/members` through `jq`. Without it every
+# read yields the empty string, every comparison fails, and the script reports a
+# broken cluster — a diagnosis that would send the reader after the wrong thing.
+# After argument parsing, so `--help` works on a machine without jq.
+command -v jq >/dev/null || { echo "verify.sh requires jq" >&2; exit 2; }
 
 cd "$(dirname "$0")"
 COMPOSE=(docker compose -f docker-compose.yml)
@@ -115,7 +116,7 @@ shapes=""
 for _ in $(seq 1 20); do
   shapes=""
   for port in "${ADMIN_PORTS[@]}"; do
-    shapes="${shapes}${shapes:+ }$(fleet_shape "$port")"
+    shape="$(fleet_shape "$port")"; shapes="${shapes}${shapes:+ }${shape:-?|?|?}"
   done
   [ "$shapes" = "3|1|3 3|1|3 3|1|3" ] && break
   sleep 2
@@ -126,7 +127,7 @@ if [ "$shapes" = "3|1|3 3|1|3 3|1|3" ]; then
 else
   echo "FAIL: expected '3|1|3 3|1|3 3|1|3' (voters|leaders|reachable per node),"
   echo "      got '${shapes:-<none>}'"
-  echo "      an empty field is a node that could not be read at all; a '0' in the"
+  echo "      a '?|?|?' is a node that could not be read at all; a '0' in the"
   echo "      middle column is a fleet still electing, a '2' is a split brain"
   "${COMPOSE[@]}" logs --tail=40
   exit 1

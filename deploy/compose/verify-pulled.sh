@@ -306,7 +306,7 @@ run_stack() {
   for _ in $(seq 1 20); do
     shapes=""
     for port in 12525 22525 32525; do
-      shapes="${shapes}${shapes:+ }$(fleet_shape "$port")"
+      shape="$(fleet_shape "$port")"; shapes="${shapes}${shapes:+ }${shape:-?|?|?}"
     done
     [ "$shapes" = "3|1|3 3|1|3 3|1|3" ] && break
     sleep 2

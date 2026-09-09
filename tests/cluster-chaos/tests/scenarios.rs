@@ -830,13 +830,28 @@ fn the_compose_verification_scripts_have_a_ci_invoker() {
     let ci = read_workflow("ci.yml");
     let job = workflow_job(&ci, "compose-smoke");
 
+    // A job that can never run has gone the same way as one that was deleted:
+    // the lane rides `cluster-smoke-prepare`'s filter verdict, and this is the
+    // line that says so. `if: false`, or dropping the `needs`, leaves the rest
+    // of the job text intact and would otherwise pass every assertion below.
+    assert!(
+        job.contains("if: needs.cluster-smoke-prepare.outputs.run == 'true'"),
+        "the compose-smoke job is not gated on cluster-smoke-prepare's filter \
+         verdict, so either it can never run or it runs without the image"
+    );
+
     for script in ["deploy/compose/verify.sh", "deploy/compose/smoke.sh"] {
+        // A `run:` line, not any mention: a commented-out invocation
+        // (`# run: deploy/compose/verify.sh …  # flaky`) still contains the path.
+        let invoked = job
+            .lines()
+            .any(|line| line.trim_start().starts_with(&format!("run: {script}")));
         assert!(
-            job.contains(script),
-            "the compose-smoke job does not invoke {script}. Both halves are \
-             load-bearing: verify.sh proves the manifests form a cluster, smoke.sh \
-             proves the core's promises hold on it. Running one is not running the \
-             other."
+            invoked,
+            "the compose-smoke job does not invoke {script} on a `run:` line. Both \
+             halves are load-bearing: verify.sh proves the manifests form a cluster, \
+             smoke.sh proves the core's promises hold on it. Running one is not \
+             running the other."
         );
     }
 
