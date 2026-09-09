@@ -21,7 +21,8 @@
 //! Serving is deliberately dumb: read-only, unauthenticated, no state. The shell is the login UI
 //! (RFC-006 §5.3), so requiring a credential to fetch the page that collects one would be a closed
 //! loop; the bundle carries no secrets, and every call it subsequently makes goes through
-//! `authorize_action` like any other client.
+//! `admin_front::authenticate` like any other client (D-73 removed `authorize_action` with the
+//! roles it used to check — there is one administrator, so the gate is authentication alone).
 
 use std::borrow::Cow;
 
