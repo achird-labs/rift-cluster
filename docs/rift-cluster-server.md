@@ -499,7 +499,7 @@ the fleet has converged.
 | `GET /_cluster/members` | node id, leadership, current leader, last applied index, voters |
 | `GET /_cluster/config` | the ports this node has a committed config for |
 | `GET /_cluster/imposters` | those ports with their committed config bodies |
-| `GET /_cluster/health` | readiness state and pending gates, whether this node is an isolated owner, the ownership ring (`m_idx` + members), this node's parked-write depth, and `blob_fetch_stall` — non-`null` while this node's apply loop is parked on a blob no member can supply (#439; degraded, not not-ready — see `FleetHealth` in `docs/api/openapi-ee.yaml` for the shape and the reasoning) |
+| `GET /_cluster/health` | readiness state and pending gates, whether this node is an isolated owner, the ownership ring (`m_idx` + members), and this node's parked-write depth (see `FleetHealth` in `docs/api/openapi-ee.yaml` for the shape) |
 
 `/_cluster/ring` and `/_cluster/kv` arrive with later phases.
 

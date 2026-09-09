@@ -323,6 +323,26 @@ pub enum JoinedAs {
     Unknown,
 }
 
+/// How a bounded [`RaftNode::await_leader`] ended.
+///
+/// Three outcomes rather than a `bool`, because the two failures are answered
+/// differently and a caller that cannot tell them apart writes a false
+/// diagnosis: "the fleet has no quorum" is exactly wrong about a node whose own
+/// raft core has already exited. Same reasoning, and the same two openraft
+/// variants, as the `Timeout`/`ShuttingDown` split in
+/// [`RaftNode::await_local_applied`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LeaderWait {
+    /// A leader became visible inside the budget.
+    Elected,
+    /// The budget elapsed with no leader visible — the fleet has not elected
+    /// one, or this node cannot see the one it has.
+    Timeout,
+    /// This node's raft core is shutting down, so no leader will ever become
+    /// visible *here*. Says nothing about the fleet.
+    ShuttingDown,
+}
+
 /// Why an address sweep failed.
 ///
 /// Two cases, kept apart in the type because they are answered differently and
@@ -1408,6 +1428,46 @@ impl RaftNode {
         }
     }
 
+    /// Wait, bounded, until this node can see a leader. Reports which of
+    /// [`LeaderWait`]'s three endings happened.
+    ///
+    /// [`Self::submit`] is deliberately not a retry loop: with no leader to
+    /// forward to it answers [`NodeError::Unavailable`] on the first try, which
+    /// is the right answer for a client request and the wrong one for a
+    /// *startup* write. A node that has just joined, or one booting into a
+    /// fleet still holding its first election, spends a window with
+    /// `current_leader == None` through no fault of its own — and the
+    /// `--imposters` bootstrap (D-72) makes that window a failed start. This is
+    /// the wait that closes it, and it is deliberately the only thing it does:
+    /// a write that is genuinely refused still fails loudly.
+    ///
+    /// Event-driven rather than polled — openraft wakes the metrics watch. A
+    /// leader elected and lost again before the caller's write lands is not
+    /// covered and is not meant to be: that failure is retry-worthy and the
+    /// caller reports it, where a silent re-wait here would hide a flapping
+    /// election behind a slow boot.
+    pub async fn await_leader(&self, timeout: Duration) -> LeaderWait {
+        match self
+            .raft
+            .wait(Some(timeout))
+            .metrics(
+                |metrics| metrics.current_leader.is_some(),
+                "a leader to accept a startup write",
+            )
+            .await
+        {
+            Ok(_) => LeaderWait::Elected,
+            // Both mean "no leader here", and they mean opposite things about
+            // the fleet: a timeout is a statement about quorum, a shutdown is a
+            // statement about this process only. Collapsing them would let a
+            // node draining under a rolling restart report its fleet as
+            // quorum-less. Same split, for the same reason, as
+            // `await_local_applied`.
+            Err(WaitError::Timeout(..)) => LeaderWait::Timeout,
+            Err(WaitError::ShuttingDown) => LeaderWait::ShuttingDown,
+        }
+    }
+
     /// Wait until every cluster member's applied index has reached `revision`,
     /// or `timeout` elapses — the read-after-write barrier (issue #9). Returns
     /// the ids of members that had NOT confirmed by the deadline; empty means
@@ -2386,6 +2446,50 @@ mod tests {
         assert!(
             node.status().last_applied.is_some_and(|a| a >= rev),
             "await_local_applied returned true before the apply landed"
+        );
+
+        node.shutdown().await.expect("shutdown");
+    }
+
+    /// The primitive the `--imposters` bootstrap (D-72) needs: a node composed
+    /// before its fleet has elected must be able to *wait* for a leader rather
+    /// than take `submit`'s first `Unavailable` as a reason to refuse its own
+    /// start.
+    ///
+    /// Both halves matter and they fail differently. A wait that never reports
+    /// [`LeaderWait::Timeout`] hangs a genuinely quorum-less boot forever; one
+    /// that never reports [`LeaderWait::Elected`] — reading the wrong metric,
+    /// say — fails every boot with a timeout that looks like a broken fleet. So
+    /// this asserts the uninitialized node times out *inside its own budget*,
+    /// and the initialized one returns immediately.
+    ///
+    /// Asserted on the variant, not on "not elected": a node whose raft core has
+    /// exited answers [`LeaderWait::ShuttingDown`], and the bootstrap renders
+    /// that as a different sentence because it is a different fact — nothing
+    /// about the fleet's quorum.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn await_leader_times_out_with_no_leader_and_returns_once_one_exists() {
+        let dir = TempDir::new().expect("tempdir");
+        let node = RaftNode::start(config_in(&dir, 9)).await.expect("start");
+
+        // Uninitialized: no membership, so no election can happen at all.
+        let started = tokio::time::Instant::now();
+        assert_eq!(
+            node.await_leader(Duration::from_millis(250)).await,
+            LeaderWait::Timeout,
+            "a node with no cluster to elect in must report a timeout — the diagnosis that names \
+             quorum — not hang and not `ShuttingDown`"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "await_leader overran its own timeout"
+        );
+
+        node.cluster_init().await.expect("cluster init");
+        assert_eq!(
+            node.await_leader(Duration::from_secs(5)).await,
+            LeaderWait::Elected,
+            "a node that has elected itself must see a leader"
         );
 
         node.shutdown().await.expect("shutdown");

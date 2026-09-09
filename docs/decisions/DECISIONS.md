@@ -2512,10 +2512,10 @@ router routes to the local imposter, never across nodes.
 
 ### D-72 — Imposter import is one-shot: `--imposters` and `POST /specs/compile` become ordinary `PutImposter` ops; the cluster retains no source, spec or dataset
 
-- **Status:** active
+- **Status:** amended
 - **Decided:** 2026-09-07 · RFC-007 §3.2 · #549
 - **Supersedes:** D-18, D-19, D-23, D-29, D-30, D-31, D-34, D-48, D-49, D-50, D-51, D-52, D-53, D-55, D-56
-- **Amends:** RFC-004 §3.4
+- **Amends:** RFC-004 §1, RFC-004 §3.4, RFC-004 §6
 - **Implemented by:** #549
 - **Code:** crates/rift-cluster-server/src/admin_front.rs, crates/rift-cluster-server/src/compose.rs
 
@@ -2563,6 +2563,53 @@ dedup table; an *edited* document hashes differently and applies. That is what t
 `applied_digest` short circuit used to buy, obtained without a replicated record — and it is why
 the digest is over the whole document rather than per imposter: an imposter removed from the
 document must change the identity of what the document declares.
+
+**Amendment (2026-09-08, retrospective review of #564):** four clarifications, none of which
+changes what is replicated.
+
+*The digest is over a canonical rendering, not over `ImposterConfig`'s own serialization.* As
+shipped, `digest` was `sha256(serde_json::to_vec(configs))`, and `ImposterConfig` transitively
+holds `std::collections::HashMap`s (a response's `headers`, `_rift.scripts`) that upstream
+serializes in raw iteration order — a fresh `RandomState` per map, so any document with two or
+more response headers could hash differently on any read (with exactly two the orderings coincide
+about half the time, and agreement collapses from there), restarts minted new `op_id`s, and the
+idempotence described above never reliably engaged. The digest is now over the config set
+round-tripped through `serde_json::Value`, whose map is a `BTreeMap` (`preserve_order` is off
+across the workspace; a unit test on the helper fails if that changes). Raw document bytes remain
+the wrong input for the reason already given — two spellings of one document, JSON where there was
+YAML, must dedup — but that dedup holds **only within one URI**: the `op_id` hashes the URI
+verbatim, so `file:mocks.json` and `file:mocks.yaml` are two documents to the dedup table however
+equal their digests, as is one file mounted at two paths on two nodes. The URI is deliberately not
+normalised; two URIs are two operator intentions.
+
+*The whole-document digest has a blast radius, and it is accepted rather than overlooked.* Editing
+one imposter changes the digest every imposter in that document is keyed on, so all of them
+re-apply — and a re-applied `PutImposter` is a delete-then-recreate that also drops that port's
+`proxy_recorded` markers (#226), so a stub already recorded there can be recorded again. Keeping
+per-imposter digests would avoid it and give up the property above (a removed imposter would leave
+the others' identities unchanged, hiding that the document moved at all); a bootstrap document is
+edited at deploy time, so the trade goes this way.
+
+*The bootstrap waits, bounded, for a leader — immediately before its first submit, not on entry.*
+`RaftNode::submit` answers `Unavailable` at once when no leader is visible, and a joiner — or any
+node in a fleet cold-starting together — is composed inside exactly that window. The bootstrap
+waits up to `BOOTSTRAP_LEADER_DEADLINE` (30 s, the seed-join budget) for one; a fleet that never
+elects still fails the start, by the deadline and saying so, and a genuine refusal is still fatal.
+The *placement* is part of the decision: everything decidable on this node alone — a retired URI
+scheme, an unreadable document, an `intercept` or `routes` block, a portless imposter — is refused
+before the wait, so a leaderless fleet cannot mask a plain misconfiguration and cost the operator a
+second deploy cycle to hear about it.
+
+*A `routes` block is refused, like `intercept`, not warned about.* Both leave the operator with
+something they configured and never got; a start-up warning is not a channel an operator reads
+before sending traffic at a front door whose table is empty. Same message shape, pointing at
+`PUT /front-door/routes`.
+
+*And one thing the bootstrap deliberately does not do:* it never removes an imposter that was
+dropped from the document. A one-shot import has no baseline to diff against — that baseline is
+precisely the source record this decision removed — so "absent from this document" is
+indistinguishable from "created through the admin API by someone else". The import is additive;
+deletion is an admin action (`DELETE /imposters/{port}`).
 
 **Authorized as `imposter.write`.** A compile is the first half of an imposter write and the only
 reason to call it is to make one; putting it below that would let a reader have the fleet do a

@@ -248,6 +248,47 @@ async fn a_body_over_the_cap_is_refused_with_413() {
     server.shutdown().await;
 }
 
+/// The cap is inclusive: a body of exactly `MAX_SPEC_BYTES` compiles. Beside the `+1 → 413` case
+/// so the boundary is pinned from both sides — an off-by-one in the limit reads as either test
+/// alone passing.
+///
+/// Padded with a YAML comment rather than a bigger document, so the thing being measured is the
+/// byte bound and not the compiler's appetite for operations.
+#[tokio::test]
+async fn a_body_of_exactly_the_cap_compiles() {
+    let state = TempDir::new().expect("tempdir");
+    let server = compose::start(cluster_cli(&state))
+        .await
+        .expect("solo cluster starts");
+    wait_ready(&server).await;
+    let admin = server.admin_addr();
+    let port = common::ports::reserve_port();
+
+    let padding = rift_cluster_spec::MAX_SPEC_BYTES - PETSTORE_YAML.len() - "# \n".len();
+    let at_cap = format!("{PETSTORE_YAML}# {}\n", "x".repeat(padding));
+    assert_eq!(at_cap.len(), rift_cluster_spec::MAX_SPEC_BYTES);
+
+    let response = reqwest::Client::new()
+        .post(format!("http://{admin}/specs/compile?port={port}"))
+        .header("content-type", "application/yaml")
+        .body(at_cap)
+        .send()
+        .await
+        .expect("post a body of exactly the cap");
+    assert_eq!(
+        response.status().as_u16(),
+        200,
+        "exactly MAX_SPEC_BYTES is within the cap, not over it"
+    );
+    let compiled: serde_json::Value = response.json().await.expect("the compile answers JSON");
+    assert_eq!(
+        compiled["imposter"]["port"], port,
+        "the padded document must compile to the same imposter: {compiled}"
+    );
+
+    server.shutdown().await;
+}
+
 /// JSON and YAML are both accepted — the compiler parses one superset — and both spellings of
 /// one document produce the same *contract*: the same stub ids, predicates, statuses and headers,
 /// and the same operation index.
