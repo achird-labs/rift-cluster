@@ -917,13 +917,21 @@ async fn a_departed_founder_rejoins_through_the_peers_its_log_remembers() {
 /// is not canonical at all — which is exactly what shipped in #564. With this fixture, a
 /// non-canonical digest re-derives a different `op_id` on the second boot, the dedup table misses,
 /// and `PutImposter` re-applies — visible below as a moved `imposter_revision`.
+///
+/// **The third boot is the other direction**, and without it a digest that is simply a *constant*
+/// passes everything above: the restart assertion is that the revision does not move, which a
+/// frozen `op_id` satisfies perfectly while making the bootstrap ignore every edit forever. So
+/// the document is rewritten and the third boot must move the revision. D-72 claims both halves —
+/// "a restart collapses in the dedup table; an *edited* document hashes differently and applies" —
+/// and only the pair pins it.
 #[tokio::test]
-async fn the_imposters_flag_bootstraps_through_the_log_and_a_restart_does_not_duplicate() {
+async fn the_imposters_flag_bootstraps_a_restart_does_not_duplicate_and_an_edit_re_applies() {
     let state = TempDir::new().expect("tempdir");
     let doc = state.path().join("mocks.json");
     let port = common::ports::reserve_port();
-    std::fs::write(
-        &doc,
+    // The document, parameterised on one header value: the smallest edit an operator can make
+    // and still mean something different by it.
+    let document = |delta: &str| {
         serde_json::json!({
             "imposters": [
                 {
@@ -940,7 +948,7 @@ async fn the_imposters_flag_bootstraps_through_the_log_and_a_restart_does_not_du
                                         "x-alpha": "a",
                                         "x-bravo": "b",
                                         "x-charlie": "c",
-                                        "x-delta": "d"
+                                        "x-delta": delta
                                     }
                                 }
                             }]
@@ -962,9 +970,9 @@ async fn the_imposters_flag_bootstraps_through_the_log_and_a_restart_does_not_du
                 }
             ]
         })
-        .to_string(),
-    )
-    .expect("write the bootstrap document");
+        .to_string()
+    };
+    std::fs::write(&doc, document("d")).expect("write the bootstrap document");
 
     let uri = format!("file:{}", doc.to_string_lossy());
     let server = compose::start(cluster_cli(
@@ -1015,6 +1023,33 @@ async fn the_imposters_flag_bootstraps_through_the_log_and_a_restart_does_not_du
         "a restart on an unchanged document must not rewrite the config"
     );
     restarted.shutdown().await;
+
+    // The other direction. An operator edits the document and restarts: the digest moves, the
+    // `op_id` with it, the dedup table misses and the imposter is re-applied under a new
+    // revision. A digest that never moves — a constant, or one that ignores the part of the
+    // document that changed — leaves this assertion as the only red one in the suite.
+    std::fs::write(&doc, document("EDITED")).expect("rewrite the bootstrap document");
+    let edited = compose::start(cluster_cli(
+        &state,
+        &["--cluster-allow-solo", "--imposters", &uri],
+    ))
+    .await
+    .expect("a restart on an edited document must start");
+    let node = edited.node().expect("clustered");
+    assert_eq!(
+        node.configured_ports().expect("ports"),
+        vec![port],
+        "an edit re-applies the imposter; it does not add a second one"
+    );
+    assert_ne!(
+        node.imposter_revision(port)
+            .expect("read the imposter's revision")
+            .expect("the imposter still exists"),
+        revision_after_first_boot,
+        "an edited document must hash differently and apply — a bootstrap that dedups an edit \
+         leaves the fleet frozen on whatever the first boot happened to read"
+    );
+    edited.shutdown().await;
 }
 
 /// A URI that cannot be read fails the start. An operator who passed `--imposters` asked for
@@ -1129,17 +1164,24 @@ async fn a_routes_block_in_a_bootstrap_document_is_refused() {
     );
 }
 
-/// A **joiner** bootstraps. The node that composes with `--imposters` here is not the founder:
-/// it starts, joins through its seed, and only then submits — the window in which
-/// `RaftNode::submit` can find no leader to forward to and answers `Unavailable` with no retry of
-/// its own.
+/// A **joiner** bootstraps: the node that composes with `--imposters` here is not the founder. It
+/// starts, joins through its seed, and submits into a log it does not lead — so the imposter is
+/// asserted on the **founder's** committed set, because the claim is that the joiner's bootstrap
+/// reached the log, not that it reached the joiner's own manager.
 ///
-/// Pins the bounded leader wait. Without it the bootstrap made that window fatal and the joiner
-/// simply failed to boot, which on a fleet cold-starting all at once is a coin flip rather than a
-/// misconfiguration. The imposter is asserted on the **founder's** committed set, because the
-/// claim is that the joiner's bootstrap reached the log, not that it reached the joiner.
+/// **This does not pin the bounded leader wait, and it is titled not to claim it.** The founder
+/// has elected long before the joiner finishes joining, so the leaderless window this scenario
+/// was written for does not reliably occur here: deleting the `await_leader` call from
+/// `bootstrap_imposters` leaves this test green (measured, 10 runs out of 10). Making that window
+/// deterministic would mean starting a joiner against a fleet that has no leader *and* can still
+/// admit it, which is not a state this harness can hold. The primitive is pinned directly, in a
+/// unit test that can put a node in exactly that state:
+/// `rift_cluster::raft::node::tests::await_leader_times_out_with_no_leader_and_returns_once_one_exists`.
+///
+/// What is left is still worth having, and nothing else covers it: a non-founder's bootstrap
+/// submitting through a leader that is a different process.
 #[tokio::test]
-async fn a_joiner_bootstraps_its_imposters_once_the_fleet_has_a_leader() {
+async fn a_joiner_bootstraps_its_imposters_into_the_founders_log() {
     let founder_state = TempDir::new().expect("tempdir");
     let joiner_state = TempDir::new().expect("tempdir");
     let founder_bind = reserve_port();
@@ -1172,7 +1214,7 @@ async fn a_joiner_bootstraps_its_imposters_once_the_fleet_has_a_leader() {
         &["--cluster-seeds", &founder_bind, "--imposters", &uri],
     ))
     .await
-    .expect("a joiner with --imposters must start, not fail on a leaderless window");
+    .expect("a joiner with --imposters must start");
 
     let founder_node = founder.node().expect("founder is clustered").clone();
     wait_voter_count(&founder_node, 2, "both nodes must be voters").await;

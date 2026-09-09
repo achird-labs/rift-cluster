@@ -22,7 +22,7 @@ pub(crate) mod store;
 pub use identity::NodeIdentity;
 pub use network::ADMIT_CURRENCY_WAIT;
 pub use node::{
-    JoinOutcome, JoinedAs, LeaveOutcome, NodeConfig, NodeError, RaftNode, StatusReport,
+    JoinOutcome, JoinedAs, LeaderWait, LeaveOutcome, NodeConfig, NodeError, RaftNode, StatusReport,
 };
 pub use ring::{KeyClass, OwnStatus, OwnedKey, Ring};
 

@@ -22,8 +22,8 @@ use rift_cluster::stores::{
     seq_routes, spawn_anti_entropy,
 };
 use rift_cluster::{
-    Authority, ClusterDecorator, ControlOp, ControlOutcome, ControlRequest, LeaveOutcome,
-    NodeConfig, NodeError, NodeIdentity, PullOnMissInterceptor, RaftNode, metrics,
+    Authority, ClusterDecorator, ControlOp, ControlOutcome, ControlRequest, LeaderWait,
+    LeaveOutcome, NodeConfig, NodeError, NodeIdentity, PullOnMissInterceptor, RaftNode, metrics,
 };
 use rift_cluster_base::seams::{
     CompiledRoutes, FileSource, HttpSource, ImposterConfig, ImposterManager, OutboundTls,
@@ -996,24 +996,23 @@ const BOOTSTRAP_LEADER_DEADLINE: Duration = Duration::from_secs(30);
 /// asked for those imposters to be serving, and a node that comes up healthy without them is the
 /// silent half-configured fleet this path exists to avoid. The one thing that is *not* treated as
 /// a failure is a fleet that has not elected yet — see [`BOOTSTRAP_LEADER_DEADLINE`].
+///
+/// **Local refusals are reported before the fleet is consulted.** A retired URI scheme, an
+/// unreadable document, an `intercept` or `routes` block, a portless imposter and a config the
+/// admission rules reject are all decidable on this node alone, so they are decided first and the
+/// leader wait happens immediately before the first `submit`. Waiting up front instead would let
+/// a fleet that has not elected mask a plain misconfiguration: the operator would spend
+/// [`BOOTSTRAP_LEADER_DEADLINE`], be told the fleet has no quorum, fix that, and only then hear
+/// about the `S3://` URI they also passed — two deploy cycles for two errors reported one at a
+/// time, cheapest last.
 async fn bootstrap_imposters(
     node: &Arc<RaftNode>,
     registry: &SourceRegistry,
     refs: &[SourceRef],
 ) -> anyhow::Result<()> {
-    // Before the first submit, not per-URI: `submit` forwards to the leader and answers
-    // `Unavailable` when there is none, with no retry of its own. On a joiner composed the
-    // instant it finished joining — or on any node in a fleet cold-starting together — that is
-    // routinely a sub-second window, and without this wait the bootstrap turns it into a node
-    // that refuses to boot. A fleet that never elects still fails the start, by the deadline and
-    // saying so.
-    if !node.await_leader(BOOTSTRAP_LEADER_DEADLINE).await {
-        anyhow::bail!(
-            "--imposters: no leader was reachable within {}s, so the bootstrap could not submit \
-             anything. The fleet has no quorum, or this node has not joined one",
-            BOOTSTRAP_LEADER_DEADLINE.as_secs()
-        );
-    }
+    // Once, before the *first* submit — not per-URI and not per-imposter. See
+    // `await_bootstrap_leader`.
+    let mut leader_awaited = false;
     for source_ref in refs {
         let uri = source_ref.uri.as_str();
         let scheme = source_ref.scheme();
@@ -1097,6 +1096,10 @@ async fn bootstrap_imposters(
                     "--imposters {uri}: imposter on port {port} is not replicable: {reason}"
                 );
             }
+            if !leader_awaited {
+                await_bootstrap_leader(node).await?;
+                leader_awaited = true;
+            }
             let response = node
                 .submit(request)
                 .await
@@ -1119,21 +1122,61 @@ async fn bootstrap_imposters(
     Ok(())
 }
 
+/// Wait for a leader that can accept the bootstrap's writes, or fail the start saying which of
+/// the two "no leader" facts is true.
+///
+/// [`RaftNode::submit`] forwards to the leader and answers `Unavailable` when there is none, with
+/// no retry of its own. On a joiner composed the instant it finished joining — or on any node in
+/// a fleet cold-starting together — that is routinely a sub-second window, and without this wait
+/// the bootstrap turns it into a node that refuses to boot.
+///
+/// Called once, immediately before the first `submit`, so a document this node can refuse on its
+/// own is refused without ever paying [`BOOTSTRAP_LEADER_DEADLINE`], and a fleet that never
+/// elects still fails the start by the deadline.
+///
+/// The two failures get different sentences because they are different facts:
+/// [`LeaderWait::Timeout`] is a statement about the fleet's quorum, [`LeaderWait::ShuttingDown`]
+/// only about this process. Answering "the fleet has no quorum" to a node whose own raft core has
+/// exited would send an operator to investigate a healthy fleet.
+async fn await_bootstrap_leader(node: &Arc<RaftNode>) -> anyhow::Result<()> {
+    match node.await_leader(BOOTSTRAP_LEADER_DEADLINE).await {
+        LeaderWait::Elected => Ok(()),
+        LeaderWait::Timeout => anyhow::bail!(
+            "--imposters: no leader was reachable within {}s, so the bootstrap could not submit \
+             anything. The fleet has no quorum, or this node has not joined one",
+            BOOTSTRAP_LEADER_DEADLINE.as_secs()
+        ),
+        LeaderWait::ShuttingDown => anyhow::bail!(
+            "--imposters: this node's raft core is shutting down, so the bootstrap could not \
+             submit anything. This says nothing about the rest of the fleet"
+        ),
+    }
+}
+
 /// A stable hash of one fetched document's config set — the third component of a bootstrap
 /// `op_id`.
 ///
-/// **Not over the raw document bytes.** Two spellings of the same document — JSON vs YAML,
-/// reordered keys, different indentation — declare the same fleet state and must not re-submit,
-/// and only the parsed configs can say that. Hashing what was read would make a whitespace edit
-/// a fleet-wide replace.
+/// **Not over the raw document bytes.** Two spellings of the same document *read from the same
+/// URI* — reordered keys, different indentation, JSON where there was YAML — declare the same
+/// fleet state and must not re-submit, and only the parsed configs can say that. Hashing what was
+/// read would make a whitespace edit a fleet-wide replace.
+///
+/// The digest is only ever *one* of the three components, so this buys less than it might read
+/// as: [`bootstrap_op_id`] hashes the URI verbatim, so `--imposters file:mocks.json` and
+/// `--imposters file:mocks.yaml` mint different `op_id`s however equal their digests, and so does
+/// the same file mounted at a different path on another node. The URI is deliberately not
+/// normalised — two URIs are two operator intentions, and quietly deciding they are one would let
+/// a node adopt a document it was never pointed at.
 ///
 /// **Canonicalised through [`serde_json::Value`], which is the load-bearing part.**
 /// `ImposterConfig` transitively holds `std::collections::HashMap`s — a stub response's
 /// `headers`, a recorded response's `headers`, the `_rift.scripts` table — and upstream's
 /// `multi_value_headers::serialize` writes them in raw map iteration order. Std's `RandomState`
 /// takes a fresh hash key for *every* map it builds, so serializing the same config twice in one
-/// process, let alone on two nodes, yields different bytes as soon as a map holds two entries.
-/// Hashing that directly minted a new `op_id` on every read, and D-72's idempotence — the whole
+/// process, let alone on two nodes, *may* yield different bytes as soon as a map holds two
+/// entries — with exactly two the orderings coincide about half the time, and the odds of two
+/// readings agreeing collapse from there. Hashing that directly minted a new `op_id` on most
+/// reads of most documents, and D-72's idempotence — the whole
 /// reason the `op_id` is derived rather than random — never engaged: each boot re-applied
 /// `PutImposter`, which on a live port is a delete-then-recreate replace. `Value`'s map is a
 /// `BTreeMap` (serde_json's `preserve_order` feature is off across this workspace, and
@@ -1151,6 +1194,13 @@ fn document_digest(configs: &[ImposterConfig]) -> anyhow::Result<String> {
 ///
 /// Split out so a test can assert the ordering property directly, rather than inferring it from
 /// two hex strings that happen to match.
+///
+/// **One path here is canonical only transitively.** Upstream's `behaviors_to_array` splats a
+/// stub response's `behaviors` object into a JSON *array* of one-key objects, and `to_value` will
+/// not re-sort an array — so that sequence is stable only because upstream's source for it is a
+/// `serde_json::Map`, which is a `BTreeMap` under the same `preserve_order` setting this helper
+/// relies on. If that field ever becomes a `HashMap` upstream, sorting here will not save it and
+/// the behaviors would have to be ordered explicitly.
 fn canonical_document_bytes(configs: &[ImposterConfig]) -> anyhow::Result<Vec<u8>> {
     Ok(serde_json::to_vec(&serde_json::to_value(configs)?)?)
 }
@@ -1741,6 +1791,17 @@ mod tests {
         serde_json::from_str(HEADER_HEAVY_DOCUMENT).expect("the fixture parses as an imposter")
     }
 
+    /// [`HEADER_HEAVY_DOCUMENT`] with one header *value* changed — the smallest edit an operator
+    /// can make to a bootstrap document and still mean something different by it.
+    fn edited_header_heavy_config() -> ImposterConfig {
+        let edited = HEADER_HEAVY_DOCUMENT.replace("\"x-h\": \"8\"", "\"x-h\": \"9\"");
+        assert_ne!(
+            edited, HEADER_HEAVY_DOCUMENT,
+            "the edit must actually apply, or the test that uses it proves nothing"
+        );
+        serde_json::from_str(&edited).expect("the edited fixture parses as an imposter")
+    }
+
     /// Pins D-72's idempotence key: the bootstrap digest is over a **canonical** rendering of the
     /// document, not over whatever byte order `HashMap` iteration happened to produce this time.
     ///
@@ -1795,6 +1856,41 @@ mod tests {
         assert!(
             positions.windows(2).all(|pair| pair[0] < pair[1]),
             "the canonical form must sort map keys; got them at {positions:?} in {canonical}"
+        );
+    }
+
+    /// The other direction of D-72's idempotence key, and the half that
+    /// [`the_document_digest_is_canonical_across_map_orderings`] cannot see: a document that
+    /// *changed* must hash differently and re-derive a different `op_id`, so the dedup table
+    /// misses and the edit applies.
+    ///
+    /// Both directions are needed because each alone is satisfiable by a wrong implementation. A
+    /// digest that is simply a constant passes the equality half and every restart assertion in
+    /// the suite, while silently making the bootstrap ignore every edit an operator ever makes —
+    /// a fleet frozen on whatever the first boot happened to read. This is the assertion that
+    /// goes red for it.
+    #[test]
+    fn an_edited_document_hashes_differently_and_re_derives_the_op_id() {
+        let original = [header_heavy_config()];
+        let edited = [edited_header_heavy_config()];
+        assert_ne!(
+            document_digest(&original).expect("digest"),
+            document_digest(&edited).expect("digest"),
+            "an edited document must hash differently, or the bootstrap can never apply an edit"
+        );
+        assert_ne!(
+            bootstrap_op_id(
+                "file:mocks.json",
+                4545,
+                &document_digest(&original).expect("digest")
+            ),
+            bootstrap_op_id(
+                "file:mocks.json",
+                4545,
+                &document_digest(&edited).expect("digest")
+            ),
+            "the op_id is the dedup key: an edit that keeps it collapses in the dedup table and \
+             never reaches the fleet"
         );
     }
 
