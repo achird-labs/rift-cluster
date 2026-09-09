@@ -37,6 +37,7 @@ lower — in an issue thread, a review, a session — *is not made* until it is 
 | every `D-n`, `RFC-00N §x.y`, `ADR-00N`, `U-n`, `docs/…md` cited anywhere resolves | error | a citation that resolves to nothing is a claim with no referent |
 | every `Amends:` in the register has an `Amended by D-n` callout in the amended section | error | the spec must announce, *at the section a reader lands on*, that it no longer holds. Four callouts are defined — `Amended by`, `Superseded by`, `Reversed by`, `Retired by` — and the checker reads only those. What each one means is the table under "Callout verbs" in [`docs/decisions/DECISIONS.md`](../decisions/DECISIONS.md) |
 | register entries are well-formed (status, supersedes ↔ superseded-by, code anchors exist) | error | |
+| no unresolved conflict marker (`<<<<<<<`, `\|\|\|\|\|\|\|`, `>>>>>>>` at line start) anywhere under the code or doc roots | error | a half-resolved merge is not a design disagreement, it is a broken file. Markers inside a `///` or `//` comment still compile, so `fmt` and `clippy` pass over them and this is the only gate that looks. `=======` is excluded on purpose — it is also a setext heading underline, and every conflict block carries a `<<<<<<<`/`>>>>>>>` pair anyway |
 | code cites a `superseded` decision | warning | the code may still do the old thing — look |
 | an active decision is cited from no code | warning | either unbuilt, or built without saying so |
 | an active decision is pinned by no test | info | nothing would go red if it were broken |

@@ -461,6 +461,51 @@ class ConflictMarkers(unittest.TestCase):
         self.assertEqual(code, 0, out)
         self.assertNotIn("conflict-marker", out)
 
+    def test_a_marker_in_a_rust_doc_comment_is_an_error(self):
+        """#578: the check walked `docs/` only, so `crates/` could carry markers past it.
+
+        This is the case that got through. A merge left a full diff3 block inside
+        a `///` doc comment in `crates/rift-cluster/src/control.rs`; markers in a
+        comment still compile, so `fmt` and `clippy` passed too, and `--strict`
+        exited 0 on the tree.
+        """
+        f = Fixture()
+        f.write(
+            "crates/rift-cluster/src/control.rs",
+            "/// Doc.\n<<<<<<< HEAD\n/// ours\n||||||| a6ee623\n=======\n/// theirs\n>>>>>>> origin/master\npub fn x() {}\n",
+        )
+        code, out = f.run("--strict")
+        self.assertEqual(code, 1, out)
+        self.assertIn("conflict-marker", out)
+        self.assertIn("crates/rift-cluster/src/control.rs", out)
+
+    def test_a_marker_in_web_src_is_an_error(self):
+        """The other code roots are covered too, not just `crates/`."""
+        f = Fixture()
+        f.write("web/src/app/queries.ts", "export const a = 1;\n>>>>>>> theirs\n")
+        code, out = f.run("--strict")
+        self.assertEqual(code, 1, out)
+        self.assertIn("conflict-marker", out)
+        self.assertIn("web/src/app/queries.ts", out)
+
+    def test_the_marker_check_covers_this_repos_own_tree(self):
+        """The real tree, not a fixture: the walk must actually reach the code roots.
+
+        Every test above builds a fixture, so all of them would still pass if the
+        widened walk named roots that do not exist in this repo. This asserts the
+        scan visits a real file under each configured code root, which is the part
+        a fixture cannot show.
+        """
+        root = Path(__file__).resolve().parents[2]
+        for sub in dc.CODE_ROOTS:
+            if not (root / sub).exists():
+                continue
+            with self.subTest(root=sub):
+                scanned = dc.walk(root, (sub,), dc.MARKER_EXT)
+                self.assertTrue(
+                    scanned, f"the marker walk reaches no file under {sub}/"
+                )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -66,6 +66,11 @@ SEAMS_DOC = "docs/architecture/11-upstream-boundary.md"
 CODE_ROOTS = ("crates", "tests", "web/src", "scripts", "deploy", ".github")
 DOC_ROOTS = ("docs",)
 CODE_EXT = {".rs", ".ts", ".tsx", ".py", ".sh", ".yml", ".yaml", ".toml"}
+# Wider than CODE_EXT: a conflict marker is a problem in any text file, not only
+# in one that can carry a citation. Extension-based rather than `git ls-files`
+# because `walk` is this script's one enumerator and prunes SKIP_DIRS — and
+# because `git ls-files` lists the `vendor/rift` gitlink, which then fails as a path.
+MARKER_EXT = CODE_EXT | {".md", ".json", ".html", ".css", ".mjs", ".cjs", ".lock"}
 SKIP_DIRS = {"vendor", "target", "node_modules", "graphify-out", ".git", "dist", ".claude"}
 
 DECISION_RE = re.compile(r"(?<![A-Za-z0-9_])D-(\d+)\b")
@@ -439,7 +444,7 @@ CONFLICT_MARKERS = ("<<<<<<<", ">>>>>>>", "|||||||")
 
 
 def check_conflict_markers(root: Path) -> list[Finding]:
-    """No design document may contain an unresolved VCS conflict marker.
+    """No tracked text file may contain an unresolved VCS conflict marker.
 
     Cheap, and it earns its place: the register is the only place a decision is
     defined, and a botched rebase can leave a marker in it that reads as prose.
@@ -448,13 +453,26 @@ def check_conflict_markers(root: Path) -> list[Finding]:
     over both, because every other check here asks whether *citations* resolve
     and none asks whether the file is intact.
 
+    **The code roots, not only `docs/` (#578).** The check was right and its scope
+    was wrong: a merge left a full diff3 block inside a `///` doc comment in
+    `crates/rift-cluster/src/control.rs` and `--strict` exited 0 on that tree.
+    Markers inside a comment still compile, so `fmt` and `clippy` passed as well,
+    and the only thing that would have caught it before CI was reading the
+    resolver's own output -- which is exactly what a tired resolver skips.
+
     `=======` is deliberately NOT a marker for this check: it is also a valid
     setext `<h1>` underline in Markdown, and a guard that fires on legitimate
     prose gets suppressed rather than fixed. The other three have no meaning in
-    Markdown, so their presence is unambiguous.
+    Markdown, so their presence is unambiguous -- and every conflict block carries
+    a `<<<<<<<`/`>>>>>>>` pair around its `=======`, so nothing is lost.
+
+    The `design-check: ignore-file` opt-out is deliberately NOT honoured here.
+    That opt-out exists for the citation scan, and respecting it would exempt this
+    script and its own tests -- the files most likely to be hand-resolved beside
+    the register. Line-start anchoring is what keeps their quoted markers safe.
     """
     findings: list[Finding] = []
-    for p in walk(root, DOC_ROOTS, {".md"}):
+    for p in walk(root, CODE_ROOTS + DOC_ROOTS, MARKER_EXT):
         try:
             text = p.read_text(encoding="utf-8")
         except (OSError, UnicodeDecodeError):
