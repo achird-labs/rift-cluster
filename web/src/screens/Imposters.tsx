@@ -66,24 +66,24 @@ type Imposter = components["schemas"]["Imposter"];
  * The screen's three tiles.
  *
  * - **Imposters / stubs** — counted from the list this screen already holds.
- * - **Requests · fleet sum** — real since #363 declared `numberOfRequests` on the contract. It had
+ * - **Requests · this node** — real since #363 declared `numberOfRequests` on the contract. It had
  *   reached the imposter body only through a non-exhaustive index signature, which is exactly the
  *   client-side guess `contract.ts` refuses, so summing it here would have laundered a value the
- *   contract rejected one file away. The tile is genuinely fleet-wide (#223 rewrites each entry to
- *   the sum across every node's slot) and says so — or says it is a floor, when `countsArePartial`
- *   reports that the fan-out missed a node.
+ *   contract rejected one file away. The tile called itself a **fleet sum** until **D-74** (#552),
+ *   when the request journal went back to being upstream's own, per node: #223's rewrite of each
+ *   entry to the sum across every node's slot is gone, so each count — and therefore this total —
+ *   is the answering node's own. The label says which, because a per-node figure read as a fleet
+ *   one is the reading an operator would act on.
  * - **Parked intents** — real since #360. Summed across voters, so it means what the label says:
  *   the fleet has taken work it has not finished. Says when the sum is a floor, and says nothing
- *   when it is complete.
+ *   when it is complete. Still genuinely fleet-wide, and still carries its own partial signal —
+ *   `/_fleet/health` is one of the reads that does still fan out.
  */
 function ImposterTiles({
   imposters,
-  countsArePartial,
   fleet,
 }: {
   imposters: readonly Imposter[];
-  /** The fleet sum could not reach every node, so it is a floor rather than a total (#363). */
-  countsArePartial: boolean;
   /** `undefined` when this node served no fleet projection — unread, which is not the same as zero. */
   fleet: FleetView | undefined;
 }): ReactNode {
@@ -101,7 +101,7 @@ function ImposterTiles({
   /*
    * Same discipline as `stubTotal` above, for the same reason (#363). `numberOfRequests` is
    * optional in the contract, so a row without one has an *unknown* count — not a zero — and
-   * adding zero for it would quietly understate the fleet total while looking like an answer.
+   * adding zero for it would quietly understate the total while looking like an answer.
    * The sum is therefore only shown when every row answered.
    */
   const requestCounts = imposters.map((imposter) => imposter.numberOfRequests);
@@ -119,26 +119,22 @@ function ImposterTiles({
         </dd>
       </div>
 
-      <div className={`tile${countsArePartial ? " is-warn" : ""}`}>
-        <dt className="eyebrow">Requests · fleet sum</dt>
+      <div className="tile">
+        <dt className="eyebrow">Requests · this node</dt>
         <dd className="v" data-testid="tile-requests">
           {requestTotal === null ? UNKNOWN : requestTotal}
         </dd>
         {/*
-          Three different notes for three different facts, because collapsing them is how a floor
-          gets read as a total.
-
-          `countsArePartial` is per-response and says the fan-out missed a node, so the number
-          under it is a lower bound. It is not a permanent caveat: a complete merge says nothing,
-          on the same reasoning the request log's scope strip records — a warning that is always
-          on is one nobody reads on the day it means something.
+          Two notes for two facts. There is no third — the "at least this many, a node did not
+          answer in time" case went with the fan-out that produced it (D-74): this read reaches no
+          peer, so there is no peer for the number to be missing. The scope it *does* need stating
+          is the one in the label above, and it is stated again here rather than left implicit,
+          because a bare total on a fleet console reads as the fleet's.
         */}
         <dd className="note">
           {requestTotal === null
             ? "not every imposter in this response carried a count"
-            : countsArePartial
-              ? "at least this many — a node did not answer in time"
-              : "summed across every node"}
+            : "recorded by the node serving this console"}
         </dd>
       </div>
 
@@ -203,12 +199,7 @@ function errorText(error: unknown): string {
 
 export function Imposters(): ReactNode {
   const imposters = useImposters();
-  /*
-   * Unwrapped once. The read carries two facts with different scopes (#363) — the rows, and
-   * whether the fleet sum on them is complete — so every use below names which one it means.
-   */
-  const listed = imposters.data?.imposters ?? [];
-  const countsArePartial = imposters.data?.partial ?? false;
+  const listed = imposters.data ?? [];
   const create = useCreateImposter();
   const remove = useDeleteImposter();
   const [creating, setCreating] = useState(false);
@@ -370,11 +361,7 @@ export function Imposters(): ReactNode {
           </button>
         </header>
 
-        <ImposterTiles
-          imposters={all}
-          countsArePartial={countsArePartial}
-          fleet={fleet.data}
-        />
+        <ImposterTiles imposters={all} fleet={fleet.data} />
 
         {exporting ? (
           <ExportSetControl count={all.length} onClose={() => setExporting(false)} />

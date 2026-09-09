@@ -91,8 +91,9 @@ pub(crate) fn classify(method: &Method, path: &str) -> Option<FleetRoute> {
 
 /// How long the members fan-out waits for every peer before answering with what it has.
 ///
-/// Matches the journal merge's own peer budget: this is the same trade — an operator read that
-/// answers promptly with stated coverage beats one that hangs on an unreachable node.
+/// The same figure as the front's `FLEET_PEER_BUDGET` for the spaces listing, and the same trade:
+/// an operator read that answers promptly with stated coverage beats one that hangs on an
+/// unreachable node. (The fleet journal merge, whose budget this once mirrored, is gone — D-74.)
 const MEMBER_PEER_BUDGET: Duration = Duration::from_secs(2);
 
 /// A rendered body, and whether it is complete.
@@ -101,6 +102,22 @@ pub(crate) struct FleetBody {
     /// A voter did not answer inside [`MEMBER_PEER_BUDGET`], so `members` carries a row it could
     /// not fill (#361). The caller stamps `Rift-Cluster-Partial`.
     pub partial: bool,
+}
+
+/// Whether a rendered `/_fleet/*` answer may carry `Rift-Cluster-Partial` (D-74).
+///
+/// Since D-74 the header rides **exactly two** reads, `/_fleet/members` and `/_fleet/health` — the
+/// two that fold a body across peers, where a voter that did not answer leaves a row (or an
+/// addend) this node could not fill. `/_fleet/ops/{id}` is served by the same front arm but is
+/// assembled from local state alone.
+///
+/// Stated as a route predicate rather than left to [`FleetBody::partial`] alone, which is what
+/// makes "exactly two" true by construction. Today [`FleetBody::local`] hardcodes `partial: false`
+/// for [`FleetRoute::Op`], so the flag would do the job by itself — and that coincidence is the
+/// problem: an `Op` body that later learned to report partiality would widen the header's contract
+/// without anyone deciding to. Here it cannot.
+pub(crate) fn stamps_partial(route: &FleetRoute, partial: bool) -> bool {
+    partial && matches!(route, FleetRoute::Members | FleetRoute::Health)
 }
 
 impl FleetBody {
@@ -693,5 +710,33 @@ mod tests {
         let (total, usable) = add_peer_depth(10, None);
         assert_eq!(total, 10);
         assert!(!usable);
+    }
+
+    /// Pins D-74's narrowing of `Rift-Cluster-Partial`: it may ride `/_fleet/members` and
+    /// `/_fleet/health` and nothing else.
+    ///
+    /// `Op` is asserted with `partial: true` — a value [`FleetBody::local`] cannot produce today —
+    /// deliberately. The claim is about the *route*, not about which bodies happen to set the flag,
+    /// so the assertion has to be made where the flag is set, or widening the guard would be
+    /// invisible.
+    #[test]
+    fn only_members_and_health_may_stamp_cluster_partial() {
+        assert!(stamps_partial(&FleetRoute::Members, true));
+        assert!(stamps_partial(&FleetRoute::Health, true));
+        assert!(
+            !stamps_partial(&FleetRoute::Op(uuid::Uuid::nil()), true),
+            "the op-status read is assembled from local state and may never be stamped partial"
+        );
+
+        for route in [
+            FleetRoute::Members,
+            FleetRoute::Health,
+            FleetRoute::Op(uuid::Uuid::nil()),
+        ] {
+            assert!(
+                !stamps_partial(&route, false),
+                "{route:?}: a complete answer is never stamped"
+            );
+        }
     }
 }

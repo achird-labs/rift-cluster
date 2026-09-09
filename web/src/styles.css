@@ -1333,33 +1333,10 @@ input[type="radio"] {
   margin-left: auto;
 }
 
-/* ── Request log (C6) ──────────────────────────────────────────────────────
-   The scope selector is deliberately prominent and permanently visible: this
-   data is per-node, and a console that lets you forget that is the failure mode
-   #189 exists to prevent. */
-
-.scope {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  flex-wrap: wrap;
-  padding: 11px 14px;
-  background: var(--surface-2);
-  border: 1px solid var(--line);
-  border-radius: var(--r-panel);
-}
-
-.scope .coverage {
-  margin-left: auto;
-  font: 500 12px/1.4 var(--sans);
-  color: var(--ink-2);
-}
-
-.scope .coverage b {
-  font-family: var(--mono);
-  font-weight: 650;
-  color: var(--ink);
-}
+/* ── Request log (C6) ─────────────────────────────────────────────────────
+   The `.scope`/`.coverage` strip that led this block is gone with the fleet
+   merge it described (D-74, #552): the request log's scope is now a `.scope-label`
+   sentence like every other screen's, naming the imposter and the node. */
 
 .method {
   font: 650 10.5px/1 var(--mono);
@@ -2115,7 +2092,7 @@ input[type="radio"] {
 
 /* ── The split screen and its right rail ───────────────────────────────────
    The landing shape — screen on the left, a fixed 348px fleet rail on the right carrying
-   the ring, the control plane and the merged tail. The rail is `aside` in the markup because it is
+   the ring and the control plane. The rail is `aside` in the markup because it is
    complementary to the screen rather than part of it: a screen reader reaches the imposter table
    without walking a ring diagram first. */
 
@@ -2339,61 +2316,6 @@ input[type="radio"] {
   font: 400 11.5px/1 var(--mono);
   font-variant-numeric: tabular-nums;
   color: var(--ink-2);
-  flex: none;
-}
-
-/* ── Live tail ─────────────────────────────────────────────────────────────
-   A rule down the left rather than a box: the tail is a continuing thing, and a closed border would
-   imply it has ends. */
-
-.tail {
-  font: 400 11px/1.85 var(--mono);
-  color: var(--ink-2);
-  border-left: 2px solid var(--line);
-  padding-left: 11px;
-  overflow: hidden;
-  min-height: 0;
-}
-
-.tail-line {
-  display: flex;
-  gap: 7px;
-  white-space: nowrap;
-  overflow: hidden;
-}
-
-.tail-line .ts {
-  color: var(--ink-3);
-  flex: none;
-}
-
-.tail-line .st {
-  flex: none;
-  font-weight: 500;
-}
-
-.tail-line .st.is-good {
-  color: var(--good);
-}
-
-.tail-line .st.is-warn {
-  color: var(--warn);
-}
-
-.tail-line .st.is-crit {
-  color: var(--crit);
-}
-
-.tail-line .what {
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-
-.tail-live {
-  width: 6px;
-  height: 6px;
-  border-radius: 50%;
-  background: var(--good);
   flex: none;
 }
 
@@ -3292,36 +3214,6 @@ input[type="radio"] {
   .stub-workspace {
     grid-template-columns: minmax(0, 1fr);
   }
-}
-
-/*
- * A table with more columns than the viewport.
- *
- * `table-layout: fixed` divides the available width between the columns it has — with twelve of
- * them it compresses every one until values clip mid-character, which is worse than a scrollbar
- * because a clipped URI still looks like a URI. A min-width makes the columns take the space they
- * need and hands the overflow to `.scroll-x`, which is already wrapped around every one of these.
- */
-table.dense.wide {
-  /*
-   * `auto` + `max-content`, not a min-width.
-   *
-   * A min-width alone did nothing: at 1500px it still fitted the container, so `table-layout: fixed`
-   * went on dividing the width between twelve columns and clipping every one. Sizing to content is
-   * the actual fix — the columns take what they need, the table overflows, and `.scroll-x` scrolls
-   * it. `min-width: 100%` keeps it filling the card when the content is narrow.
-   */
-  table-layout: auto;
-  width: max-content;
-  min-width: 100%;
-}
-
-/* `overflow: hidden` on the cell is what turned "too narrow" into "clipped mid-character". With the
-   table sizing to content there is nothing to hide, and values must not wrap into two lines. */
-table.dense.wide td,
-table.dense.wide th {
-  overflow: visible;
-  white-space: nowrap;
 }
 
 /* One row per gate still holding readiness. The word carries the state; the glyph and colour

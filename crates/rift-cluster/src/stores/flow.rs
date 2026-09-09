@@ -362,9 +362,10 @@ struct CountsReq {
 #[derive(Debug, Serialize, Deserialize)]
 struct CountsReply {
     /// `(port, this node's owned live-entry count)`. A list rather than a
-    /// `HashMap<u16, _>`, matching [`super::journal_net::CountsReply`]'s own
-    /// reasoning: a JSON object's keys are strings, and a `u16` round-tripping
-    /// through one is a decode failure waiting to happen.
+    /// `HashMap<u16, _>`: a JSON object's keys are strings, and a `u16`
+    /// round-tripping through one is a decode failure waiting to happen. The
+    /// fleet journal's own counts reply drew the same conclusion for the same
+    /// reason, and left with it (D-74).
     slots: Vec<(u16, u64)>,
 }
 
@@ -1321,10 +1322,11 @@ impl FlowNet {
     }
 
     /// `numberOfFlowEntries` for a batch of ports (#372): this node's own owned
-    /// share, plus a budgeted fan-out to every other ring member for theirs —
-    /// the same shape as [`super::journal_net::JournalNet::fleet_counts`]. Flow
-    /// entries carry no analogue of a journal port's clear generation, but the
-    /// ring's own `m_idx` (RFC-001 §7.6) is exactly that kind of gate: each
+    /// share, plus a budgeted fan-out to every other ring member for theirs.
+    /// This is now the only fan-out count in the crate — the fleet journal's
+    /// `numberOfRequests` sum had the same shape and left with the merge
+    /// (D-74). The ring's own `m_idx` (RFC-001 §7.6) is the gate that makes
+    /// this one answerable across a membership change: each
     /// peer answers under its own ring, and a membership change in flight can
     /// leave rings disagreeing about who owns a flow, so the fan-out stamps
     /// its caller `m_idx` on every request and a peer whose ring has since
@@ -1333,8 +1335,12 @@ impl FlowNet {
     ///
     /// `partial` is `true` when any peer's answer was missing (an error, a
     /// panicked task, a ring-divergence refusal, or one still outstanding when
-    /// `budget` expired) — the same "never a fabricated zero" contract
-    /// [`JournalNet::fleet_counts`] upholds. A local ring that is not yet
+    /// `budget` expired) — the "never a fabricated zero" contract. It reaches
+    /// no header: since D-74 `Rift-Cluster-Partial` rides exactly two routes,
+    /// `/_fleet/members` and `/_fleet/health`, and this method has no
+    /// production caller at all (only `tests/flow_store.rs` and this module),
+    /// so the flag is a contract kept ready for a caller rather than one any
+    /// response carries today. A local ring that is not yet
     /// available (still starting, or no applied membership) answers an empty
     /// map with `partial: true` rather than a count this node cannot vouch
     /// for.

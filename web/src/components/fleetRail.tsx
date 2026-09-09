@@ -1,21 +1,27 @@
 import type { ReactNode } from "react";
 
 import type { FleetView } from "../app/fleetView.ts";
-import { useFleetRequests } from "../app/queries.ts";
 import { Pending, PendingPanel } from "./pending.tsx";
 
 /**
- * The fleet rail: the hash ring, the control plane, and the merged tail.
+ * The fleet rail: the hash ring and the control plane.
  *
  * Complementary to the screen rather than part of it, so it is an `aside` with its own label — a
  * screen reader reaches the imposter table without walking a ring diagram to get there.
+ *
+ * A third panel — `Live tail · merged`, the newest requests across every imposter the fleet serves
+ * — sat below these until **D-74** (#552). It read `GET /admin/requests`, the admin front's
+ * server-side merge of every node's journal shard; that route and the subsystem behind it are gone,
+ * and the panel is not rebuilt against the per-node route in its place. A rail fed by one node
+ * would be a slice of one node's traffic under a label reading "merged", and a rail fed by a
+ * client-side fan-out would order N reads by whichever returned first and present that as a
+ * stream. Neither is a live tail; the request log, per imposter and per node, is the honest answer.
  */
 export function FleetRail({ fleet }: { fleet: FleetView | undefined }): ReactNode {
   return (
     <aside className="rail-right" aria-label="Fleet">
       <HashRing fleet={fleet} />
       <ControlPlane fleet={fleet} />
-      <LiveTail />
     </aside>
   );
 }
@@ -153,69 +159,6 @@ export function ControlPlane({ fleet }: { fleet: FleetView | undefined }): React
           );
         })}
       </div>
-    </section>
-  );
-}
-
-/**
- * The merged tail — the newest requests across every imposter the fleet serves (#362).
- *
- * Reads `GET /admin/requests`, which merges the fleet server-side, rather than fanning out across
- * imposters here: this panel used to be a placeholder precisely because assembling it client-side
- * would have been a different thing wearing the same label — N reads per poll, ordered by whichever
- * came back first, presented as one ordered stream.
- *
- * "Live" here means polled, like every other live surface in this console: the server's SSE tail
- * (`/admin/requests/stream`) is published but this console has never consumed it. (The reason it
- * could not — `EventSource` cannot set the `X-Rift-Tenant` header — went away with #550; adopting
- * the stream is its own change, not a side effect of removing tenancy.) The poll shares
- * `useFleetRequests`' cache with the request log, so opening both costs one read, not two.
- *
- * Capped to the newest few rows — this is a rail, not the log. The request log is the whole answer,
- * and the footer says so rather than letting a truncated rail read as the complete picture.
- */
-const TAIL_ROWS = 8;
-
-function LiveTail(): ReactNode {
-  const fleet = useFleetRequests();
-  const rows = (fleet.data?.rows ?? []).slice(0, TAIL_ROWS);
-
-  return (
-    <section className="rail-sect" style={{ flex: 1, minHeight: 0 }}>
-      <h2 className="eyebrow">Live tail · merged</h2>
-      {fleet.isError ? (
-        <p className="muted" data-testid="merged-tail-error">
-          Could not read the fleet journal.
-        </p>
-      ) : rows.length === 0 ? (
-        <p className="muted" data-testid="merged-tail-empty">
-          {fleet.isPending ? "Reading…" : "No requests recorded yet."}
-        </p>
-      ) : (
-        <ul className="tail-list" data-testid="merged-tail">
-          {rows.map((row, index) => (
-            <li
-              // The journal has no fleet-wide identity to key on — that is the whole premise of
-              // #362 — so position within this page is the only stable key available.
-              key={`${String(row.port)}-${String(index)}`}
-              className="tail-line"
-              data-testid="merged-tail-row"
-            >
-              <span className="mono">{row.port}</span>{" "}
-              <span className="mono">{row.request.method}</span>{" "}
-              <span className="tail-path">{row.request.path}</span>
-              {row.request.status === undefined ? null : (
-                <span className="mono muted"> {row.request.status}</span>
-              )}
-            </li>
-          ))}
-        </ul>
-      )}
-      <p className="muted tail-foot">
-        Newest {rows.length === 0 ? "" : `${String(rows.length)} `}across the fleet — ordered by
-        recorded timestamp, so rows from different imposters are about this order rather than a
-        sequence. The request log is the full journal.
-      </p>
     </section>
   );
 }

@@ -18,11 +18,12 @@
 #
 # Two published FLAVORS (#270), selected with `--target`:
 #
-#   `runtime`        (the production default — pass `--target runtime` explicitly: since
-#                     issue #228 the file's LAST stage is the chaos suite's
-#                     `runtime-faketime`, so a bare untargeted build no longer produces
-#                     this) — `debian:bookworm-slim`, with a shell and the usual slim
-#                     package set.
+#   `runtime`        (the production default, and the file's last stage again since #552
+#                     retired the chaos suite's `runtime-faketime` flavor with the clock-skew
+#                     scenario that was its only user) — `debian:bookworm-slim`, with a shell
+#                     and the usual slim package set. Build sites still pin `target:`
+#                     explicitly, and a chaos-tier test still fails any that forgets: the
+#                     invariant is cheap to keep and its absence has cost a wrong image once.
 #   `runtime-static` (`-static` tag suffix) — `FROM scratch`, a musl binary and nothing
 #                     else: no shell, no package manager. Smaller and a narrower attack
 #                     surface, at the cost of the shell — see `deploy/README.md`'s
@@ -393,14 +394,15 @@ ENTRYPOINT ["/usr/local/bin/rift-cluster-server"]
 # ---------------------------------------------------------------------------
 # Runtime
 # ---------------------------------------------------------------------------
-# NO LONGER the last stage in the file (issue #228): `runtime-faketime` — the chaos
-# suite's clock-skew flavor, which must build FROM this stage — sits after it, so an
-# untargeted build now resolves to *that*. The invariant therefore inverted: every build
-# site in the repo pins `target:` explicitly (the base compose, the demo compose, the
-# chaos tier's overlays, release.yml's matrix, and the README's build command), and
-# `every_dockerfile_build_site_pins_a_target` in the chaos suite's `scenarios.rs` fails
-# the build of any compose file that forgets — appending a stage can never again silently
-# change what anyone builds.
+# The last stage in the file again (#552): `runtime-faketime`, the chaos suite's clock-skew
+# flavor, sat after it from #228 until the clock-skew scenario that was its only user left
+# with the journal clear generations it exercised. An untargeted build therefore resolves
+# here once more — but every build site in the repo still pins `target:` explicitly (the
+# base compose, the demo compose, the chaos tier's overlays, release.yml's matrix, and the
+# README's build command), and `every_dockerfile_build_site_pins_a_target` in the chaos
+# suite's `scenarios.rs` still fails the build of any compose file that forgets. The
+# invariant is kept rather than relaxed: it costs one line per build site, and appending a
+# stage silently changing what everyone builds is a failure this repo has already had.
 FROM debian:bookworm-slim AS runtime
 
 # ca-certificates is needed for outbound TLS (proxied imposters). Nothing else
@@ -440,23 +442,3 @@ HEALTHCHECK --interval=10s --timeout=3s --start-period=10s --retries=3 \
     CMD ["rift-cluster-server", "healthcheck"]
 
 ENTRYPOINT ["rift-cluster-server"]
-
-# --- runtime-faketime: the chaos suite's clock-skew flavor (issue #228, C12) -----------------
-#
-# Identical to `runtime` plus libfaketime, selected only by
-# `tests/cluster-chaos/compose/faketime.overlay.yml` via `build.target`. Never
-# published and never the default: skewing a production node's clock is not a
-# feature, and keeping the stage here (rather than a second Dockerfile) is what
-# guarantees it can never drift from the runtime image it decorates. The
-# symlink gives the overlay an architecture-independent LD_PRELOAD path —
-# Debian installs the library under the multiarch triplet, which differs
-# between the amd64 CI runner and an arm64 laptop.
-FROM runtime AS runtime-faketime
-# The runtime stage runs as `rift`; apt needs root, and the drop back is what
-# keeps this flavor's only delta the library itself.
-USER root
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends libfaketime \
-    && rm -rf /var/lib/apt/lists/* \
-    && ln -s "$(find /usr/lib -name 'libfaketime.so.1' | head -n 1)" /usr/local/lib/libfaketime.so.1
-USER rift

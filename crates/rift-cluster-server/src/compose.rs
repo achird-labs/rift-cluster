@@ -16,10 +16,9 @@ use std::time::{Duration, Instant};
 use anyhow::Context;
 use arc_swap::ArcSwap;
 use rift_cluster::stores::{
-    ClusterJournal, ClusterProxyStore, ClusteredFlowStoreProvider, ClusteredSequencer,
-    DEFAULT_ANTI_ENTROPY_INTERVAL, FlowBindConfig, FlowNet, FlowShard, JournalNet, ProxyBindConfig,
-    ProxyNet, SequencingRegistry, ShardConfig, flow_routes, journal_routes, proxy_routes,
-    seq_routes, spawn_anti_entropy,
+    ClusterProxyStore, ClusteredFlowStoreProvider, ClusteredSequencer, FlowBindConfig, FlowNet,
+    FlowShard, ProxyBindConfig, ProxyNet, SequencingRegistry, ShardConfig, flow_routes,
+    proxy_routes, seq_routes,
 };
 use rift_cluster::{
     Authority, ClusterDecorator, ControlOp, ControlOutcome, ControlRequest, LeaderWait,
@@ -517,41 +516,6 @@ pub async fn start_with_runtimes(
         }
     };
     let flow_net = FlowNet::new(flow_shard);
-    // This node's writer shard of the fleet request journal (issue #222), constructed
-    // beside `flow_net` for the same reason: the manager needs it now, and the node whose
-    // membership sizes its shard cap does not exist yet.
-    //
-    // The node *id* is passed now rather than bound later, because the manager begins
-    // serving during node startup — catch-up replay drives imposters before
-    // `start_with_front_door_routes` returns. An entry recorded in that window must
-    // already carry this writer's real id: `(node_id, seq, clear_gen)` is the key #223
-    // merges on, and a placeholder there is wrong data, not a late label.
-    // Built with the state directory, not bare: the shard's seq counter is the one piece
-    // of journal state that must outlive a crash (issue #351). Entries stay volatile --
-    // that is Ch.7's decision and is unchanged -- but `node_id` is stable across restarts,
-    // so a counter restarting at 0 would re-issue `(node_id, seq)` keys the fleet still
-    // holds in its replica caches and still addresses with live cursors.
-    let request_journal = match ClusterJournal::with_state_dir(identity.node_id(), &state_dir) {
-        Ok(journal) => journal,
-        Err(e) => {
-            // Shutdown-then-return, not `?`: `ProbeListener` has no `Drop`, and dropping
-            // its `JoinHandle` does not abort the task -- only `shutdown()` does, which is
-            // what actually releases the port. A bare `?` here would leave the probe
-            // listener bound and `/readyz` answering after the start failed. The binary
-            // would get away with it (process exit frees the port), but the test suites
-            // drive `start_with_runtimes` in-process, where the listener outlives the
-            // error. Every other fallible step in this window does the same.
-            probes.shutdown().await;
-            return Err(anyhow::Error::new(e).context(format!(
-                "reading the journal seq floors from {}",
-                state_dir.display()
-            )));
-        }
-    };
-    // The front door's half of the fleet request journal (issue #223): wraps the same
-    // `request_journal` the manager writes through, so the merge-on-read the front serves and the
-    // writer shard the manager appends to can never be two different journals under the hood.
-    let journal_net = JournalNet::new(Arc::clone(&request_journal));
 
     // The proxy-claim subsystem (#226): created before the manager for the same reason
     // `flow_net` is — the manager build takes the store handle, and the node binds in later.
@@ -569,7 +533,6 @@ pub async fn start_with_runtimes(
         accept_runtimes,
         Arc::clone(&pull_on_miss),
         Arc::clone(&flow_net),
-        Arc::clone(&request_journal),
         Arc::clone(&proxy_net),
         Arc::clone(&sequencer),
     ) {
@@ -615,30 +578,24 @@ pub async fn start_with_runtimes(
             secret: cluster.secret,
             // Seeded with the flow routes: the registry ships empty and the state
             // backends register their own endpoints (its design contract), and the
-            // operator surface layers its routes on top. `journal_routes` is folded in
-            // with `merge` rather than nested in the same chain: unlike `flow_routes`
-            // and `cluster_api::routes`, it builds its own table from scratch instead of
-            // accepting a base to extend (issue #223's network layer, #147/#152's Phase 4a,
-            // predates this composition and its own signature is frozen), so this is the
-            // seam that brings the two tables together.
+            // operator surface layers its routes on top. `proxy_routes`/`seq_routes` are
+            // folded in with `merge` rather than nested in the same chain: unlike
+            // `flow_routes` and `cluster_api::routes`, each builds its own table from
+            // scratch instead of accepting a base to extend, so this is the seam that
+            // brings the tables together.
             routes: cluster_api::routes(
                 flow_routes(Arc::clone(&flow_net)),
                 slot.clone(),
                 Arc::clone(&readiness),
             )
-            .merge(journal_routes(Arc::clone(&journal_net)))
             .merge(proxy_routes(Arc::clone(&proxy_net)))
             .merge(seq_routes(Arc::clone(&sequencer))),
             engine: Some(Arc::clone(&manager)),
             snapshot_log_entries: cli.cluster.cluster_snapshot_log_entries,
         },
         Arc::clone(&front_door_routes),
-        // Bound before `Raft::new` (issue #224), the same before-construction contract as
-        // `engine`/`front_door_routes` just above: catch-up replay during a join must push
-        // clear generations into this node's own journal too, not just live commits after
-        // `start` returns.
-        Arc::clone(&request_journal),
-        // Same contract again: the modes must be current from the first applied
+        // Same before-construction contract as `engine`/`front_door_routes` just above: the
+        // modes must be current from the first applied
         // config, including the ones a join replays, or the sequencer answers an
         // `owner`-mode imposter from local cursors until the next config change.
         Arc::clone(&sequencing),
@@ -672,24 +629,6 @@ pub async fn start_with_runtimes(
         return Err(anyhow::Error::new(e).context("starting the proxy-claim bridge"));
     }
 
-    // Attach the membership the shard cap divides by. Infallible and immediate — unlike
-    // the flow bridge there is no runtime to start, so there is nothing to unwind. Until
-    // this lands the journal sizes shards as a single voter, which over-retains rather
-    // than evicting entries an early request might still be asserted on.
-    request_journal.bind(&node);
-    // The journal net's own late-bound node slot (issue #223), same "infallible and
-    // immediate" shape as the line above — `slices_for`/`merge_read`/`fleet_counts` all
-    // work with no roster to ask until this runs, exactly as `request_journal` does before
-    // its own `bind`. The anti-entropy loop goes on the ambient runtime, like the source
-    // scheduler just above (never a bare `Runtime` of its own, #120):
-    // unlike the flow bridge, this net owns no runtime of its own to spawn it on instead.
-    journal_net.bind(&node);
-    spawn_anti_entropy(
-        &journal_net,
-        &tokio::runtime::Handle::current(),
-        DEFAULT_ANTI_ENTROPY_INTERVAL,
-    );
-
     if let Err(e) = sequencer.bind(&node, rift_cluster::BridgeConfig::default()) {
         tracing::error!(error = %e, "starting the response-sequencer bridge");
     }
@@ -715,7 +654,6 @@ pub async fn start_with_runtimes(
         Arc::clone(&manager),
         front_door_routes,
         source_registry,
-        Arc::clone(&journal_net),
         Arc::clone(&flow_net),
     )
     .await
@@ -756,7 +694,6 @@ async fn attach_data_plane(
     manager: Arc<ImposterManager>,
     front_door_routes: Arc<ArcSwap<CompiledRoutes>>,
     source_registry: SourceRegistry,
-    journal_net: Arc<JournalNet>,
     flow_net: Arc<FlowNet>,
 ) -> anyhow::Result<(
     RunningServer,
@@ -775,7 +712,6 @@ async fn attach_data_plane(
     let api_key = cli.oss.api_key.clone();
     let allow_injection = cli.oss.allow_injection;
     let scripts_dir = cli.oss.scripts_dir.clone();
-    let fleet_journal_port_cap = cli.cluster.cluster_fleet_journal_port_cap;
     cli.oss.host = "127.0.0.1".to_owned();
     cli.oss.port = 0;
     // **`cli.oss.api_key` is deliberately left in place** (#550, D-73). Before tenancy was
@@ -882,9 +818,7 @@ async fn attach_data_plane(
             barrier_timeout,
             admin_async,
             readiness: Arc::clone(readiness),
-            journal_net: Arc::clone(&journal_net),
             flow_net: Arc::clone(&flow_net),
-            fleet_journal_port_cap,
         },
         node,
     )
@@ -1408,7 +1342,6 @@ fn cluster_manager(
     accept_runtimes: Vec<tokio::runtime::Handle>,
     pull_on_miss: Arc<PullOnMissInterceptor>,
     flow_net: Arc<FlowNet>,
-    request_journal: Arc<ClusterJournal>,
     proxy_net: Arc<ProxyNet>,
     sequencer: Arc<ClusteredSequencer>,
 ) -> anyhow::Result<ImposterManager> {
@@ -1479,12 +1412,6 @@ fn cluster_manager(
         // function, which is the whole off-switch. A manager-scoped *provider*
         // over one shared `FlowNet`, rather than a per-imposter store, is D-7.
         .with_flow_store_provider(Arc::new(ClusteredFlowStoreProvider::new(flow_net)))
-        // One journal shared by every imposter on this node, keyed by port — the shard
-        // a fleet-wide verification read merges (#223). Same reasoning as the flow store:
-        // a per-imposter private journal behind a round-robin LB answers `savedRequests`
-        // with whatever fraction of the traffic happened to land here, for every imposter
-        // rather than only the ones that opted in.
-        .with_request_journal(request_journal)
         // The fleet's proxyOnce exactly-once gate (#226): every imposter on a cluster node
         // claims through the HRW owner and publishes recorded stubs via consensus, so N
         // nodes make one upstream call per `(port, signature)` instead of up to N. Same
@@ -1492,7 +1419,7 @@ fn cluster_manager(
         // function, so single-node keeps the upstream per-imposter `LocalProxyStore`
         // byte-identical.
         .with_proxy_store(Arc::new(ClusterProxyStore::new(proxy_net)))
-        // Installed for every imposter, like the flow store and the journal: the
+        // Installed for every imposter, like the flow store: the
         // *mode* is per-imposter (D-10 keeps `local` the default), but which object
         // answers is not. An imposter that never opts in gets local cursors from this
         // one just as it would from upstream's `LocalSequencer` (#466, D-47).

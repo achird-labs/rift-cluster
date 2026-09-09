@@ -501,8 +501,9 @@ Ch. 13).
 
 - `spec_violations`: `(port, journal_index) → {ts, mode, phase, operation,
   violations[]}` — one row per violating exchange, on the node that served
-  it. Read via the cluster-merged read pattern of Ch. 7 (violations join a
-  journal that is itself per-node and merged at read time). Retention:
+  it. The cluster-merged read pattern of Ch. 7 this once named is gone (D-74,
+  #552): the journal it would join is upstream's own, per node, so a violation
+  is read from the node that recorded it. Retention:
   `--cluster-spec-violation-retention`, default 7 d, plus a per-port row
   cap (default 10 000, mirroring `MAX_RECORDED_REQUESTS`,
   `journal.rs:19`).

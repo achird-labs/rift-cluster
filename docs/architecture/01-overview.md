@@ -54,9 +54,9 @@ an embedded ACID store (`redb`).
 Just as load-bearing. The cluster is **not**:
 
 - **A general database.** Durability covers configs, tenancy, admin intents,
-  and (tunably) flow state. Response cursors, the recorded-request journal, and
-  in-flight proxy claims are deliberately volatile — Chapter 9 has the full
-  matrix and the reasoning for each row.
+  and (tunably) flow state. Response cursors, the recorded requests upstream's
+  own per-node journal holds, and in-flight proxy claims are deliberately
+  volatile — Chapter 9 has the full matrix and the reasoning for each row.
 - **Cross-region.** One failure domain, one LAN. WAN latencies would invalidate
   every timeout in this book.
 - **Linearizable end-to-end.** The *control plane* is linearizable. The *data
@@ -89,7 +89,7 @@ flowchart TB
         direction LR
         S[Stateless stub matching<br/>100% in-process]
         F[Flow state / scenario FSM<br/>HRW owner + replicas + WAL]
-        J[Request journal & counters<br/>per-writer CRDT shards]
+        J[Request journal & counters<br/>upstream's own, per node]
         P[proxyOnce claims<br/>owner state machine]
     end
 

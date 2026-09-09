@@ -1,5 +1,6 @@
 /** @vitest-environment jsdom */
 import { screen } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { ImposterDetail } from "../screens/ImposterDetail.tsx";
@@ -36,6 +37,26 @@ describe("imposter detail", () => {
     expect(screen.getByTestId("detail-protocol").textContent).toBe("http");
     expect(screen.getByTestId("detail-host").textContent).toBe("0.0.0.0");
     expect(screen.getByTestId("detail-stubs").textContent).toBe("2");
+  });
+
+  /*
+   * Pins D-74 on the one dialog that used to say the opposite. The clear is proxied to the node
+   * the browser reached and empties that node's journal alone; the copy said "fleet-wide — the
+   * clear commits through Raft to every node", which is exactly the act an operator would reason
+   * about wrongly. Asserted both ways — the words that must be there and the words that must not —
+   * because a dialog that named the node and *also* kept the Raft sentence would still be wrong.
+   */
+  it("says the clear reaches this node only, never the fleet (D-74)", async () => {
+    onDetailTab("settings");
+    stubFetch({ "/imposters/4545": { json: IMPOSTER } });
+    renderInApp(<ImposterDetail port={4545} />);
+
+    const user = userEvent.setup();
+    await user.click(await screen.findByTestId("danger-clear-requests"));
+
+    const dialog = await screen.findByTestId("confirm-danger-clear");
+    expect(dialog.textContent).toMatch(/this node/i);
+    expect(dialog.textContent).not.toMatch(/fleet-wide|through Raft/i);
   });
 
   it("lists stubs, and never invents an id for one that has none", async () => {

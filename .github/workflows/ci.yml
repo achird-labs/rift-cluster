@@ -205,8 +205,6 @@ jobs:
       # `outputs: type=cacheonly` rather than `load: true`: the image itself is of
       # no use here and exporting it to the docker store would only cost time.
       #
-      # The faketime flavor is not built. It is `FROM runtime` plus one apt layer,
-      # so every expensive layer it needs is in what this produces.
       - name: Seed the node image build cache
         uses: docker/build-push-action@v6
         with:
@@ -296,11 +294,10 @@ jobs:
       # --build`, which is why its ~10 min cost could only be recovered by
       # regressing job wall clock against scenario count across a month of runs.
       #
-      # Both flavors, because the tier runs both and a shard has no build cache
-      # to fall back on: `runtime` is what ships, `runtime-faketime` is the same
-      # stage plus libfaketime for C12's clock skew. They are separate tags as of
-      # D-58 — see `BUILT_IMAGES` in the harness for why sharing one was a latent
-      # bug rather than a tidy saving.
+      # One flavor since #552, which retired the chaos tier's clock-skew
+      # `runtime-faketime` image along with the clock-free clear generations it
+      # existed to prove. `BUILT_IMAGES` in the harness still records why a second
+      # flavor would have to declare its own tag rather than share this one (D-58).
       #
       # `RIFT_UPSTREAM_VERSION` is deliberately not passed, matching what the
       # compose build did here before: the banner says `rift unknown`, which is
@@ -327,12 +324,10 @@ jobs:
       # If this regresses, the tell is in the log: no `importing cache manifest`
       # at the start of the build, and the cargo step back at ~400 s.
       #
-      # ONE scope for both flavors, unlike `release.yml`, which scopes per
-      # flavor. That file's reasoning is sound for the pair it describes —
-      # `runtime` and `runtime-static` diverge at `builder` (musl, different apt
-      # packages), so a shared scope would have each evict the other. These two
-      # do not diverge: `runtime-faketime` is `FROM runtime` plus libfaketime, so
-      # its graph is a superset and one scope holds both.
+      # ONE scope, unlike `release.yml`, which scopes per flavor. That file's
+      # reasoning is sound for the pair it describes — `runtime` and
+      # `runtime-static` diverge at `builder` (musl, different apt packages), so
+      # a shared scope would have each evict the other. This job builds one image.
       - name: Build the node image
         if: steps.changed.outputs.run == 'true'
         uses: docker/build-push-action@v6
@@ -345,38 +340,24 @@ jobs:
           cache-from: type=gha,scope=cluster-smoke
           cache-to: type=gha,mode=max,scope=cluster-smoke,ignore-error=true
 
-      - name: Build the faketime flavor
-        if: steps.changed.outputs.run == 'true'
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: deploy/Dockerfile
-          target: runtime-faketime
-          tags: rift-cluster-server:faketime
-          load: true
-          cache-from: type=gha,scope=cluster-smoke
-          cache-to: type=gha,mode=max,scope=cluster-smoke,ignore-error=true
-
-      # Assert the read-back rather than trusting the steps above: `load` is the
+      # Assert the read-back rather than trusting the step above: `load` is the
       # part that can quietly not happen, and a missing image would surface four
       # jobs later as a registry pull for a tag that only ever existed on a
       # runner's disk.
-      - name: Both flavors are loaded
+      - name: The node image is loaded
         if: steps.changed.outputs.run == 'true'
         run: |
           set -euo pipefail
-          for tag in rift-cluster-server:local rift-cluster-server:faketime; do
-            docker image inspect "$tag" >/dev/null
-          done
+          docker image inspect rift-cluster-server:local >/dev/null
 
       # `gzip -1`: the layers are already compressed, so anything harder spends
       # CPU to save nothing. What matters is that all four shards load the same
       # bytes — three nodes and four shards on one provable artifact.
-      - name: Save the images for the shards
+      - name: Save the image for the shards
         if: steps.changed.outputs.run == 'true'
         run: |
           set -euo pipefail
-          docker save rift-cluster-server:local rift-cluster-server:faketime \
+          docker save rift-cluster-server:local \
             | gzip -1 > "${RUNNER_TEMP}/chaos-images.tar.gz"
           ls -lh "${RUNNER_TEMP}/chaos-images.tar.gz"
 
@@ -446,9 +427,7 @@ jobs:
           gunzip -c "${RUNNER_TEMP}/chaos-images.tar.gz" | docker load
           # Same read-back assertion as the build step's, for the same reason —
           # and here it is what lets the harness trust RIFT_CHAOS_PREBUILT_IMAGE.
-          for tag in rift-cluster-server:local rift-cluster-server:faketime; do
-            docker image inspect "$tag" >/dev/null
-          done
+          docker image inspect rift-cluster-server:local >/dev/null
 
       # Serial WITHIN a shard by necessity: the compose file publishes fixed host
       # ports, so two stacks cannot coexist on one runner. Across shards it is

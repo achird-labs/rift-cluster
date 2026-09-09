@@ -532,7 +532,7 @@ describe("#251 — import", () => {
 
 });
 
-describe("the fleet-sum request tile (#363)", () => {
+describe("the request tile counts this node's own journal (#363, D-74)", () => {
   const FLEET = { "/_fleet/members": { status: 404 }, "/_fleet/health": { status: 404 } };
 
   function withCounts(a: number | undefined, b: number | undefined): Record<string, unknown> {
@@ -544,21 +544,40 @@ describe("the fleet-sum request tile (#363)", () => {
     };
   }
 
-  it("sums every imposter's count and says the sum spans the fleet", async () => {
+  it("sums every imposter's count and says whose count it is", async () => {
     stubFetch({ ...FLEET, "/imposters": { json: withCounts(7, 5) } });
     renderInApp(<Imposters />);
     await screen.findByText("billing");
 
     expect((await screen.findByTestId("tile-requests")).textContent).toBe("12");
-    expect(screen.getByText(/summed across every node/i)).toBeTruthy();
+    expect(screen.getByText(/recorded by the node serving this console/i)).toBeTruthy();
   });
 
   /*
-   * The reason this issue needed the partial header at all. The fan-out stamps
-   * `Rift-Cluster-Partial` when a node did not answer in time, and the sum is then a floor. Showing
-   * `12` under a label reading "fleet sum" would report a total the fleet never confirmed.
+   * The sweep #552 performs, asserted rather than assumed. `numberOfRequests` was a fleet sum
+   * (#223) that the admin front rewrote by fanning out across every node's journal slot; D-74
+   * removed that rewrite, so the number is one node's. A tile still labelled "fleet sum" over a
+   * per-node figure is the reading an operator would act on — and it is the kind of copy that
+   * survives a refactor because nothing renders differently when it is wrong.
    */
-  it("says the sum is a floor when a node did not answer", async () => {
+  it("never calls the total a fleet figure", async () => {
+    stubFetch({ ...FLEET, "/imposters": { json: withCounts(7, 5) } });
+    renderInApp(<Imposters />);
+    await screen.findByText("billing");
+
+    const tile = (await screen.findByTestId("tile-requests")).closest(".tile");
+    expect(tile?.textContent).toMatch(/this node/i);
+    expect(tile?.textContent).not.toMatch(/fleet sum/i);
+    expect(tile?.textContent).not.toMatch(/summed across every node/i);
+  });
+
+  /*
+   * The floor caveat is gone with the fan-out that produced it. `Rift-Cluster-Partial` is never
+   * stamped on `GET /imposters` any more (D-74) — but a proxy, or a node mid-upgrade, can still
+   * put the header on the wire, and the tile must not resurrect a warning about a peer that was
+   * never consulted.
+   */
+  it("shows no floor caveat even if a stray partial header rides the response", async () => {
     stubFetch({
       ...FLEET,
       "/imposters": { json: withCounts(7, 5), headers: { "rift-cluster-partial": "true" } },
@@ -567,19 +586,7 @@ describe("the fleet-sum request tile (#363)", () => {
     await screen.findByText("billing");
 
     expect((await screen.findByTestId("tile-requests")).textContent).toBe("12");
-    expect(screen.getByText(/at least this many/i)).toBeTruthy();
-    expect(screen.queryByText(/summed across every node/i)).toBeNull();
-  });
-
-  // A complete merge says nothing — a caveat that is always on is one nobody reads on the day it
-  // means something, which is the rule the request log's scope strip already follows.
-  it("carries no caveat when the merge reached every node", async () => {
-    stubFetch({ ...FLEET, "/imposters": { json: withCounts(7, 5) } });
-    renderInApp(<Imposters />);
-    await screen.findByText("billing");
-
-    await screen.findByTestId("tile-requests");
-    expect(screen.queryByText(/at least this many/i)).toBeNull();
+    expect(screen.queryByText(/at least this many — a node did not answer in time/i)).toBeNull();
   });
 
   /*

@@ -758,8 +758,10 @@ becomes the §7.6 503, never a silent wrong match. OSS behavior is unchanged in 
 > go to the **Raft leader** as a `ControlOp` (§7.6, #9), not to a per-port config owner
 > assigning `(g, revision)`, and ADR-001 deletes the content-addressed
 > `GET /internal/v1/config/{port}/{digest}` fetch along with the digest-gossip mechanism it
-> served. Retained for context, like §7.1/§7.2/§7.4. The KV, sequence, proxy and journal
-> rows are unaffected — they are data-plane, which stays off consensus.
+> served. Retained for context, like §7.1/§7.2/§7.4. The KV, sequence and proxy rows are
+> unaffected — they are data-plane, which stays off consensus. The journal row is **gone**: it
+> was never built as written, and D-71 (#552) retired the sharded journal that would have needed
+> it, so no journal RPC crosses the cluster port at all (D-74).
 >
 > **Content-addressed fetch returned as `/internal/v1/blob/{digest}` (#437, epic #432), and is
 > gone again.** It was the sideloading transport for the payloads that should never have been *on*
@@ -782,7 +784,6 @@ version (§11.4).
 | `POST /internal/v1/proxy/complete` / `release` `{port, signature, token, ...}` | owner: Pending→Recorded (after config-write ack, §7.5.3) / Pending→Unclaimed; stale token rejected | Idempotent |
 | `POST /internal/v1/config/write` `{port, body \| stub_patch \| delete}` | **port-config owner**: validate, assign `(g, revision)`, publish | Idempotent via client op-id |
 | `GET /internal/v1/config/{port}/{digest}` | content-addressed config body fetch | Idempotent, cacheable |
-| `GET /internal/v1/journal/{port}?since=<seq-vector>&gen=<g>` | pull journal shard deltas ≥ watermark | Idempotent |
 
 Timeouts: connect 500 ms, request 2 s. **Fast-fail:** if the local view already marks the
 owner Suspect/Dead, skip the RPC and resolve immediately per the §7.6 owner-unreachable
@@ -993,6 +994,13 @@ binds can fail on some nodes (port taken by an unrelated process). Built (#143):
 
 #### 7.5.1 Recorded-request journal
 
+> **Retired by D-71** (RFC-007 §3.2, #552). Nothing in this section is built any more: the
+> per-writer shards, the merge-on-read and its anti-entropy pull, the caps and watermarks, and the
+> vector cursor and merged SSE tail were all removed. The journal is upstream Rift's own,
+> per node — `GET /imposters/:port/requests` answers for the node you reached. **D-74** records the
+> replacement and supersedes D-32, D-37 and D-39. The callout below is kept because those
+> decisions' amendments to this section are part of the record.
+
 > **Amended by D-37 and D-39** (as built, #223/#225/#348): per-writer shards merged on read stand; the cursor shipped as base64url-JSON `{v1, gen, pos: node_id → seq}` (not CBOR), lapses surface as `x-rift-truncated: true` (not `Cursor-Lapsed`), `Cursor-Reset` is carried but not acted on, the age cap defaults to 600 s, and `read_since` is not a seam — U-13 is the exchange inspector. The register entries are normative for the built shape.
 
 - Per port, a **grow-only log sharded by writer**: each node appends locally to its own
@@ -1073,8 +1081,9 @@ needed — the vector cursor (#225) landed first, so the tail could be built dir
 cursor walk that never ends, over the replica cache the anti-entropy pull already fills.
 `hello` declares the bound this section insists on, as `clusterTailLatencyMs`. `GET /events`
 is **not** part of that decision: it stays proxied per-node and FleetAdmin-gated until #163
-filters it by tenant, which is a tenancy question rather than a merging one. See Ch.7
-§"Cursor reads and live streams".
+filters it by tenant, which is a tenancy question rather than a merging one. Chapter 7's
+§"Cursor reads and live streams" went with the merge (D-74, #552);
+`docs/architecture/07-verification-plane.md` is a stub kept for inbound links.
 
 Phase-3 exit criterion: **`test_journal_cursor_merge`** — spray across 3 nodes while
 polling with the returned cursor. Stated per generation, because a clear deliberately
@@ -1089,6 +1098,12 @@ generation; a node going unreachable mid-sequence yields `Rift-Cluster-Partial` 
 entries on a later poll rather than never.
 
 #### 7.5.2 Clears are generation bumps (clock-free)
+
+> **Retired by D-71** (RFC-007 §3.2, #552). There is no fleet-wide clear to make clock-free:
+> `DELETE .../savedRequests` clears the journal of the node it reached, upstream's own way, and
+> `ControlOp::JournalClearGen` and the `sm_journal_gens` table are gone with the merge that read
+> them. **D-74** records the replacement and supersedes D-38. The callout below is kept because
+> D-38's amendment to this section is part of the record.
 
 > **Amended by D-38** (as built, #223): the generation rides the Raft log as `ControlOp::JournalClearGen`, not gossip; the per-`(port, flow)` TTL and the `teardown_space` `(g, v, deleted)` markers were never built.
 
@@ -1268,7 +1283,7 @@ for gate B). Summary:
 | `FlowStore` + `compare_and_set` (`extensions::flow_state`) | itself | `ClusteredFlowStore` (owner-serialized, successor-replicated) |
 | `FlowStoreProvider` (`extensions::flow_state`) | private `create_flow_store` match (`imposter/core.rs:152`) | provider returning clustered stores |
 | `ResponseSequencer` (`behaviors::sequencer`) | `RuleCycler`/`StubState` cursor call sites | `ClusteredSequencer` (owner INCR); `RedisSequencer` |
-| `RequestJournal` (`imposter::journal`) | `RwLock<Vec<RecordedRequest>>` + count `AtomicU64` | `ClusteredJournal` (sharded G-log) |
+| `RequestJournal` (`imposter::journal`) | `RwLock<Vec<RecordedRequest>>` + count `AtomicU64` | none — the seam (U-4) is **withdrawn**: since D-74 (#552) the cluster registers no journal, and upstream's own per-node one serves the reads unwrapped |
 | `ProxyRecordingStore` (`recording::store`) | concrete `RecordingStore` | `ClusteredProxyStore` (owner state machine); `RedisProxyStore` |
 | `ImposterEventListener` + `apply_config` + `move_stub` + `stub_key` (`imposter::manager`, `imposter`) | `reload()` for sync purposes | config publisher + reconciler |
 | Embeddable server pieces (`rift-http-proxy`): bootstrap builder, metrics server, gateway dispatch | bin-private `main.rs` | `rift-cluster-server` composition |
@@ -1406,6 +1421,14 @@ Phase 1 is not blocked by seams it doesn't need.
 | **3 — Recorded-request verification** | `ClusteredJournal`: sharded log, watermarks, pull-on-read, generation clears; count G-counter | U-4 (+0a); **U-13** for the vector-cursor/streaming form (§7.5.1) | spray N (< shard-cap) requests across 3 nodes → `GET .../requests` on each node returns exactly N (`test_journal_merge_exact`); `DELETE savedRequests` clears cluster-wide ≤ 5 s incl. concurrent appends, clock-skew-immune (`test_journal_clear`); `numberOfRequests` = N on every node (`test_count_merge`); incremental reads with the returned vector cursor concatenate, **within one clear generation**, to exactly a full read of that generation — no duplicate, no gap — with `Rift-Cluster-Cursor-Reset` exactly once across a clear and `Rift-Cluster-Partial` for a node unreachable mid-sequence (`test_journal_cursor_merge`, §7.5.1; needs seam U-13) | `--cluster-features` without `journal` → local Vec |
 | **4 — Response sequencing (strict = Redis first)** | `RedisSequencer` (strict, requires `--cluster-redis <url>`); `ClusteredSequencer` (gossip-native, experimental flag) | U-3 (+0a); **named customer request on file for gossip-native strict** | Redis mode: cyclic stub sprayed across nodes → global sequence no dup/skip incl. during single-node kill (`test_sequence_redis_strict`); gossip mode: no dup/skip while membership stable, documented reset on handoff (`test_sequence_no_dup_no_skip`, `test_sequence_handoff_reset`). Chaos: C2, C13 | feature flag off → per-node cursors (today's behavior) |
 | **5 — Proxy + proxyOnce (strict = Redis first)** | `RedisProxyStore` (strict claims); `ClusteredProxyStore` (Pending/Recorded, experimental); recordings as leader-serialized `PatchStubs` `ControlOp`s (ADR-001) | U-5 (+0a); same demand gate for gossip-native | Redis mode: 3 nodes, concurrent first-hits, 100-run soak incl. node kill → upstream called exactly once (`test_proxy_once_redis_strict`); gossip mode: exactly-once while membership stable, duplicates ≤ documented bound under owner kill, measured (`test_proxy_once_gossip_bound`); recorded stubs appear on all nodes (`test_recording_replicates`); concurrent recordings on 3 nodes, no partition → zero lost stubs (`test_recording_no_loss`). Chaos: C3, C10, C11 | feature flag off → local store (today) |
+
+> **Amended by D-74** (RFC-007 §3.2, #552) — the **Phase 3** row is retired. `ClusteredJournal`
+> and everything the row names (sharded log, watermarks, pull-on-read, generation clears, the count
+> G-counter, the vector cursor) were built (#223–#225, #348) and then removed in full; its four
+> exit criteria (`test_journal_merge_exact`, `test_journal_clear`, `test_count_merge`,
+> `test_journal_cursor_merge`) are permanently unallocated, as
+> `docs/architecture/12-testing.md` records. Recorded-request
+> verification is per node: `GET .../requests` and `numberOfRequests` answer for the node reached.
 
 **Phase 1 must land and be validated with a design partner before 2–5 proceed** (also a
 kill-criteria gate, §13.3). Every phase ships behind `--cluster` +
@@ -1665,6 +1688,11 @@ timing-sensitive — **not** claimed deterministic):
 | C13 | **Owner black-hole + 20 % stateful load** | Stateless p99 < 5 ms throughout (bridge semaphore + fast-fail); bounded rejected-op count |
 | C14 (from #9) | **Leader docker-kill mid 100-write storm** | Every write is either acked-and-present, or `503`-with-op-id and present after replay; zero duplicates; a new leader within 3 s |
 | C15 (from #9) | **`kill -9` all three nodes under load** | After restart, configs *and* parked intents are identical to the last acknowledgement — R3/R4 end to end |
+
+> **Amended by D-74** (RFC-007 §3.2, #552) — **C12**'s first clause, "journal clears exact
+> (generation-based)", is retired. There is no fleet-wide clear left for skew to disturb:
+> `DELETE savedRequests` is a proxied clear of the reached node's own journal, and upstream's
+> journal never compares timestamps across nodes. The HMAC-window and age-GC clauses stand.
 
 CI budget: **PR smoke** = 3 iterations of each phase-relevant scenario (~20 min,
 parallelized compose stacks); **nightly full** = 100 iterations across parallel stacks

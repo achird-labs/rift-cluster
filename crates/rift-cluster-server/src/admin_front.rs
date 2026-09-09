@@ -62,7 +62,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
-use http_body_util::{BodyExt, Full, Limited, channel::Channel, combinators::BoxBody};
+use http_body_util::{BodyExt, Full, Limited, combinators::BoxBody};
 use hyper::body::{Bytes, Incoming};
 use hyper::header::{HeaderName, HeaderValue};
 use hyper::service::service_fn;
@@ -74,19 +74,15 @@ use rift_cluster::control::{
     self, ControlOp, ControlRequest, PreconditionTarget, StubEdit, StubEditScript,
 };
 use rift_cluster::decorate::{
-    HEADER_BIND_FAILURES, HEADER_NEXT_INDEX, HEADER_OP_ID, HEADER_PARTIAL, HEADER_REVISION,
-    HEADER_TRUNCATED, HEADER_WARNINGS,
+    HEADER_BIND_FAILURES, HEADER_OP_ID, HEADER_PARTIAL, HEADER_REVISION, HEADER_WARNINGS,
 };
-use rift_cluster::stores::{
-    ContextScope, Coverage, FleetCursor, FleetTailEvent, FlowConfig, FlowNet, IdPolicy, JoinMode,
-    JournalCursor, JournalNet, ResolvedKnobs,
-};
+use rift_cluster::stores::{ContextScope, FlowConfig, FlowNet, ResolvedKnobs};
 use rift_cluster::{
     ControlOutcome, ControlResponse, KeyClass, NodeError, NodeId, OwnedKey, RaftNode,
     SESSION_KEY_BYTES, SessionKey,
 };
 use rift_cluster_base::seams::{
-    ErrorKind, ImposterConfig, RecordedRequest, RiftScriptConfig, RouteTable, ScriptBaseDir, Stub,
+    ErrorKind, ImposterConfig, RiftScriptConfig, RouteTable, ScriptBaseDir, Stub,
     classify as classify_upstream, config_uses_script_surface, error_response_typed,
     not_a_stub_reason, resolve_scripts, resolve_stub_scripts, tcp_fault_carrier, validate_stub,
     validate_stubs,
@@ -119,11 +115,12 @@ const MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
 /// timeout, which begins after the commit and degrades to a warning.
 const WRITE_DEADLINE: Duration = Duration::from_secs(10);
 
-/// Total budget for a merge-on-read fan-out to every other roster peer (issue #223): the merged
-/// journal read, its `numberOfRequests` decoration, and the transitional `DELETE savedRequests`
-/// fan-out all share it. Bounded so one slow or unreachable peer degrades an answer to
-/// `Rift-Cluster-Partial: true` rather than hanging the client on it.
-const JOURNAL_PEER_BUDGET: Duration = Duration::from_secs(2);
+/// Total budget for a read that genuinely fans out to every other roster peer — since D-74 that
+/// is the spaces listing and nothing else on this front. Bounded so one slow or unreachable peer
+/// degrades the answer rather than hanging the client on it: the caller reports the shortfall in
+/// the body as `partial: true` (beside `unavailable`), not through `Rift-Cluster-Partial`, which
+/// is reserved for `/_fleet/members` and `/_fleet/health`.
+const FLEET_PEER_BUDGET: Duration = Duration::from_secs(2);
 
 type FrontBody = BoxBody<Bytes, hyper::Error>;
 
@@ -152,20 +149,9 @@ pub struct FrontConfig {
     /// issue #185) can report the same state `/readyz` does without a second latch to keep in
     /// sync.
     pub readiness: Arc<Readiness>,
-    /// This node's view of the fleet request journal (issue #223): the merged read, the
-    /// `numberOfRequests` decoration, and the transitional `DELETE savedRequests` fan-out all
-    /// reach the fleet through it.
-    pub journal_net: Arc<JournalNet>,
     /// The flow-state subsystem: the space listing's fleet-wide fan-out reaches it, and so does
     /// the owner lookup a space read is decorated with.
     pub flow_net: Arc<FlowNet>,
-    /// How many imposters one fleet journal answer may cover (issue #362).
-    ///
-    /// A cap exists because the resumption token carries a row per covered port and rides a
-    /// `Last-Event-ID` header, and because the walk's cost is linear in the ports it touches. What
-    /// it must never be is *silent*: whatever this leaves out is named in the answer's `coverage`
-    /// block, which is the whole of the issue's third acceptance criterion.
-    pub fleet_journal_port_cap: usize,
 }
 
 /// A bound, serving admin front.
@@ -283,12 +269,8 @@ struct FrontState {
     barrier_timeout: Duration,
     admin_async: bool,
     readiness: Arc<Readiness>,
-    /// See [`FrontConfig::journal_net`].
-    journal_net: Arc<JournalNet>,
     /// See [`FrontConfig::flow_net`].
     flow_net: Arc<FlowNet>,
-    /// See [`FrontConfig::fleet_journal_port_cap`].
-    fleet_journal_port_cap: usize,
     /// Streams proxied requests through unchanged (SSE included).
     proxy: Client<hyper_util::client::legacy::connect::HttpConnector, Incoming>,
     /// Issues the internal re-reads mutation responses are rendered from.
@@ -315,9 +297,7 @@ pub async fn bind(config: FrontConfig, node: &Arc<RaftNode>) -> std::io::Result<
         barrier_timeout: config.barrier_timeout,
         admin_async: config.admin_async,
         readiness: config.readiness,
-        journal_net: config.journal_net,
         flow_net: config.flow_net,
-        fleet_journal_port_cap: config.fleet_journal_port_cap,
         proxy: Client::builder(TokioExecutor::new()).build_http(),
         fetch: Client::builder(TokioExecutor::new()).build_http(),
     });
@@ -417,68 +397,25 @@ pub(crate) enum Terminated {
     ReplaceStubById(u16, String),
     DeleteStubById(u16, String),
     SetEnabled(u16, bool),
-    /// `GET /imposters/{port}/requests|savedRequests` with no `?match=` (issues #223, #225): a
-    /// fleet-wide merge-on-read rather than a proxy, **including** the `?since=` form as of #225 —
-    /// the vector cursor is what made a merged cursor read expressible at all, so the front door
-    /// now terminates every requests-read that is not predicate-scoped.
-    ReadSavedRequests(u16),
-    /// `GET /imposters/{port}/savedRequests/stream` with no `?match=` (issue #348): the live
-    /// sibling of [`Self::ReadSavedRequests`] — a merged, fleet-wide SSE tail instead of the
-    /// per-node proxy this path used to get.
-    ///
-    /// Only the canonical spelling, mirroring upstream's `stream_target`, which recognises
-    /// exactly this one. The `/admin/imposters/` alias above exists because *upstream itself*
-    /// serves the requests read under both spellings; it does not serve the stream under both, so
-    /// terminating a second spelling here would invent a route that answers 404 when proxied.
-    ///
-    /// `?match=` still proxies, for [`terminated_saved_requests`]'s reason verbatim (issue #223
-    /// review, B1): the merge path evaluates no predicates, so terminating a predicate-scoped
-    /// stream would answer with the whole fleet's requests instead of the caller's subset.
-    ///
-    /// `GET /events` is deliberately **not** here: it is upstream's own firehose, answered by the
-    /// node it reaches, and this front merges the per-port tail instead.
-    StreamSavedRequests(u16),
-    /// `GET /admin/requests` (issue #362): the fleet's whole request journal in one merged,
-    /// cursor-exact read — [`Self::ReadSavedRequests`] across every applied imposter instead of
-    /// one.
-    ///
-    /// Terminates because there is nothing to proxy to: upstream has no fleet surface, and a
-    /// per-node one could not answer for the fleet anyway.
-    ///
-    /// No `?match=`: the merge path evaluates no predicates, so a predicate-scoped fleet read would
-    /// answer with everything instead of the caller's scoped subset — issue #223 B1's reason,
-    /// unchanged. Predicate-scoped reads stay per-imposter and proxied.
-    ReadFleetRequests,
-    /// `GET /admin/requests/stream` (issue #362): the live sibling of [`Self::ReadFleetRequests`],
-    /// and [`Self::StreamSavedRequests`]'s fleet-wide counterpart.
-    StreamFleetRequests,
-    /// `DELETE` on the same two paths. Two different designs live under this one variant now,
-    /// selected in `terminate` by whether `?match=` narrowed the request (issue #223 item 4's
-    /// original design decision, B3, still holds for the scoped form):
-    ///
-    /// - **Unscoped** (no `?match=`, issue #224): a Raft-committed `ControlOp::JournalClearGen`
-    ///   with `space: None` — see `build_mutation`. This replaced the pre-#224 fan-out over the
-    ///   cluster RPC port entirely; that mechanism (`JournalNet::clear_peers`) no longer exists.
-    /// - **Scoped** (`?match=` present): unchanged from #223 — a local-only proxy to the local
-    ///   engine, always stamped `Rift-Cluster-Partial: true`, never a Raft write. See
-    ///   `terminate_clear_saved_requests`'s own doc for why this half was deliberately left alone.
-    ClearSavedRequests(u16),
     /// `DELETE /imposters/{port}/savedProxyResponses` (issue #226): a Raft-committed
-    /// `ControlOp::ProxyRecordedClear` — the proxy-recording sibling of the unscoped
-    /// `ClearSavedRequests` commit above, for the same reason: pre-#226 this proxied to
-    /// one node's in-process store, which cleared nothing the fleet's claim table holds.
+    /// `ControlOp::ProxyRecordedClear`. Pre-#226 this proxied to one node's in-process store,
+    /// which cleared nothing the fleet's claim table holds. Its one-time sibling, the
+    /// `savedRequests` clear, went the other way with D-74 (#552): the journal is per node again,
+    /// so that DELETE is an ordinary proxied route and no longer terminates here.
     /// Recorded *stubs* stay, deliberately — they are imposter config, deleted through
     /// the stub-edit surfaces; this clears the exactly-once markers so signatures record
     /// afresh. GET on the same path stays proxied: the listing is upstream's own surface.
     ClearSavedProxyResponses(u16),
-    /// `DELETE /imposters/{port}/spaces/{flow}` (issue #224): a space teardown has two
+    /// `DELETE /imposters/{port}/spaces/{flow}` (issue #537, D-69): a space teardown has two
     /// independent halves. The *flow-state* half — already clustered via `ClusteredFlowStore` —
-    /// stays exactly what it was: proxied to the local engine, untouched by this issue. The
-    /// *journal* half is what #224 adds: after a successful proxied teardown,
-    /// `terminate_space_teardown` additionally commits `ControlOp::JournalClearGen { space:
-    /// Some(flow), .. }` through Raft, the space-scoped sibling of the unscoped
-    /// `ClearSavedRequests` commit above. Not routed through `build_mutation` — there is no
-    /// loopback path to `FetchAfter`/`Captured` render from; the response is the proxy's own.
+    /// is proxied to the local engine, and upstream's own `teardown_space` clears that space's
+    /// recorded requests on the way through (`RequestJournal::clear_flow`), which since D-74 is
+    /// the whole of the journal side: the journal is upstream's, per node, so there is nothing
+    /// fleet-wide left to clear. The *stub* half is what #537 adds: space stubs are replicated
+    /// config, so after a successful proxied teardown `terminate_space_teardown` commits
+    /// `StubEdit::DeleteBySpace` through Raft, or the next `EngineAction::Sync` would resurrect
+    /// them fleet-wide. Not routed through `build_mutation` — there is no loopback path to
+    /// `FetchAfter`/`Captured` render from; the response is the proxy's own.
     SpaceTeardown(u16, String),
     /// `POST /imposters/{port}/spaces/{flow}/stubs` (issue #537, D-69): a stub scoped to one
     /// correlated-isolation space, committed as an ordinary `ControlOp::PatchStubs` instead of
@@ -499,11 +436,13 @@ pub(crate) enum Terminated {
     /// and owning node plus the imposter's resolved `durability` on the envelope.
     ///
     /// Terminates — there is nothing to proxy to. Unlike [`Self::SpaceTeardown`], which proxies its
-    /// flow-state half and adds a journal commit alongside it, upstream's router has no bare
-    /// `["spaces"]` shape at all: only the two-segment single-space read and the three-segment
-    /// stubs write exist there. This is a merge-on-read fan-out over `FlowNet::fleet_spaces`, the
-    /// same shape [`Self::ReadFleetRequests`] and the `numberOfFlowEntries` decoration already use
-    /// for a fleet-scoped read that has no single node's answer to trust.
+    /// flow-state half and adds a replicated stub delete alongside it, upstream's router has no
+    /// bare `["spaces"]` shape at all: only the two-segment single-space read and the
+    /// three-segment stubs write exist there. This is a fan-out over `FlowNet::fleet_spaces` —
+    /// since D-74 the only *terminated* read on this front that reaches peers at all. It reports
+    /// its incompleteness in the body (`partial`, beside `unavailable`) rather than through
+    /// `Rift-Cluster-Partial`, because a listing refused by policy and one shortened by a slow
+    /// peer are different facts and the header cannot tell them apart.
     SpacesList(u16),
     /// `POST /admin/imposters/{port}/try` (issue #335): send a sample request to this imposter and
     /// hand back what it answered, so an operator can tell whether a stub matches without leaving
@@ -543,62 +482,16 @@ pub(crate) enum Terminated {
     SpecCompile,
 }
 
-/// `GET|DELETE .../requests|savedRequests`, once `port` is already known — shared by the
-/// canonical `/imposters/{port}/...` match arm and the `/admin/imposters/{port}/...` alias in
-/// [`classify`], so the two spellings cannot silently drift apart the way they did before issue
-/// #223's review (Important: the alias proxied local-only while the canonical path terminated).
-fn terminated_saved_requests(
-    method: &Method,
-    query: Option<&str>,
-    port: u16,
-) -> Option<Terminated> {
-    match *method {
-        // `?since=` now terminates too (issue #225): the vector cursor replaced the scalar one
-        // #223 could not honour, so a `since` read is a merged read like any other and the
-        // engine's `parse_since` must never see a vector token. That carve-out is deleted here.
-        //
-        // `?match=` still falls through to the proxy (issue #223 review, B1), and for a reason
-        // #225 does not touch: it is a predicate the merge-on-read path never evaluates at all,
-        // so terminating a `?match=`-scoped request would silently answer with the *whole*
-        // fleet's requests instead of the caller's scoped subset, and would turn a malformed
-        // filter's upstream `400` into a `200` with everything. Proxying leaves upstream's own
-        // clause parser and its existing error handling in charge of it.
-        Method::GET if !has_query_param(query, "match") => {
-            Some(Terminated::ReadSavedRequests(port))
-        }
-        Method::DELETE => Some(Terminated::ClearSavedRequests(port)),
-        _ => None,
-    }
-}
-
-pub(crate) fn classify(method: &Method, path: &str, query: Option<&str>) -> Option<Terminated> {
+/// Takes no query string, as of D-74. It used to: the merged requests read terminated or proxied
+/// depending on whether `?since=`/`?match=` was present, which made the classifier's answer a
+/// function of the query as well as the route. With the journal back in the engine no route on
+/// this front is query-conditioned, and a classifier that cannot see the query cannot grow a
+/// second, quieter routing rule inside one.
+pub(crate) fn classify(method: &Method, path: &str) -> Option<Terminated> {
     // Fleet-wide state, matched before every port-addressed prefix below because it names no
     // port. Another method on this path falls through to the proxy and answers upstream's 404.
     if path == fleet::FLEET_NAME_PATH && *method == Method::PUT {
         return Some(Terminated::FleetNamePut);
-    }
-    // The fleet request journal (issue #362), EE-only and terminating: there is no upstream
-    // fleet surface to proxy to. Matched before the `/admin/imposters/` and `/imposters/`
-    // prefixes below because it is not port-addressed at all — it is the whole fleet's journal,
-    // and there is no port segment to parse. A recognized path with another method falls through
-    // to the proxy and answers upstream's own 404/405.
-    if path == "/admin/requests" {
-        return match *method {
-            // `?match=` deliberately does not terminate here: see `Terminated::ReadFleetRequests`.
-            // Unlike the per-imposter path there is no sensible proxy fallback for a fleet-scoped
-            // predicate read, so it is simply not offered — a `?match=` read stays a per-imposter
-            // request, which is the surface that can actually honour it.
-            Method::GET if !has_query_param(query, "match") => Some(Terminated::ReadFleetRequests),
-            _ => None,
-        };
-    }
-    if path == "/admin/requests/stream" {
-        return match *method {
-            Method::GET if !has_query_param(query, "match") => {
-                Some(Terminated::StreamFleetRequests)
-            }
-            _ => None,
-        };
     }
     // The one-shot OpenAPI import (D-72, #549): EE-only and terminating, because there is no
     // upstream `/specs` to proxy to and nothing here reads or writes replicated state. A
@@ -646,21 +539,14 @@ pub(crate) fn classify(method: &Method, path: &str, query: Option<&str>) -> Opti
     {
         return Some(Terminated::SpacesList(port));
     }
-    // The savedRequests alias under `/admin/imposters/` (issue #223 review, Important):
-    // upstream's own `/admin/imposters/` prefix is otherwise reserved for flow-state inspection
-    // (`classify_admin_flow_state` in the vendored authorizer), but this front's own
-    // merge-on-read read and clear fan-out terminate the identical two verbs the canonical
-    // `/imposters/{port}/...` spelling does. `is_imposter_listing` already treats both spellings
-    // of the *listing* alike; without this, the two spellings disagreed about the very same
-    // imposter's requests — the canonical path terminated (fleet-merged, honestly partial), the
-    // alias silently proxied local-only with yesterday's `x-rift-next-index` and no partial
-    // header at all.
+    // The `/admin/imposters/{port}/requests|savedRequests` alias #223 invented for the merged
+    // read is **gone** with the merge (D-74). It never existed upstream — upstream's own
+    // `/admin/imposters/` prefix is reserved for flow-state inspection — so it was only ever a
+    // spelling of a cluster-merged read, and with requests answered per node there is nothing
+    // for it to be a second spelling *of*. The canonical `/imposters/{port}/requests` is the
+    // route, and it proxies to this node's engine like any other read.
     if let Some(rest) = path.strip_prefix("/admin/imposters/") {
         let segments: Vec<&str> = rest.split('/').collect();
-        if let [port_str, "requests" | "savedRequests"] = segments.as_slice() {
-            let port: u16 = port_str.parse().ok()?;
-            return terminated_saved_requests(method, query, port);
-        }
         // `POST /admin/imposters/{port}/try` (issue #335). Deliberately only under the `/admin/`
         // prefix and not the canonical `/imposters/` one: the canonical prefix is Mountebank's
         // published imposter surface, where `{port}/try` would read as a resource upstream might
@@ -681,28 +567,23 @@ pub(crate) fn classify(method: &Method, path: &str, query: Option<&str>) -> Opti
         [_] if *method == Method::DELETE => Some(Terminated::DeleteImposter(port)),
         [_, "enable"] if *method == Method::POST => Some(Terminated::SetEnabled(port, true)),
         [_, "disable"] if *method == Method::POST => Some(Terminated::SetEnabled(port, false)),
-        // Both spellings are one handler upstream (`router.rs` maps `["requests"]` and
-        // `["savedRequests"]` identically), so they classify identically here too (issue #223).
-        [_, "requests" | "savedRequests"] => terminated_saved_requests(method, query, port),
-        // The live tail (issue #348). Exactly upstream's `stream_target` shape — `savedRequests`
-        // only, never `requests`, because that is the one spelling upstream's own classifier
-        // recognises. Anything else on this path (a non-GET, or a `?match=`-scoped tail) falls
-        // through to the proxy and keeps behaving precisely as it does today.
-        [_, "savedRequests", "stream"]
-            if *method == Method::GET && !has_query_param(query, "match") =>
-        {
-            Some(Terminated::StreamSavedRequests(port))
-        }
+        // `requests`, `savedRequests` and `savedRequests/stream` are deliberately **absent**
+        // (D-74): the journal is upstream's own, per node, so every verb on those paths — the
+        // reads, the `?since=` cursor read, the SSE tail and the `DELETE` clear — proxies to this
+        // node's engine and keeps upstream's Mountebank semantics verbatim, its own scalar
+        // `x-rift-next-index`/`x-rift-truncated` included. Terminating them was what the merge
+        // needed; nothing else did.
+        //
         // Only the DELETE terminates (issue #226): the clear must purge the fleet's
         // replicated claim markers, which no proxied engine call can reach. GET stays
         // proxied — the recorded-responses listing is upstream's own surface.
         [_, "savedProxyResponses"] if *method == Method::DELETE => {
             Some(Terminated::ClearSavedProxyResponses(port))
         }
-        // `DELETE /imposters/{port}/spaces/{flow}` (issue #224): exactly the two-segment shape
+        // `DELETE /imposters/{port}/spaces/{flow}` (issue #537): exactly the two-segment shape
         // upstream's own router matches for `ImposterRoute::Space` (`["spaces", flow_id]`). Every
         // other method on this shape stays proxied exactly as before — only the delete gets a
-        // journal half, and (issue #537) a stub half, to commit.
+        // replicated stub half to commit.
         [_, "spaces", flow] if *method == Method::DELETE && !flow.is_empty() => {
             Some(Terminated::SpaceTeardown(port, (*flow).to_owned()))
         }
@@ -739,35 +620,14 @@ pub(crate) fn classify(method: &Method, path: &str, query: Option<&str>) -> Opti
     }
 }
 
-/// Whether `query` names `name` at all — a bare `name` with no `=value` still counts, because it
-/// is the *presence* of the parameter that matters at this classifier (not what it says): with
-/// either `since` or `match` present, the merge-on-read route falls through to the proxy instead
-/// of terminating (issue #223 review, B1 — generalised from the `since`-only `has_since_param`
-/// this replaces).
+/// The **raw** value of a query parameter, or `None` when it is absent. A bare `name` with no
+/// `=value` yields `Some("")`, because presence and absence are different requests to every
+/// caller here.
 ///
-/// Raw and case-sensitive, with **no** percent-decoding — deliberately mirroring upstream's own
-/// `query_pairs` key semantics, so this classifier and the proxy target it falls through to agree
-/// on what counts as "the parameter is present" for the identical query string.
-fn has_query_param(query: Option<&str>, name: &str) -> bool {
-    query
-        .unwrap_or_default()
-        .split('&')
-        .any(|pair| pair == name || pair.split_once('=').is_some_and(|(key, _)| key == name))
-}
-
-/// The **raw** value of a query parameter, or `None` when it is absent — [`has_query_param`]'s
-/// matching rules, with the value handed back instead of discarded.
-///
-/// No percent-decoding, for the same reason that function does none: this and the proxy it can
-/// fall through to must agree byte-for-byte about what the query string says. Nothing this reads
-/// ever needs escaping — a cursor token is unpadded base64url (`[A-Za-z0-9_-]`) and the legacy
-/// form it also accepts is decimal digits, neither of which a conforming client encodes. A token
-/// that arrives encoded anyway is, correctly, not a token this node issued, and is refused as one
-/// rather than silently repaired into a position nobody asked for.
-///
-/// A valueless `?since` (no `=`) yields `Some("")`, not `None`: for a cursor those are different
-/// requests — "this token is empty" is a client bug worth a 400, while absence means "start from
-/// the beginning" — and collapsing them would turn the first into the second.
+/// No percent-decoding, deliberately mirroring upstream's own `query_pairs` key semantics: this
+/// and the proxy a request can fall through to must agree byte-for-byte about what the query
+/// string says. Nothing this reads ever needs escaping — the one caller is `/specs/compile`'s
+/// `?port=`/`?name=`, decimal digits and a bare imposter name.
 fn query_param<'q>(query: Option<&'q str>, name: &str) -> Option<&'q str> {
     query
         .unwrap_or_default()
@@ -846,10 +706,16 @@ async fn handle(state: Arc<FrontState>, req: Request<Incoming>) -> Response<Fron
                                 json_content_type(),
                             )
                             .unwrap_or_else(|response| response);
-                            // Same header, same meaning, as the journal merge stamps (#361): the
-                            // members list is folded across peers, and a voter that did not answer
-                            // leaves a row this node could not fill.
-                            if body.partial {
+                            // The one production stamp of `Rift-Cluster-Partial` (D-74), serving
+                            // both `/_fleet/members` and `/_fleet/health`: each body is folded
+                            // across peers, and a voter that did not answer leaves a row (or an
+                            // addend) this node could not fill.
+                            //
+                            // This arm also serves `FleetRoute::Op`, so `body.partial` alone would
+                            // leave "exactly two routes" resting on `FleetBody::local`'s hardcoded
+                            // `partial: false`. `fleet::stamps_partial` names the two routes
+                            // instead, and its own test pins them.
+                            if fleet::stamps_partial(&route, body.partial) {
                                 set_header(&mut response, HEADER_PARTIAL, "true");
                             }
                             response
@@ -899,7 +765,7 @@ async fn handle(state: Arc<FrontState>, req: Request<Incoming>) -> Response<Fron
         };
     }
 
-    if let Some(kind) = classify(req.method(), &path, req.uri().query()) {
+    if let Some(kind) = classify(req.method(), &path) {
         return match authenticate(&state, &req) {
             Ok(()) => terminate(state, req, kind).await,
             Err(response) => response,
@@ -921,14 +787,11 @@ async fn handle(state: Arc<FrontState>, req: Request<Incoming>) -> Response<Fron
         // Likewise the editor's token (C5, #188): the same applied state the write path's
         // precondition will check, read before the move for the same reason.
         let token = imposter_read_token(&state, req.method(), &path, &target.params);
-        let list_read = req.method() == Method::GET && is_imposter_listing(&path);
-        // `numberOfRequests` decoration (issue #223): the single-imposter read and the listing
-        // both carry it, and upstream's own answer is this node's local G-counter slot only —
-        // cloned ahead of `proxy`'s move of `state`, same as `degraded`/`token` above, since the
-        // fleet total is asked for only after the loopback has already answered.
-        let number_of_requests = (list_read
-            || (req.method() == Method::GET && is_single_imposter_read(&path)))
-        .then(|| Arc::clone(&state.journal_net));
+        // `numberOfRequests` is **not** decorated any more (D-74): upstream's own answer — this
+        // node's own count of what this node recorded — is the answer, because the journal is
+        // upstream's own and per node. The fleet-sum rewrite that used to run here is gone with
+        // the merge that produced the other nodes' halves.
+        //
         // `owner` on a space read (issue #359), resolved before `proxy` moves `state` for the
         // same reason `degraded`/`token` are. A flow is the only thing the ring owns, so this is
         // the one read that can name one.
@@ -951,9 +814,6 @@ async fn handle(state: Arc<FrontState>, req: Request<Incoming>) -> Response<Fron
             .flatten()
             .and_then(|port| flow_state_resolved(&state, port));
         let mut response = proxy(state, req, ProxyLeg::Admin).await;
-        if let Some(net) = number_of_requests {
-            response = decorate_number_of_requests(response, &net, JOURNAL_PEER_BUDGET).await;
-        }
         if let Some(owner) = space_flow_owner {
             response = decorate_space_owner(response, owner).await;
         }
@@ -1435,16 +1295,6 @@ fn port_param(params: &[(&'static str, String)]) -> Option<u16> {
         .and_then(|(_, value)| value.parse().ok())
 }
 
-/// Whether `path` addresses the imposter *collection*, whose body lists every imposter the local
-/// engine holds, which is every imposter the fleet has applied to this node.
-///
-/// Named once so the proxied read and the post-mutation re-read cannot disagree about which paths
-/// need narrowing. Them disagreeing is exactly how one of the two shipped unfiltered.
-fn is_imposter_listing(path: &str) -> bool {
-    let path = path.split('?').next().unwrap_or(path);
-    matches!(path, "/imposters" | "/admin/imposters")
-}
-
 /// The `(port, flowId)` of a space read — `GET /imposters/{port}/spaces/{flowId}` — or `None`.
 ///
 /// Exactly the two-segment shape upstream's router matches for `ImposterRoute::Space`; the
@@ -1593,11 +1443,10 @@ fn imposter_read_token(
 /// Whether `path` is exactly the single-imposter read, `/imposters/{port}` — the one proxied read
 /// whose response carries a conditionable record's revision.
 ///
-/// Also matches the `/admin/imposters/{port}` alias (issue #223 review, Important): the
-/// collection listing already answers identically under both spellings (see
-/// [`is_imposter_listing`]), and leaving this one unaware of the alias is exactly how it and the
-/// listing ended up disagreeing about the very same imposter — the listing's `numberOfRequests`
-/// fleet-decorated, the single-imposter alias silently answering this node's local count alone.
+/// Also matches the `/admin/imposters/{port}` alias (issue #223 review, Important): upstream
+/// answers the imposter read identically under both spellings, and leaving this one unaware of
+/// the alias is exactly how the two ended up disagreeing about the very same imposter — one
+/// carrying the revision token and the resolved-knobs block, the other silently not.
 fn is_single_imposter_read(path: &str) -> bool {
     let path = path.split('?').next().unwrap_or(path);
     let mut segments = path.trim_start_matches('/').split('/');
@@ -1611,12 +1460,10 @@ fn is_single_imposter_read(path: &str) -> bool {
 
 /// Add `owner` to a proxied space read (issue #359).
 ///
-/// Purely additive, which is what makes its failure handling differ from
-/// [`decorate_number_of_requests`] below. That one **fails closed** because it *corrects* a value
-/// upstream already answered wrongly — a `numberOfRequests` this node cannot vouch for is worse
-/// than a 500. This one adds a field that is optional by construction: the console renders its
-/// absence as "not known", so a body arriving without `owner` is honest, while a 500 would break a
-/// space read that upstream answered perfectly well.
+/// Purely additive, which is what makes its failure handling differ from a decoration that
+/// *corrects* a value upstream already answered: this one adds a field that is optional by
+/// construction — the console renders its absence as "not known", so a body arriving without
+/// `owner` is honest, while a 500 would break a space read that upstream answered perfectly well.
 ///
 /// So an unparseable body passes through **unchanged and logged**, never silently defaulted: the
 /// caller then sees exactly what upstream sent rather than a laundered version of it, and the log
@@ -1653,9 +1500,10 @@ async fn decorate_space_owner(
 
 /// Add `_rift.flowStateResolved` to a proxied single-imposter read (issue #370).
 ///
-/// Additive, and so it takes [`decorate_space_owner`]'s failure polarity rather than
-/// [`decorate_number_of_requests`]'s: an unparseable body passes through **unchanged and logged**,
-/// never silently defaulted. That is safe here in a way it would not be if this rendered the stored
+/// Additive, and so it takes [`decorate_space_owner`]'s failure polarity: an unparseable body
+/// passes through **unchanged and logged**, never silently defaulted — never the fail-closed
+/// polarity a decoration that *corrects* an upstream value would need. That is safe here in a way
+/// it would not be if this rendered the stored
 /// config — the block is built from the already-parsed knobs ([`ResolvedKnobs`]), so upstream's
 /// redaction of the credentialed `flowState.redis` block cannot be undone by any path through here,
 /// including the failure path.
@@ -1688,14 +1536,15 @@ async fn decorate_flow_state_resolved(
     response
 }
 
-/// Move the headers an earlier decoration set onto a rebuilt response.
+/// Move the proxied response's own headers onto a rebuilt response.
 ///
-/// [`buffered_response`] starts from an **empty** header map. That is right for the first
-/// decoration in a chain and wrong for any later one, and this is the first decoration that runs
-/// after another: on the single-imposter read [`decorate_number_of_requests`] has already stamped
-/// `Rift-Cluster-Partial` when the fleet fan-out could not reach a peer, and dropping it would make
-/// a count that is knowingly missing a node's slot arrive looking authoritative — the wrong-but-
-/// quiet failure that decoration fails closed to avoid in the first place.
+/// [`buffered_response`] starts from an **empty** header map. That is right for a response this
+/// front composes from nothing and wrong for one it *rewrites*: the knobs decoration rebuilds the
+/// body of an answer the embedded engine already produced, and every header that answer carried
+/// — the revision token, a bind-failure marker, upstream's own cache and vary headers — would be
+/// dropped on the floor by a rebuild that started empty, leaving an answer that has silently lost
+/// what it was saying about itself. (Before D-74 the same helper also carried headers across a
+/// chain of front decorations; the single-imposter read now has exactly this one.)
 ///
 /// `content-type` is left as the rebuild set it, and `content-length` is deliberately not carried:
 /// the body it described is not the body being sent.
@@ -1720,8 +1569,9 @@ fn carry_over_headers(response: &mut Response<FrontBody>, previous: &hyper::Head
 /// break rift-verify against an EE cluster, which is what this repo's `parity` job exists to catch.
 ///
 /// Not *byte*-identical: the document round-trips through `serde_json::Value` without
-/// `preserve_order`, so key order comes out normalised. Already true of this path — the
-/// `numberOfRequests` decoration re-serialises the same way — and no consumer depends on it.
+/// `preserve_order`, so key order comes out normalised. This is the only rewrite the
+/// single-imposter read goes through since D-74 (#552) removed the `numberOfRequests` fleet-sum
+/// decoration, and no consumer depends on key order.
 fn rewrite_flow_state_resolved(bytes: &[u8], knobs: &ResolvedKnobs) -> Result<Vec<u8>, String> {
     let mut doc: serde_json::Value = serde_json::from_slice(bytes)
         .map_err(|e| format!("the imposter body was not JSON: {e}"))?;
@@ -1792,114 +1642,6 @@ fn rewrite_space_owner(bytes: &[u8], owner: NodeId) -> Result<Vec<u8>, String> {
     // adjacent routes is a contract a client has to special-case.
     map.insert("owner".to_owned(), serde_json::json!(owner.to_string()));
     serde_json::to_vec(&doc).map_err(|e| e.to_string())
-}
-
-/// Rewrite `numberOfRequests` to the fleet sum on a proxied imposter read (issue #223): after #222
-/// bound the engine to `ClusterJournal`, upstream's own answer is this node's local G-counter slot
-/// only, real but partial — the fleet total is `fleet_count`'s job, fetched over
-/// `/_cluster/journal/counts` under `budget` via [`JournalNet::fleet_counts`]. Runs on both shapes
-/// upstream answers: the listing's array (already narrowed to `owned` by
-/// [`filter_imposter_list`], so only ports the caller can see are ever asked about) and the
-/// single-imposter object.
-///
-/// **Fails closed**, exactly like [`narrow_imposter_listing`]: a body that is not what the
-/// tenancy filter already required refuses rather than passing the un-decorated original through —
-/// a `numberOfRequests` this node cannot vouch for is worse than a 500 that says so.
-async fn decorate_number_of_requests(
-    response: Response<FrontBody>,
-    net: &JournalNet,
-    budget: Duration,
-) -> Response<FrontBody> {
-    let (parts, body) = response.into_parts();
-    if !parts.status.is_success() {
-        return Response::from_parts(parts, body);
-    }
-    let bytes = match body.collect().await {
-        Ok(collected) => collected.to_bytes(),
-        Err(e) => {
-            return internal(&format!(
-                "reading the imposter body to decorate numberOfRequests: {e}"
-            ));
-        }
-    };
-    match rewrite_number_of_requests(&bytes, net, budget).await {
-        Ok((rewritten, partial)) => {
-            let mut response =
-                buffered_response(parts.status, Bytes::from(rewritten), json_content_type())
-                    .unwrap_or_else(|response| response);
-            if partial {
-                set_header(&mut response, HEADER_PARTIAL, "true");
-            }
-            response
-        }
-        Err(e) => internal(&e),
-    }
-}
-
-/// Collect every `port` the body names, ask the fleet for each one's slot in one round trip per
-/// peer, and rewrite `numberOfRequests` in place — `imposters[].numberOfRequests` for the listing,
-/// the one object's field for the single-imposter read.
-async fn rewrite_number_of_requests(
-    bytes: &[u8],
-    net: &JournalNet,
-    budget: Duration,
-) -> Result<(Vec<u8>, bool), String> {
-    let mut doc: serde_json::Value = serde_json::from_slice(bytes).map_err(|e| {
-        format!("the imposter body was not JSON, so numberOfRequests could not be decorated: {e}")
-    })?;
-    let is_listing = doc.get("imposters").and_then(|v| v.as_array()).is_some();
-
-    let ports: Vec<u16> = if is_listing {
-        doc["imposters"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(|entry| entry.get("port").and_then(serde_json::Value::as_u64))
-            .filter_map(|p| u16::try_from(p).ok())
-            .collect()
-    } else {
-        doc.get("port")
-            .and_then(serde_json::Value::as_u64)
-            .and_then(|p| u16::try_from(p).ok())
-            .into_iter()
-            .collect()
-    };
-    // Nothing to decorate — an empty listing, or a body this shouldn't have run against at all —
-    // is not a failure; it just re-encodes unchanged.
-    if ports.is_empty() {
-        return serde_json::to_vec(&doc)
-            .map(|body| (body, false))
-            .map_err(|e| e.to_string());
-    }
-
-    let (totals, partial) = net.fleet_counts(&ports, budget).await;
-    let rewrite_entry = |entry: &mut serde_json::Value| {
-        let Some(port) = entry
-            .get("port")
-            .and_then(serde_json::Value::as_u64)
-            .and_then(|p| u16::try_from(p).ok())
-        else {
-            return;
-        };
-        if let Some(total) = totals.get(&port)
-            && let Some(map) = entry.as_object_mut()
-        {
-            map.insert("numberOfRequests".to_owned(), serde_json::json!(total));
-        }
-    };
-    if is_listing {
-        if let Some(array) = doc.get_mut("imposters").and_then(|v| v.as_array_mut()) {
-            for entry in array {
-                rewrite_entry(entry);
-            }
-        }
-    } else {
-        rewrite_entry(&mut doc);
-    }
-
-    serde_json::to_vec(&doc)
-        .map(|body| (body, partial))
-        .map_err(|e| format!("re-encoding the decorated imposter body: {e}"))
 }
 
 /// `<port>=<reason>` when this node could not realize the addressed imposter's port, else `None`
@@ -2180,48 +1922,19 @@ async fn terminate(
         Terminated::TryImposter(port) => {
             return terminate_try_imposter(&node, req, port).await;
         }
-        // A merge-on-read has nothing to commit, so it returns here for the same reason the
-        // source surface does — none of the `If-Match`/`_rift.script`/loopback-render machinery
-        // below applies.
-        Terminated::ReadSavedRequests(port) => {
-            return terminate_read_saved_requests(&state, port, req.uri().query()).await;
-        }
-        // The live sibling of the read above, and it returns here for the same reason: nothing to
-        // commit, and none of the `If-Match`/`_rift.script`/loopback-render machinery applies to a
-        // response whose body is still being written when the handler returns (issue #348).
-        Terminated::StreamSavedRequests(port) => {
-            return terminate_stream_saved_requests(&state, port, req.headers());
-        }
-        // The fleet pair (issue #362) returns here for the identical reasons — nothing to commit,
-        // and a streamed body outlives the handler.
-        Terminated::ReadFleetRequests => {
-            return terminate_read_fleet_requests(&state, req.uri().query());
-        }
-        Terminated::StreamFleetRequests => {
-            return terminate_stream_fleet_requests(&state, req.headers());
-        }
-        // Only the `?match=`-narrowed form diverts here (issue #223 item 4's original design,
-        // B3 — #224 left it alone deliberately, see `terminate_clear_saved_requests`'s doc): a
-        // scoped clear has no fleet-wide meaning, so it stays a local-only proxy stamped
-        // `Rift-Cluster-Partial`, never a Raft write. The **unscoped** form falls through this
-        // match (to `_ => {}` below) into the ordinary terminated-write pipeline instead — as of
-        // #224 it commits `ControlOp::JournalClearGen` through Raft like any other write, so it
-        // needs exactly the machinery this early return exists to skip.
-        Terminated::ClearSavedRequests(_) if has_query_param(req.uri().query(), "match") => {
-            return terminate_clear_saved_requests(&state, req).await;
-        }
-        // Two independent halves (issue #224): the flow-state teardown proxies exactly as
-        // before this issue, and the journal-generation commit happens alongside it inside
-        // `terminate_space_teardown` itself. Diverted here for the same reason the source
-        // writes and the tenancy surface are — neither half fits `build_mutation`'s single-op,
-        // loopback-rendered shape, and there is nothing to `FetchAfter`/`Captured` from for a
-        // route with no state-machine record of its own.
+        // Two independent halves (issue #537, D-69): the flow-state teardown proxies exactly as
+        // it always has — and clears that space's recorded requests on this node's engine on the
+        // way through, which since D-74 is all the journal side there is — and the replicated
+        // stub delete is committed alongside it inside `terminate_space_teardown` itself.
+        // Diverted here for the same reason the try and the compile are — neither half fits
+        // `build_mutation`'s single-op, loopback-rendered shape, and there is nothing to
+        // `FetchAfter`/`Captured` from for a route with no state-machine record of its own.
         Terminated::SpaceTeardown(port, flow) => {
             return terminate_space_teardown(&state, &node, req, port, flow).await;
         }
-        // A merge-on-read fan-out has nothing to commit, so it returns here for the same reason
-        // `ReadSavedRequests`/`ReadFleetRequests` do above — none of the `If-Match`/`_rift.script`/
-        // loopback-render machinery below applies to a read.
+        // A fan-out read has nothing to commit, so it returns here for the same reason the try
+        // and the compile do above — none of the `If-Match`/`_rift.script`/loopback-render
+        // machinery below applies to a read.
         Terminated::SpacesList(port) => {
             return terminate_spaces_list(&state, &node, port).await;
         }
@@ -2290,728 +2003,30 @@ async fn terminate(
     }
 }
 
-/// `GET /imposters/{port}/requests|savedRequests` with no `?match=` (issues #223, #225): the
-/// fleet-wide merge-on-read `classify` terminated this route for, in both its uncursored and its
-/// `?since=` form.
+/// `DELETE /imposters/{port}/spaces/{flow}`: proxy the flow-state teardown exactly as this route
+/// always has — it is already clustered via `ClusteredFlowStore` — then, only if that teardown
+/// actually happened, commit the space's stub delete through Raft (issue #537, D-69).
 ///
-/// `merge_shards_since`'s gate tests already prove the walk's properties (every entry exactly
-/// once, per-shard gaplessness across membership changes, a token that never regresses, an honest
-/// truncation bit); this is purely turning that outcome into the bytes and headers the openapi
-/// contract pins:
+/// **The journal half is upstream's now (D-74).** The proxied teardown lands in upstream's
+/// `teardown_space`, which already calls `RequestJournal::clear_flow(port, space)` on the way
+/// through — so the space's recorded requests go on the node that took the teardown, which is the
+/// node whose journal they were in. The `ControlOp::JournalClearGen { space: Some(flow), .. }`
+/// this function used to commit alongside existed only to raise a *replicated* clear generation
+/// the merge-on-read consulted; with no merge and no fleet-wide journal, there is nothing for it
+/// to be replicated for.
 ///
-/// - the body stays a **bare JSON array** of `RecordedRequest`, cursored or not — the historical
-///   shape is a compatibility contract, and `matchOutcome` rides inside each entry untouched so
-///   #220's diagnostics survive a merged read for free;
-/// - `x-rift-next-index` carries the **opaque vector token**, replacing #223's withheld-header
-///   convention. #223 withheld it because a scalar index means nothing across shards; #225's
-///   whole point is that there is now a value that does mean something, so withholding it would
-///   leave the client no way to page at all;
-/// - `x-rift-truncated: true` only when the walk really lost entries to eviction, matching the
-///   meaning upstream gives the header.
+/// The stub half stays committed, and must: #537 made space stubs *replicated* config, so a
+/// teardown that only tore down the local engine would be undone by the next
+/// `EngineAction::Sync`, which re-renders every imposter from `sm_configs` and would resurrect the
+/// stubs fleet-wide.
 ///
-/// A malformed token is a **typed 400**, never a defaulted position: silently reading it as 0
-/// would replay the whole journal, and reading it as "current" would skip everything recorded
-/// since — both are wrong-but-quiet, and the wrongness would surface in the client's decoder with
-/// nothing server-side to correlate. Upstream refuses an unparseable `since` the same way.
-async fn terminate_read_saved_requests(
-    state: &Arc<FrontState>,
-    port: u16,
-    query: Option<&str>,
-) -> Response<FrontBody> {
-    let this_node = state.journal_net.node_id();
-    let cursor = match query_param(query, "since") {
-        // Legacy acceptance is deliberate and narrow: a bare `u64` a client holds can only have
-        // come from a per-node proxied read of THIS node, because a merged read has issued no
-        // cursor at all until this issue. Reading it as `{this_node: seq}` is the honest upgrade
-        // -window interpretation; every other shard starts at 0 because the client provably has
-        // seen none of them.
-        Some(raw) => match JournalCursor::decode_or_legacy(raw, this_node) {
-            Ok(cursor) => Some(cursor),
-            Err(e) => {
-                return typed_error(
-                    StatusCode::BAD_REQUEST,
-                    ErrorKind::BadData,
-                    &format!("since is not a usable cursor: {e}"),
-                );
-            }
-        },
-        // Absent `since` is a **baseline** read, and stays `None` all the way down rather than
-        // becoming a cursor at position zero. The two differ in exactly one observable: a
-        // baseline read is a snapshot and can never be truncated, while a reader who claims a
-        // position of zero has provably missed whatever eviction removed. Upstream and this
-        // crate's single-node path both draw that line, so collapsing it here would make every
-        // ordinary uncursored read of an evicting port answer `x-rift-truncated: true`.
-        None => None,
-    };
-
-    let page = state
-        .journal_net
-        .merge_read_since(port, cursor.as_ref(), JOURNAL_PEER_BUDGET)
-        .await;
-    let requests: Vec<&RecordedRequest> = page.entries.iter().map(|entry| &entry.request).collect();
-    match serde_json::to_vec(&requests) {
-        Ok(bytes) => {
-            // Headers are set only on a response that carries the body they describe: a 500
-            // from `buffered_response` must not advertise a cursor for a page nobody received,
-            // which is why upstream splits its own cursor-response builder the same way.
-            match buffered_response(StatusCode::OK, Bytes::from(bytes), json_content_type()) {
-                Ok(mut response) => {
-                    set_header(&mut response, HEADER_NEXT_INDEX, &page.next.encode());
-                    if page.truncated {
-                        set_header(&mut response, HEADER_TRUNCATED, "true");
-                    }
-                    if page.partial {
-                        set_header(&mut response, HEADER_PARTIAL, "true");
-                    }
-                    response
-                }
-                Err(response) => response,
-            }
-        }
-        // Fails closed like `narrow_imposter_listing`: a body this node cannot encode must not
-        // become a 200 with nothing in it, which would read as "no requests ever recorded" to
-        // whatever is asserting against this.
-        Err(e) => internal(&format!("encoding the merged journal read: {e}")),
-    }
-}
-
-/// The ports one fleet journal answer covers, and what it left out — resolved from the caller's
-/// Every port the fleet has an applied config for — the walk both the fleet read and the fleet
-/// stream take (issue #362).
-///
-/// Resolved per call, never frozen: an imposter created after a stream connects belongs in the
-/// walk, and a deleted one does not.
-///
-/// Carries a `result_large_err` allow because the error *is* a built `Response`, which is the
-/// whole point — a refusal here is already the answer to send, not a code some caller has to
-/// re-render.
-#[allow(clippy::result_large_err)]
-fn fleet_ports(state: &Arc<FrontState>) -> Result<Vec<u16>, Response<FrontBody>> {
-    let Some(node) = state.node.upgrade() else {
-        return Err(typed_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            ErrorKind::Unavailable,
-            "cluster node is shutting down",
-        ));
-    };
-    node.configured_ports()
-        .map_err(|e| internal(&e.to_string()))
-}
-
-/// The `coverage` block every fleet journal answer carries — the stated cap (issue #362, AC3).
-///
-/// D-32: `coverage: {covered, total, omitted, capped}` is on every fleet read and re-announced
-/// on the stream whenever the covered set moves, so a capped view is never mistaken for the whole.
-///
-/// `omitted` names the ports rather than counting them: "3 imposters were left out" tells an
-/// operator their view is short, while naming them tells them whose traffic they are not seeing.
-fn coverage_json(coverage: &Coverage) -> serde_json::Value {
-    serde_json::json!({
-        "covered": coverage.covered,
-        "total": coverage.total(),
-        "omitted": coverage.omitted,
-        "capped": coverage.is_capped(),
-    })
-}
-
-/// One row of a fleet journal answer: the recorded request, plus which imposter it was recorded on.
-///
-/// The port is what makes a merged fleet row readable at all — without it the answer is a pile of
-/// requests with no way to tell which mock served them.
-fn fleet_row(event: &FleetTailEvent) -> serde_json::Value {
-    serde_json::json!({
-        "port": event.port,
-        "flowId": event.entry.flow_id,
-        "request": event.entry.request,
-    })
-}
-
-/// `GET /admin/requests` (issue #362) — the fleet's whole request journal, merged server-side and
-/// resumable through one cursor.
-///
-/// This is `terminate_read_saved_requests` across every applied imposter, and it exists
-/// because assembling the same view in the console cost N requests per poll, an ordering that was
-/// an artifact of which response arrived first, N independent cursors that could drop or replay
-/// entries at a poll boundary, and a **silent** truncation at the first 25 ports. Each of those is
-/// answered here: one request, one order by recorded timestamp, one exact cursor, and a cap that
-/// states what it left out.
-///
-/// A missing `?since=` is a baseline read, exactly as it is per imposter: every covered port serves
-/// its retained history. Because a baseline names no port, every covered port is a join — so the
-/// answer declares them in `joined`, which is what tells a *resuming* client which ports may repeat
-/// entries it has already seen.
-fn terminate_read_fleet_requests(
-    state: &Arc<FrontState>,
-    query: Option<&str>,
-) -> Response<FrontBody> {
-    let cursor = match query_param(query, "since") {
-        Some(raw) => match FleetCursor::decode(raw) {
-            Ok(cursor) => Some(cursor),
-            // Refused, never defaulted, for `JournalCursor`'s reason: defaulting to the beginning
-            // replays the whole journal and defaulting to "now" silently skips everything since the
-            // token went stale. `CursorError::WrongScope` is what lets this message tell a caller
-            // who pasted a per-imposter token which endpoint takes it.
-            Err(e) => {
-                return typed_error(
-                    StatusCode::BAD_REQUEST,
-                    ErrorKind::BadData,
-                    &format!("since is not a usable fleet cursor: {e}"),
-                );
-            }
-        },
-        None => None,
-    };
-
-    let ports = match fleet_ports(state) {
-        Ok(ports) => ports,
-        Err(response) => return response,
-    };
-
-    let page = state.journal_net.fleet_page(
-        &ports,
-        state.fleet_journal_port_cap,
-        cursor.as_ref(),
-        // A read serves history: a joining port's retained entries are exactly what the caller
-        // asked for, and `joined` declares where duplicates are possible.
-        JoinMode::Replay,
-        // No `id:` lines to emit, so no per-event token is folded — see `IdPolicy`.
-        IdPolicy::PageOnly,
-    );
-
-    let body = serde_json::json!({
-        "requests": page.events.iter().map(fleet_row).collect::<Vec<_>>(),
-        "cursor": page.next.encode(),
-        "coverage": coverage_json(&page.coverage),
-        "joined": page.joined,
-    });
-
-    match serde_json::to_vec(&body) {
-        Ok(bytes) => {
-            match buffered_response(StatusCode::OK, Bytes::from(bytes), json_content_type()) {
-                Ok(mut response) => {
-                    // The same three headers the per-imposter read sets, meaning the same three things
-                    // — so a client that already understands one read understands this one.
-                    set_header(&mut response, HEADER_NEXT_INDEX, &page.next.encode());
-                    if page.truncated {
-                        set_header(&mut response, HEADER_TRUNCATED, "true");
-                    }
-                    if page.partial {
-                        set_header(&mut response, HEADER_PARTIAL, "true");
-                    }
-                    response
-                }
-                Err(response) => response,
-            }
-        }
-        // Fails closed like the per-imposter read: a body this node cannot encode must not become a
-        // 200 with nothing in it, which reads as "no requests ever recorded".
-        Err(e) => internal(&format!("encoding the fleet journal read: {e}")),
-    }
-}
-
-/// How often an idle stream emits `: ping`, matching upstream's `HEARTBEAT` exactly so a load
-/// balancer's idle timeout behaves the same clustered as it does single-node.
-const STREAM_HEARTBEAT: Duration = Duration::from_secs(15);
-
-/// Smallest gap between two drains of one stream. The append signal is journal-wide (one channel
-/// per journal, not per port), so recording on ANY imposter wakes every attached tail; without a
-/// floor here a busy node would have each tail re-merging back-to-back, overwhelmingly to produce
-/// empty pages for ports its client never asked about. Far below the anti-entropy cadence a tail
-/// declares, so it costs no visible latency.
-const STREAM_DRAIN_DEBOUNCE: Duration = Duration::from_millis(25);
-
-/// Write-side buffer for the SSE channel, upstream's `CHANNEL_BUFFER` verbatim. A client this far
-/// behind on the socket blocks the forwarder on `send_data`, which is what turns a slow reader
-/// into *its own* cursor stalling rather than into unbounded memory here.
-const STREAM_CHANNEL_BUFFER: usize = 16;
-
-/// One SSE frame. `id` is a cursor token rather than upstream's scalar bus seq — the one
-/// deliberate divergence in the framing, and the reason the tail and the `?since=` read are the
-/// same contract.
-fn sse_frame(event: &str, id: Option<&str>, data: &serde_json::Value) -> Bytes {
-    let mut frame = format!("event: {event}\n");
-    if let Some(id) = id {
-        frame.push_str(&format!("id: {id}\n"));
-    }
-    frame.push_str(&format!("data: {data}\n\n"));
-    Bytes::from(frame)
-}
-
-/// `GET /imposters/{port}/savedRequests/stream` with no `?match=` (issue #348) — the merged,
-/// fleet-wide live tail.
-///
-/// **Shape:** a cursor walk that never ends. Every wake re-runs `merge_cached_since` — the same
-/// `merge_shards_since` the `?since=` read runs — from the cursor this connection holds, emits
-/// whatever is new, and folds the cursor forward. Live tailing, a `Last-Event-ID` reconnect and a
-/// polled cursor read are therefore one code path, which is what makes "the `id:` after an event
-/// is the token a simultaneous cursor read would return" true by construction rather than by
-/// test.
-///
-/// **Latency is declared, not pretended away.** Local entries surface as soon as the journal's
-/// append signal fires. *Peer* entries cannot: they arrive in the replica cache on the
-/// anti-entropy cadence, and asking every peer per wake would multiply inter-node traffic by the
-/// number of attached clients. So the tail rides that cadence and says so — `hello` carries
-/// `clusterTailLatencyMs`, and the number is the interval the loop was actually started with.
-///
-/// **What is deliberately different from upstream's stream**, all additive per Ch.12's standing
-/// gate: `hello` carries `clusterTailLatencyMs` and `cursor` and omits upstream's scalar `seq`
-/// (a merged stream has no single bus position); `id:` is the vector cursor token; and `index` is
-/// emitted only for entries this node wrote — a peer's bare seq means nothing in this node's
-/// numbering, and offering it would invite a client to present another shard's position as a
-/// legacy scalar `?since=`.
-fn terminate_stream_saved_requests(
-    state: &Arc<FrontState>,
-    port: u16,
-    headers: &hyper::HeaderMap,
-) -> Response<FrontBody> {
-    let this_node = state.journal_net.node_id();
-    // A reconnect presents the id of the last event it actually received. Same acceptance as the
-    // read path's `?since=`, legacy scalar included, so a client can move between the two modes
-    // with one token — and the same typed 400 rather than a defaulted position, because
-    // defaulting either replays everything or silently skips it.
-    let resume = match headers.get("last-event-id") {
-        None => None,
-        Some(value) => {
-            let Ok(raw) = value.to_str() else {
-                return typed_error(
-                    StatusCode::BAD_REQUEST,
-                    ErrorKind::BadData,
-                    "Last-Event-ID is not readable ASCII; expected a cursor token",
-                );
-            };
-            match JournalCursor::decode_or_legacy(raw, this_node) {
-                Ok(cursor) => Some(cursor),
-                Err(e) => {
-                    return typed_error(
-                        StatusCode::BAD_REQUEST,
-                        ErrorKind::BadData,
-                        &format!("Last-Event-ID is not a usable cursor: {e}"),
-                    );
-                }
-            }
-        }
-    };
-
-    let journal_net = Arc::clone(&state.journal_net);
-    let tail_latency = journal_net.tail_latency();
-
-    // Subscribed BEFORE the baseline position is read, and the order is load-bearing. `subscribe`
-    // marks a receiver as having already seen the channel's current value, so a recording that
-    // lands between the read and the subscribe would be above the baseline — owed to this client —
-    // yet leave no bump for it to wake on. The entry would then sit unsent until some later
-    // append, tick, or the cadence timer, which is exactly the "local entries surface immediately"
-    // promise below broken. Subscribing first can only cost a spurious first wake, which drains
-    // nothing and is free.
-    let mut appends = journal_net.journal_changes();
-    let mut ticks = journal_net.tick_changes();
-
-    // A plain connect is live-only: take the position a baseline cursor read would answer with and
-    // emit nothing for it. That is upstream's contract too — v1 never replays on connect, and a
-    // client that wants history polls the read. A reconnect instead starts from the presented
-    // token, so its first drain IS the catch-up, which is where zero-loss comes from.
-    let (mut cursor, mut drain_now) = match resume {
-        Some(cursor) => (cursor, true),
-        None => (journal_net.merge_cached_since(port, None).next, false),
-    };
-
-    let hello = serde_json::json!({
-        "engineVersion": rift_cluster_base::version(),
-        "types": ["requests"],
-        "port": port,
-        "clusterTailLatencyMs": u64::try_from(tail_latency.as_millis()).unwrap_or(u64::MAX),
-        "cursor": cursor.encode(),
-    });
-
-    let (mut tx, body) = Channel::<Bytes, hyper::Error>::new(STREAM_CHANNEL_BUFFER);
-
-    tokio::spawn(async move {
-        if tx
-            .send_data(sse_frame("hello", None, &hello))
-            .await
-            .is_err()
-        {
-            return;
-        }
-        let mut heartbeat = tokio::time::interval(STREAM_HEARTBEAT);
-        heartbeat.tick().await; // the immediate first tick, consumed so no ping fires now
-        // A floor under how often peer entries are looked for, even if no tick ever reports having
-        // merged anything new — the declared latency has to hold whether or not the cache moved.
-        let mut cadence = tokio::time::interval(tail_latency);
-        cadence.tick().await;
-        // Only transitions are announced, so a healthy stream stays silent and a degraded one says
-        // so exactly once until it recovers.
-        let mut declared_partial = false;
-
-        loop {
-            if drain_now {
-                drain_now = false;
-                let page = journal_net.tail_page(port, &cursor);
-
-                if page.truncated {
-                    // Upstream's `lagged` means "there is a gap; reconcile by polling", which is
-                    // precisely what truncation means here — entries this reader had not reached
-                    // were dropped by retention. Reusing the event name keeps one vocabulary.
-                    let frame = sse_frame(
-                        "lagged",
-                        None,
-                        &serde_json::json!({ "truncated": true, "cursor": page.next.encode() }),
-                    );
-                    if tx.send_data(frame).await.is_err() {
-                        return;
-                    }
-                }
-                if page.partial != declared_partial {
-                    declared_partial = page.partial;
-                    let frame = sse_frame(
-                        "partial",
-                        None,
-                        &serde_json::json!({ "partial": declared_partial }),
-                    );
-                    if tx.send_data(frame).await.is_err() {
-                        return;
-                    }
-                }
-
-                // Emission order and the per-event token both come from `tail_page`: they are
-                // one rule (a token is only sound over a per-shard seq-ascending sequence) and it
-                // lives with the walk, not here.
-                for event in &page.events {
-                    let entry = &event.entry;
-                    let id = event.id.encode();
-
-                    let mut data = serde_json::json!({
-                        "port": port,
-                        "flowId": entry.flow_id,
-                        "request": entry.request,
-                    });
-                    if entry.node_id == this_node {
-                        // Parity with the proxied single-node stream, which carries the local
-                        // journal index. Withheld for peer entries on purpose: that seq is a
-                        // position in *another* shard, and this field is what a client would hand
-                        // back as a legacy scalar `?since=`, where it would be read as ours.
-                        data["index"] = serde_json::json!(entry.seq);
-                    }
-                    if tx
-                        .send_data(sse_frame("request", Some(&id), &data))
-                        .await
-                        .is_err()
-                    {
-                        return;
-                    }
-                }
-                // Adopt the page token even when the drain emitted nothing: it additionally covers
-                // ranges the shards no longer hold (evicted, or dropped by a clear generation), so
-                // a cursor left at the running fold would re-examine and re-reject them on every
-                // wake for the life of the connection.
-                cursor = page.next;
-                tokio::time::sleep(STREAM_DRAIN_DEBOUNCE).await;
-                continue;
-            }
-
-            tokio::select! {
-                // A local append is visible immediately; this is what keeps single-node latency
-                // indistinguishable from upstream's.
-                result = appends.changed() => {
-                    if result.is_err() {
-                        return; // the journal is gone: the node is shutting down
-                    }
-                    drain_now = true;
-                }
-                // A tick that merged something new — how peer entries arrive.
-                result = ticks.changed() => {
-                    if result.is_err() {
-                        return;
-                    }
-                    drain_now = true;
-                }
-                _ = cadence.tick() => drain_now = true,
-                _ = heartbeat.tick() => {
-                    if tx.send_data(Bytes::from_static(b": ping\n\n")).await.is_err() {
-                        return;
-                    }
-                }
-            }
-        }
-    });
-
-    match Response::builder()
-        .status(StatusCode::OK)
-        .header("Content-Type", "text/event-stream")
-        .header("Cache-Control", "no-cache")
-        // Defeat proxy/response buffering so events reach the client immediately — upstream sets
-        // the same header for the same reason.
-        .header("X-Accel-Buffering", "no")
-        .body(body.boxed())
-    {
-        Ok(response) => response,
-        // Unreachable in practice (a static status and three static headers), but this file's rule
-        // is that a failure surfaces rather than becoming a wrong-status 200.
-        Err(e) => internal(&format!("building the savedRequests stream response: {e}")),
-    }
-}
-
-/// `GET /admin/requests/stream` (issue #362) — the live fleet journal.
-///
-/// Structurally `terminate_stream_saved_requests` with a fleet cursor and a port set instead of one
-/// port, deliberately: the two are the same walk, and keeping the shapes identical is what makes
-/// "the `id:` after an event is the token a simultaneous fleet read would return" true by
-/// construction. Everything load-bearing there is load-bearing here for the same reasons — the
-/// subscribe-before-baseline ordering, the debounce, the declared `clusterTailLatencyMs`, and the
-/// `partial`/`lagged` vocabulary.
-///
-/// One event is new. `coverage` is emitted in `hello` and again whenever the covered set changes,
-/// because the cap is dynamic: a port that goes quiet can be displaced by one that wakes up, and a
-/// client whose view silently narrowed would have no way to know. Announced on change only, so a
-/// steady fleet stays quiet.
-fn terminate_stream_fleet_requests(
-    state: &Arc<FrontState>,
-    headers: &hyper::HeaderMap,
-) -> Response<FrontBody> {
-    let resume = match headers.get("last-event-id") {
-        None => None,
-        Some(value) => {
-            let Ok(raw) = value.to_str() else {
-                return typed_error(
-                    StatusCode::BAD_REQUEST,
-                    ErrorKind::BadData,
-                    "Last-Event-ID is not readable ASCII; expected a fleet cursor token",
-                );
-            };
-            match FleetCursor::decode(raw) {
-                Ok(cursor) => Some(cursor),
-                Err(e) => {
-                    return typed_error(
-                        StatusCode::BAD_REQUEST,
-                        ErrorKind::BadData,
-                        &format!("Last-Event-ID is not a usable fleet cursor: {e}"),
-                    );
-                }
-            }
-        }
-    };
-
-    // Resolved once here only to fail fast — a caller whose port set cannot be read should get a
-    // status code, not an SSE stream that dies on its first drain. The value is deliberately NOT
-    // carried into the task: see the re-resolution inside the loop.
-    if let Err(response) = fleet_ports(state) {
-        return response;
-    }
-
-    let journal_net = Arc::clone(&state.journal_net);
-    let cap = state.fleet_journal_port_cap;
-    let owner = Arc::clone(state);
-    let tail_latency = journal_net.tail_latency();
-    let this_node = journal_net.node_id();
-
-    // Subscribed BEFORE the baseline is read, and the order is load-bearing for the reason issue
-    // #348 records: `subscribe` marks a receiver as having seen the channel's current value, so a
-    // recording landing between the read and the subscribe would be owed to this client yet leave
-    // no bump to wake on. Subscribing first can only cost a spurious first wake, which is free.
-    let mut appends = journal_net.journal_changes();
-    let mut ticks = journal_net.tick_changes();
-
-    // A plain connect is live-only — every covered port adopts its baseline and replays nothing,
-    // which is `JoinMode::Live` applied across the set. A reconnect starts from the presented
-    // token, so its first drain IS the catch-up, and that is where zero-loss comes from.
-    // The set as it stands at connect, for `hello` only. Every drain re-derives its own.
-    let ports = fleet_ports(state).unwrap_or_default();
-    let (mut cursor, mut drain_now) = match resume {
-        Some(cursor) => (cursor, true),
-        None => (
-            journal_net
-                .fleet_page(&ports, cap, None, JoinMode::Live, IdPolicy::PageOnly)
-                .next,
-            false,
-        ),
-    };
-
-    let baseline = journal_net.coverage_for(&ports, cap);
-    let hello = serde_json::json!({
-        "engineVersion": rift_cluster_base::version(),
-        "types": ["requests"],
-        "scope": "fleet",
-        "clusterTailLatencyMs": u64::try_from(tail_latency.as_millis()).unwrap_or(u64::MAX),
-        "cursor": cursor.encode(),
-        "coverage": coverage_json(&baseline),
-    });
-    let mut declared_coverage = baseline;
-
-    let (mut tx, body) = Channel::<Bytes, hyper::Error>::new(STREAM_CHANNEL_BUFFER);
-
-    tokio::spawn(async move {
-        if tx
-            .send_data(sse_frame("hello", None, &hello))
-            .await
-            .is_err()
-        {
-            return;
-        }
-        let mut heartbeat = tokio::time::interval(STREAM_HEARTBEAT);
-        heartbeat.tick().await;
-        let mut cadence = tokio::time::interval(tail_latency);
-        cadence.tick().await;
-        let mut declared_partial = false;
-
-        loop {
-            if drain_now {
-                drain_now = false;
-                // **Re-resolved every drain, never captured.** A stream lives indefinitely and the
-                // fleet's imposter set does not: an imposter created after the connect belongs in
-                // the walk, and a deleted one does not. A set frozen at connect would keep reading
-                // a shard the fleet no longer has and would never show a new imposter at all. The
-                // read path re-resolves per request for the same reason; this is what makes the
-                // two agree about what "the fleet" means at any instant.
-                let Ok(ports) = fleet_ports(&owner) else {
-                    // Only reachable when the node is shutting down. Ending the stream is the
-                    // honest answer — the client reconnects and gets a status code.
-                    return;
-                };
-                let page = journal_net.fleet_page(
-                    &ports,
-                    cap,
-                    Some(&cursor),
-                    // A port that (re-)enters coverage mid-stream starts live: replaying its
-                    // history into an open tail would look like a burst of new traffic that never
-                    // happened. `coverage` below is what tells the client its view widened.
-                    JoinMode::Live,
-                    IdPolicy::PerEvent,
-                );
-
-                if page.coverage != declared_coverage {
-                    declared_coverage = page.coverage.clone();
-                    let frame = sse_frame("coverage", None, &coverage_json(&declared_coverage));
-                    if tx.send_data(frame).await.is_err() {
-                        return;
-                    }
-                }
-                if page.truncated {
-                    let frame = sse_frame(
-                        "lagged",
-                        None,
-                        &serde_json::json!({ "truncated": true, "cursor": page.next.encode() }),
-                    );
-                    if tx.send_data(frame).await.is_err() {
-                        return;
-                    }
-                }
-                if page.partial != declared_partial {
-                    declared_partial = page.partial;
-                    let frame = sse_frame(
-                        "partial",
-                        None,
-                        &serde_json::json!({ "partial": declared_partial }),
-                    );
-                    if tx.send_data(frame).await.is_err() {
-                        return;
-                    }
-                }
-
-                for event in &page.events {
-                    let mut data = fleet_row(event);
-                    if event.entry.node_id == this_node {
-                        // Parity with the per-imposter stream, and withheld for peer entries for
-                        // its reason: that seq is a position in another node's shard, and this is
-                        // the field a client would hand back as a legacy scalar `?since=`.
-                        data["index"] = serde_json::json!(event.entry.seq);
-                    }
-                    // An absent id omits the line rather than substituting the page token — see
-                    // `FleetTailEvent::id`. Under `PerEvent` it is always present; the fallback
-                    // costs a duplicate on reconnect and can never skip an entry.
-                    let id = event.id.as_ref().map(FleetCursor::encode);
-                    if tx
-                        .send_data(sse_frame("request", id.as_deref(), &data))
-                        .await
-                        .is_err()
-                    {
-                        return;
-                    }
-                }
-
-                cursor = page.next;
-                tokio::time::sleep(STREAM_DRAIN_DEBOUNCE).await;
-                continue;
-            }
-
-            tokio::select! {
-                result = appends.changed() => {
-                    if result.is_err() {
-                        return; // the journal is gone: the node is shutting down
-                    }
-                    drain_now = true;
-                }
-                result = ticks.changed() => {
-                    if result.is_err() {
-                        return;
-                    }
-                    drain_now = true;
-                }
-                _ = cadence.tick() => drain_now = true,
-                _ = heartbeat.tick() => {
-                    if tx.send_data(Bytes::from_static(b": ping\n\n")).await.is_err() {
-                        return;
-                    }
-                }
-            }
-        }
-    });
-
-    match Response::builder()
-        .status(StatusCode::OK)
-        .header("Content-Type", "text/event-stream")
-        .header("Cache-Control", "no-cache")
-        .header("X-Accel-Buffering", "no")
-        .body(body.boxed())
-    {
-        Ok(response) => response,
-        Err(e) => internal(&format!(
-            "building the fleet savedRequests stream response: {e}"
-        )),
-    }
-}
-
-/// `DELETE /imposters/{port}/requests|savedRequests` **with `?match=`** (issue #223 item 4's
-/// original design, B3 — reachable only for the scoped form as of issue #224; see
-/// `Terminated::ClearSavedRequests`'s own doc for where the unscoped form went).
-///
-/// Design decision (issue #223 review, B3), unchanged by #224: a `?match=` clear stays
-/// **local-only**, proxied to the local engine exactly as any other proxied write is, and always
-/// stamped `Rift-Cluster-Partial: true`. #224 gave the *unscoped* clear a wire format that can
-/// carry real fleet-wide meaning (a Raft-committed generation bump) — but the wire a scoped clear
-/// would need is a different, harder problem this issue does not solve: `ControlOp::JournalClearGen`
-/// carries a `space`, not an arbitrary match predicate, so a `?match=` filter (an SDK's own
-/// `flowId`/method/path clause) has nowhere to travel that isn't either dropped or misrepresented
-/// as a full-space clear. Committing the wrong, wider thing would be worse than staying local: a
-/// client that asked to clear ten of a space's two hundred entries would find all two hundred
-/// gone fleet-wide instead. So this stays exactly what B3 shipped it as — a local, honestly
-/// partial clear — until a predicate-carrying op is designed for it.
-async fn terminate_clear_saved_requests(
-    state: &Arc<FrontState>,
-    req: Request<Incoming>,
-) -> Response<FrontBody> {
-    let mut response = proxy(Arc::clone(state), req, ProxyLeg::Admin).await;
-    // Stamped only for a clear the local engine actually performed: a 404/409/etc. means nothing
-    // was cleared on this node, and claiming a scoped-but-honest partial regardless would attach
-    // the header to a request that never actually cleared anything.
-    if response.status().is_success() {
-        set_header(&mut response, HEADER_PARTIAL, "true");
-    }
-    response
-}
-
-/// `DELETE /imposters/{port}/spaces/{flow}` (issue #224): proxy the flow-state teardown exactly
-/// as this route always has — it is already clustered via `ClusteredFlowStore`, and #224 does not
-/// touch that half — then, only if that teardown actually happened, additionally commit
-/// `ControlOp::JournalClearGen { space: Some(flow), .. }` through Raft so every node's own
-/// journal starts dropping that space's pre-clear entries too, the space-scoped sibling of what
-/// the unscoped `savedRequests` clear now commits for a whole port.
-///
-/// Ordering mirrors `terminate_clear_saved_requests`'s own "only act on a clear that really
-/// happened" rule: a proxy failure means the flow-state store was never touched, so there is
-/// nothing for the journal half to record either. The reverse failure — proxy succeeds but the
-/// commit does not — is answered as an error rather than swallowed (this file's production rule:
-/// a failed commit must surface, never a silent 200), even though the flow-state half has by then
-/// already torn down; there is no atomic way to straddle a proxied side effect and a Raft write,
-/// and reporting the honest partial failure is better than hiding it behind the proxy's own 200.
+/// Ordering is "only act on a teardown that really happened": a proxy failure means the
+/// flow-state store was never touched, so there is nothing for the stub half to record either.
+/// The reverse failure — proxy succeeds but the commit does not — is answered as an error rather
+/// than swallowed (this file's production rule: a failed commit must surface, never a silent
+/// 200), even though the flow-state half has by then already torn down; there is no atomic way to
+/// straddle a proxied side effect and a Raft write, and reporting the honest partial failure is
+/// better than hiding it behind the proxy's own 200.
 async fn terminate_space_teardown(
     state: &Arc<FrontState>,
     node: &Arc<RaftNode>,
@@ -3023,46 +2038,22 @@ async fn terminate_space_teardown(
     if !response.status().is_success() {
         return response;
     }
-    // Two committed halves, in this order. The journal clear is #224's; the stub delete is #537's
-    // and exists because that issue made space stubs *replicated*: a teardown that only tore down
-    // the local engine would be undone by the next `EngineAction::Sync`, which re-renders every
-    // imposter from `sm_configs` — so the stubs would come back fleet-wide, which is worse than
-    // the node-local staleness #537 set out to fix.
-    //
-    // Committed op-by-op rather than atomically, which is what `run_mutation` already does for
-    // every multi-op mutation. A partial (journal cleared, stubs not) is surfaced as an error by
-    // the helper rather than hidden behind the proxy's 200, the same doctrine this function
-    // already applies to the proxied half.
-    for (op, what) in [
-        (
-            ControlOp::JournalClearGen {
-                port,
-                space: Some(flow.clone()),
-            },
-            "journal clear",
-        ),
-        (
-            ControlOp::PatchStubs {
-                port,
-                edit: StubEditScript(vec![StubEdit::DeleteBySpace {
-                    space: flow.clone(),
-                }]),
-            },
-            "space-stub delete",
-        ),
-    ] {
-        if let Err(error) = commit_teardown_half(node, op, what).await {
-            return error;
-        }
+    let op = ControlOp::PatchStubs {
+        port,
+        edit: StubEditScript(vec![StubEdit::DeleteBySpace { space: flow }]),
+    };
+    match commit_teardown_half(node, op, "space-stub delete").await {
+        Ok(()) => response,
+        Err(error) => error,
     }
-    response
 }
 
-/// Commit one half of a space teardown, after its proxied flow-state half already succeeded.
+/// Commit the replicated half of a space teardown, after its proxied flow-state half already
+/// succeeded.
 ///
-/// `what` names the half in every failure message, because the caller commits more than one and
-/// "the teardown failed" would not say which — and the halves fail for different reasons and are
-/// recovered differently.
+/// `what` names the half in every failure message rather than being folded into a constant
+/// string: "the teardown failed" would not say which side of the proxy boundary broke, and the
+/// two sides are recovered differently.
 ///
 /// The reverse failure — proxy succeeded, this did not — is answered as an error rather than
 /// swallowed (this file's production rule: a failed commit must surface, never a silent 200), even
@@ -3177,7 +2168,7 @@ async fn terminate_spaces_list(
         Some(prefix) => {
             state
                 .flow_net
-                .fleet_spaces(port, prefix, JOURNAL_PEER_BUDGET)
+                .fleet_spaces(port, prefix, FLEET_PEER_BUDGET)
                 .await
         }
     };
@@ -4457,74 +3448,38 @@ async fn build_mutation(
                 },
             })
         }
-        // `terminate` diverts the tenancy surface to `terminate_tenancy` before
-        // this is reached, so this arm is unreachable through the front's own
-        // routing. Answered as an internal error rather than `unreachable!`:
-        // if a future edit *does* route one here, a 500 names a bug in this
-        // file, whereas a panic would take the whole admin listener down with
-        // it — and an admin front that dies on a routing mistake is a worse
-        // failure than the mistake.
-        // Not a `ControlOp` at all — the merged read has nothing to commit — and diverts to its
-        // own `terminate_*` handler before this is ever reached.
-        Terminated::ReadSavedRequests(_) => Err(internal(
-            "the merged journal read is served by terminate_read_saved_requests, not build_mutation",
-        )),
-        // Same shape as the read above, and diverted in `terminate` for the same reason.
-        Terminated::StreamSavedRequests(_) => Err(internal(
-            "the merged journal tail is served by terminate_stream_saved_requests, not build_mutation",
-        )),
-        // The fleet pair (issue #362), diverted in `terminate` exactly as the per-imposter pair is.
-        Terminated::ReadFleetRequests => Err(internal(
-            "the fleet journal read is served by terminate_read_fleet_requests, not build_mutation",
-        )),
-        Terminated::StreamFleetRequests => Err(internal(
-            "the fleet journal tail is served by terminate_stream_fleet_requests, not build_mutation",
-        )),
-        // Only the **unscoped** form of the clear reaches here (issue #224): the `?match=`
-        // narrowed form diverts to `terminate_clear_saved_requests` in `terminate` before
-        // `build_mutation` is ever called (see that match arm's own comment), so `kind` is
-        // always the port-wide clear here, never the scoped one.
-        Terminated::ClearSavedRequests(port) => Ok(Mutation {
-            ops: vec![ControlOp::JournalClearGen { port, space: None }],
-            port: Some(port),
-            // Byte-identical to what upstream's own `handle_clear_requests` answers with
-            // (`handle_get(port, ...)`, the imposter's own `GET` representation) — a re-render,
-            // not a canned message, is what "re-render the imposter as upstream does" means here.
-            render: Render::FetchAfter {
-                path: format!("/imposters/{port}"),
-                status: StatusCode::OK,
-            },
-        }),
-        // The proxy-recording sibling of the clear above (issue #226): one committed op
-        // deletes the port's exactly-once markers fleet-wide, and every node's stale
-        // completion-cache entries retire against the applied state (`completed_lookup`'s
-        // revision check) — no fan-out, nothing a partitioned peer can miss forever.
+        // `DELETE /imposters/{port}/savedProxyResponses` (issue #226): one committed op deletes
+        // the port's exactly-once markers fleet-wide, and every node's stale completion-cache
+        // entries retire against the applied state (`completed_lookup`'s revision check) — no
+        // fan-out, nothing a partitioned peer can miss forever. This is the one clear on this
+        // front that still commits; the `savedRequests` clear is the local engine's own again
+        // (D-74), proxied like every other verb on that path.
         Terminated::ClearSavedProxyResponses(port) => Ok(Mutation {
             ops: vec![ControlOp::ProxyRecordedClear { port }],
             port: Some(port),
-            // Same re-render upstream's own clear answers with, for the same reason as
-            // `ClearSavedRequests` above.
+            // Byte-identical to what upstream's own clear answers with (`handle_get(port, ...)`,
+            // the imposter's own `GET` representation) — a re-render, not a canned message, is
+            // what "re-render the imposter as upstream does" means here.
             render: Render::FetchAfter {
                 path: format!("/imposters/{port}"),
                 status: StatusCode::OK,
             },
         }),
-        // Neither half of a space teardown is a single `ControlOp` `build_mutation` can render
-        // the normal way: the flow-state half is a proxy, not a state-machine record with a
-        // loopback path to `FetchAfter` from, and the journal half's response is the proxy's own
-        // body, not a re-read. Diverts to `terminate_space_teardown` in `terminate`, same shape
-        // as the source writes and the tenancy surface above.
+        // A space teardown is a proxy plus a commit, and `build_mutation` renders neither shape:
+        // the flow-state half is a proxy, not a state-machine record with a loopback path to
+        // `FetchAfter` from, and the response the client gets is the proxy's own body, not a
+        // re-read. Diverts to `terminate_space_teardown` in `terminate`.
         Terminated::SpaceTeardown(_, _) => Err(internal(
             "space teardown is served by terminate_space_teardown, not build_mutation",
         )),
-        // A merge-on-read fan-out, not a `ControlOp` — same shape as the saved-requests reads
-        // above. Diverts to `terminate_spaces_list` in `terminate` before this is ever reached.
+        // A fan-out read, not a `ControlOp`. Diverts to `terminate_spaces_list` in `terminate`
+        // before this is ever reached.
         Terminated::SpacesList(_) => Err(internal(
             "the spaces listing is served by terminate_spaces_list, not build_mutation",
         )),
         // A try commits nothing — it is an outbound exchange whose whole result is the response
-        // body. Diverts to `terminate_try_imposter` in `terminate`, same shape as the source
-        // writes, the tenancy surface and the space teardown above.
+        // body. Diverts to `terminate_try_imposter` in `terminate`, same shape as the space
+        // teardown above.
         Terminated::TryImposter(_) => Err(internal(
             "a try is served by terminate_try_imposter, not build_mutation",
         )),
@@ -5329,13 +4284,16 @@ mod tests {
         );
     }
 
-    /// Issue #370 — regression. The knobs decoration is the first that runs *after* another one, so
-    /// it is the first that can destroy what an earlier one set.
+    /// Issue #370 — regression. The knobs decoration rebuilds the response through
+    /// `buffered_response`, whose header map starts empty, so it is the stage that can destroy
+    /// what the proxied response already carried.
     ///
-    /// `decorate_number_of_requests` stamps `Rift-Cluster-Partial` on the single-imposter read when
-    /// the fleet fan-out could not reach a peer, and the knobs decoration rebuilds the response
-    /// through `buffered_response`, whose header map starts empty. Losing the stamp would leave a
-    /// count that is knowingly missing a node's slot looking authoritative.
+    /// When this was written, `decorate_number_of_requests` ran first and stamped
+    /// `Rift-Cluster-Partial` on the single-imposter read; D-74 (#552) removed that decoration,
+    /// and the header no longer rides this read at all. The two headers below are now stand-ins
+    /// for whatever the proxied response carried — `Rift-Cluster-Revision` is the one that
+    /// matters in production — and the claim is unchanged: nothing set on the response before the
+    /// rebuild may be lost by it.
     ///
     /// Asserted on both branches, because the rebuild happens on the failure path too.
     #[tokio::test]
@@ -5401,19 +4359,10 @@ mod tests {
             (Method::DELETE, "/imposters/4545/stubs/by-id/a"),
             (Method::POST, "/imposters/4545/enable"),
             (Method::POST, "/imposters/4545/disable"),
-            // Issue #223: the fleet merge-on-read (no `?since=`) and the clear — unscoped as of
-            // #224 a Raft-committed generation bump, `?match=`-scoped still a local proxy (see
-            // `Terminated::ClearSavedRequests`'s doc) — but both forms terminate either way, so
-            // `classify` draws no distinction here. Both spellings, since they are one handler
-            // behind two paths.
-            (Method::GET, "/imposters/4545/requests"),
-            (Method::GET, "/imposters/4545/savedRequests"),
-            (Method::DELETE, "/imposters/4545/savedRequests"),
-            (Method::DELETE, "/imposters/4545/requests"),
-            // Issue #224: the journal half of a space teardown now rides alongside the
-            // flow-state proxy, so this route terminates too — the flow-state half is still
-            // proxied *inside* `terminate_space_teardown`, but `classify` itself now recognizes
-            // the route rather than falling through entirely.
+            // Issue #537: the replicated space-stub delete rides alongside the flow-state proxy,
+            // so this route terminates too — the flow-state half is still proxied *inside*
+            // `terminate_space_teardown`, but `classify` itself recognizes the route rather than
+            // falling through entirely.
             (Method::DELETE, "/imposters/4545/spaces/flow-1"),
             // Issue #374: the spaces **listing** terminates too — there is no upstream
             // `["spaces"]` route to proxy to at all (see `spaces_list_target`'s doc).
@@ -5421,7 +4370,7 @@ mod tests {
         ];
         for (method, path) in terminated {
             assert!(
-                classify(&method, path, None).is_some(),
+                classify(&method, path).is_some(),
                 "{method} {path} must terminate"
             );
         }
@@ -5430,7 +4379,7 @@ mod tests {
         // `spaces_list_target` requires an absent or empty third segment, so a real flow id keeps
         // this proxied to the engine exactly as it always has been.
         assert!(
-            classify(&Method::GET, "/imposters/4545/spaces/qa-flow", None).is_none(),
+            classify(&Method::GET, "/imposters/4545/spaces/qa-flow").is_none(),
             "GET .../spaces/{{flowId}} must stay proxied, not be swept into the listing route"
         );
 
@@ -5448,130 +4397,73 @@ mod tests {
         ];
         for (method, path) in proxied {
             assert!(
-                classify(&method, path, None).is_none(),
+                classify(&method, path).is_none(),
                 "{method} {path} must proxy"
             );
         }
 
-        // Issue #225 flips this row. `?since=` used to fall through to the proxy because a
-        // scalar cursor cannot address a multi-writer merge; the vector cursor is exactly the
-        // value that can, so the cursored read now terminates like its uncursored sibling and
-        // the engine's own `parse_since` never sees a vector token. Both spellings, and the
-        // legacy scalar form a pre-#225 client still holds.
-        for query in ["since=3", "since=eyJ2IjoxfQ", "since"] {
+        // D-74: the whole recorded-request surface proxies again, under either spelling and
+        // whatever the query says. The journal is upstream's own and per node, so there is
+        // nothing for this front to terminate — the read, its `?since=` cursor form, the SSE
+        // tail and the clear all reach this node's engine and answer with upstream's own
+        // semantics. Pinned as an exhaustive row rather than a comment because #223/#224/#225
+        // terminated exactly these and a half-reverted classifier would leave one of them
+        // answering out of a subsystem that no longer exists.
+        for (method, path) in [
+            (Method::GET, "/imposters/4545/requests"),
+            (Method::GET, "/imposters/4545/savedRequests"),
+            (Method::DELETE, "/imposters/4545/requests"),
+            (Method::DELETE, "/imposters/4545/savedRequests"),
+            (Method::GET, "/imposters/4545/savedRequests/stream"),
+            // The `/admin/imposters/` alias #223 invented for the merged read goes with it: it
+            // never existed upstream, so there is nothing left for it to be a second spelling of.
+            (Method::GET, "/admin/imposters/4545/requests"),
+            (Method::GET, "/admin/imposters/4545/savedRequests"),
+            (Method::DELETE, "/admin/imposters/4545/requests"),
+            (Method::DELETE, "/admin/imposters/4545/savedRequests"),
+            // The fleet-wide pair, which had no upstream to proxy to at all.
+            (Method::GET, "/admin/requests"),
+            (Method::GET, "/admin/requests/stream"),
+        ] {
             assert!(
-                classify(&Method::GET, "/imposters/4545/requests", Some(query)).is_some(),
-                "GET .../requests?{query} must terminate as of #225"
-            );
-            assert!(
-                classify(&Method::GET, "/imposters/4545/savedRequests", Some(query)).is_some(),
-                "GET .../savedRequests?{query} must terminate as of #225"
+                classify(&method, path).is_none(),
+                "{method} {path} must not terminate: the request journal is upstream's own \
+                 (D-74)"
             );
         }
 
-        // Issue #223 review, B1, and **not** widened by #225: `?match=` is a scoped predicate the
-        // merge-on-read path never evaluates, so terminating on it would silently widen the answer
-        // to the whole fleet's requests and turn a malformed filter's upstream 400 into a 200 with
-        // everything. Both spellings, both query forms (`match=...` and a bare `match`), still
-        // fall through to the proxy.
-        for query in ["match=flow_id%3Drun-7", "match"] {
-            assert!(
-                classify(&Method::GET, "/imposters/4545/requests", Some(query)).is_none(),
-                "GET .../requests?{query} must still proxy"
-            );
-            assert!(
-                classify(&Method::GET, "/imposters/4545/savedRequests", Some(query)).is_none(),
-                "GET .../savedRequests?{query} must still proxy"
-            );
-        }
-        // `match` still wins when both are present: `since` no longer excuses a read from
-        // terminating, but `match` alone is still enough to send the whole thing to the proxy.
-        assert!(
-            classify(
-                &Method::GET,
-                "/imposters/4545/savedRequests",
-                Some("since=3&match=flow_id%3Drun-7")
-            )
-            .is_none(),
-            "GET .../savedRequests?since=3&match=... must still proxy — `match` is the exception"
-        );
-        // `?match=` on the DELETE, unlike the GET, still terminates — B3's design decision is
-        // that a scoped clear stays local-only (and stamps partial), not that it stops
-        // terminating; `classify` has no query-based exception on the DELETE arm.
-        assert!(
-            classify(
-                &Method::DELETE,
-                "/imposters/4545/savedRequests",
-                Some("match=flow_id%3Drun-7")
-            )
-            .is_some(),
-            "DELETE .../savedRequests?match=... must still terminate"
-        );
-
-        // Issue #224: a space teardown classifies with the port and flow id extracted, exactly
+        // Issue #537: a space teardown classifies with the port and flow id extracted, exactly
         // the shape `terminate_space_teardown` needs.
         assert!(
             matches!(
-                classify(&Method::DELETE, "/imposters/4545/spaces/flow-1", None),
+                classify(&Method::DELETE, "/imposters/4545/spaces/flow-1"),
                 Some(Terminated::SpaceTeardown(4545, flow)) if flow == "flow-1"
             ),
             "DELETE .../spaces/{{flow}} must terminate with the port and flow extracted"
         );
         // Every other method on the same two-segment shape stays proxied — only the delete
-        // gains a journal half; a write there is `SpaceStubs`' three-segment sibling, a
-        // different route entirely, untouched by this issue.
+        // gains a replicated half; a write there is `SpaceStubs`' three-segment sibling, a
+        // different route entirely.
         for method in [Method::GET, Method::PUT, Method::POST] {
             assert!(
-                classify(&method, "/imposters/4545/spaces/flow-1", None).is_none(),
+                classify(&method, "/imposters/4545/spaces/flow-1").is_none(),
                 "{method} .../spaces/{{flow}} must still proxy"
             );
         }
         assert!(
-            classify(&Method::DELETE, "/imposters/4545/spaces/", None).is_none(),
+            classify(&Method::DELETE, "/imposters/4545/spaces/").is_none(),
             "an empty flow id names no space to tear down"
         );
 
-        // Issue #223 review, Important: the `/admin/imposters/{port}/...` alias must terminate
-        // identically to the canonical `/imposters/{port}/...` spelling for both verbs — the same
-        // "both spellings, one handler" treatment `is_imposter_listing` already gives the
-        // collection listing, extended to the two-verb savedRequests route.
-        for (method, path) in [
-            (Method::GET, "/admin/imposters/4545/requests"),
-            (Method::GET, "/admin/imposters/4545/savedRequests"),
-            (Method::DELETE, "/admin/imposters/4545/requests"),
-            (Method::DELETE, "/admin/imposters/4545/savedRequests"),
-        ] {
-            assert!(
-                classify(&method, path, None).is_some(),
-                "{method} {path} (admin alias) must terminate"
-            );
-        }
-        // The alias must flip with the canonical path (issue #225), not lag behind it — the two
-        // spellings drifting apart is exactly the defect #223's review caught on this route.
+        // Flow-state inspection under the `/admin/imposters/` prefix stays this front's
+        // non-concern and falls through to the proxy.
         assert!(
-            classify(
-                &Method::GET,
-                "/admin/imposters/4545/savedRequests",
-                Some("since=3")
-            )
-            .is_some(),
-            "GET admin-alias .../savedRequests?since=3 must terminate as of #225"
-        );
-        // The admin alias is scoped to the savedRequests/requests shape — flow-state inspection
-        // and any other unrecognized suffix under this prefix stay this front's non-concern and
-        // fall through exactly as before this fix.
-        assert!(
-            classify(
-                &Method::DELETE,
-                "/admin/imposters/4545/flow-state/flow-9",
-                None
-            )
-            .is_none(),
-            "DELETE .../flow-state/... must not be captured by the new alias arm"
+            classify(&Method::DELETE, "/admin/imposters/4545/flow-state/flow-9").is_none(),
+            "DELETE .../flow-state/... must not be captured by this front"
         );
 
         // An unparseable port is not this surface's route at all.
-        assert!(classify(&Method::DELETE, "/imposters/not-a-port", None).is_none());
+        assert!(classify(&Method::DELETE, "/imposters/not-a-port").is_none());
     }
 
     // ---- Spaces listing (issue #374) ---------------------------------------------------------
@@ -5579,21 +4471,18 @@ mod tests {
     // `GET /imposters/{port}/spaces` had zero HTTP-level coverage: everything above pins
     // `classify`, but nothing drove a real request through `terminate` into
     // `terminate_spaces_list` and inspected the body it renders. These do, over `test_front_over`
-    // — the same bound-front-plus-reqwest harness `read_fleet_requests`/`read_requests` already
-    // use for the other merge-on-read routes, since GET reads terminate exactly like writes do
-    // (see `classify`'s own routing) and nothing here needs `upstream_admin` dialled.
+    // — a bound front plus `reqwest`, since GET reads terminate exactly like writes do (see
+    // `classify`'s own routing) and nothing here needs `upstream_admin` dialled.
     //
     // Most of these run over `test_front_over` as-is, whose `FlowNet` is deliberately never bound
     // to `node`'s ring (see its own doc) — exactly right for pinning the envelope (field names,
     // `unavailable`'s two refusal states, `durability`'s presence/absence), since an unbound net
     // answers `fleet_spaces` via its own cluster-view-unavailable arm regardless of scope. The one
     // test below that needs a real row builds its own front over a bound one-voter ring instead
-    // (`test_front_with_bound_flow`), the same way the cursor tests above build their own front
-    // over a caller-supplied journal rather than stretching `test_front_over` to cover every case.
+    // (`test_front_with_bound_flow`) rather than stretching `test_front_over` to cover every case.
 
     /// `GET /imposters/{port}/spaces` against the bound front, returned as `(status, body)` —
-    /// no headers needed here, unlike `read_requests`/`read_fleet_requests`, since this route
-    /// carries no cursor.
+    /// no headers needed here, since this route carries no cursor.
     async fn read_spaces(front: &AdminFront, port: u16) -> (u16, String) {
         let addr = front.local_addr();
         let response = reqwest::get(format!("http://{addr}/imposters/{port}/spaces"))
@@ -5629,8 +4518,7 @@ mod tests {
     /// `Ok(None)` and returns early).
     #[tokio::test]
     async fn spaces_list_with_no_imposter_is_scope_unresolved_and_omits_durability() {
-        let (front, _node, _journal, _dir) =
-            test_front_over(rift_cluster::stores::ClusterJournal::new(1)).await;
+        let (front, _node, _dir) = test_front_over().await;
 
         let (status, body) = read_spaces(&front, 9999).await;
 
@@ -5652,8 +4540,7 @@ mod tests {
     /// boundary left to cross, and `scope-unresolved` is the only refusal that remains.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn spaces_list_for_a_fleet_scoped_imposter_is_served() {
-        let (front, node, _journal, _dir) =
-            test_front_over(rift_cluster::stores::ClusterJournal::new(1)).await;
+        let (front, node, _dir) = test_front_over().await;
         node.cluster_init()
             .await
             .expect("single-voter cluster init");
@@ -5679,8 +4566,7 @@ mod tests {
     /// this group that actually has a row to inspect.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn spaces_list_for_an_ordinary_imposter_carries_no_unavailable_key() {
-        let (front, node, _journal, _dir) =
-            test_front_over(rift_cluster::stores::ClusterJournal::new(1)).await;
+        let (front, node, _dir) = test_front_over().await;
         node.cluster_init()
             .await
             .expect("single-voter cluster init");
@@ -5746,9 +4632,7 @@ mod tests {
                 barrier_timeout: Duration::from_secs(1),
                 admin_async: false,
                 readiness: Arc::new(crate::readiness::Readiness::awaiting([])),
-                journal_net: JournalNet::new(rift_cluster::stores::ClusterJournal::new(1)),
                 flow_net: Arc::clone(&net),
-                fleet_journal_port_cap: rift_cluster::stores::DEFAULT_FLEET_JOURNAL_PORT_CAP,
             },
             &node,
         )
@@ -5805,126 +4689,39 @@ mod tests {
         );
     }
 
-    /// Issue #224: `?match=` must keep `terminate`'s scoped-vs-unscoped dispatch on the
-    /// pure-proxy path (`terminate_clear_saved_requests`), never `build_and_run`/
-    /// `build_mutation`'s Raft-committing one — so a scoped clear never becomes a `ControlOp`.
-    /// `classify` alone cannot prove this: it answers `Some(Terminated::ClearSavedRequests(port))`
-    /// either way, by design (see that variant's own doc) — the dispatch guard in `terminate` is
-    /// `has_query_param(query, "match")`, which is what actually decides, and which this tests
-    /// directly against the same query strings `classify_terminates_exactly_the_config_surface`
-    /// already proves still terminate.
-    #[test]
-    fn a_match_narrowed_clear_still_proxies() {
-        assert!(
-            has_query_param(Some("match=flow_id%3Drun-7"), "match"),
-            "a ?match=... clear must be recognized as scoped, so `terminate` routes it to the \
-             proxy path instead of committing a JournalClearGen"
-        );
-        assert!(
-            has_query_param(Some("match"), "match"),
-            "a bare ?match with no value is still scoped — presence is what matters, not the \
-             value"
-        );
-        assert!(
-            !has_query_param(None, "match"),
-            "no query at all is the unscoped form, which commits through Raft"
-        );
-        assert!(
-            !has_query_param(Some("since=3"), "match"),
-            "an unrelated query parameter must not be mistaken for `match`"
-        );
-    }
-
-    /// `query_param` is what hands the cursor token to the decoder, so the ways it can quietly
-    /// return the wrong string are the ways a walk silently restarts or skips (issue #225).
     #[test]
     fn the_query_value_reader_finds_exactly_the_named_parameter() {
-        assert_eq!(query_param(Some("since=abc"), "since"), Some("abc"));
+        assert_eq!(query_param(Some("port=4545"), "port"), Some("4545"));
         assert_eq!(
-            query_param(Some("match=x&since=abc&limit=5"), "since"),
-            Some("abc"),
+            query_param(Some("name=petstore&port=4545&x=5"), "port"),
+            Some("4545"),
             "position in the query string must not matter"
         );
         assert_eq!(
-            query_param(Some("sincerely=no&since=yes"), "since"),
+            query_param(Some("portly=no&port=yes"), "port"),
             Some("yes"),
-            "a parameter whose name merely starts with `since` is a different parameter"
+            "a parameter whose name merely starts with `port` is a different parameter"
         );
         assert_eq!(
-            query_param(Some("since"), "since"),
+            query_param(Some("port"), "port"),
             Some(""),
-            "a valueless `since` is an empty token, not an absent one — the caller 400s on it"
+            "a valueless `port` is an empty value, not an absent one — the caller 400s on it"
         );
-        assert_eq!(query_param(Some("match=x"), "since"), None);
-        assert_eq!(query_param(None, "since"), None);
-        // A base64url token contains `-` and `_` and nothing that needs escaping; it must arrive
-        // byte-identical or the walk resumes somewhere the client never asked for.
-        let token = JournalCursor {
-            generation: 3,
-            pos: [(1u64, 9u64), (2, 4)].into_iter().collect(),
-        }
-        .encode();
+        assert_eq!(query_param(Some("name=x"), "port"), None);
+        assert_eq!(query_param(None, "port"), None);
+        // Raw and undecoded: the value must arrive byte-identical, or the compile names an
+        // imposter the caller never asked for.
         assert_eq!(
-            query_param(Some(&format!("since={token}")), "since"),
-            Some(token.as_str()),
-            "the issued token must survive the query string unchanged"
+            query_param(Some("name=pet-store_v2"), "name"),
+            Some("pet-store_v2"),
+            "the submitted value must survive the query string unchanged"
         );
     }
 
-    /// The three shapes `?since=` can take, and what each must mean (issue #225, AC5). The
-    /// malformed case is the one that matters most: defaulting it would either replay the whole
-    /// journal or skip everything since, and both are silent.
-    #[test]
-    fn a_since_value_is_a_token_a_legacy_scalar_or_a_refusal() {
-        let this_node = 7;
-
-        let token = JournalCursor {
-            generation: 2,
-            pos: [(1u64, 5u64)].into_iter().collect(),
-        }
-        .encode();
-        assert_eq!(
-            JournalCursor::decode_or_legacy(&token, this_node).expect("a vector token is accepted"),
-            JournalCursor {
-                generation: 2,
-                pos: [(1u64, 5u64)].into_iter().collect(),
-            }
-        );
-
-        let legacy =
-            JournalCursor::decode_or_legacy("42", this_node).expect("a legacy scalar is accepted");
-        assert_eq!(
-            legacy.pos.get(&this_node).copied(),
-            Some(42),
-            "a bare u64 can only have come from a proxied read of this node"
-        );
-
-        for bad in ["", "not base64!!", "-1", "Zm9v"] {
-            assert!(
-                JournalCursor::decode_or_legacy(bad, this_node).is_err(),
-                "{bad:?} must be refused, not defaulted to a position"
-            );
-        }
-    }
-
-    /// The try surface (issue #335): exactly `POST /admin/imposters/{port}/try`, and nothing
-    /// adjacent to it.
-    ///
-    /// The negative half carries the weight. This is the one route that dispatches to the
-    /// imposter's own engine in-process, so every shape that is *not* it must fall through to the
-    /// proxy rather than be generously accepted — a classifier that also matched, say, the
-    /// canonical `/imposters/`
-    /// prefix or a `GET` would widen a deliberately narrow capability by accident.
     #[test]
     fn classify_terminates_exactly_the_try_surface() {
         assert!(matches!(
-            classify(&Method::POST, "/admin/imposters/4545/try", None),
-            Some(Terminated::TryImposter(4545))
-        ));
-        // A query string is not part of the match — the sample's own query rides in the body's
-        // `path`, so anything here is ignored rather than making the route miss.
-        assert!(matches!(
-            classify(&Method::POST, "/admin/imposters/4545/try", Some("x=1")),
+            classify(&Method::POST, "/admin/imposters/4545/try"),
             Some(Terminated::TryImposter(4545))
         ));
 
@@ -5946,170 +4743,21 @@ mod tests {
             (Method::POST, "/admin/imposters/4545"),
         ] {
             assert!(
-                !matches!(
-                    classify(&method, path, None),
-                    Some(Terminated::TryImposter(_))
-                ),
+                !matches!(classify(&method, path), Some(Terminated::TryImposter(_))),
                 "{method} {path} must not classify as a try"
             );
         }
     }
 
-    /// The fleet journal (issue #362) terminates on exactly two paths and one method each.
-    ///
-    /// The negative half matters as much as the positive: these paths sit above the
-    /// `/admin/imposters/` and `/imposters/` prefixes in `classify`, so a mistake here would
-    /// shadow the per-imposter routes rather than merely fail to match.
-    #[test]
-    fn classify_terminates_exactly_the_fleet_journal_routes() {
-        assert!(matches!(
-            classify(&Method::GET, "/admin/requests", None),
-            Some(Terminated::ReadFleetRequests)
-        ));
-        assert!(matches!(
-            classify(&Method::GET, "/admin/requests", Some("since=abc")),
-            Some(Terminated::ReadFleetRequests)
-        ));
-        assert!(matches!(
-            classify(&Method::GET, "/admin/requests/stream", None),
-            Some(Terminated::StreamFleetRequests)
-        ));
-
-        for (method, path, query) in [
-            // `?match=` is a predicate the merge path never evaluates. Unlike the per-imposter
-            // route there is no proxy fallback to fall through to, so it simply does not
-            // terminate — a fleet-scoped predicate read is not on offer.
-            (Method::GET, "/admin/requests", Some("match=method:GET")),
-            (
-                Method::GET,
-                "/admin/requests/stream",
-                Some("match=method:GET"),
-            ),
-            // Reads only: there is no fleet-wide clear, and inventing one here would silently
-            // widen a per-imposter destructive verb to the whole fleet.
-            (Method::DELETE, "/admin/requests", None),
-            (Method::POST, "/admin/requests", None),
-            (Method::PUT, "/admin/requests", None),
-            (Method::DELETE, "/admin/requests/stream", None),
-            // Neighbours that must keep their own meaning.
-            (Method::GET, "/admin/requests/", None),
-            (Method::GET, "/admin/requests/4545", None),
-            (Method::GET, "/admin/requestsfoo", None),
-        ] {
-            let classified = classify(&method, path, query);
-            assert!(
-                !matches!(
-                    classified,
-                    Some(Terminated::ReadFleetRequests | Terminated::StreamFleetRequests)
-                ),
-                "{method} {path} (query {query:?}) must not classify as a fleet journal route"
-            );
-        }
-    }
-
-    /// The per-imposter routes must still classify exactly as they did — the fleet paths are
-    /// matched before them, so this is the shadowing check.
-    #[test]
-    fn the_fleet_routes_do_not_shadow_the_per_imposter_ones() {
-        assert!(matches!(
-            classify(&Method::GET, "/imposters/4545/savedRequests", None),
-            Some(Terminated::ReadSavedRequests(4545))
-        ));
-        assert!(matches!(
-            classify(&Method::GET, "/admin/imposters/4545/savedRequests", None),
-            Some(Terminated::ReadSavedRequests(4545))
-        ));
-        assert!(matches!(
-            classify(&Method::GET, "/imposters/4545/savedRequests/stream", None),
-            Some(Terminated::StreamSavedRequests(4545))
-        ));
-    }
-
-    /// The live tail (issue #348) terminates on exactly one path, one method, and only without a
-    /// predicate — everything else on or near it keeps proxying exactly as it does today.
-    #[test]
-    fn classify_terminates_exactly_the_saved_requests_stream() {
-        assert!(matches!(
-            classify(&Method::GET, "/imposters/4545/savedRequests/stream", None),
-            Some(Terminated::StreamSavedRequests(4545))
-        ));
-        assert!(
-            matches!(
-                classify(
-                    &Method::GET,
-                    "/imposters/4545/savedRequests/stream",
-                    Some("types=requests")
-                ),
-                Some(Terminated::StreamSavedRequests(4545))
-            ),
-            "an unrelated query parameter must not push the tail back onto the proxy"
-        );
-
-        for (method, path, query) in [
-            // `?match=` is a predicate the merge path never evaluates, so it keeps proxying —
-            // issue #223 review B1, verbatim. Terminating it would answer with the whole fleet's
-            // requests instead of the caller's scoped subset.
-            (
-                Method::GET,
-                "/imposters/4545/savedRequests/stream",
-                Some("match=method:GET"),
-            ),
-            // `GET /events` is upstream's own firehose, answered by the node it reaches. It must
-            // never reach this front's terminator.
-            (Method::GET, "/events", None),
-            (Method::GET, "/events", Some("port=4545")),
-            // Only `savedRequests` has a stream upstream — `requests` does not, so terminating it
-            // would invent a route that 404s when proxied.
-            (Method::GET, "/imposters/4545/requests/stream", None),
-            // The `/admin/` alias exists for the read because upstream serves the read under both
-            // spellings. It does not serve the stream under both.
-            (
-                Method::GET,
-                "/admin/imposters/4545/savedRequests/stream",
-                None,
-            ),
-            // A stream is a read.
-            (Method::POST, "/imposters/4545/savedRequests/stream", None),
-            (Method::DELETE, "/imposters/4545/savedRequests/stream", None),
-            // Ports that are not ports, and neighbouring shapes.
-            (
-                Method::GET,
-                "/imposters/notaport/savedRequests/stream",
-                None,
-            ),
-            (Method::GET, "/imposters/70000/savedRequests/stream", None),
-            (
-                Method::GET,
-                "/imposters/4545/savedRequests/stream/more",
-                None,
-            ),
-            (Method::GET, "/imposters/4545/savedRequestsstream", None),
-        ] {
-            assert!(
-                !matches!(
-                    classify(&method, path, query),
-                    Some(Terminated::StreamSavedRequests(_))
-                ),
-                "{method} {path} (query {query:?}) must not classify as the merged tail"
-            );
-        }
-    }
-
-    /// `POST /specs/compile` is the only route on `/specs` (D-72, #549). Every other verb and
-    /// every id-addressed shape the retired store served must fall through, not be force-fit.
     #[test]
     fn classify_terminates_only_the_stateless_compile() {
         assert!(matches!(
-            classify(&Method::POST, "/specs/compile", Some("port=4545")),
+            classify(&Method::POST, "/specs/compile"),
             Some(Terminated::SpecCompile)
         ));
-        // The query is not part of the match: a missing `port` is the handler's `400`, not a
-        // route that does not exist — the difference matters, because 404 would send a caller
-        // looking for a route they typed correctly.
-        assert!(matches!(
-            classify(&Method::POST, "/specs/compile", None),
-            Some(Terminated::SpecCompile)
-        ));
+        // The query is not part of the match — `classify` cannot see one (D-74) — so a missing
+        // `port` is the handler's `400`, not a route that does not exist. The difference matters,
+        // because 404 would send a caller looking for a route they typed correctly.
 
         for (method, path) in [
             (Method::GET, "/specs"),
@@ -6126,7 +4774,7 @@ mod tests {
             (Method::POST, "/specs/petstore/deploy"),
         ] {
             assert!(
-                classify(&method, path, None).is_none(),
+                classify(&method, path).is_none(),
                 "{method} {path} must not terminate"
             );
         }
@@ -6146,11 +4794,11 @@ mod tests {
     #[test]
     fn classify_terminates_exactly_the_route_write_surface() {
         assert!(matches!(
-            classify(&Method::PUT, "/front-door/routes", None),
+            classify(&Method::PUT, "/front-door/routes"),
             Some(Terminated::PutRoutes)
         ));
         assert!(matches!(
-            classify(&Method::DELETE, "/front-door/routes/svc", None),
+            classify(&Method::DELETE, "/front-door/routes/svc"),
             Some(Terminated::DeleteRoute(id)) if id == "svc"
         ));
 
@@ -6162,7 +4810,7 @@ mod tests {
             (Method::DELETE, "/front-door/routes/"),
         ] {
             assert!(
-                classify(&method, path, None).is_none(),
+                classify(&method, path).is_none(),
                 "{method} {path} must not terminate as a route write"
             );
         }
@@ -6231,26 +4879,13 @@ mod tests {
     /// A bound front over a throwaway node, for the accept-loop observation
     /// tests. `upstream_admin` is never dialled — nothing sends a request.
     async fn test_front() -> (AdminFront, Arc<RaftNode>, tempfile::TempDir) {
-        let (front, node, _journal, dir) =
-            test_front_over(rift_cluster::stores::ClusterJournal::new(1)).await;
+        let (front, node, dir) = test_front_over().await;
         (front, node, dir)
     }
 
-    /// [`test_front`] over a caller-supplied journal, handed back so a test can record into the
-    /// very shard the front will read (issue #225).
-    ///
-    /// The cursor tests need this because `?since=` **terminates** now: nothing they exercise
-    /// dials `upstream_admin`, so a front over a journal they control is a complete, honest
-    /// harness for the whole handler — query parsing, token decode, the merge walk, and the
-    /// response headers — rather than a mock of it.
-    async fn test_front_over(
-        journal: Arc<rift_cluster::stores::ClusterJournal>,
-    ) -> (
-        AdminFront,
-        Arc<RaftNode>,
-        Arc<rift_cluster::stores::ClusterJournal>,
-        tempfile::TempDir,
-    ) {
+    /// A bound front over a throwaway node whose `FlowNet` is deliberately never bound to the
+    /// node's ring — enough to drive the terminated reads that answer from this node alone.
+    async fn test_front_over() -> (AdminFront, Arc<RaftNode>, tempfile::TempDir) {
         let (node, dir) = test_node().await;
         let front = bind(
             FrontConfig {
@@ -6263,419 +4898,18 @@ mod tests {
                 barrier_timeout: Duration::from_secs(1),
                 admin_async: false,
                 readiness: Arc::new(crate::readiness::Readiness::awaiting([])),
-                journal_net: JournalNet::new(Arc::clone(&journal)),
                 // In-memory and never bound to `node`'s ring: this only needs to satisfy
                 // `FrontConfig`'s required field.
                 flow_net: FlowNet::new(rift_cluster::stores::FlowShard::in_memory(
                     rift_cluster::stores::ShardConfig::default(),
                 )),
-                fleet_journal_port_cap: rift_cluster::stores::DEFAULT_FLEET_JOURNAL_PORT_CAP,
             },
             &node,
         )
         .await
         .expect("front binds");
-        (front, node, journal, dir)
+        (front, node, dir)
     }
-
-    // ---- Cursor wiring on the merged read (issue #225) ---------------------------------
-    //
-    // The token codec and the merge walk each have their own gate tests. These cover the seam
-    // between them — query parsing, decode, and the response headers — which is the part a
-    // mutation could break while every other test in the tree stayed green.
-
-    use rift_cluster_base::seams::RequestJournal;
-
-    const CURSOR_TEST_PORT: u16 = 4545;
-
-    fn recorded(path: &str) -> rift_cluster_base::seams::RecordedRequest {
-        rift_cluster_base::seams::RecordedRequest {
-            mode: rift_cluster_base::seams::ResponseMode::Text,
-            request_from: "t".into(),
-            method: "GET".into(),
-            path: path.into(),
-            query: Default::default(),
-            headers: Default::default(),
-            body: None,
-            timestamp: format!("2026-01-01T00:00:{:02}Z", path.len()),
-            match_outcome: None,
-            status: None,
-            latency_ms: None,
-            node: None,
-        }
-    }
-
-    /// `GET /admin/requests` against the bound front (issue #362).
-    async fn read_fleet_requests(
-        front: &AdminFront,
-        query: Option<&str>,
-    ) -> (u16, reqwest::header::HeaderMap, String) {
-        let addr = front.local_addr();
-        let url = match query {
-            Some(q) => format!("http://{addr}/admin/requests?{q}"),
-            None => format!("http://{addr}/admin/requests"),
-        };
-        let response = reqwest::get(url).await.expect("the front answers");
-        let status = response.status().as_u16();
-        let headers = response.headers().clone();
-        let body = response.text().await.expect("a body");
-        (status, headers, body)
-    }
-
-    /// A fleet holding no imposters still gets a well-formed answer — an empty page that says it
-    /// covers nothing, rather than a 404 or a bare `[]` a client has to guess the shape of.
-    #[tokio::test]
-    async fn the_fleet_read_answers_a_stated_empty_coverage() {
-        let (front, _node, _journal, _dir) =
-            test_front_over(rift_cluster::stores::ClusterJournal::new(1)).await;
-
-        let (status, headers, body) = read_fleet_requests(&front, None).await;
-
-        assert_eq!(status, 200, "body: {body}");
-        let page: serde_json::Value = serde_json::from_str(&body).expect("a JSON page");
-        assert_eq!(
-            page["requests"].as_array().map(Vec::len),
-            Some(0),
-            "no imposters, no rows"
-        );
-        assert_eq!(page["coverage"]["total"], 0);
-        assert_eq!(page["coverage"]["capped"], false);
-        assert!(
-            page["cursor"]
-                .as_str()
-                .is_some_and(|token| !token.is_empty()),
-            "even an empty page hands back a resumable position: {body}"
-        );
-        assert!(
-            headers.contains_key(HEADER_NEXT_INDEX),
-            "the cursor is also a header, for parity with the per-imposter read"
-        );
-    }
-
-    /// A per-imposter token pasted into the fleet endpoint is a good cursor at the wrong door.
-    /// It must be refused — never read as a fleet position — and the message must be specific
-    /// enough to act on.
-    #[tokio::test]
-    async fn the_fleet_read_refuses_a_per_imposter_cursor() {
-        let (front, _node, _journal, _dir) =
-            test_front_over(rift_cluster::stores::ClusterJournal::new(1)).await;
-        let per_port = JournalCursor::start().encode();
-
-        let (status, _headers, body) =
-            read_fleet_requests(&front, Some(&format!("since={per_port}"))).await;
-
-        assert_eq!(status, 400, "body: {body}");
-        assert!(
-            body.contains("per-imposter"),
-            "the refusal must name the scope mismatch, not just say 'bad cursor': {body}"
-        );
-    }
-
-    /// The legacy bare scalar names a position in one shard of one port. It has no fleet meaning,
-    /// so it is refused here rather than quietly read as one.
-    #[tokio::test]
-    async fn the_fleet_read_refuses_the_legacy_scalar_cursor() {
-        let (front, _node, _journal, _dir) =
-            test_front_over(rift_cluster::stores::ClusterJournal::new(1)).await;
-
-        let (status, _headers, body) = read_fleet_requests(&front, Some("since=42")).await;
-
-        assert_eq!(status, 400, "body: {body}");
-    }
-
-    /// Garbage is refused too — and, critically, never defaulted to the beginning (which would
-    /// replay the whole journal) or to now (which would skip everything since).
-    #[tokio::test]
-    async fn the_fleet_read_refuses_a_malformed_cursor() {
-        let (front, _node, _journal, _dir) =
-            test_front_over(rift_cluster::stores::ClusterJournal::new(1)).await;
-
-        let (status, _headers, body) =
-            read_fleet_requests(&front, Some("since=not%20base64%21%21")).await;
-
-        assert_eq!(status, 400, "body: {body}");
-    }
-
-    /// `GET /imposters/{port}/savedRequests` against the bound front, with an optional raw
-    /// query string — returned as `(status, headers, body)` so a test can assert on all three.
-    async fn read_requests(
-        front: &AdminFront,
-        query: Option<&str>,
-    ) -> (u16, reqwest::header::HeaderMap, String) {
-        let addr = front.local_addr();
-        let url = match query {
-            Some(q) => format!("http://{addr}/imposters/{CURSOR_TEST_PORT}/savedRequests?{q}"),
-            None => format!("http://{addr}/imposters/{CURSOR_TEST_PORT}/savedRequests"),
-        };
-        let response = reqwest::get(url).await.expect("the front answers");
-        let status = response.status().as_u16();
-        let headers = response.headers().clone();
-        let body = response.text().await.expect("a body");
-        (status, headers, body)
-    }
-
-    /// Open the merged tail and return whatever frames arrive in a short window. Raw socket
-    /// rather than an HTTP client because the body never ends — a client that waits for
-    /// completion would wait forever.
-    async fn stream_frames(front: &AdminFront, last_event_id: Option<&str>) -> String {
-        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
-
-        let addr = front.local_addr();
-        let resume = last_event_id
-            .map(|id| format!("Last-Event-ID: {id}\r\n"))
-            .unwrap_or_default();
-        let mut socket = tokio::net::TcpStream::connect(addr)
-            .await
-            .expect("connect to the front");
-        socket
-            .write_all(
-                format!(
-                    "GET /imposters/{CURSOR_TEST_PORT}/savedRequests/stream HTTP/1.1\r\n\
-                     Host: {addr}\r\nAccept: text/event-stream\r\n{resume}\r\n"
-                )
-                .as_bytes(),
-            )
-            .await
-            .expect("write the stream request");
-
-        let mut seen = Vec::new();
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        // Read until the first drain has plainly happened (a `request` or `lagged` frame), or the
-        // window closes — an idle stream legitimately sends nothing more than `hello`.
-        while std::time::Instant::now() < deadline {
-            let mut buf = [0_u8; 8192];
-            match tokio::time::timeout(Duration::from_millis(300), socket.read(&mut buf)).await {
-                Ok(Ok(0)) => break,
-                Ok(Ok(read)) => seen.extend_from_slice(&buf[..read]),
-                Ok(Err(e)) => panic!("the stream connection failed mid-read: {e}"),
-                Err(_) => {}
-            }
-            let text = String::from_utf8_lossy(&seen);
-            if text.contains("event: lagged") || text.contains("event: request") {
-                break;
-            }
-        }
-        String::from_utf8_lossy(&seen).into_owned()
-    }
-
-    fn header_of(headers: &reqwest::header::HeaderMap, name: &str) -> Option<String> {
-        headers
-            .get(name)
-            .and_then(|value| value.to_str().ok())
-            .map(str::to_owned)
-    }
-
-    /// The happy path end to end: a merged read issues a token, and presenting that token walks
-    /// forward rather than replaying. Nothing else in the tree proves `x-rift-next-index` is
-    /// actually *set* by the handler, nor that a token survives the query string and decodes on
-    /// the way back in.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_merged_read_issues_a_cursor_that_pages_forward() {
-        let journal = rift_cluster::stores::ClusterJournal::new(1);
-        let (front, node, journal, _dir) = test_front_over(journal).await;
-
-        RequestJournal::record(&*journal, CURSOR_TEST_PORT, "", recorded("/a"));
-        RequestJournal::record(&*journal, CURSOR_TEST_PORT, "", recorded("/bb"));
-
-        let (status, headers, body) = read_requests(&front, None).await;
-        assert_eq!(status, 200, "uncursored merged read: {body}");
-        assert!(body.contains("/a") && body.contains("/bb"), "body: {body}");
-        assert!(
-            header_of(&headers, HEADER_TRUNCATED).is_none(),
-            "nothing was evicted, so truncation must not be claimed"
-        );
-        let token = header_of(&headers, HEADER_NEXT_INDEX)
-            .expect("a merged read must issue a cursor (issue #225)");
-        assert!(
-            JournalCursor::decode(&token).is_ok(),
-            "the issued token must decode, not merely look opaque: {token}"
-        );
-
-        // Presenting it walks forward: everything recorded so far is consumed.
-        let (status, _, body) = read_requests(&front, Some(&format!("since={token}"))).await;
-        assert_eq!(status, 200);
-        assert_eq!(body, "[]", "the token must not replay the page it followed");
-
-        // And a genuinely new entry surfaces on the next page, so "empty" was exhaustion
-        // rather than the cursor swallowing everything.
-        RequestJournal::record(&*journal, CURSOR_TEST_PORT, "", recorded("/ccc"));
-        let (status, _, body) = read_requests(&front, Some(&format!("since={token}"))).await;
-        assert_eq!(status, 200);
-        assert!(
-            body.contains("/ccc") && !body.contains("/bb"),
-            "only the entry recorded after the token may appear: {body}"
-        );
-
-        node.shutdown().await.expect("node shuts down");
-    }
-
-    /// A cursor the front cannot read is a **typed 400**, never a defaulted position. This is
-    /// the arm with the most expensive silent failure in the change: defaulting to 0 replays
-    /// the whole journal as new traffic, and defaulting to "current" hides everything recorded
-    /// since — both surface in the client's decoder with nothing server-side to correlate.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_malformed_since_is_a_typed_400_not_a_defaulted_position() {
-        let journal = rift_cluster::stores::ClusterJournal::new(1);
-        let (front, node, journal, _dir) = test_front_over(journal).await;
-        RequestJournal::record(&*journal, CURSOR_TEST_PORT, "", recorded("/a"));
-
-        for bad in ["not%20base64%21", "Zm9v", "since-was-empty"] {
-            let (status, _, body) = read_requests(&front, Some(&format!("since={bad}"))).await;
-            assert_eq!(status, 400, "since={bad} must be refused: {body}");
-            assert!(
-                !body.contains("/a"),
-                "a refused cursor must not answer with journal entries: {body}"
-            );
-        }
-        // A bare `?since` with no value is an empty token, not an absent one.
-        let (status, _, _) = read_requests(&front, Some("since")).await;
-        assert_eq!(
-            status, 400,
-            "a valueless `since` is a broken token, not a baseline read"
-        );
-
-        node.shutdown().await.expect("node shuts down");
-    }
-
-    /// The upgrade window: a bare `u64` predates the vector cursor and can only have come from
-    /// a proxied per-node read of this node, so it is honoured as this node's own position.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_legacy_scalar_since_is_read_as_this_nodes_position() {
-        let journal = rift_cluster::stores::ClusterJournal::new(1);
-        let (front, node, journal, _dir) = test_front_over(journal).await;
-        RequestJournal::record(&*journal, CURSOR_TEST_PORT, "", recorded("/a"));
-        RequestJournal::record(&*journal, CURSOR_TEST_PORT, "", recorded("/bb"));
-
-        // Seq 1 is `/a`, so a scalar cursor of 1 has consumed it and must not see it again.
-        let (status, headers, body) = read_requests(&front, Some("since=1")).await;
-        assert_eq!(status, 200, "a legacy scalar must be accepted: {body}");
-        assert!(
-            body.contains("/bb") && !body.contains("\"/a\""),
-            "a scalar cursor must resume this node's shard, not restart it: {body}"
-        );
-        assert!(
-            header_of(&headers, HEADER_NEXT_INDEX).is_some(),
-            "a legacy read still upgrades the caller to a vector token"
-        );
-
-        node.shutdown().await.expect("node shuts down");
-    }
-
-    /// AC3's wiring half: `x-rift-truncated` is stamped when — and only when — retention ate
-    /// entries the presented position had not reached. The walk's own gate tests pin the
-    /// boundary arithmetic; this pins that the bit actually reaches the response.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn eviction_stamps_the_truncation_header_on_a_stale_cursor() {
-        // A cap this small makes retention pressure immediate and deterministic, instead of
-        // recording ten thousand entries to reach the default.
-        let journal = rift_cluster::stores::ClusterJournal::with_parts(
-            1,
-            rift_cluster::stores::JournalConfig {
-                fleet_capacity: 2,
-                min_shard_cap: 2,
-                ..Default::default()
-            },
-            Arc::new(rift_cluster::stores::journal::MonotonicClock::default()),
-        );
-        let (front, node, journal, _dir) = test_front_over(journal).await;
-
-        RequestJournal::record(&*journal, CURSOR_TEST_PORT, "", recorded("/a"));
-        let (_, headers, _) = read_requests(&front, None).await;
-        let early = header_of(&headers, HEADER_NEXT_INDEX).expect("a cursor");
-        assert!(
-            header_of(&headers, HEADER_TRUNCATED).is_none(),
-            "nothing has been evicted yet"
-        );
-
-        // Push past the cap so the shard's watermark climbs above where `early` points.
-        for path in ["/bb", "/ccc", "/dddd", "/eeeee"] {
-            RequestJournal::record(&*journal, CURSOR_TEST_PORT, "", recorded(path));
-        }
-
-        let (status, headers, body) = read_requests(&front, Some(&format!("since={early}"))).await;
-        assert_eq!(
-            status, 200,
-            "a truncated read still serves what survives: {body}"
-        );
-        assert_eq!(
-            header_of(&headers, HEADER_TRUNCATED).as_deref(),
-            Some("true"),
-            "the reader's position predates the eviction watermark and must be told so: {body}"
-        );
-
-        // But a **baseline** read of the very same evicting shard must NOT claim truncation: it
-        // is a snapshot of what is retained, so it has no hole. Collapsing absence into a
-        // position of zero would make this the loudest false alarm in the API — every ordinary
-        // uncursored read of a busy port, forever. Upstream and the single-node path both draw
-        // this line, so the merged read has to as well.
-        let (_, headers, _) = read_requests(&front, None).await;
-        assert!(
-            header_of(&headers, HEADER_TRUNCATED).is_none(),
-            "a baseline read is a snapshot and can never be truncated"
-        );
-
-        node.shutdown().await.expect("node shuts down");
-    }
-
-    /// Issue #64: the accept loop dying is *observable*.
-    ///
-    /// Before this, the front held a bare `JoinHandle` that was only ever
-    /// aborted. A panic in the loop left the node a zombie cluster member —
-    /// public admin dead, still a Raft voter, `/readyz` still 200 — and nothing
-    /// waiting on it, so `serve_until` never returned. An abort that `shutdown`
-    /// The `lagged` half of issue #348's honesty rule: retention overtaking a reader is
-    /// **announced**, not quietly skipped over.
-    ///
-    /// Worth an end-to-end test rather than trusting the flag: `truncated` is computed by the
-    /// merge and the stream just forwards it, so the only thing that can break here is the
-    /// forwarding — which no unit test of the merge would ever notice. Uses the same tiny
-    /// retention cap `eviction_stamps_the_truncation_header_on_a_stale_cursor` does, so eviction
-    /// is immediate and deterministic instead of ten thousand recordings away.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn eviction_past_a_resuming_reader_is_announced_as_lagged() {
-        let journal = rift_cluster::stores::ClusterJournal::with_parts(
-            1,
-            rift_cluster::stores::JournalConfig {
-                fleet_capacity: 2,
-                min_shard_cap: 2,
-                ..Default::default()
-            },
-            Arc::new(rift_cluster::stores::journal::MonotonicClock::default()),
-        );
-        let (front, _node, journal, _dir) = test_front_over(journal).await;
-
-        RequestJournal::record(&*journal, CURSOR_TEST_PORT, "", recorded("/a"));
-        let (_, headers, _) = read_requests(&front, None).await;
-        let early = header_of(&headers, HEADER_NEXT_INDEX).expect("a cursor");
-
-        // Push past the cap, so the shard's watermark climbs above where `early` points and the
-        // entries that reader had not reached are gone for good.
-        for path in ["/bb", "/ccc", "/dddd", "/eeeee"] {
-            RequestJournal::record(&*journal, CURSOR_TEST_PORT, "", recorded(path));
-        }
-
-        let body = stream_frames(&front, Some(&early)).await;
-        assert!(
-            body.contains("event: lagged"),
-            "a reader whose position predates the eviction watermark must be told, not silently \
-             served the remainder as though nothing were missing: {body}"
-        );
-        assert!(
-            body.contains("\"truncated\": true") || body.contains("\"truncated\":true"),
-            "the lagged frame says what was lost: {body}"
-        );
-
-        // The vacuity guard: a reader that has missed nothing must NOT be told it lagged, or the
-        // assertion above would pass on a stream that cries wolf on every connection.
-        let (_, headers, _) = read_requests(&front, None).await;
-        let current = header_of(&headers, HEADER_NEXT_INDEX).expect("a cursor");
-        let body = stream_frames(&front, Some(&current)).await;
-        assert!(
-            !body.contains("event: lagged"),
-            "an up-to-date reader has no hole and must not be told it has one: {body}"
-        );
-    }
-
     /// did not request takes byte-for-byte the same path as a panic unwind:
     /// the drop guard runs and classifies it.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -14,7 +14,7 @@ export interface paths {
         /**
          * List imposters (upstream)
          * @description Proxied to the embedded engine's own admin API, which binds every replicated imposter in-process.
-         *     Each entry's `numberOfRequests` is then rewritten to the fleet sum (issue #223), the same decoration `getImposter` documents in full, fetched for every listed port in one round trip per peer. `Rift-Cluster-Partial` marks the rare case where a peer could not be reached in time.
+         *     Each entry's `numberOfRequests` is **this node's own count** — the requests this node recorded — exactly as `getImposter` documents. It was a fleet sum until D-74 (#552); with the request journal back in the engine, per node, there is no other node's half to add.
          */
         get: operations["listImposters"];
         /**
@@ -49,7 +49,7 @@ export interface paths {
         };
         /**
          * Read one imposter (upstream)
-         * @description The body is upstream's own imposter detail, proxied verbatim, except for one field: `numberOfRequests` is rewritten in place to the fleet sum (issue #223) — upstream's own value is this node's local G-counter slot only, fetched fleet-wide over the cluster RPC port under the same 2 s budget the merged journal read uses. `Rift-Cluster-Partial` marks the rare case where a peer could not be reached in time.
+         * @description The body is upstream's own imposter detail, proxied verbatim. `numberOfRequests` is therefore **the answering node's own count** — the requests this node recorded. Until D-74 (#552) this front rewrote it to a fleet sum; the request journal is the engine's own again, per node, so a client that needs a fleet total reads every node and adds them up, and one that reached a particular node is told that node's truth rather than a number no single node could vouch for.
          *     The `Rift-Cluster-Revision` header is the EE front's addition (C5): the exact `If-Match` token a conditional write on this imposter or its stubs will be judged against, read from the same applied record the precondition checks. Absent when the applied state holds no record to condition on. Only this single-imposter read carries it — the listing names no single conditionable record.
          */
         get: operations["getImposter"];
@@ -210,55 +210,22 @@ export interface paths {
             cookie?: never;
         };
         /**
-         * List recorded requests for an imposter, merged across the fleet
-         * @description Without `match`, the cluster front **terminates** this route (issues #223, #225) rather than proxying: it merges this node's own writer shard with every other roster peer's, pulled live under a 2 s fleet-wide budget, and falls back to the last anti-entropy-cached copy of any peer that misses it. Answers a **bare JSON array** of recorded requests, ordered by each entry's own recorded timestamp (never a node-local arrival clock, which would let two nodes disagree about the order) — not an envelope. `matchOutcome` survives on every entry unchanged.
-         *     `x-rift-next-index` carries an **opaque vector cursor** (issue #225), not an integer: a position per writer shard plus the clear generation it was issued under, base64url encoded. Round-trip it verbatim; do not parse it. This replaces #223's withheld-header convention — #223 withheld the cursor because a scalar index names a position in no shard in particular, and the vector token is precisely the value that does mean the same thing on every node. Passing it back as `since` resumes the walk gaplessly and without duplicates **per shard**, across membership changes (a departed node's position freezes; a joining node enters at 0) and across clears (#224 — cleared entries are never replayed and the token never regresses).
-         *     `x-rift-truncated: true` when retention evicted entries this reader had not yet seen, exactly as upstream means it. Additive-only: never sent as `false`. A **baseline** read (no `since` at all) is a snapshot of everything still retained and is therefore never truncated — only a reader resuming from a position can have missed something.
-         *     Pages are ordered by recorded timestamp *within* a page. Concatenating pages is not a globally sorted stream: a peer that becomes reachable between pages contributes entries older than everything already returned, so do not build an append-only "latest requests" view by appending pages without re-sorting.
-         *     A `since` value that is neither a token this fleet issued nor a bare `u64` answers **400**, never a defaulted position — defaulting would silently replay the whole journal or silently skip everything recorded since. A bare `u64` is accepted for the upgrade window and read as this node's own shard position (`{this_node: seq}`), which is the only thing it can have meant: before #225 a merged read issued no cursor at all, so any scalar a client holds came from a proxied per-node read of this node.
-         *     With `match` present, this proxies to the local engine exactly as before #223: it is a predicate the merge-on-read path never evaluates at all, so terminating on it would silently answer with the *whole* fleet's requests instead of the caller's scoped subset, and turn a malformed filter's upstream `400` into a `200` with everything. Proxying leaves upstream's own clause parser and its existing error handling in charge, and on that path the cursor headers carry upstream's own scalar index rather than a vector token.
-         *     `/imposters/{port}/requests` is an alias: `classify` collapses both spellings onto the same handler, so the two operations describe identical bytes and are kept identical here. So are both spellings under `/admin/imposters/{port}/...` (issue #223 review): the alias `classify` already gave the imposter listing is extended here too, so a caller cannot get a different answer by spelling the path differently.
+         * List recorded requests for an imposter, on the node you reached (upstream)
+         * @description Proxied to the embedded engine's own admin API. The answer is **this node's** recorded requests — the ones this node served — as a **bare JSON array**, not an envelope. `matchOutcome` rides on every entry.
+         *     **Per node, by design (D-74).** Until #552 this route was terminated by the cluster front and merged every node's writer shard under a fleet-wide budget. That subsystem — per-writer shards, a k-way merge, anti-entropy, generation clears and a vector cursor — is removed. A test that needs fleet-wide verification pins a node or reads all of them and adds up; if a shared journal is ever wanted it belongs in the engine, once, for every deployment shape (RFC-007 §3.3). Consequently no answer here is ever `Rift-Cluster-Partial`: there is no peer for it to be partial about.
+         *     `since` and `match` are upstream's own parameters, parsed by upstream. `since` is upstream's **scalar** index, echoed back in `x-rift-next-index`, and `x-rift-truncated: true` appears when retention evicted entries this reader had not yet seen. Both are the engine's, with the engine's meanings, unchanged by the cluster.
+         *     `/imposters/{port}/requests` is upstream's own alias for this route and answers identical bytes.
          */
         get: operations["listSavedRequests"];
         put?: never;
         post?: never;
         /**
-         * Clear recorded requests for an imposter, converging by consensus
-         * @description Terminates (issue #223 item 4), and as of issue #224 the two forms below diverge in *how* they terminate — both are covered by `classify` regardless, so the front owns this route either way; only the mechanism differs.
-         *     **Without `match`**: commits a Raft-replicated clear generation for this port (`ControlOp::JournalClearGen`, `space` unset). A clear never deletes an entry directly — it raises a counter every reader compares its own entries' stamps against, so the clear converges by consensus rather than by a best-effort broadcast a partitioned peer could miss forever. Two clears racing from different nodes both take effect (the counter has no fixed value to overwrite), and a node that was offline when this committed still applies it correctly once it catches up, by replication or by snapshot. `Rift-Cluster-Partial` is never stamped on this path — a consensus write is not partial.
-         *     **With `match`** (issue #223 review, B3 — a design decision #224 deliberately left alone): the clear stays **local-only**, proxied to the local engine exactly as before #223, and never becomes a Raft write. `ControlOp::JournalClearGen` carries a `space`, not an arbitrary match predicate, so a scoped filter has nowhere on that op to travel that isn't either dropped or misrepresented as a full clear — committing the wrong, wider thing would be worse than staying local. `Rift-Cluster-Partial: true` is stamped unconditionally on this path, not because a peer was unreachable but because the clear itself is knowingly not fleet-wide by design, so a client cannot mistake a scoped, local clear for a fleet-complete one.
-         *     Answers the imposter's current state either way. Aliased as `DELETE /imposters/{port}/requests`, and — issue #223 review — as both spellings under `/admin/imposters/{port}/...` too.
+         * Clear recorded requests for an imposter, on the node you reached (upstream)
+         * @description Proxied to the embedded engine's own admin API, which clears **this node's** recorded requests for the port and answers the imposter as it now stands.
+         *     **Per node, by design (D-74).** Until #552 the unscoped form committed a Raft-replicated clear generation (`ControlOp::JournalClearGen`) that every node's merge consulted, and the `?match=`-scoped form stayed a local proxy stamped `Rift-Cluster-Partial`. With the journal back in the engine there is nothing fleet-wide to converge: a clear addresses the node it reached, and a caller that wants the fleet clear issues it on each node. Neither form stamps `Rift-Cluster-Partial` any more.
+         *     `match` is upstream's own parameter, parsed by upstream. `DELETE /imposters/{port}/requests` is upstream's own alias and behaves identically.
          */
         delete: operations["clearSavedRequests"];
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/imposters/{port}/savedRequests/stream": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                /** @description The imposter's port number. */
-                port: components["parameters"]["Port"];
-            };
-            cookie?: never;
-        };
-        /**
-         * Live tail of recorded requests, merged across the fleet (SSE)
-         * @description The live sibling of `GET /imposters/{port}/savedRequests`, terminated by the cluster front rather than proxied to one node (issue #348). Answers `text/event-stream`.
-         *     **One contract, two read modes.** Every wake re-runs the same merged cursor walk the `savedRequests` read runs, from the position this connection holds. So the `id:` line after an event is a cursor token in exactly the sense `x-rift-next-index` is, and once a burst has drained it is the same token a simultaneous cursor read would answer with. Reconnect with `Last-Event-ID` and the walk resumes gaplessly and without duplicates **per shard** — the same guarantee, and the same token vocabulary, as `since`.
-         *     **Latency is declared, not hidden.** Entries this node records surface immediately. Entries from *peer* shards arrive on the anti-entropy cadence, because a tail that fanned out to every peer per event would multiply inter-node traffic by the number of attached clients. The `hello` event therefore carries `clusterTailLatencyMs`, the interval this fleet actually runs that cadence at, and it is an honest upper bound on how late a peer's entry can be.
-         *     **Events.** `hello` first, carrying `engineVersion`, `types` (always `["requests"]`), `port`, `clusterTailLatencyMs`, and `cursor` — the position the stream starts from, so a client can bootstrap a poll from it. Then `request` events, whose `data` is `{port, flowId, request}`, plus `index` **only** for entries this node wrote (a peer's seq is a position in another shard and must never be presented back as a scalar `since`). `lagged` when retention evicted entries this reader had not reached — same meaning as upstream's: reconcile by polling, this stream does not replay. `partial` on every transition of the merged read's degraded state, `true` and back to `false`, so a peer going unreachable mid-stream is visible rather than silent. `: ping` every 15 s.
-         *     **Divergences from the engine's own stream**, all additive: `hello` gains `clusterTailLatencyMs` and `cursor` and omits the engine's scalar `seq` (a merged stream has no single bus position); `id:` is the vector cursor token rather than a bus sequence number; `index` is withheld for peer entries; and `partial` is new.
-         *     With `match` present this proxies to the local engine unchanged, for the reason `GET .../savedRequests` documents: the merge path evaluates no predicates, so terminating a predicate-scoped tail would answer with the whole fleet's requests instead of the caller's subset.
-         *     Unlike this route, `GET /events` stays proxied per-node: it is upstream's own firehose, answered by the node it reaches. This per-port tail carries one imposter's requests and is authorized as the ordinary port-scoped `imposter.read` it always was.
-         */
-        get: operations["streamSavedRequests"];
-        put?: never;
-        post?: never;
-        delete?: never;
         options?: never;
         head?: never;
         patch?: never;
@@ -275,18 +242,44 @@ export interface paths {
             cookie?: never;
         };
         /**
-         * List matched requests for an imposter, merged across the fleet
-         * @description The alias spelling of `GET /imposters/{port}/savedRequests` — `classify` maps both spellings to the same handler, so this answers the identical body and headers. Declared in full rather than by reference because a generated client reads each operation independently.
-         *     Without `match`, terminates as the fleet merge-on-read `savedRequests` documents in full, `?since=` included (issue #225); with `match` present, proxies to the local engine, because it is a predicate the merge-on-read path never evaluates. See that operation's description for the whole contract, including the opaque vector cursor `x-rift-next-index` carries on the merged path.
+         * List matched requests for an imposter, on the node you reached (upstream)
+         * @description Upstream's own alias spelling of `GET /imposters/{port}/savedRequests` — one handler in the engine, so this answers identical bytes and headers. Declared in full rather than by reference because a generated client reads each operation independently.
+         *     Per node (D-74), with upstream's own scalar `since` cursor and `x-rift-next-index`/`x-rift-truncated` headers. See that operation for the whole contract.
          */
         get: operations["listRequests"];
         put?: never;
         post?: never;
         /**
-         * Clear matched requests for an imposter, converging by consensus
-         * @description The alias spelling of `DELETE /imposters/{port}/savedRequests` — the same handler, so the same parameters, body, status codes and Raft-committed-generation contract.
+         * Clear matched requests for an imposter, on the node you reached (upstream)
+         * @description Upstream's own alias spelling of `DELETE /imposters/{port}/savedRequests` — the same handler, so the same parameters, status codes and per-node semantics (D-74).
          */
         delete: operations["clearRequests"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/imposters/{port}/savedRequests/stream": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The imposter's port number. */
+                port: components["parameters"]["Port"];
+            };
+            cookie?: never;
+        };
+        /**
+         * Live tail of recorded requests, on the node you reached (SSE, upstream)
+         * @description Proxied to the embedded engine's own admin API. The live sibling of `GET /imposters/{port}/savedRequests`, and per node for the same reason (D-74): it tails **this node's** journal — the requests this node served — and answers `text/event-stream`.
+         *     **Per node, by design (D-74).** Until #552 this route was terminated by the cluster front (issue #348) and re-ran the fleet merge on every wake, with a vector-cursor `id:`, a `clusterTailLatencyMs` bound on how late a peer's entry could arrive, and a `partial` event on each transition of the merged read's degraded state. All three were properties of the merge; with the journal back in the engine there is no peer to be late or partial about, so the stream is upstream's own frames verbatim. A client that wants the fleet's tail opens one stream per node.
+         *     **Events** are the engine's. `hello` first, carrying `engineVersion`, the bus position `seq`, `types` (always `["requests"]` on this alias) and `port`. Then `request` events whose `data` is `{port, flowId, request}` plus `index` when the journal backend has stable indices — the same scalar `since` position the polling read uses, and omitted entirely when it does not, so its absence is a capability probe rather than a value. `lagged` when the subscriber fell behind the bus, carrying `missed`. `: ping` every 15 s.
+         *     The alias pre-binds the port and streams request events only; upstream ignores `types` and `port` here. `match` is upstream's own parameter, parsed by upstream, and filters the frames. `GET /events` is the engine's unfiltered firehose and is likewise per node.
+         */
+        get: operations["streamSavedRequests"];
+        put?: never;
+        post?: never;
+        delete?: never;
         options?: never;
         head?: never;
         patch?: never;
@@ -454,7 +447,7 @@ export interface paths {
         post?: never;
         /**
          * Tear down one correlated-isolation space
-         * @description Two independent halves (issue #224). The flow-state store is already clustered via `ClusteredFlowStore`, so this proxies to the local engine exactly as it always has — this issue does not touch that half, and the response below is that proxy's own body, unchanged. What #224 adds is the journal half: once the flow-state teardown actually succeeds, the cluster front additionally commits a Raft-replicated clear generation for this space (the same convergence primitive `DELETE .../savedRequests` commits for a whole port), so every node's own recorded-request journal starts dropping this space's pre-teardown entries too. A teardown that fails locally (404/409/etc.) commits nothing — there is nothing to converge on if the space was never actually torn down.
+         * @description Two independent halves (issue #537, D-69). The flow-state store is already clustered via `ClusteredFlowStore`, so this proxies to the local engine exactly as it always has, and the response below is that proxy's own body, unchanged. Upstream's `teardown_space` also clears this space's **recorded requests** on the node that took the teardown, via its own `RequestJournal::clear_flow` — which since D-74 (#552) is the whole of the journal side, the journal being per node. The half this front adds is the **stub** delete: space-scoped stubs are replicated config, so once the proxied teardown actually succeeds the front commits a `DeleteBySpace` stub edit through Raft, or the next config reconcile would re-render the imposter from `sm_configs` and resurrect them fleet-wide. A teardown that fails locally (404/409/etc.) commits nothing — there is nothing to delete if the space was never actually torn down.
          */
         delete: operations["deleteSpace"];
         options?: never;
@@ -637,54 +630,6 @@ export interface paths {
          * @description Terminates: idempotent at the state-machine level, but the admin surface still answers `404` for a route id that was never in the table (captured before the delete commits, the same shape as `deleteImposter`). A delete mutates the table, so it advances the table's revision and invalidates any outstanding `If-Match` against it.
          */
         delete: operations["deleteFrontDoorRoute"];
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/admin/requests": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /**
-         * The fleet's recorded requests across every imposter, merged and resumable
-         * @description Terminates. `GET /imposters/{port}/savedRequests` across every imposter the fleet has applied, merged server-side into one ordered, resumable answer.
-         *     **Ordering is the journal's, not the network's.** Rows are ordered by each request's own recorded timestamp. That timestamp is stamped by whichever node served the request, so entries recorded within milliseconds of each other on clock-skewed nodes can still transpose — there is no fleet-wide sequence and this endpoint does not invent one. What it removes is the *other* source of disorder: assembling this view client-side ordered rows by which of N responses arrived first.
-         *     **One cursor, not N.** `cursor` in the response is a single opaque token covering every port this answer covers; pass it back as `since` for the next page. Within the covered set the walk is gapless and duplicate-free per shard, exactly as the per-imposter cursor is. A per-imposter token presented here is refused with a `400` that says so, rather than misread as a fleet position.
-         *     **The cap is stated.** A fleet may hold more imposters than one answer covers. Coverage ranks ports by most recent activity and keeps `--cluster-fleet-journal-port-cap` of them (default 100); `coverage.omitted` names every port left out and `coverage.capped` says whether the cap bit at all. Nothing is dropped silently.
-         *     **`joined`** names covered ports that had no position in the presented cursor and whose history was therefore replayed — the ports a resuming client may see duplicates from. On a baseline read (no `since`) that is every covered port, by definition.
-         *     No `match` parameter: the merge path evaluates no predicates, so a predicate-scoped fleet read would answer with everything instead of the caller's scoped subset. Predicate-scoped reads stay per-imposter.
-         */
-        get: operations["readFleetRequests"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/admin/requests/stream": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /**
-         * Live tail of the fleet's recorded requests across every imposter (SSE)
-         * @description The live sibling of `GET /admin/requests`, and the fleet-wide counterpart of `GET /imposters/{port}/savedRequests/stream`. Answers `text/event-stream`.
-         *     Every property that route documents holds here, for the same reasons and with the same token vocabulary: one contract shared with the cursor read, `Last-Event-ID` resuming gaplessly and without duplicates per shard, and a declared `clusterTailLatencyMs` bounding how late a peer's entry can arrive.
-         *     **Events.** `hello` first, carrying `engineVersion`, `types` (always `["requests"]`), `scope` (always `"fleet"`), `clusterTailLatencyMs`, `cursor`, and `coverage`. Then `request` events whose `data` is `{port, flowId, request}`, plus `index` **only** for entries this node wrote. `coverage` whenever the covered set changes — the cap is dynamic, so a client whose view narrowed or widened is told rather than left to guess. `lagged` when retention evicted entries this reader had not reached. `partial` on every transition of the degraded state. `: ping` every 15 s.
-         *     **A connect never replays**, per port: a port entering coverage — at connect or later — starts from its current position and emits nothing retroactively, so a widening view cannot look like a burst of traffic that never happened. Poll `GET /admin/requests` for history.
-         */
-        get: operations["streamFleetRequests"];
-        put?: never;
-        post?: never;
-        delete?: never;
         options?: never;
         head?: never;
         patch?: never;
@@ -993,9 +938,9 @@ export interface components {
             /** @description How many stubs this imposter has, on the list projection (`GET /imposters`), where the `stubs` array is omitted. Absent on a single-imposter read, which carries `stubs` instead. A client wanting a count for both shapes reads `stubs.length` when the array is there and falls back to this — neither field alone covers both responses. */
             stubCount?: number;
             /**
-             * @description How many requests this imposter has served, **fleet-wide** (issue #363). Present on both the list projection and the single-imposter read.
+             * @description How many requests this imposter has served **on the node that answered** (D-74). Present on both the list projection and the single-imposter read.
              *     Declared rather than left to this schema's `additionalProperties`, which is what previously kept it off the console: a field reaching the body only through the index signature is one no typed client can render without asserting a shape the contract never promised.
-             *     The value is not this node's own tally. Upstream answers its local G-counter slot, and the front rewrites it to the sum across every node's slot for this port (issue #223) — so it is the figure the design's `REQUESTS · FLEET SUM` tile claims to be. When a peer could not be reached inside the fan-out budget the response carries `Rift-Cluster-Partial`, and the sum is of the nodes that answered: a floor, not a total.
+             *     It was a fleet sum until #552: upstream answered its local counter and the front rewrote it to the sum across every node's slot. The request journal is upstream's own again, per node, so there is no other node's half to add — a client wanting a fleet total reads every node and sums the values itself, and knows which nodes it counted rather than being handed a floor it cannot attribute.
              */
             numberOfRequests?: number;
             _rift?: components["schemas"]["RiftExtensions"];
@@ -1060,33 +1005,6 @@ export interface components {
         } & {
             [key: string]: unknown;
         };
-        /** @description One page of the fleet-wide request journal (issue #362) — the rows, the cursor that fetches the next page, and an explicit statement of which imposters the answer actually speaks for. */
-        FleetRequestPage: {
-            /** @description Recorded requests across the covered imposters, ordered by each request's own recorded timestamp. Each row names the imposter it came from — without that a merged answer is a pile of requests with no way to tell which mock served them. */
-            requests: {
-                /** @description The imposter this request was recorded on. */
-                port: number;
-                /** @description The flow (space) the request was resolved to at record time. */
-                flowId: string;
-                request: components["schemas"]["RecordedRequest"];
-            }[];
-            /** @description Opaque, versioned resumption token covering every port in `coverage.covered`. Pass it back as `since`. Round-trip it unmodified — never parse it. */
-            cursor: string;
-            coverage: components["schemas"]["FleetJournalCoverage"];
-            /** @description Covered ports that had no position in the presented cursor, so their retained history was replayed into this page. A resuming client may see entries here it has already seen; on a baseline read this is every covered port. */
-            joined: number[];
-        };
-        /** @description Which imposters a fleet journal answer speaks for, and which it left out. The cap exists to bound the token size and the walk's cost; this block is what stops it being silent. */
-        FleetJournalCoverage: {
-            /** @description The imposters this answer walked, ascending. */
-            covered: number[];
-            /** @description Every imposter the fleet holds that was considered, covered or not. */
-            total: number;
-            /** @description The imposters the cap excluded, ascending — named rather than counted, so an operator can tell whose traffic they are not looking at. Ports rank by most recent activity, so these are the least recently active. */
-            omitted: number[];
-            /** @description Whether the cap actually excluded anything. */
-            capped: boolean;
-        };
         /**
          * @description One request an imposter recorded, exactly as the engine serializes it (upstream `rift-mock-core::imposter::types::RecordedRequest`). Non-exhaustive.
          *     Three fields do not follow the obvious Rust-to-JSON mapping, and each one has bitten a client. `_mode` keeps its leading underscore — an explicit serde rename that overrides the struct's camelCase rule — and is omitted entirely for a text body, so `binary` is the only value that ever reaches the wire. `body` is absent when the request carried none. And a `headers` value is a **bare string** when the header carried a single value, an array only when it carried several; a key whose value list is empty is dropped rather than emitted as `[]`.
@@ -1133,8 +1051,8 @@ export interface components {
              */
             latencyMs?: number;
             /**
-             * @description The node that served this request (issue #364), stamped by the clustered journal at record time — it is the same identity the entry is keyed by, so a merged read cannot show a row whose `node` disagrees with the shard it came from.
-             *     A string, not a number: node ids are identifiers rather than magnitudes, and an id above 2^53 would be silently rounded by any JavaScript reading it. Absent from a recording made before this shipped, and from a single-node engine, which has no name for itself.
+             * @description The node that served this request (issue #364). Upstream's field, and upstream never sets it: only a `RequestJournal` implementation that spans nodes knows a node's identity, and since D-74 (#552) the cluster installs no such implementation — every imposter keeps upstream's own per-node journal. So this is **absent** on a RiftCluster fleet, and a reader that needs to know which node an entry came from knows it from the node it asked: the answering node's id is the top-level `node_id` of `GET /_fleet/members`.
+             *     A string, not a number, for when an embedder does set it: node ids are identifiers rather than magnitudes, and an id above 2^53 would be silently rounded by any JavaScript reading it.
              */
             node?: string;
         } & {
@@ -1630,8 +1548,8 @@ export interface components {
         CsrfHeader: string;
         /**
          * @description Journal cursor: return only entries recorded after this position, as previously reported by this endpoint's x-rift-next-index response header. Absent means a baseline read of everything still retained.
-         *     On the clustered merge-on-read path this is an **opaque vector cursor** (issue #225) — a string, not an integer: it encodes a position per writer shard plus the clear generation it was issued under, because a scalar index names a position in no shard in particular once more than one node is recording. Round-trip it verbatim; do not parse it, and do not construct one. A bare `u64` is still accepted during the upgrade window and read as this node's own shard position.
-         *     An unparseable value here answers 400 rather than taking a default — a cursor that silently restarted at zero would re-deliver the whole journal as if it were new traffic, and one that silently jumped to the end would hide everything recorded since it was issued.
+         *     Upstream's own parameter, parsed by upstream and scoped to the node the request reached (D-74): the value is the engine's scalar index. Round-trip it verbatim rather than constructing one — an unparseable value answers 400 rather than taking a default, because a cursor that silently restarted at zero would re-deliver the whole journal as if it were new traffic, and one that silently jumped to the end would hide everything recorded since it was issued.
+         *     It is a *node's* position, not a fleet's: presenting a cursor issued by one node to another names a position in a journal that node never wrote.
          */
         JournalSince: string;
         /**
@@ -1651,16 +1569,16 @@ export interface components {
         RiftClusterOpId: string;
         /**
          * @description The cursor to send as `since` on the next read to continue exactly where this response stopped. Its **presence is the protocol**: a client probes for this header to discover whether cursoring is supported at all, rather than assuming a default and paging against a backend that cannot honour it (issue #603).
-         *     On the clustered merge-on-read path (issue #225) the value is an **opaque vector cursor** — a string encoding a position per writer shard and the clear generation it was issued under. Round-trip it verbatim; never parse it. It is emitted on every merged read, including a degraded one: a `Rift-Cluster-Partial` answer is still a real position in every shard that did answer, so withholding the cursor there would strand a client mid-walk for the duration of a partition. Proxied per-node reads still carry upstream's own scalar index here, under the same "do not parse it" contract.
+         *     Upstream's own header, emitted by upstream, carrying upstream's scalar index for the node that answered (D-74). Round-trip it verbatim; never parse it, and never present a cursor from one node to another.
          */
         XRiftNextIndex: string;
         /** @description Present, with the value `true`, when retention evicted entries the caller's `since` cursor had not yet read — the gap is unrecoverable and the client has silently missed requests. Emitted **only** when that is the case: there is no `false` form, so a client tests for the header's presence and never parses its value. */
         XRiftTruncated: true;
         /**
-         * @description Two distinct reasons emit this header, never conflated by the response that carries it:
-         *     A fleet merge-on-read (issue #223) could not confirm every roster peer within its budget — the merged journal entries, or the fleet `numberOfRequests` decoration on getImposter/listImposters. Emitted only when at least one peer was unreachable or too slow; never means a peer's data was dropped from the answer, since whatever the last anti-entropy pass cached for that peer still merges in — this says "possibly missing something newer," never "missing that peer entirely."
-         *     A `?match=`-scoped `clearSavedRequests`/`clearRequests` (issue #223 review, B3 — #224 left this deliberately unchanged): stamped unconditionally, not because a peer was unreachable but because a scoped clear is knowingly local-only *by design* — it never becomes the Raft-committed, fleet-converging write the unscoped form is.
-         *     There is no `false` form either way, exactly like `x-rift-truncated`, and a Ch.12 strict-mode gate asserts its absence on a fully healthy, unscoped answer.
+         * @description A read that **genuinely fans out** across the fleet could not confirm every roster peer within its budget. Emitted by exactly two operations — `getFleetMembers` and `getFleetHealth` — and only when at least one peer was unreachable or too slow. It says "possibly missing something newer", never "missing that peer entirely".
+         *     Since **D-74** (#552) it marks only those. It used to ride the merged journal read, the fleet `numberOfRequests` decoration and a `?match=`-scoped requests clear; the request journal is upstream's own and per node now, so a requests read has no peer to be partial about — it either answers for the node the caller reached, or it fails.
+         *     The spaces listing also fans out, and reports its own incompleteness in the body (`partial`, beside `unavailable`) rather than through this header: an enumeration that is short for a *policy* reason and one that is short because a peer was slow are different facts, and a boolean header cannot tell them apart.
+         *     There is no `false` form, exactly like `x-rift-truncated`, and a Ch.12 strict-mode gate asserts its absence on a fully healthy answer.
          */
         RiftClusterPartial: true;
     };
@@ -1680,7 +1598,6 @@ export interface operations {
             /** @description The fleet's imposters. */
             200: {
                 headers: {
-                    "Rift-Cluster-Partial": components["headers"]["RiftClusterPartial"];
                     [name: string]: unknown;
                 };
                 content: {
@@ -1829,7 +1746,6 @@ export interface operations {
             200: {
                 headers: {
                     "Rift-Cluster-Revision": components["headers"]["RiftClusterRevision"];
-                    "Rift-Cluster-Partial": components["headers"]["RiftClusterPartial"];
                     [name: string]: unknown;
                 };
                 content: {
@@ -2438,8 +2354,8 @@ export interface operations {
             query?: {
                 /**
                  * @description Journal cursor: return only entries recorded after this position, as previously reported by this endpoint's x-rift-next-index response header. Absent means a baseline read of everything still retained.
-                 *     On the clustered merge-on-read path this is an **opaque vector cursor** (issue #225) — a string, not an integer: it encodes a position per writer shard plus the clear generation it was issued under, because a scalar index names a position in no shard in particular once more than one node is recording. Round-trip it verbatim; do not parse it, and do not construct one. A bare `u64` is still accepted during the upgrade window and read as this node's own shard position.
-                 *     An unparseable value here answers 400 rather than taking a default — a cursor that silently restarted at zero would re-deliver the whole journal as if it were new traffic, and one that silently jumped to the end would hide everything recorded since it was issued.
+                 *     Upstream's own parameter, parsed by upstream and scoped to the node the request reached (D-74): the value is the engine's scalar index. Round-trip it verbatim rather than constructing one — an unparseable value answers 400 rather than taking a default, because a cursor that silently restarted at zero would re-deliver the whole journal as if it were new traffic, and one that silently jumped to the end would hide everything recorded since it was issued.
+                 *     It is a *node's* position, not a fleet's: presenting a cursor issued by one node to another names a position in a journal that node never wrote.
                  */
                 since?: components["parameters"]["JournalSince"];
                 /**
@@ -2465,7 +2381,6 @@ export interface operations {
                 headers: {
                     "x-rift-next-index": components["headers"]["XRiftNextIndex"];
                     "x-rift-truncated": components["headers"]["XRiftTruncated"];
-                    "Rift-Cluster-Partial": components["headers"]["RiftClusterPartial"];
                     [name: string]: unknown;
                 };
                 content: {
@@ -2510,7 +2425,102 @@ export interface operations {
             /** @description Requests cleared; answers the imposter as it now stands. */
             200: {
                 headers: {
-                    "Rift-Cluster-Partial": components["headers"]["RiftClusterPartial"];
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Imposter"];
+                };
+            };
+            400: components["responses"]["BadData"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            /** @description No such imposter on this port. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    listRequests: {
+        parameters: {
+            query?: {
+                /**
+                 * @description Journal cursor: return only entries recorded after this position, as previously reported by this endpoint's x-rift-next-index response header. Absent means a baseline read of everything still retained.
+                 *     Upstream's own parameter, parsed by upstream and scoped to the node the request reached (D-74): the value is the engine's scalar index. Round-trip it verbatim rather than constructing one — an unparseable value answers 400 rather than taking a default, because a cursor that silently restarted at zero would re-deliver the whole journal as if it were new traffic, and one that silently jumped to the end would hide everything recorded since it was issued.
+                 *     It is a *node's* position, not a fleet's: presenting a cursor issued by one node to another names a position in a journal that node never wrote.
+                 */
+                since?: components["parameters"]["JournalSince"];
+                /**
+                 * @description Repeatable filter clause; every clause supplied must match (AND). The grammar is closed — `method=<Verb>`, `path=<Path>`, `flow_id=<Value>`, or `header:<Name>=<Value>` — and a value outside it answers 400 rather than being ignored, because a filter that silently degraded to "match everything" would cross-contaminate correlated scenarios.
+                 * @example [
+                 *       "method=POST",
+                 *       "header:Content-Type=application/json"
+                 *     ]
+                 */
+                match?: components["parameters"]["JournalMatch"];
+            };
+            header?: never;
+            path: {
+                /** @description The imposter's port number. */
+                port: components["parameters"]["Port"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Matched requests, oldest first (bare array, not an envelope). */
+            200: {
+                headers: {
+                    "x-rift-next-index": components["headers"]["XRiftNextIndex"];
+                    "x-rift-truncated": components["headers"]["XRiftTruncated"];
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RecordedRequest"][];
+                };
+            };
+            400: components["responses"]["BadData"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            /** @description No such imposter on this port. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    clearRequests: {
+        parameters: {
+            query?: {
+                /**
+                 * @description Repeatable filter clause; every clause supplied must match (AND). The grammar is closed — `method=<Verb>`, `path=<Path>`, `flow_id=<Value>`, or `header:<Name>=<Value>` — and a value outside it answers 400 rather than being ignored, because a filter that silently degraded to "match everything" would cross-contaminate correlated scenarios.
+                 * @example [
+                 *       "method=POST",
+                 *       "header:Content-Type=application/json"
+                 *     ]
+                 */
+                match?: components["parameters"]["JournalMatch"];
+            };
+            header?: never;
+            path: {
+                /** @description The imposter's port number. */
+                port: components["parameters"]["Port"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Requests cleared; answers the imposter as it now stands. */
+            200: {
+                headers: {
                     [name: string]: unknown;
                 };
                 content: {
@@ -2559,104 +2569,6 @@ export interface operations {
                 };
                 content: {
                     "text/event-stream": string;
-                };
-            };
-            400: components["responses"]["BadData"];
-            401: components["responses"]["Unauthorized"];
-            403: components["responses"]["Forbidden"];
-            /** @description No such imposter on this port. */
-            404: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Error"];
-                };
-            };
-        };
-    };
-    listRequests: {
-        parameters: {
-            query?: {
-                /**
-                 * @description Journal cursor: return only entries recorded after this position, as previously reported by this endpoint's x-rift-next-index response header. Absent means a baseline read of everything still retained.
-                 *     On the clustered merge-on-read path this is an **opaque vector cursor** (issue #225) — a string, not an integer: it encodes a position per writer shard plus the clear generation it was issued under, because a scalar index names a position in no shard in particular once more than one node is recording. Round-trip it verbatim; do not parse it, and do not construct one. A bare `u64` is still accepted during the upgrade window and read as this node's own shard position.
-                 *     An unparseable value here answers 400 rather than taking a default — a cursor that silently restarted at zero would re-deliver the whole journal as if it were new traffic, and one that silently jumped to the end would hide everything recorded since it was issued.
-                 */
-                since?: components["parameters"]["JournalSince"];
-                /**
-                 * @description Repeatable filter clause; every clause supplied must match (AND). The grammar is closed — `method=<Verb>`, `path=<Path>`, `flow_id=<Value>`, or `header:<Name>=<Value>` — and a value outside it answers 400 rather than being ignored, because a filter that silently degraded to "match everything" would cross-contaminate correlated scenarios.
-                 * @example [
-                 *       "method=POST",
-                 *       "header:Content-Type=application/json"
-                 *     ]
-                 */
-                match?: components["parameters"]["JournalMatch"];
-            };
-            header?: never;
-            path: {
-                /** @description The imposter's port number. */
-                port: components["parameters"]["Port"];
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Matched requests, oldest first (bare array, not an envelope). */
-            200: {
-                headers: {
-                    "x-rift-next-index": components["headers"]["XRiftNextIndex"];
-                    "x-rift-truncated": components["headers"]["XRiftTruncated"];
-                    "Rift-Cluster-Partial": components["headers"]["RiftClusterPartial"];
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["RecordedRequest"][];
-                };
-            };
-            400: components["responses"]["BadData"];
-            401: components["responses"]["Unauthorized"];
-            403: components["responses"]["Forbidden"];
-            /** @description No such imposter on this port. */
-            404: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Error"];
-                };
-            };
-        };
-    };
-    clearRequests: {
-        parameters: {
-            query?: {
-                /**
-                 * @description Repeatable filter clause; every clause supplied must match (AND). The grammar is closed — `method=<Verb>`, `path=<Path>`, `flow_id=<Value>`, or `header:<Name>=<Value>` — and a value outside it answers 400 rather than being ignored, because a filter that silently degraded to "match everything" would cross-contaminate correlated scenarios.
-                 * @example [
-                 *       "method=POST",
-                 *       "header:Content-Type=application/json"
-                 *     ]
-                 */
-                match?: components["parameters"]["JournalMatch"];
-            };
-            header?: never;
-            path: {
-                /** @description The imposter's port number. */
-                port: components["parameters"]["Port"];
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Requests cleared; answers the imposter as it now stands. */
-            200: {
-                headers: {
-                    "Rift-Cluster-Partial": components["headers"]["RiftClusterPartial"];
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Imposter"];
                 };
             };
             400: components["responses"]["BadData"];
@@ -3494,61 +3406,6 @@ export interface operations {
             504: components["responses"]["WriteTimeout"];
         };
     };
-    readFleetRequests: {
-        parameters: {
-            query?: {
-                /** @description A cursor token from a previous answer's `cursor` field or `x-rift-next-index` header. Absent means a baseline read: every covered port's retained history. Malformed, wrong-scope and unknown-version tokens are all refused with `400` rather than defaulted — defaulting would either replay the whole journal or silently skip everything recorded since the token went stale. */
-                since?: string;
-            };
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description The merged page, its resumption cursor, and its stated coverage. */
-            200: {
-                headers: {
-                    /** @description The same token as the body's `cursor`, for parity with the per-imposter read. */
-                    "x-rift-next-index"?: string;
-                    /** @description Retention dropped entries this reader had not reached, on at least one covered port. */
-                    "x-rift-truncated"?: boolean;
-                    /** @description At least one covered port's merged view is short — a peer was unreachable, or a crash-restarted writer's entries are gone. Never set by a coverage omission, which is a different fact and is reported in `coverage`. */
-                    "Rift-Cluster-Partial"?: boolean;
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["FleetRequestPage"];
-                };
-            };
-            400: components["responses"]["BadData"];
-            401: components["responses"]["Unauthorized"];
-            403: components["responses"]["Forbidden"];
-        };
-    };
-    streamFleetRequests: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description An open SSE stream. Ends only when the client disconnects or the node stops. */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "text/event-stream": string;
-                };
-            };
-            400: components["responses"]["BadData"];
-            401: components["responses"]["Unauthorized"];
-            403: components["responses"]["Forbidden"];
-        };
-    };
     compileSpec: {
         parameters: {
             query: {
@@ -3659,6 +3516,7 @@ export interface operations {
             /** @description This node's raft membership view. */
             200: {
                 headers: {
+                    "Rift-Cluster-Partial": components["headers"]["RiftClusterPartial"];
                     [name: string]: unknown;
                 };
                 content: {
@@ -3681,6 +3539,7 @@ export interface operations {
             /** @description This node's readiness and ring view. */
             200: {
                 headers: {
+                    "Rift-Cluster-Partial": components["headers"]["RiftClusterPartial"];
                     [name: string]: unknown;
                 };
                 content: {

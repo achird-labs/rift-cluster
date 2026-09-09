@@ -4,16 +4,33 @@ import userEvent from "@testing-library/user-event";
 import { type ReactNode, useState } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { REQUEST_POLL_INTERVAL_MS } from "../app/query.ts";
+import { POLL_INTERVAL_MS, REQUEST_POLL_INTERVAL_MS } from "../app/query.ts";
 import { RequestLog } from "../screens/RequestLog.tsx";
 import { renderInApp, setTabVisibility, stubFetch } from "./harness.tsx";
 
 const PORT = 4545;
 const REQUESTS = `/imposters/${PORT}/requests`;
 
+/*
+ * Node ids are STRINGS on the wire, and the fixtures say so.
+ *
+ * A raft id is a `u64` and JSON numbers are IEEE-754 doubles wherever the reader is JavaScript, so
+ * the contract sends `node_id` and `voters` as strings (`fleetView.ts` documents the rounding this
+ * prevents). Since #552 the request log renders that id, which makes the fixture's spelling
+ * load-bearing rather than incidental: a numeric fixture would exercise a shape the fleet does not
+ * send. They are also deliberately not bare digits — a one-character id collides with substrings of
+ * every other number on the screen, which is how the old fleet-journal node test passed against a
+ * hard-coded dash.
+ */
 const THREE_NODE = {
   "/_fleet/members": {
-    json: { node_id: 3, is_leader: false, current_leader: 1, last_applied: 12, voters: [1, 2, 3] },
+    json: {
+      node_id: "node-c",
+      is_leader: false,
+      current_leader: "node-a",
+      last_applied: 12,
+      voters: ["node-a", "node-b", "node-c"],
+    },
   },
   "/_fleet/health": {
     json: {
@@ -21,14 +38,20 @@ const THREE_NODE = {
       state: "ready",
       pending_gates: [],
       isolated: false,
-      ring: { m_idx: 4, members: [1, 2, 3] },
+      ring: { m_idx: 4, members: ["node-a", "node-b", "node-c"] },
     },
   },
 };
 
 const SINGLE_NODE = {
   "/_fleet/members": {
-    json: { node_id: 1, is_leader: true, current_leader: 1, last_applied: 3, voters: [1] },
+    json: {
+      node_id: "node-a",
+      is_leader: true,
+      current_leader: "node-a",
+      last_applied: 3,
+      voters: ["node-a"],
+    },
   },
   "/_fleet/health": {
     json: {
@@ -36,7 +59,7 @@ const SINGLE_NODE = {
       state: "ready",
       pending_gates: [],
       isolated: false,
-      ring: { m_idx: 1, members: [1] },
+      ring: { m_idx: 1, members: ["node-a"] },
     },
   },
 };
@@ -66,98 +89,87 @@ afterEach(() => {
   setTabVisibility("visible");
 });
 
-describe("the merged journal (#147 H — the epic's exit criterion)", () => {
-  // #189 shipped this screen deliberately per-node-labelled and said the label would disappear on
-  // its own once the merged journal landed. The epic's words: "M3 does not close with the console
-  // still saying per-node." So the assertion is that the element is **absent**, not that its text
-  // changed — an empty-but-present label would satisfy a weaker test and still say nothing true.
-  it("renders no scope label at all when the merge reached every node", async () => {
+describe("the screen names the node it read from (D-74)", () => {
+  /*
+   * The point of #552 on this screen.
+   *
+   * The journal is upstream's own again and strictly per node: these rows are what the node the
+   * browser reached recorded, and say nothing about the rest of the fleet. A table with no node on
+   * it reads as the fleet's — which is how an operator concludes "the call never arrived" from a
+   * log that is merely someone else's.
+   *
+   * Asserted on the id itself, from `/_fleet/members`' top-level `node_id`, rather than on the word
+   * "node" appearing somewhere: a label that says "this node" without naming which one is the same
+   * non-answer in friendlier words.
+   */
+  it("names the answering node beside the imposter", async () => {
     stubFetch({ ...THREE_NODE, [REQUESTS]: { json: [recorded()] } });
     renderInApp(<RequestLog port={PORT} />);
 
-    // Wait for the rows, so this cannot pass merely by asserting on a screen that has not
-    // rendered yet — the failure mode a bare `queryByTestId` null-check invites.
+    // Waits for the rows, so this cannot pass on a screen that has not rendered yet.
     expect(await screen.findByText("/v1/payments/status")).toBeTruthy();
-    expect(screen.queryByTestId("request-scope-label")).toBeNull();
-  });
-
-  // A one-voter fleet used to get its own "this node is the whole fleet" copy. It is now simply a
-  // complete merge like any other, so it must be label-free too rather than keeping a special case.
-  it("renders no scope label on a single-node fleet either", async () => {
-    stubFetch({ ...SINGLE_NODE, [REQUESTS]: { json: [recorded()] } });
-    renderInApp(<RequestLog port={PORT} />);
-
-    expect(await screen.findByText("/v1/payments/status")).toBeTruthy();
-    expect(screen.queryByTestId("request-scope-label")).toBeNull();
-  });
-
-  // The label does not vanish — it changes meaning, from "this is one node" to "this merge was
-  // incomplete". Same testid, same role: the plumbing is what #189 built for this handover.
-  it("shows the partial-merge label when the server stamps Rift-Cluster-Partial", async () => {
-    stubFetch({
-      ...THREE_NODE,
-      [REQUESTS]: { json: [recorded()], headers: { "rift-cluster-partial": "true" } },
-    });
-    renderInApp(<RequestLog port={PORT} />);
-
     const label = await screen.findByTestId("request-scope-label");
-    expect(label.getAttribute("role")).toBe("status");
-    // Says the merge was incomplete, and says nothing about "one node" — the copy this slice
-    // deletes must not survive by being reused here.
-    expect(label.textContent).toMatch(/incomplete|could not be reached|may be missing/i);
-    expect(label.textContent).not.toMatch(/one node/i);
-    expect(label.textContent).not.toMatch(/whole fleet/i);
+    expect(label.textContent).toContain("node-c");
+    expect(label.textContent).toContain(String(PORT));
+  });
+
+  // The name comes from the fleet cache every other screen already holds, not from a second read of
+  // its own — and certainly not from `RecordedRequest.node`, which upstream's `LocalJournal` never
+  // stamps, so every row on a live fleet carries it absent.
+  it("reads the node id from the shared fleet cache, not a second fleet fetch", async () => {
+    const { requests } = stubFetch({ ...THREE_NODE, [REQUESTS]: { json: [recorded()] } });
+    renderInApp(<RequestLog port={PORT} />);
+
+    await screen.findByTestId("request-scope-label");
+    expect(requests.filter((sent) => sent.path === "/_fleet/members").length).toBe(1);
   });
 
   /*
-   * The other half of the criterion, and the half a regression would actually hit: "peer back →
-   * label gone **without user action**". Asserting only that the label appears would be satisfied
-   * by an implementation that latches it on forever — coverage held in a ref, or OR-ed with a
-   * stale value — and an operator would go on being told the merge is incomplete long after it
-   * healed. Coverage has to be derived fresh from each response, and only a poll-driven
-   * disappearance proves it is.
+   * The node this console is talking to can change under a screen left open — a load balancer
+   * reconnects the browser elsewhere, and the rows below change with it. Latching the first id seen
+   * would leave the label naming a node whose journal is no longer on screen, which is worse than
+   * no label: it is a confident wrong answer.
    */
-  it("drops the partial label on its own once the merge reaches every node again", async () => {
+  it("follows the answering node when the console is reconnected elsewhere", async () => {
     vi.useFakeTimers({ shouldAdvanceTime: true });
-    let partial = true;
+    let members = THREE_NODE["/_fleet/members"].json;
     vi.stubGlobal(
       "fetch",
       vi.fn((input: RequestInfo | URL) => {
         const path = typeof input === "string" ? input : input.toString();
         if (path === "/_fleet/members") {
-          return Promise.resolve(
-            new Response(JSON.stringify(THREE_NODE["/_fleet/members"].json), { status: 200 }),
-          );
+          return Promise.resolve(new Response(JSON.stringify(members), { status: 200 }));
         }
         if (path === "/_fleet/health") {
           return Promise.resolve(
             new Response(JSON.stringify(THREE_NODE["/_fleet/health"].json), { status: 200 }),
           );
         }
-        return Promise.resolve(
-          new Response(JSON.stringify([recorded()]), {
-            status: 200,
-            headers: partial ? { "rift-cluster-partial": "true" } : {},
-          }),
-        );
+        return Promise.resolve(new Response(JSON.stringify([recorded()]), { status: 200 }));
       }),
     );
     renderInApp(<RequestLog port={PORT} />);
 
-    await screen.findByTestId("request-scope-label");
+    await waitFor(() =>
+      expect(screen.getByTestId("request-scope-label").textContent).toContain("node-c"),
+    );
 
-    // The peer comes back. No click, no reload — just the next poll.
-    partial = false;
-    await vi.advanceTimersByTimeAsync(REQUEST_POLL_INTERVAL_MS * 2 + 100);
+    members = { ...members, node_id: "node-b" };
+    await vi.advanceTimersByTimeAsync(POLL_INTERVAL_MS * 2 + 100);
 
-    await waitFor(() => expect(screen.queryByTestId("request-scope-label")).toBeNull());
+    await waitFor(() =>
+      expect(screen.getByTestId("request-scope-label").textContent).toContain("node-b"),
+    );
+    expect(screen.getByTestId("request-scope-label").textContent).not.toContain("node-c");
     vi.useRealTimers();
   });
 
-  // Coverage now comes from the response, not from fleet topology — so a screen refused
-  // `/_fleet/*` gets the same complete-merge answer as anyone else, rather than a per-node label.
-  // This is the test that proves the topology inference is really gone rather than merely unused.
-  it("does not fall back to a per-node label when the fleet projection is refused", async () => {
+  /*
+   * A refused `/_fleet/*` costs the *name* of the node, not the rows: the journal read stands on
+   * its own. Saying which of the two failed is the whole job of the label here — blanking it would
+   * leave the sentence claiming nothing, and defaulting to a node id would invent one.
+   */
+  it("says it could not name the node rather than dropping the label or inventing an id", async () => {
     stubFetch({
       "/_fleet/members": { status: 404, json: { message: "not found" } },
       "/_fleet/health": { status: 404, json: { message: "not found" } },
@@ -166,21 +178,51 @@ describe("the merged journal (#147 H — the epic's exit criterion)", () => {
     renderInApp(<RequestLog port={PORT} />);
 
     expect(await screen.findByText("/v1/payments/status")).toBeTruthy();
-    expect(screen.queryByTestId("request-scope-label")).toBeNull();
+    const label = await screen.findByTestId("request-scope-label");
+    await waitFor(() => expect(label.textContent).toMatch(/could not name/i));
+  });
+
+  // The screen must not go on describing a fleet-wide merge that no longer exists — most of all in
+  // the copy an operator reads when the table is empty, which is where a stale "the merge answered"
+  // would say the fleet has nothing while one node was merely asked.
+  it("describes an empty log as this node's, never as the fleet's", async () => {
+    stubFetch({ ...THREE_NODE, [REQUESTS]: { json: [] } });
+    renderInApp(<RequestLog port={PORT} />);
+
+    const empty = await screen.findByTestId("request-log-empty");
+    expect(empty.textContent).toMatch(/this node/i);
+    expect(empty.textContent).not.toMatch(/merge/i);
   });
 });
 
-describe("the per-node copy is gone from the source, not just from the screen", () => {
+/**
+ * A file with its `/* … *\/` blocks and whole-line `//` comments removed.
+ *
+ * The guard below is about what the console still *calls*, and a comment saying why a route was
+ * removed is the opposite of a regression — this repo documents removals at length, and a guard
+ * that punished that would be repaired by deleting the explanation, which is the wrong repair.
+ *
+ * Deliberately conservative rather than a real tokenizer. A trailing `// …` after code on the same
+ * line is left in place, because stripping from a bare `//` would also cut `"https://…"` out of a
+ * string literal; the cost is that such a comment can still fail this test, which is the safe
+ * direction to be wrong in. No file under `src` currently has one.
+ */
+function code(text: string): string {
+  return text.replace(/\/\*[\s\S]*?\*\//g, "").replace(/^[ \t]*\/\/.*$/gm, "");
+}
+
+describe("the fleet-merge surface is gone from the source, not just from the screen", () => {
   /*
-   * A grep-level assertion, in the suite, on purpose (an explicit acceptance criterion).
+   * A grep-level assertion, in the suite, on purpose — the same guard #229 used for the copy it
+   * deleted, re-pointed at what D-74 deletes.
    *
-   * Every other test here proves the label is not *rendered* in the states it exercises. None of
-   * them can prove the strings are gone: a branch left behind for some state nobody wrote a test
-   * for would keep saying "One node's traffic" and the suite would stay green. Reading the source
-   * is the only assertion that closes that, and the criterion asks for exactly it — "so a
-   * regression cannot ship silently".
+   * Every other test here proves the merge machinery is not *reached* in the states it exercises.
+   * None of them can prove it is gone: a hook nothing calls, a path constant nothing builds, a
+   * component left mounted behind a flag would all keep the suite green while the console still
+   * carried a client for routes the server no longer serves. Reading the source is the only
+   * assertion that closes that.
    */
-  it("no longer contains the per-node strings anywhere in web/src", async () => {
+  it("names no removed route, hook or component anywhere in web/src", async () => {
     const { readdir, readFile } = await import("node:fs/promises");
     const { join } = await import("node:path");
 
@@ -194,32 +236,42 @@ describe("the per-node copy is gone from the source, not just from the screen", 
       return found;
     }
 
-    // This file necessarily names the strings in order to assert they are absent, so it is the one
-    // exemption — and it is exempted by path rather than by a looser pattern, so a *new* file
-    // reintroducing the copy is still caught.
-    const self = join("src", "__tests__", "requestLog.test.tsx");
-    const files = (await sources("src")).filter((path) => !path.endsWith(self));
-
     /*
-     * The two label *sentences*, not the loose words. "whole fleet" on its own appears in
-     * unrelated prose that this slice has no business deleting — `fleetView.ts` and the generated
-     * `schema.ts`. Matching those would make this assertion fail for reasons
-     * that have nothing to do with the request log, and the usual repair for a noisy guard is to
-     * loosen it until it stops meaning anything. Anchoring on the exact copy keeps it strict
-     * where it matters: either sentence reappearing anywhere under `src` fails this test.
+     * Two exemptions, both by exact path rather than by a looser pattern, so a *new* file
+     * reintroducing any of this is still caught.
+     *
+     * This file names the strings in order to assert they are absent. `api/schema.ts` is generated
+     * from `docs/api/openapi-ee.yaml` and is the contract's own word on what exists — if a removed
+     * route reappeared there the fix is in the contract, and a red assertion here would only point
+     * at the wrong file.
      */
+    const self = join("src", "__tests__", "requestLog.test.tsx");
+    const generated = join("src", "api", "schema.ts");
+    const files = (await sources("src")).filter(
+      (path) => !path.endsWith(self) && !path.endsWith(generated),
+    );
+
+    const banned =
+      /\/admin\/requests|savedRequests\/stream|useFleetRequests|FleetRequestPage|FleetJournalCoverage|MergedJournal|LiveTail|coverageFor|describeCoverage/;
     const offenders: string[] = [];
     for (const file of files) {
-      const text = await readFile(file, "utf8");
-      if (/One node's traffic|This node is the whole fleet/i.test(text)) offenders.push(file);
+      if (banned.test(code(await readFile(file, "utf8")))) offenders.push(file);
     }
     expect(offenders).toEqual([]);
   });
 });
 
-describe("server cursor replaces client-side slicing", () => {
-  // The screen used to refetch the whole journal every 2 s and slice it locally. The cursor #225
-  // added makes each poll a delta fetch: send back the token the last response issued.
+describe("upstream's scalar cursor replaces client-side slicing", () => {
+  /*
+   * The screen used to refetch the whole journal every 2 s and slice it locally. `?since=` makes
+   * each poll a delta fetch: send back the token the last response issued.
+   *
+   * The token is upstream's own **scalar** index since D-74 — the engine's position in its own
+   * journal, not the opaque per-node vector the removed fleet merge used to encode. The fixtures
+   * spell it that way so a client that quietly started parsing or arithmetic-ing the value would
+   * be exercising the shape the engine really sends. Nothing on this side parses it either way: it
+   * is round-tripped verbatim.
+   */
   it("sends the issued cursor as ?since= on the next poll", async () => {
     // `shouldAdvanceTime` so the fetch double's promises still settle while the clock is driven
     // manually — the idiom the polling tests below already use.
@@ -228,16 +280,16 @@ describe("server cursor replaces client-side slicing", () => {
       ...THREE_NODE,
       [REQUESTS]: {
         json: [recorded()],
-        headers: { "x-rift-next-index": "eyJ2IjoxfQ" },
+        headers: { "x-rift-next-index": "42" },
       },
-      [`${REQUESTS}?since=eyJ2IjoxfQ`]: {
+      [`${REQUESTS}?since=42`]: {
         json: [recorded({ path: "/v1/payments/second" })],
-        headers: { "x-rift-next-index": "eyJ2IjoyfQ" },
+        headers: { "x-rift-next-index": "43" },
       },
       // Stubbed explicitly so a third poll gets an empty delta. Without it the harness's
       // query-stripping fallback would answer the *baseline* page, appending a duplicate row and
       // making the assertions below flake on timing rather than on behaviour.
-      [`${REQUESTS}?since=eyJ2IjoyfQ`]: { json: [], headers: { "x-rift-next-index": "eyJ2IjoyfQ" } },
+      [`${REQUESTS}?since=43`]: { json: [], headers: { "x-rift-next-index": "43" } },
     });
     renderInApp(<RequestLog port={PORT} />);
 
@@ -246,12 +298,59 @@ describe("server cursor replaces client-side slicing", () => {
     await vi.advanceTimersByTimeAsync(REQUEST_POLL_INTERVAL_MS + 1);
 
     await waitFor(() =>
-      expect(requests.some((sent) => sent.path === `${REQUESTS}?since=eyJ2IjoxfQ`)).toBe(true),
+      expect(requests.some((sent) => sent.path === `${REQUESTS}?since=42`)).toBe(true),
     );
     // The delta is appended, not swapped in: the first page's row must still be on screen, or the
     // "incremental" poll has silently become a destructive one.
     expect(await screen.findByText("/v1/payments/second")).toBeTruthy();
     expect(screen.getByText("/v1/payments/status")).toBeTruthy();
+  });
+
+  /*
+   * The engine does not promise a cursor back. Upstream's `handle_get_requests` stamps
+   * `x-rift-next-index` only when its journal backend has stable indices, and a backend without
+   * them ignores `since` and answers the whole journal with no header at all. A screen that treated
+   * every cursored ask as a delta would append that whole journal to the rows it already holds —
+   * every row on screen, twice — with nothing in the body to say so. `resuming` is therefore
+   * derived from the answer: no cursor back means no merge, the cursor is dropped, and the next
+   * poll is a full read.
+   */
+  it("does not append a cursored answer that came back without a cursor; it re-baselines", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    const { requests } = stubFetch({
+      ...THREE_NODE,
+      [REQUESTS]: {
+        json: [recorded()],
+        headers: { "x-rift-next-index": "42" },
+      },
+      // The whole journal, and no header: what a backend without stable indices answers to
+      // `?since=`. Appended, this would put "/v1/payments/status" on screen twice.
+      [`${REQUESTS}?since=42`]: {
+        json: [recorded(), recorded({ path: "/v1/payments/second" })],
+      },
+    });
+    renderInApp(<RequestLog port={PORT} />);
+
+    expect(await screen.findByText("/v1/payments/status")).toBeTruthy();
+
+    await vi.advanceTimersByTimeAsync(REQUEST_POLL_INTERVAL_MS + 1);
+    await waitFor(() =>
+      expect(requests.some((sent) => sent.path === `${REQUESTS}?since=42`)).toBe(true),
+    );
+    // The un-cursored answer is not merged into the held rows...
+    expect(screen.getAllByText("/v1/payments/status")).toHaveLength(1);
+    expect(screen.queryByText("/v1/payments/second")).toBeNull();
+
+    // ...and the cursor is gone: the very next poll asks for the whole journal again rather than
+    // resuming from a token the engine has just shown it does not honour.
+    await vi.advanceTimersByTimeAsync(REQUEST_POLL_INTERVAL_MS + 1);
+    await waitFor(() => {
+      const uncursored = requests.filter((sent) => sent.path === REQUESTS).length;
+      expect(uncursored).toBeGreaterThan(1);
+    });
+    // Exactly one cursored ask was ever made — the drop is not "try the same token again".
+    expect(requests.filter((sent) => sent.path.includes("?since=")).length).toBe(1);
+    vi.useRealTimers();
   });
 
   /*
@@ -267,8 +366,8 @@ describe("server cursor replaces client-side slicing", () => {
   it("re-reads from the start after a clear instead of resuming the pre-clear cursor", async () => {
     const { requests } = stubFetch({
       ...THREE_NODE,
-      [REQUESTS]: { json: [recorded()], headers: { "x-rift-next-index": "eyJ2IjoxfQ" } },
-      [`${REQUESTS}?since=eyJ2IjoxfQ`]: { json: [], headers: { "x-rift-next-index": "eyJ2IjoxfQ" } },
+      [REQUESTS]: { json: [recorded()], headers: { "x-rift-next-index": "42" } },
+      [`${REQUESTS}?since=42`]: { json: [], headers: { "x-rift-next-index": "42" } },
     });
     renderInApp(<RequestLog port={PORT} />);
 
@@ -276,7 +375,7 @@ describe("server cursor replaces client-side slicing", () => {
 
     const user = userEvent.setup();
     await user.click(screen.getByTestId("clear-requests"));
-    // A clear commits fleet-wide through Raft, so the dialog holds the act until the port is typed.
+    // Nothing restores the rows, so the dialog holds the act until the port is typed.
     await user.type(screen.getByTestId("confirm-typed"), "4545");
     await user.click(screen.getByTestId("confirm-destructive"));
 
@@ -330,7 +429,7 @@ describe("server cursor replaces client-side slicing", () => {
         return Promise.resolve(
           new Response(JSON.stringify(body), {
             status: 200,
-            headers: { "x-rift-next-index": "eyJ2IjoxfQ" },
+            headers: { "x-rift-next-index": "42" },
           }),
         );
       }),
@@ -353,13 +452,21 @@ describe("server cursor replaces client-side slicing", () => {
   });
 
   /*
-   * The contract's own warning, made a test: "Concatenating pages is not a globally sorted stream —
-   * a peer that becomes reachable between pages contributes entries older than everything already
-   * returned" (`openapi-ee.yaml`, the `x-rift-next-index` description). That is the degraded-fan-out
-   * moment the partial label announces, so a blind append puts a chronological screen out of order
-   * exactly when an operator is leaning on it to find "the call I just made".
+   * The delta is appended in the order the engine served it, and **not** re-sorted (D-74, #552).
+   *
+   * The screen used to sort the concatenation by `timestamp`, because the merged read it replaced
+   * concatenated per-node pages the contract itself declared not to be a globally sorted stream: a
+   * peer coming back between polls contributed entries older than everything already returned. One
+   * engine's journal has no such case — it is an append-only sequence, and `?since=` continues it
+   * exactly where the last response stopped — so the sort can only ever move rows the engine had
+   * already placed correctly.
+   *
+   * Pinned with an out-of-order `timestamp`, which is the field the old sort keyed on: a clock step
+   * (NTP, a container resume) makes a later request carry an earlier stamp, and journal position is
+   * still the truth about what arrived first. A re-sort would silently reorder the log on exactly
+   * the machine whose clock cannot be trusted to reorder it.
    */
-  it("re-sorts an appended delta rather than trusting page order", async () => {
+  it("appends a delta in journal order rather than re-sorting it by timestamp", async () => {
     vi.useFakeTimers({ shouldAdvanceTime: true });
     let served = 0;
     vi.stubGlobal(
@@ -374,32 +481,32 @@ describe("server cursor replaces client-side slicing", () => {
           return Promise.resolve(new Response(JSON.stringify(json), { status: 200 }));
         }
         served += 1;
-        // Page 2 is the peer coming back: its entry is OLDER than page 1's.
+        // Page 2 arrived later but is stamped earlier — the clock stepped back between them.
         const body =
           served === 1
-            ? [recorded({ path: "/v1/late", timestamp: "2026-07-31T10:00:09Z" })]
-            : [recorded({ path: "/v1/early", timestamp: "2026-07-31T10:00:01Z" })];
+            ? [recorded({ path: "/v1/first", timestamp: "2026-07-31T10:00:09Z" })]
+            : [recorded({ path: "/v1/second", timestamp: "2026-07-31T10:00:01Z" })];
         return Promise.resolve(
           new Response(JSON.stringify(body), {
             status: 200,
-            headers: { "x-rift-next-index": `tok-${served}` },
+            headers: { "x-rift-next-index": String(served) },
           }),
         );
       }),
     );
     renderInApp(<RequestLog port={PORT} />);
-    expect(await screen.findByText("/v1/late")).toBeTruthy();
+    expect(await screen.findByText("/v1/first")).toBeTruthy();
 
     await vi.advanceTimersByTimeAsync(REQUEST_POLL_INTERVAL_MS + 100);
-    await screen.findByText("/v1/early");
+    await screen.findByText("/v1/second");
 
     await waitFor(() => {
       const shown = screen.getAllByTestId("request-row").map((row) => row.textContent ?? "");
-      const early = shown.findIndex((text) => text.includes("/v1/early"));
-      const late = shown.findIndex((text) => text.includes("/v1/late"));
-      expect(early).toBeGreaterThanOrEqual(0);
-      expect(late).toBeGreaterThanOrEqual(0);
-      expect(early).toBeLessThan(late);
+      const first = shown.findIndex((text) => text.includes("/v1/first"));
+      const second = shown.findIndex((text) => text.includes("/v1/second"));
+      expect(first).toBeGreaterThanOrEqual(0);
+      expect(second).toBeGreaterThanOrEqual(0);
+      expect(first).toBeLessThan(second);
     });
     vi.useRealTimers();
   });
@@ -538,15 +645,13 @@ describe("a busy imposter", () => {
     stubFetch({ ...THREE_NODE, [REQUESTS]: { json: many } });
     renderInApp(<RequestLog port={PORT} />);
 
-    // Synchronises on a row, not on the scope label: #229 deletes that label for a complete
-    // merge, so waiting for it here would hang forever on the very state this suite now expects.
+    // Synchronises on a row rather than on the scope label, which renders before the journal read
+    // lands — waiting on it would let this assert against a table that has not been filled yet.
     await waitFor(() => expect(screen.getAllByTestId("request-row").length).toBeGreaterThan(0));
     expect(screen.getAllByTestId("request-row").length).toBeLessThanOrEqual(50);
-    // The total is now a plain fleet figure. #189 qualified it "this node" precisely because it
-    // was one node's count; #147 H makes it the merge's, so the qualifier would be a false one —
-    // and the sweep of per-node copy this slice performs is what removes it.
+    // The pager counts what this node holds, which is what the scope line above the table already
+    // says it is — so the number stands unqualified here.
     expect(screen.getByTestId("request-total").textContent).toContain("2500");
-    expect(screen.getByTestId("request-total").textContent).not.toMatch(/this node/i);
   });
 });
 
@@ -860,7 +965,7 @@ describe("polling (RFC-006 §6)", () => {
     vi.useFakeTimers({ shouldAdvanceTime: true });
     const { calls } = stubFetch({ ...THREE_NODE, [REQUESTS]: { json: [recorded()] } });
     renderInApp(<RequestLog port={PORT} />);
-    // Waits for the first load via a row — the scope label is gone on a complete merge (#229).
+    // Waits for the first load via a row: the scope label renders before the journal read lands.
     await screen.findByTestId("request-row");
 
     const before = calls.filter((path) => path === REQUESTS).length;
@@ -872,7 +977,7 @@ describe("polling (RFC-006 §6)", () => {
     vi.useFakeTimers({ shouldAdvanceTime: true });
     const { calls } = stubFetch({ ...THREE_NODE, [REQUESTS]: { json: [recorded()] } });
     renderInApp(<RequestLog port={PORT} />);
-    // Waits for the first load via a row — the scope label is gone on a complete merge (#229).
+    // Waits for the first load via a row: the scope label renders before the journal read lands.
     await screen.findByTestId("request-row");
 
     setTabVisibility("hidden");
@@ -1170,191 +1275,50 @@ describe("#250 — turning a request into a stub", () => {
   });
 });
 
-const FLEET_REQUESTS = "/admin/requests";
-
-/** One `FleetRequestPage`, from `#362`'s merged endpoint — the shape `useFleetRequests` reads. */
-function fleetPage(
-  rows: { port: number; request: Record<string, unknown> }[],
-  coverage: Record<string, unknown> = { covered: [PORT], total: 1, omitted: [], capped: false },
-): Record<string, unknown> {
-  return {
-    requests: rows.map(({ port, request }) => ({ port, flowId: "default", request })),
-    cursor: "tok",
-    coverage,
-    joined: rows.map(({ port }) => port),
-  };
-}
-
-describe("the fleet journal is one read, not a fan-out (#362)", () => {
-  // Three imposters, so a regression to the old per-port fan-out would be visible as three reads
-  // rather than one — the acceptance criterion this epic exists to close.
-  const THREE_IMPOSTERS = {
+describe("with no imposter in the hash (D-74)", () => {
+  const LISTING = {
     ...SINGLE_NODE,
     "/imposters": {
       json: {
         imposters: [
           { port: 4545, name: "payments", protocol: "http" },
-          { port: 4546, name: "billing", protocol: "http" },
-          { port: 4547, name: "shipping", protocol: "http" },
+          // Nameless on purpose: `name` is optional on the contract, and a chooser that links by
+          // name would leave this one unreachable — the defect #321 fixed on the imposter table.
+          { port: 4546, protocol: "http" },
         ],
       },
     },
   };
 
-  it("issues exactly one request to the merged endpoint, never one per imposter", async () => {
-    const { requests } = stubFetch({
-      ...THREE_IMPOSTERS,
-      [FLEET_REQUESTS]: {
-        json: fleetPage([{ port: 4545, request: recorded() }], {
-          covered: [4545, 4546, 4547],
-          total: 3,
-          omitted: [],
-          capped: false,
-        }),
-      },
-    });
-    renderInApp(<RequestLog port={null} />);
-
-    await screen.findByTestId("merged-request-row");
-
-    const journalReads = requests.filter((sent) => sent.path.split("?")[0] === FLEET_REQUESTS);
-    expect(journalReads.length).toBe(1);
-    // And no per-port fallback alongside it — the fan-out this replaces.
-    expect(requests.some((sent) => sent.path.startsWith("/imposters/4545/requests"))).toBe(false);
-    expect(requests.some((sent) => sent.path.startsWith("/imposters/4546/requests"))).toBe(false);
-    expect(requests.some((sent) => sent.path.startsWith("/imposters/4547/requests"))).toBe(false);
-  });
-
-  // The wire order is oldest-first (openapi-ee.yaml's `savedRequests` convention, which the merge
-  // preserves); the screen's own label says "newest first". A pass-through here would silently make
-  // that label false and show the log upside down.
-  it("renders newest first even though the server answers oldest first", async () => {
-    const ONE_IMPOSTER = {
-      ...SINGLE_NODE,
-      "/imposters": { json: { imposters: [{ port: PORT, name: "payments", protocol: "http" }] } },
-    };
-    stubFetch({
-      ...ONE_IMPOSTER,
-      [FLEET_REQUESTS]: {
-        json: fleetPage([
-          { port: PORT, request: recorded({ path: "/v1/oldest", timestamp: "2026-07-31T10:00:00Z" }) },
-          { port: PORT, request: recorded({ path: "/v1/newest", timestamp: "2026-07-31T10:00:09Z" }) },
-        ]),
-      },
-    });
-    renderInApp(<RequestLog port={null} />);
-
-    const rows = await screen.findAllByTestId("merged-request-row");
-    expect(rows.length).toBe(2);
-    expect(rows[0]?.textContent).toContain("/v1/newest");
-    expect(rows[1]?.textContent).toContain("/v1/oldest");
-  });
-});
-
-describe("the coverage cap banner reflects the server's coverage block (#362)", () => {
-  const ONE_IMPOSTER = {
-    ...SINGLE_NODE,
-    "/imposters": { json: { imposters: [{ port: PORT, name: "payments", protocol: "http" }] } },
-  };
-
-  it("shows the banner and names the omitted ports when coverage.capped is true", async () => {
-    stubFetch({
-      ...ONE_IMPOSTER,
-      [FLEET_REQUESTS]: {
-        json: fleetPage([{ port: PORT, request: recorded() }], {
-          covered: [PORT],
-          total: 101,
-          omitted: [4600, 4601],
-          capped: true,
-        }),
-      },
-    });
-    renderInApp(<RequestLog port={null} />);
-
-    const banner = await screen.findByTestId("merged-journal-partial");
-    expect(banner.textContent).toMatch(/2 of 101/);
-    expect(banner.textContent).toContain("4600");
-    expect(banner.textContent).toContain("4601");
-  });
-
-  it("shows no cap banner when coverage.capped is false, however many are covered", async () => {
-    stubFetch({
-      ...ONE_IMPOSTER,
-      [FLEET_REQUESTS]: {
-        json: fleetPage([{ port: PORT, request: recorded() }], {
-          covered: [PORT],
-          total: 1,
-          omitted: [],
-          capped: false,
-        }),
-      },
-    });
-    renderInApp(<RequestLog port={null} />);
-
-    await screen.findByTestId("merged-request-row");
-    expect(screen.queryByTestId("merged-journal-partial")).toBeNull();
-  });
-});
-
-describe("the fleet journal's node, status and latency columns (#364)", () => {
-  // The merged journal reads every imposter the fleet has, so the fixture needs the listing as
-  // well as the fleet-wide traffic.
-  const FLEET_JOURNAL = {
-    ...SINGLE_NODE,
-    "/imposters": { json: { imposters: [{ port: PORT, name: "payments", protocol: "http" }] } },
-  };
-
   /*
-   * Asserted per cell, by testid, rather than over the row's text.
-   *
-   * The first draft of this test checked `row.textContent).toContain("3")` for the node id and
-   * passed while the node cell was hard-coded to a dash — because "503" in the status cell also
-   * contains a "3". A row-wide `toContain` is a assertion that cannot fail for the reason it
-   * claims to test, and the node id is exactly the kind of short value that collides.
+   * The portless route used to render the **fleet** journal: one read of `GET /admin/requests`,
+   * which the admin front assembled by merging every node's writer shard. That route and its
+   * subsystem are gone (D-74), and the console must not replace it with a client-side fan-out —
+   * ordering N per-node reads by whichever returned first would present network timing as journal
+   * order under the label of one stream. So this route asks which imposter, and nothing else.
    */
-  it("renders the three columns the engine now records", async () => {
-    stubFetch({
-      ...FLEET_JOURNAL,
-      [FLEET_REQUESTS]: {
-        json: fleetPage([{ port: PORT, request: recorded({ node: "rift-7", status: 503, latencyMs: 42 }) }]),
-      },
-    });
+  it("offers a per-imposter chooser and reads no journal at all", async () => {
+    const { requests } = stubFetch(LISTING);
     renderInApp(<RequestLog port={null} />);
 
-    expect((await screen.findByTestId("merged-cell-node")).textContent).toBe("rift-7");
-    expect((await screen.findByTestId("merged-cell-status")).textContent).toContain("503");
-    expect((await screen.findByTestId("merged-cell-latency")).textContent).toBe("42 ms");
+    const picker = await screen.findByTestId("request-picker");
+    expect(picker.textContent).toContain("4545");
+    expect(picker.textContent).toContain("4546");
+    // Every port is a link, named or not, and it points at that imposter's own log.
+    const links = [...picker.querySelectorAll("a")].map((a) => a.getAttribute("href"));
+    expect(links).toEqual(["#/requests/4545", "#/requests/4546"]);
+
+    // No journal read of any spelling — neither the removed fleet route nor a fan-out over the
+    // per-imposter one.
+    expect(requests.some((sent) => sent.path.includes("/requests"))).toBe(false);
+    expect(requests.some((sent) => sent.path.startsWith("/admin/"))).toBe(false);
   });
 
-  /*
-   * The half that matters. `status` and `latencyMs` are attached after the response exists, so an
-   * entry recorded before that — the debug path, or a request journalled before an error — carries
-   * neither. Rendering `0 ms` there would report an instant answer the engine never observed, and
-   * rendering a status would invent one outright.
-   */
-  it("does not invent an outcome the engine never recorded", async () => {
-    stubFetch({
-      ...FLEET_JOURNAL,
-      [FLEET_REQUESTS]: { json: fleetPage([{ port: PORT, request: recorded() }]) },
-    });
+  it("says there is nothing to choose rather than rendering an empty list", async () => {
+    stubFetch({ ...SINGLE_NODE, "/imposters": { json: { imposters: [] } } });
     renderInApp(<RequestLog port={null} />);
 
-    expect((await screen.findByTestId("merged-cell-node")).textContent).toBe("\u2014");
-    expect((await screen.findByTestId("merged-cell-status")).textContent).toBe("\u2014");
-    expect((await screen.findByTestId("merged-cell-latency")).textContent).toBe("\u2014");
-  });
-
-  // A latency of zero is a reading, not a gap: a stub answered from memory is sub-millisecond, and
-  // blanking it would hide the fact that the mock was fast rather than unmeasured.
-  it("renders a zero latency as a measurement, not as absence", async () => {
-    stubFetch({
-      ...FLEET_JOURNAL,
-      [FLEET_REQUESTS]: {
-        json: fleetPage([{ port: PORT, request: recorded({ node: "rift-1", status: 200, latencyMs: 0 }) }]),
-      },
-    });
-    renderInApp(<RequestLog port={null} />);
-
-    expect((await screen.findByTestId("merged-cell-latency")).textContent).toBe("0 ms");
+    expect(await screen.findByTestId("request-picker-empty")).toBeTruthy();
+    expect(screen.queryByTestId("request-picker")).toBeNull();
   });
 });

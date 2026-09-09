@@ -3531,6 +3531,10 @@ fn flow_keyed_imposter(port: u16) -> serde_json::Value {
     json!({
         "port": port,
         "protocol": "http",
+        // On, so a space teardown has recorded requests to clear — the half of D-69's teardown
+        // that is upstream's own (`RequestJournal::clear_flow`) and would otherwise be untested
+        // because nothing was ever recorded to begin with.
+        "recordRequests": true,
         "_rift": { "flowState": { "flowIdSource": "header:X-Flow-Id" } },
         "stubs": [{
             "id": "global",
@@ -3544,6 +3548,28 @@ fn space_stub(body: &str) -> serde_json::Value {
         "predicates": [{ "equals": { "path": "/cart" } }],
         "responses": [{ "is": { "statusCode": 200, "body": body } }],
     })
+}
+
+/// The `?space=` value of every request this node recorded, in recorded order, read from its
+/// **own** journal (D-74).
+///
+/// Identifies an entry by a query parameter the caller set rather than by its flow id, because a
+/// recorded entry does not carry the flow on the wire — the flow is the journal's key, not a
+/// field of `RecordedRequest`. The driver sends the two in lockstep, so the query names the space.
+async fn recorded_spaces_on(admin: &str, port: u16) -> Vec<String> {
+    let read: serde_json::Value =
+        reqwest::get(format!("http://{admin}/imposters/{port}/savedRequests"))
+            .await
+            .expect("read the recorded requests")
+            .json()
+            .await
+            .expect("json");
+    read.as_array()
+        .expect("savedRequests answers a bare array")
+        .iter()
+        .filter_map(|entry| entry["query"]["space"].as_str())
+        .map(str::to_owned)
+        .collect()
 }
 
 /// The ids of the stubs an imposter holds, read from `node`'s own engine.
@@ -3650,12 +3676,18 @@ async fn a_space_stub_replicates_and_survives_an_unrelated_reconcile() {
 
 /// Pins D-69 (the inverse half): once space stubs are in the replicated config, a
 /// space `DELETE` that only tears down the local engine would be undone by the next `Sync`, which
-/// would resurrect the stubs fleet-wide. The teardown therefore commits a space-scoped stub delete
-/// alongside its journal clear.
+/// would resurrect the stubs fleet-wide. The teardown therefore commits a space-scoped stub delete.
 ///
 /// Also pins that the delete is *scoped*: another space's stubs and the imposter's global stubs
 /// are untouched, which is what makes a space-addressed delete correct rather than approximately
 /// right.
+///
+/// And pins **D-74's** half of the same teardown: the space's *recorded requests* still go, on the
+/// node that took the teardown. That used to be a Raft-committed `JournalClearGen` the fleet-wide
+/// merge consulted; it is now upstream's own `RequestJournal::clear_flow`, called by
+/// `teardown_space` on the way through the proxy. The distinction that matters is per node — the
+/// node the teardown reached loses that space's entries, and the sibling space's entries on the
+/// same node do not — because a per-node journal is the whole of what D-74 leaves.
 #[tokio::test]
 async fn a_space_teardown_removes_only_that_spaces_stubs_fleet_wide_and_they_stay_gone() {
     let leader_state = TempDir::new().expect("tempdir");
@@ -3695,6 +3727,33 @@ async fn a_space_teardown_removes_only_that_spaces_stubs_fleet_wide_and_they_sta
         assert_eq!(added.status().as_u16(), 201, "seeding {flow}");
     }
 
+    // Drive one request into each space **through the leader's own gateway**, so both are
+    // recorded in the leader's journal under their resolved flow id. The gateway leg rather than
+    // the imposter's data port: two nodes bind the same port and only one of them wins it, so a
+    // direct dial names whichever node happened to get there first — which is precisely the
+    // ambiguity a per-node assertion cannot afford.
+    for flow in ["blue", "green"] {
+        let driven = client
+            .get(format!(
+                "http://{lead_admin}/__rift/{port}/cart?space={flow}"
+            ))
+            .header("X-Flow-Id", flow)
+            .send()
+            .await
+            .expect("drive a request into the space");
+        assert!(
+            driven.status().is_success(),
+            "{flow}: the space stub must answer: {}",
+            driven.status()
+        );
+    }
+    assert_eq!(
+        recorded_spaces_on(&lead_admin, port).await,
+        vec!["blue".to_string(), "green".to_string()],
+        "both spaces' requests must be recorded before the teardown, or the assertion below \
+         would pass against a journal that was empty all along"
+    );
+
     let torn = client
         .delete(format!("http://{lead_admin}/imposters/{port}/spaces/blue"))
         .send()
@@ -3704,6 +3763,13 @@ async fn a_space_teardown_removes_only_that_spaces_stubs_fleet_wide_and_they_sta
         torn.status().is_success(),
         "the teardown itself must succeed: {}",
         torn.status()
+    );
+
+    assert_eq!(
+        recorded_spaces_on(&lead_admin, port).await,
+        vec!["green".to_string()],
+        "the torn-down space's recorded requests must be gone on the node that took the \
+         teardown, and only that space's"
     );
 
     // Force the reconcile that would resurrect them if the delete had stayed node-local.
@@ -4147,4 +4213,380 @@ async fn a_fleet_scoped_flow_survives_deleting_its_imposter() {
 
     joiner.shutdown().await;
     founder.shutdown().await;
+}
+
+/// [`minimal_imposter`] with recording on. Upstream defaults `recordRequests` to `false`, so a
+/// per-node journal assertion against the default imposter would be comparing two empty logs.
+fn recording_imposter(port: u16) -> serde_json::Value {
+    let mut config = minimal_imposter(port);
+    config["recordRequests"] = json!(true);
+    config
+}
+
+/// `numberOfRequests` as `admin`'s own `GET /imposters/{port}` reports it, with the response so
+/// the caller can also assert on its headers.
+async fn imposter_read_on(admin: &str, port: u16) -> (reqwest::header::HeaderMap, u64) {
+    let response = reqwest::get(format!("http://{admin}/imposters/{port}"))
+        .await
+        .expect("read the imposter");
+    assert_eq!(
+        response.status().as_u16(),
+        200,
+        "{admin}: the imposter read"
+    );
+    let headers = response.headers().clone();
+    let body: serde_json::Value = response.json().await.expect("json");
+    let count = body["numberOfRequests"]
+        .as_u64()
+        .expect("numberOfRequests is a number");
+    (headers, count)
+}
+
+/// How many entries `admin`'s own `GET /imposters/{port}/savedRequests` holds.
+async fn recorded_count_on(admin: &str, port: u16) -> usize {
+    let read: serde_json::Value =
+        reqwest::get(format!("http://{admin}/imposters/{port}/savedRequests"))
+            .await
+            .expect("read the recorded requests")
+            .json()
+            .await
+            .expect("json");
+    read.as_array()
+        .expect("savedRequests answers a bare array")
+        .len()
+}
+
+/// Empty `admin`'s own journal for `port` — the proxied `DELETE savedRequests` of D-74.
+async fn clear_journal_on(admin: &str, port: u16) {
+    let cleared = reqwest::Client::new()
+        .delete(format!("http://{admin}/imposters/{port}/savedRequests"))
+        .send()
+        .await
+        .expect("clear the recorded requests");
+    assert!(
+        cleared.status().is_success(),
+        "{admin}: the clear must succeed: {}",
+        cleared.status()
+    );
+}
+
+/// Leave **exactly** `n` recorded requests in `admin`'s own journal for `port`.
+///
+/// The warm-up is the fiddly part, and getting it wrong is how this helper first went wrong. A
+/// follower's listener comes up after the write barrier already answered the leader's `201`, so an
+/// early request finds nothing registered; and a gateway request that ends in an error the client
+/// retries may still have been served — and therefore recorded — before the error was produced, so
+/// "poll until one succeeds, and call that the first entry" silently over-counts under load.
+///
+/// So the warm-up polls until a request through `admin` both succeeds *and* shows up in `admin`'s
+/// own journal — which is also what proves this node's engine served it rather than some other —
+/// and then clears that journal, discarding however many entries the warm-up actually left. Only
+/// the `n` requests after the clear are counted, and they are counted exactly.
+///
+/// The clear it leans on is the per-node one this change introduces, so a clear that regressed to
+/// fleet-wide does not hide here: it would wipe a node this helper had already loaded, and the
+/// caller's absolute counts would fail.
+async fn drive_recorded(admin: &str, port: u16, n: usize) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        if gateway(admin, port, "/").await == (201, "from-a".to_owned())
+            && recorded_count_on(admin, port).await > 0
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{admin}: the imposter never recorded a request served through this node's gateway"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    clear_journal_on(admin, port).await;
+    assert_eq!(
+        recorded_count_on(admin, port).await,
+        0,
+        "{admin}: the warm-up clear must leave this node's journal empty, or every count below \
+         is measured from an unknown baseline"
+    );
+    for _ in 0..n {
+        assert_eq!(
+            gateway(admin, port, "/").await,
+            (201, "from-a".to_owned()),
+            "{admin}: a request that is to be recorded must be served"
+        );
+    }
+}
+
+/// A two-node fleet with one recording imposter on it, created through the leader.
+struct RecordingFleet {
+    leader: ComposedServer,
+    follower: ComposedServer,
+    port: u16,
+    /// Held for the fleet's lifetime; dropping a state dir under a running node is the failure
+    /// mode this field exists to rule out.
+    _state: [TempDir; 2],
+}
+
+/// Poll `admin`'s `/_fleet/health` until its **applied** ring holds `want` members.
+///
+/// A join is two steps: the seed admits a learner, then a membership change makes it a voter, and
+/// only the second moves quorum from one node to two. A write issued between them meets a leader
+/// stepping through the change and is refused `503 no quorum / leader unreachable` — the load
+/// flake #561 records. Waiting for the applied ring closes that window rather than retrying into
+/// it: a retried create could park and replay later, and a replayed create rebuilds the imposter
+/// core, which is exactly what discards the journal these tests then count.
+async fn wait_ring(admin: &str, want: usize) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        if let Ok(response) = reqwest::get(format!("http://{admin}/_fleet/health")).await
+            && response.status().as_u16() == 200
+            && let Ok(body) = response.json::<serde_json::Value>().await
+            && body["ring"]["members"]
+                .as_array()
+                .is_some_and(|members| members.len() == want)
+        {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{admin}: the applied ring never reached {want} members"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+async fn two_nodes_with_a_recording_imposter() -> RecordingFleet {
+    let leader_state = TempDir::new().expect("tempdir");
+    let leader = compose::start(cluster_cli(&leader_state, &["--cluster-allow-solo"]))
+        .await
+        .expect("leader starts");
+    wait_ready(&leader).await;
+    let seed = leader.cluster_addr().expect("cluster addr").to_string();
+
+    let follower_state = TempDir::new().expect("tempdir");
+    let follower = compose::start(cluster_cli(&follower_state, &["--cluster-seeds", &seed]))
+        .await
+        .expect("follower joins");
+    wait_ready(&follower).await;
+    wait_ring(&leader.admin_addr().to_string(), 2).await;
+    wait_ring(&follower.admin_addr().to_string(), 2).await;
+
+    let port = reserve_port();
+    let created = reqwest::Client::new()
+        .post(format!("http://{}/imposters", leader.admin_addr()))
+        .json(&recording_imposter(port))
+        .send()
+        .await
+        .expect("create the imposter");
+    assert_eq!(created.status().as_u16(), 201, "seeding the imposter");
+    RecordingFleet {
+        leader,
+        follower,
+        port,
+        _state: [leader_state, follower_state],
+    }
+}
+
+/// Pins D-74: `numberOfRequests` is **the answering node's own count**, not a fleet sum.
+///
+/// Three requests go through the leader's gateway and one through the follower's, so the two
+/// journals differ from each other and both differ from their sum: a per-node journal answers `3`
+/// on one and `1` on the other. Before #552 the front rewrote the field by fanning out to every
+/// peer, so both nodes answered the *same* number — which is the equality this test denies.
+///
+/// That number would not have been `4`, though it is tempting to say so. `drive_recorded`'s
+/// warm-up clear was fleet-wide under the old design, so the follower's warm-up would have emptied
+/// the leader's three entries as well and the merged count would have read `1` on both nodes. The
+/// old code fails the two per-node equalities below; it would have passed the `!= 4` line. That
+/// line is here to state D-74's contract in words, not to be the discriminator.
+///
+/// The gateway leg rather than the data port, for the reason the D-69 teardown test gives: two
+/// nodes bind the same port and a direct dial names whichever won it.
+#[tokio::test]
+async fn number_of_requests_is_the_answering_nodes_own_count_not_a_fleet_sum() {
+    let RecordingFleet {
+        leader,
+        follower,
+        port,
+        _state,
+    } = two_nodes_with_a_recording_imposter().await;
+    let lead_admin = leader.admin_addr().to_string();
+    let follow_admin = follower.admin_addr().to_string();
+
+    drive_recorded(&lead_admin, port, 3).await;
+    drive_recorded(&follow_admin, port, 1).await;
+
+    let (_, on_leader) = imposter_read_on(&lead_admin, port).await;
+    let (_, on_follower) = imposter_read_on(&follow_admin, port).await;
+    assert_eq!(on_leader, 3, "the leader counts what the leader served");
+    assert_eq!(
+        on_follower, 1,
+        "the follower counts what the follower served"
+    );
+    // Stated on its own even though the two equalities imply it: this is the contract change
+    // D-74 declares, and the assertion should read as that claim.
+    assert!(
+        on_leader != 4 && on_follower != 4,
+        "neither node answers the fleet sum (leader {on_leader}, follower {on_follower})"
+    );
+
+    follower.shutdown().await;
+    leader.shutdown().await;
+}
+
+/// Pins D-74: `DELETE /imposters/{port}/savedRequests` is proxied to the node it reached and
+/// empties **that node's** journal alone; every other node keeps what it recorded.
+///
+/// Until #552 this DELETE terminated on the front as a Raft-committed clear generation that
+/// every node's merge consulted, so a clear anywhere emptied the read everywhere. With the journal
+/// back in each engine there is nothing for a clear to replicate through — the console's confirm
+/// dialog says "on this node only", and this is the test that keeps it honest.
+#[tokio::test]
+async fn a_proxied_clear_empties_only_the_journal_of_the_node_it_reached() {
+    let RecordingFleet {
+        leader,
+        follower,
+        port,
+        _state,
+    } = two_nodes_with_a_recording_imposter().await;
+    let lead_admin = leader.admin_addr().to_string();
+    let follow_admin = follower.admin_addr().to_string();
+
+    drive_recorded(&lead_admin, port, 2).await;
+    drive_recorded(&follow_admin, port, 2).await;
+    assert_eq!(
+        (
+            recorded_count_on(&lead_admin, port).await,
+            recorded_count_on(&follow_admin, port).await
+        ),
+        (2, 2),
+        "both journals must hold entries before the clear, or the assertions below would pass \
+         against journals that were empty all along"
+    );
+
+    clear_journal_on(&follow_admin, port).await;
+
+    assert_eq!(
+        recorded_count_on(&follow_admin, port).await,
+        0,
+        "the node that took the clear has an empty journal"
+    );
+    let (_, on_follower) = imposter_read_on(&follow_admin, port).await;
+    assert_eq!(on_follower, 0, "and its count agrees with its journal");
+
+    assert_eq!(
+        recorded_count_on(&lead_admin, port).await,
+        2,
+        "the node that did NOT take the clear keeps every entry it recorded"
+    );
+    let (_, on_leader) = imposter_read_on(&lead_admin, port).await;
+    assert_eq!(on_leader, 2, "and its count is untouched too");
+
+    follower.shutdown().await;
+    leader.shutdown().await;
+}
+
+/// The negative half of D-74's narrowing of `Rift-Cluster-Partial`: it is **absent** from a
+/// single-imposter read and from the spaces listing — in a fleet that has a peer, so a stamp that
+/// still existed would have a peer to be partial about. The spaces listing fans out and reports its
+/// own incompleteness in the body (`partial`, beside `unavailable`) instead, so that field is
+/// asserted present.
+///
+/// The positive half — that the two routes D-74 keeps really do stamp — is
+/// `cluster_partial_rides_members_and_health_when_a_voter_is_down` below. Absence alone would also
+/// be satisfied by a header nothing ever sets.
+#[tokio::test]
+async fn cluster_partial_is_absent_from_the_imposter_read_and_the_spaces_listing() {
+    let RecordingFleet {
+        leader,
+        follower,
+        port,
+        _state,
+    } = two_nodes_with_a_recording_imposter().await;
+    let lead_admin = leader.admin_addr().to_string();
+    let follow_admin = follower.admin_addr().to_string();
+
+    for admin in [&lead_admin, &follow_admin] {
+        let (headers, _) = imposter_read_on(admin, port).await;
+        assert!(
+            headers.get("rift-cluster-partial").is_none(),
+            "{admin}: a single-imposter read reaches exactly one node and cannot be partial: {headers:?}"
+        );
+
+        let listing = reqwest::get(format!("http://{admin}/imposters/{port}/spaces"))
+            .await
+            .expect("list the spaces");
+        assert_eq!(
+            listing.status().as_u16(),
+            200,
+            "{admin}: the spaces listing"
+        );
+        assert!(
+            listing.headers().get("rift-cluster-partial").is_none(),
+            "{admin}: the spaces listing reports partiality in the body, never the header: {:?}",
+            listing.headers()
+        );
+        let body: serde_json::Value = listing.json().await.expect("json");
+        assert!(
+            body["partial"].is_boolean(),
+            "{admin}: the listing's envelope carries `partial` as a boolean: {body}"
+        );
+    }
+
+    follower.shutdown().await;
+    leader.shutdown().await;
+}
+
+/// The positive half of D-74's narrowing of `Rift-Cluster-Partial`: `/_fleet/members` and
+/// `/_fleet/health` really are stamped when a voter cannot be reached.
+///
+/// Its sibling above asserts only the header's *absence*, which a header nothing ever sets would
+/// satisfy just as well. Both halves are needed for "exactly two routes" to mean anything: this one
+/// says the two are live, that one says the rest are not.
+///
+/// The follower is shut down and the survivor read, so each fan-out has a voter it cannot fill —
+/// `members` a row, `health` an addend of `parked_intents_fleet`. Polled rather than read once: a
+/// shutting-down peer can still accept a connection for a moment, and a fan-out that happened to
+/// succeed would answer complete, correctly.
+#[tokio::test]
+async fn cluster_partial_rides_members_and_health_when_a_voter_is_down() {
+    let RecordingFleet {
+        leader,
+        follower,
+        port: _port,
+        _state,
+    } = two_nodes_with_a_recording_imposter().await;
+    let lead_admin = leader.admin_addr().to_string();
+
+    follower.shutdown().await;
+
+    for route in ["/_fleet/members", "/_fleet/health"] {
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            let response = reqwest::get(format!("http://{lead_admin}{route}"))
+                .await
+                .expect("read the fleet route");
+            assert_eq!(
+                response.status().as_u16(),
+                200,
+                "{route}: the survivor still answers"
+            );
+            if response
+                .headers()
+                .get("rift-cluster-partial")
+                .and_then(|v| v.to_str().ok())
+                == Some("true")
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{route}: a voter is down, so this read cannot be complete — but it never stamped \
+                 `Rift-Cluster-Partial`: {:?}",
+                response.headers()
+            );
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    }
+
+    leader.shutdown().await;
 }

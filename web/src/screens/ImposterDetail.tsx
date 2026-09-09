@@ -372,8 +372,9 @@ function DangerZone({ port, name }: { port: number; name: string | undefined }):
       <div className="card-body">
         <h2>Danger zone</h2>
         <p className="muted">
-          Each of these is a replicated control op — it lands on every node, and nothing here undoes
-          it.
+          Nothing here undoes itself. Deleting the imposter is a replicated control op and lands on
+          every node; clearing its recorded requests is proxied to this node&rsquo;s own engine and
+          reaches only the node you are reading (D-74).
         </p>
         <div className="row">
           <button
@@ -401,8 +402,9 @@ function DangerZone({ port, name }: { port: number; name: string | undefined }):
           title="Clear this imposter's recorded requests?"
           body={
             <>
-              This empties the recorded requests for imposter {port} <b>fleet-wide</b> — the clear
-              commits through Raft to every node, and nothing restores these rows.
+              This empties the recorded requests for imposter {port} <b>on this node only</b> — the
+              clear is proxied to this node&rsquo;s own engine (D-74), every other node keeps what it
+              recorded, and nothing restores these rows.
             </>
           }
           confirmLabel="Clear log"

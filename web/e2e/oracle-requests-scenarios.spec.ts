@@ -93,9 +93,13 @@ async function apiScenarios(
 /**
  * The total the pager reports, parsed out of "1–50 of 55".
  *
- * The trailing "on this node" this used to require is gone: #147 H points the screen at the
- * fleet's merged journal, so the count is the fleet's and qualifying it per-node would be a false
- * claim. That sweep is what this regex tracks.
+ * The oracle it is compared against is `GET /imposters/:port/requests` on the node this page is
+ * served from, and since **D-74** (#552) that is the whole relation: the request journal is
+ * upstream's own, per node, so the screen's count and the API's are two readings of one node's
+ * journal. There is no merge between them to disagree — which is what makes an exact equality the
+ * right assertion here rather than a bound. (Until #552 this route was terminated by the cluster
+ * front and merged every node's shard; the comment that used to sit here described that, and the
+ * premise stopped being true when the merge was removed.)
  */
 async function shownTotal(page: Page): Promise<number> {
   const label = (await page.getByTestId("request-total").textContent()) ?? "";

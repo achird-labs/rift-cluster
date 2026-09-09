@@ -65,8 +65,10 @@ These are the ones that separate an honest operator console from a plausible-loo
 1. **`?screen=imposters&data=empty&fleet=degraded`** — a naive console says "no imposters" here and is
    *wrong*. An imposter configured on the node that did not answer would not appear. This prototype
    says "cannot confirm this fleet is empty" and names the coverage.
-2. **`?screen=requests&fleet=degraded&scopeNode=rift-3`** — the scoped node is unreachable. Its log is
-   **unknown**, not empty, and the screen says so in those words.
+2. **`?screen=requests&fleet=degraded&scopeNode=rift-3`** — the node the log is scoped to is
+   unreachable. Its log is **unknown**, not empty, and the screen says so in those words. This is
+   the state that matters most now that every request read is one node's: an unreachable node has
+   no answer, and rendering that as an empty log would be the console inventing a fact.
 3. **`?screen=requests&data=empty`** — the reachable-and-genuinely-empty case, for contrast with (2).
    Two different screens, deliberately.
 4. **`?screen=fleet&fleet=degraded`** — applied-spread renders `—`, not `0`. Unknown and zero are
@@ -156,16 +158,26 @@ reads. A sparkline would imply history the API does not have, which is RFC-006 �
 UI-only") applied to charts. The single chart is magnitude-by-identity over `numberOfRequests` — a
 value the imposter body genuinely carries — and it is labelled *this node, not a fleet total*.
 
-**The request log's scope label appears only for an incomplete merge.** #147 H landed the convergence
-RFC-006 §4 promised: the screen reads the fleet's already-merged journal rather than one node's own,
-so there is no per-node fact left to keep permanently in front of the reader, and the old
-never-collapsing strip is gone with it. What survives is the one case an operator still needs told to
-them before trusting a result — the merge's own `Rift-Cluster-Partial` header, stamped when the
-fan-out could not reach every node inside its budget — and the label renders, undismissable, exactly
-then.
+**The Requests screen names the node it is reading from, always.** Since D-74 (#552) there is no
+fleet merge to report on: `GET /imposters/:port/requests` is upstream's own per-imposter journal,
+answered by whichever node the browser reached, and `numberOfRequests` is that node's count. So the
+screen labels the table with that node — the answering node's id, which `GET /_fleet/members`
+carries as its top-level `node_id` and which matches exactly one row of the `members` array (the
+same identity the fleet rail marks as self). A request log with no node on it is a log the reader
+will take for the fleet's, and it is not.
 
-**The console never fans out and merges client-side.** That would reinvent the verification plane
-without its cursors or gap repair, producing a merged view with no way to know what it missed.
+There is correspondingly **no partial-merge banner** on this screen, and no `Rift-Cluster-Partial`
+to render: that header is stamped on exactly two reads, `/_fleet/members` and `/_fleet/health`. A
+read that reached exactly one node cannot have missed one. The spaces listing fans out too and
+keeps reporting its own incompleteness in the body (`partial`, beside `unavailable`) — an
+enumeration refused by policy and one shortened by a slow peer are different facts, and a boolean
+header cannot tell them apart.
+
+**The console never fans out and merges client-side.** Reading all three nodes and stitching the
+answers together would be inventing a fleet journal in the browser — with no cursor that means
+anything across nodes, and no way to know what it missed. A user who wants the fleet's answer
+reads each node and says so. What the screen does offer is a *scope*: pick a node, read that
+node's log, and see its name on the result.
 
 **Status is triple-encoded** — glyph shape (● ▲ ■ ○), colour, and word. This came from measurement:
 the palette validator put green↔red at ΔE 5.8–7.2 under protanopia/deuteranopia, which no hue tweak

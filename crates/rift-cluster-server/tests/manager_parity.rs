@@ -59,14 +59,6 @@ const CLUSTER_ADDITIONS: &[&str] = &[
     // #120). Unconditional under --cluster by design: a process-local store is
     // wrong for every imposter there, not just the configured ones.
     "with_flow_store_provider",
-    // One journal shared by every imposter on the node, keyed by port, so this
-    // node's recorded requests are shard-shaped and a fleet-wide verification
-    // read has something to merge (issue #222). Unconditional under --cluster
-    // for the same reason as the flow store: behind a round-robin LB a private
-    // per-imposter journal answers `savedRequests` with whatever fraction of the
-    // traffic happened to land here, and that is wrong for every imposter rather
-    // than only the ones that opted into something.
-    "with_request_journal",
     // Response cursors that can be owned by one node, so `responses: [A, B, C]`
     // cycles once fleet-wide behind a round-robin LB instead of once per node
     // (issue #466, D-47). Installed unconditionally like the three above, but

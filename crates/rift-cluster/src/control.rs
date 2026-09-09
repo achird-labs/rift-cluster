@@ -43,14 +43,15 @@ pub struct ControlRequest {
 
 /// Application-level operation carried by the Raft log (ADR-001 §4.1).
 ///
-/// **Removing a variant is a log-format break, and #546, #549 and #550 each took one
-/// deliberately.** This enum is externally-tagged `serde_json` with no envelope
+/// **Removing a variant is a log-format break, and #546, #549, #550 and #552 each took
+/// one deliberately.** This enum is externally-tagged `serde_json` with no envelope
 /// version and no `#[serde(other)]` catch-all — `raft::store` writes entries with
 /// `serde_json::to_vec` and reads them back with `from_slice` — so a variant that
 /// is gone here cannot be decoded at all: a node replaying a log that still holds
 /// an `AuditSinkPut`, `SourcePut`, `SpecPut`, `TenantPut`, `TenantDelete`,
-/// `PrincipalPut`, `PrincipalCreate`, `PrincipalDelete`, `BindingPut` or
-/// `BindingDelete` entry fails to start rather than skipping it. **#550 additionally
+/// `PrincipalPut`, `PrincipalCreate`, `PrincipalDelete`, `BindingPut`,
+/// `BindingDelete` or `JournalClearGen` (#552, D-74) entry fails to start rather
+/// than skipping it. **#550 additionally
 /// removed the `tenant` field from every surviving variant**, which changes the
 /// encoding of ops that still exist, so this is a break for the whole log rather
 /// than for the removed variants alone. Pre-release that is the right trade, and
@@ -124,30 +125,7 @@ pub enum ControlOp {
     FleetNamePut {
         name: String,
     },
-    /// Bump a port's journal clear generation, or one space's within it (Ch.7 §"Clears are
-    /// generation bumps — never timestamps", issue #224).
-    ///
-    /// A clear deletes nothing. It raises a counter, and every reader ignores entries stamped
-    /// below it — so the clear converges by consensus rather than by a best-effort broadcast a
-    /// partitioned peer can miss forever, and no node consults a clock to decide what "before the
-    /// clear" means. That is what makes the result immune to skew: there is no timestamp in the
-    /// path at all.
-    ///
-    /// **Carries no number.** Apply *increments*, rather than storing a value the submitter
-    /// chose, because two clears racing from two nodes must both take effect: they commit in log
-    /// order and compose to +2, which is harmlessly stronger than either alone since both mean
-    /// "ignore everything before me". A submitted number would instead make the second clear
-    /// silently overwrite the first with the same value.
-    ///
-    /// `space: None` clears the whole port; `Some(flow)` clears only that space's entries and
-    /// leaves the port generation — and therefore every sibling space — untouched.
-    ///
-    /// D-38: a clear is a generation bump committed on the log, never a timestamped deletion.
-    JournalClearGen {
-        port: u16,
-        space: Option<String>,
-    },
-    /// One `proxyOnce`/`proxyAlways` recording, as consensus fact (#226, Ch.7 §proxyOnce, D-40).
+    /// One `proxyOnce`/`proxyAlways` recording, as consensus fact (#226, Ch.6 §proxyOnce, D-40).
     ///
     /// Carries **both** the replayable response and — when predicate generation built one —
     /// the recorded stub, in a single op. Deliberately not two ops riding one front-door
@@ -272,8 +250,8 @@ pub enum StubEdit {
     /// Every stub scoped to `space` (issue #537, D-69). Set-addressed, not id-addressed, because a
     /// space stub is not required to carry an `id` — `DeleteById` cannot express this at all.
     ///
-    /// Committed by a space teardown alongside its journal clear. Once space stubs replicate, a
-    /// teardown that only tore down the local engine would be undone by the next
+    /// Committed by a space teardown. Once space stubs replicate, a teardown that only tore
+    /// down the local engine would be undone by the next
     /// `EngineAction::Sync`, which re-renders every imposter from `sm_configs` and would
     /// resurrect them fleet-wide.
     DeleteBySpace {
@@ -300,7 +278,6 @@ impl ControlOp {
             ControlOp::DeleteRoute { .. } => "DeleteRoute",
             ControlOp::SessionKeyPut { .. } => "SessionKeyPut",
             ControlOp::FleetNamePut { .. } => "FleetNamePut",
-            ControlOp::JournalClearGen { .. } => "JournalClearGen",
             ControlOp::ProxyRecorded { .. } => "ProxyRecorded",
             ControlOp::ProxyRecordedClear { .. } => "ProxyRecordedClear",
         }
@@ -417,29 +394,11 @@ pub fn validate(op: &ControlOp) -> Result<(), String> {
             }
             Ok(())
         }
-        // Deliberately shallow: only the checks that hold regardless of state. Whether an
-        // imposter exists on `port` is an apply-time question (`raft::store::mutate_tables`'
-        // `JournalClearGen` arm) — the same split every other op here draws, and the reason is the
-        // same too: `validate` runs identically on every replica from the op alone, so it must
-        // never depend on a table a replica could disagree with another about.
-        ControlOp::JournalClearGen { port, space } => {
-            if *port == 0 {
-                return Err("port must be non-zero: 0 addresses no imposter to clear".to_owned());
-            }
-            if let Some(space) = space
-                && space.is_empty()
-            {
-                return Err(
-                    "space must not be empty when given: an empty scope is not a narrower \
-                     clear, it is an unaddressed one"
-                        .to_owned(),
-                );
-            }
-            Ok(())
-        }
-        // Shallow for the same reason as `JournalClearGen`: whether the port's imposter
-        // exists — and whether a proxy stub with `proxy_to` is still in it — are apply-time
-        // questions against the then-current tables.
+        // Deliberately shallow: only the checks that hold regardless of state. Whether the
+        // port's imposter exists — and whether a proxy stub with `proxy_to` is still in it — are
+        // apply-time questions against the then-current tables. `validate` runs identically on
+        // every replica from the op alone, so it must never depend on a table a replica could
+        // disagree with another about.
         ControlOp::ProxyRecorded {
             port,
             sig_hash,
@@ -583,15 +542,10 @@ pub fn precondition_target(op: &ControlOp) -> Option<PreconditionTarget> {
         // The fleet name addresses the fleet, not an imposter record — same reasoning as the
         // session key immediately above.
         | ControlOp::FleetNamePut { .. }
-        // A clear is a convergence primitive, not a config write conditioned on a stored
-        // revision: it commits unconditionally (apply takes the `max`), so two concurrent clears
-        // compose rather than one losing an optimistic-concurrency race the op was never meant
-        // to run.
-        | ControlOp::JournalClearGen { .. }
         // A recording is submitted by the engine's claim owner, not by an
         // optimistic-concurrency client; its placement is resolved at apply against the
         // then-current stubs, which is the property a stored-revision precondition would
-        // re-introduce a race against. The clear follows `JournalClearGen`'s reasoning.
+        // re-introduce a race against. Its clear follows the same reasoning.
         | ControlOp::ProxyRecorded { .. }
         | ControlOp::ProxyRecordedClear { .. } => None,
     }
@@ -777,13 +731,6 @@ mod tests {
                 "FleetNamePut",
             ),
             (
-                ControlOp::JournalClearGen {
-                    port: 1,
-                    space: None,
-                },
-                "JournalClearGen",
-            ),
-            (
                 ControlOp::ProxyRecordedClear { port: 1 },
                 "ProxyRecordedClear",
             ),
@@ -885,43 +832,6 @@ mod tests {
         };
         let err = validate(&op).expect_err("duplicate ids corrupt the stub-key diff");
         assert!(err.contains('a'), "{err}");
-    }
-
-    // -- validate: JournalClearGen (issue #224) --------------------------------
-
-    #[test]
-    fn validate_rejects_a_journal_clear_on_port_zero() {
-        let op = ControlOp::JournalClearGen {
-            port: 0,
-            space: None,
-        };
-        let err = validate(&op).expect_err("port 0 addresses no imposter");
-        assert!(err.contains("port"), "{err}");
-    }
-
-    #[test]
-    fn validate_rejects_a_journal_clear_on_an_empty_space() {
-        let op = ControlOp::JournalClearGen {
-            port: 1,
-            space: Some(String::new()),
-        };
-        let err = validate(&op).expect_err("an empty space is not a narrower clear");
-        assert!(err.contains("space"), "{err}");
-    }
-
-    #[test]
-    fn validate_accepts_a_well_formed_journal_clear_for_both_scopes() {
-        let port_wide = ControlOp::JournalClearGen {
-            port: 1,
-            space: None,
-        };
-        assert_eq!(validate(&port_wide), Ok(()));
-
-        let space_scoped = ControlOp::JournalClearGen {
-            port: 1,
-            space: Some("checkout".to_owned()),
-        };
-        assert_eq!(validate(&space_scoped), Ok(()));
     }
 
     // -- validate: PutRoutes / DeleteRoute -------------------------------------
