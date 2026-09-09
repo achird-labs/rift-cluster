@@ -27,9 +27,10 @@ mitigated. The one residual window (a node partitioned away that hasn't yet
 learned it lost ownership) is closed by a lease rule at the *owner* side
 (Chapter 6), not by caller-side guessing.
 
-The same log then carries configs, tenancy, and admin intents — so R1
+The same log then carries configs, the route table, and admin intents — so R1
 (fleet-wide visibility), R3 (durability), and R4 (no lost requests) come from
-one mechanism instead of three bespoke protocols.
+one mechanism instead of three bespoke protocols. (It carried tenancy and RBAC
+records too, until D-73 (#550) removed them.)
 
 ## Anatomy
 

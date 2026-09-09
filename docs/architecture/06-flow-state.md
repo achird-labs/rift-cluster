@@ -76,9 +76,11 @@ node**, from the state machine's apply loop — the same per-node, once-per-entr
 discipline as the config reconcile, so it also covers a delete replayed on join
 or installed by a snapshot; a cold-start reconcile additionally sweeps any
 `i<port>:` namespace the committed configs no longer name, for a delete that
-committed while the node was down. `f:` and `t<tenant>:` are not any one
-imposter's and are never dropped by a delete, and a config change on the port
-(a `PutImposter`) is not a delete and keeps the state.
+committed while the node was down. `f:` is not any one imposter's and is never dropped by a
+delete, and a config change on the port (a `PutImposter`) is not a delete and
+keeps the state. (There was a third prefix, `t<tenant>:`, under the same rule;
+D-73 (#550) removed the tenant scope, so `ContextScope` is `Imposter | Fleet`
+and `prefix_for` renders `i<port>:` or `f:` and nothing else.)
 
 Scope is per-imposter and not a cluster-wide setting, because it is a property
 of what an imposter's contexts *mean* — the same reason `readConsistency` is
@@ -200,7 +202,7 @@ fencing):
 | State | On ownership change | Rationale |
 |---|---|---|
 | Scenario FSM / flow KV | **Adopt** highest `(m_idx, v, origin)` from replicas/disk | ≤ 1 replication round staleness; adopt-found-nothing ⇒ FSM restarts, and a takeover that could not verify against any replica is named in a `warn` line — no response header, because the store is reached through `spawn_blocking`, which the annotation scope does not cross; bounded and visible, never silent |
-| Sequence cursors | **Reset** | Deliberate (D-8): replicating every advance puts a network write on the hottest stateful path for test-run-scoped data. A mid-test membership change may restart sequences; documented. *Not yet built:* no clustered sequencer exists — cursors are node-local (`LocalSequencer`) today, so there is nothing to hand off |
+| Sequence cursors | **Reset** | Deliberate (D-8): replicating every advance puts a network write on the hottest stateful path for test-run-scoped data. A mid-test membership change may restart sequences; documented. Since D-47 (#466) the cursor *is* clustered — `ClusteredSequencer` routes `next` to the ring owner and falls back to the local cursor, annotating, when the owner cannot answer — so a handoff resets rather than migrating, which is what this row has always described |
 | proxyOnce | `Recorded` adopts (replicated); `Pending` dies with the owner → re-claim | Duplicate-upstream bound: 1 + ownership changes in flight (the proxyOnce section at the end of this chapter). That is now the bound on *upstream calls* too, not just recordings: a claim the cluster cannot serialize is refused `503` rather than forwarded (D-66), so an outage no longer adds a call per request |
 
 Graceful leave adds no separate flush: every accepted write was already pushed

@@ -121,9 +121,12 @@ converts "404 because I'm 200 ms behind" into a correct answer.
 ## Writes that are not config
 
 The same path carries `SetEnabled` (pause/resume — a first-class op precisely
-because it must replicate and survive restart, issue #15), tenancy ops
-(Chapter 8), and proxy-recorded stubs (a recording is a `PatchStubs` append —
-recording already waits on an upstream call, so a Raft round is noise).
+because it must replicate and survive restart, issue #15), the route table
+(`PutRoutes`/`DeleteRoute`, [Chapter 13](13-router.md)), the console's session
+signing key (`SessionKeyPut`, [Chapter 10](10-operations.md)), and
+proxy-recorded stubs (a recording is a `PatchStubs` append — recording already
+waits on an upstream call, so a Raft round is noise). It used to carry tenancy
+ops too; D-73 (#550) removed them.
 
 What does **not** go through Raft: scenario-state writes from the admin API
 (`PUT .../scenarios/:name/state`, reset) — those are *flow state*, routed to

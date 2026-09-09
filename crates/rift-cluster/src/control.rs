@@ -103,13 +103,15 @@ pub enum ControlOp {
     /// fleet-internal and meaningless anywhere else. It cannot be stored hashed the way a
     /// principal's API key is (`argon2id`, RFC-002 §3.2), because verifying an HMAC needs the key
     /// itself, not a one-way digest of it — a hash would make the cookie unverifiable by anyone,
-    /// including us. A secret with power over a *third-party* system has no op that carries it:
-    /// the credential-bearing source ops were removed with the tracking sources (#549, D-72).
+    /// including us. (The hashed comparison is what an API key gets; there are no principal keys
+    /// to hash since #566, D-73, and the fleet's own `--api-key` never enters the log at all.) A
+    /// secret with power over a *third-party* system has no op that carries it: the
+    /// credential-bearing source ops were removed with the tracking sources (#549, D-72).
     ///
-    /// So it sits inside the same trust boundary as the state directory, which already holds every
-    /// principal's argon2 record and all committed config. Rotation is the containment: writing a
-    /// new key invalidates every outstanding session at once. Recorded in
-    /// `docs/architecture/08-tenancy-security.md`.
+    /// So it sits inside the same trust boundary as the state directory, which already holds all
+    /// committed config. Rotation is the containment: writing a new key invalidates every
+    /// outstanding session at once — and with one credential it is the *only* revocation the
+    /// fleet has. Recorded in `docs/architecture/10-operations.md`.
     SessionKeyPut {
         /// 32 random bytes, hex-encoded. Hex rather than raw so the op stays printable in a log
         /// dump and survives JSON without a base64 alphabet decision.

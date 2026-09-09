@@ -21,11 +21,13 @@ cannot give you is:
 
 RiftCluster delivers these as a **layered build**:
 the open-source engine is unmodified and unaware of clustering; every cluster
-behavior enters through eight generic extension seams that were upstreamed
-first (`achird-labs/rift#311–#318` — pluggable flow store with CAS, response
-sequencer, request journal, proxy-recording store, incremental config apply
-with change events, the embeddable server builder, and response decoration).
-Chapter 11 covers that boundary in detail.
+behavior enters through generic extension seams that are upstreamed first. The
+original eight (`achird-labs/rift#311–#318`) were the pluggable flow store with
+CAS, the response sequencer, the request journal, the proxy-recording store,
+incremental config apply with change events, the embeddable server builder, and
+response decoration; there are eighteen now, and four — the journal among them —
+are upstream's still but consumed here no longer. Chapter 11 covers that
+boundary in detail, seam by seam.
 
 ## The four load-bearing requirements
 
@@ -53,8 +55,8 @@ an embedded ACID store (`redb`).
 
 Just as load-bearing. The cluster is **not**:
 
-- **A general database.** Durability covers configs, tenancy, admin intents,
-  and (tunably) flow state. Response cursors, the recorded requests upstream's
+- **A general database.** Durability covers configs, the route table, admin
+  intents, and (tunably) flow state. Response cursors, the recorded requests upstream's
   own per-node journal holds, and in-flight proxy claims are deliberately
   volatile — Chapter 9 has the full matrix and the reasoning for each row.
 - **Cross-region.** One failure domain, one LAN. WAN latencies would invalidate
