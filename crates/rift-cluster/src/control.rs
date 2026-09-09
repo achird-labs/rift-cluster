@@ -55,7 +55,10 @@ pub struct ControlRequest {
 /// break on its own: this enum sets no `deny_unknown_fields`, so an old entry's extra
 /// `tenant` key is dropped and the op decodes — pinned on *this* type by
 /// [`tests::an_old_entrys_tenant_field_is_ignored`], because a claim D-73 leans on
-/// operationally should not rest on a test of some other wire shape. What actually refuses an
+/// operationally should not rest on a test of some other wire shape, and across *every*
+/// surviving variant by [`tests::every_surviving_variant_ignores_an_old_entrys_tenant_field`],
+/// because `deny_unknown_fields` is per-container and one variant proves nothing about the
+/// next. What actually refuses an
 /// old state directory is redb: every state-machine table's key or value type lost
 /// its tenant component, and redb answers `TableTypeMismatch` when a table is opened
 /// under a definition whose types differ from the ones it was created with. That
@@ -1252,9 +1255,113 @@ mod tests {
         }
 
         // The other direction, so "it decodes" cannot mean the enum decodes anything at all: a
-        // *missing* required field is still an error, not a silent default.
+        // *missing* required field is still an error, not a silent default. Bound and grepped,
+        // like every other negative assertion in this module: `serde_json` also answers `Err`
+        // for `unknown variant \`PatchStubs\``, and #546/#549/#550 each removed variants — one
+        // more rename and a bare `expect_err` would assert nothing while staying green, in
+        // exactly the "it decodes anything" direction this case exists to rule out.
         let missing = json!({ "PatchStubs": { "port": 4545 } });
-        serde_json::from_value::<ControlOp>(missing)
+        let err = serde_json::from_value::<ControlOp>(missing)
             .expect_err("a variant missing a required field must not decode");
+        assert!(
+            err.to_string().contains("missing field `edit`"),
+            "must fail on the missing field, not on the variant name having moved: {err}"
+        );
+    }
+
+    /// [`ControlOp`]'s doc claims #550 dropped `tenant` from **every** surviving variant, so
+    /// every one of them must ignore the stale key — not just the `PutImposter` that
+    /// [`tests::an_old_entrys_tenant_field_is_ignored`] happens to spell out.
+    /// `deny_unknown_fields` is per-container: adding it to `PatchStubs` alone would leave that
+    /// test green while every pre-#550 `PatchStubs` entry stopped replaying — the same
+    /// one-level-down defeat its own rationale describes, one level further down.
+    ///
+    /// Each op is serialized, given a `tenant` key, decoded, and re-serialized: the round trip
+    /// must land back on the byte-identical clean value, so "it decoded" cannot mean it decoded
+    /// into something else.
+    #[test]
+    fn every_surviving_variant_ignores_an_old_entrys_tenant_field() {
+        // Adding a variant breaks this match, which is the reminder to extend the list below.
+        // `DeleteAll` is absent from it on purpose: a unit variant serializes as the bare tag
+        // string, so there is no object for a stale key to sit in.
+        fn _every_variant_is_accounted_for(op: &ControlOp) {
+            match op {
+                ControlOp::PutImposter { .. }
+                | ControlOp::PatchStubs { .. }
+                | ControlOp::DeleteImposter { .. }
+                | ControlOp::DeleteAll
+                | ControlOp::SetEnabled { .. }
+                | ControlOp::PutRoutes { .. }
+                | ControlOp::DeleteRoute { .. }
+                | ControlOp::SessionKeyPut { .. }
+                | ControlOp::FleetNamePut { .. }
+                | ControlOp::JournalClearGen { .. }
+                | ControlOp::ProxyRecorded { .. }
+                | ControlOp::ProxyRecordedClear { .. } => {}
+            }
+        }
+
+        let survivors = vec![
+            ControlOp::PutImposter { config: config(1) },
+            ControlOp::PatchStubs {
+                port: 1,
+                edit: StubEditScript(vec![]),
+            },
+            ControlOp::DeleteImposter { port: 1 },
+            ControlOp::SetEnabled {
+                port: 1,
+                enabled: true,
+            },
+            ControlOp::PutRoutes {
+                table: RouteTable::default(),
+            },
+            ControlOp::DeleteRoute { id: "r".to_owned() },
+            ControlOp::SessionKeyPut {
+                key: "00".repeat(SESSION_KEY_BYTES),
+            },
+            ControlOp::FleetNamePut {
+                name: "prod".to_owned(),
+            },
+            ControlOp::JournalClearGen {
+                port: 1,
+                space: None,
+            },
+            ControlOp::ProxyRecorded {
+                port: 1,
+                sig_hash: "0123456789abcdef".to_owned(),
+                resp: RecordedResponse {
+                    status: 200,
+                    headers: vec![],
+                    body: vec![],
+                    latency_ms: None,
+                    timestamp_secs: 0,
+                },
+                stub: None,
+            },
+            ControlOp::ProxyRecordedClear { port: 1 },
+        ];
+
+        for op in survivors {
+            let clean = serde_json::to_value(&op).expect("a ControlOp serializes");
+            let mut with_tenant = clean.clone();
+            let (tag, fields) = with_tenant
+                .as_object_mut()
+                .and_then(|object| object.iter_mut().next())
+                .expect("externally tagged: one key, the variant tag");
+            let tag = tag.clone();
+            fields
+                .as_object_mut()
+                .unwrap_or_else(|| panic!("`{tag}` must be a struct variant to be listed here"))
+                .insert("tenant".to_owned(), json!("default"));
+
+            let back: ControlOp = serde_json::from_value(with_tenant).unwrap_or_else(|e| {
+                panic!("a pre-#550 `{tag}` entry's stale `tenant` key must be ignored: {e}")
+            });
+            assert_eq!(
+                serde_json::to_value(&back).expect("a ControlOp serializes"),
+                clean,
+                "`{tag}` must decode back to exactly itself"
+            );
+        }
     }
 }
