@@ -143,11 +143,6 @@ at the owner, not assumed at the caller.
   20–40k RPS is unacceptable. Flow state stays single-writer HRW + WAL; D-8
   (cursor reset on ownership move) and D-12 (Redis-strict path) both stand.
 
-> **Superseded by D-72** (2026-09-08): the blob corpus this rejection and the D-18/D-19 entries
-> below reason about no longer exists — stored specs, datasets and the content-addressed blob
-> store were removed by #549, and RFC-005 was retired with them. The bullet and the decision-log
-> paragraph are kept as the historical argument; neither is a live constraint.
-
 - **Object-store tiering of the blob corpus** (evict cold datasets/specs
   locally, fetch from a bucket on demand — rift-cluster#458, 2026-08-24). D-12's
   "external system by choice" is *not* a precedent for this: the Redis-strict
@@ -158,6 +153,12 @@ at the owner, not assumed at the caller.
   §3.2 bounds dataset bytes by quota precisely so the corpus is
   consensus-worthy small and fully replicated; a corpus that outgrows a voter's
   disk is a redesign with numbers, not a tier. See D-18.
+
+  > **Superseded by D-72** (2026-09-08): the blob corpus this rejection and the D-18/D-19
+  > entries below reason about no longer exists — stored specs, datasets and the
+  > content-addressed blob store were removed by #549, and RFC-005 was retired with them. The
+  > bullet above and the decision-log paragraph are kept as the historical argument; neither is
+  > a live constraint.
 
 ## Decision-log entries
 
