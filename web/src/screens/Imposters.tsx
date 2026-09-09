@@ -17,6 +17,7 @@ import {
 } from "../app/queries.ts";
 import { toHash, useHashQuery } from "../app/routing.ts";
 import { ExportDialog } from "../components/exportDialog.tsx";
+import { OpenApiImport } from "../features/import/OpenApiImport.tsx";
 import { FleetRail } from "../components/fleetRail.tsx";
 import { ImposterField, stubCountOf } from "../components/imposterFields.tsx";
 import { useToast } from "../components/toast.tsx";
@@ -204,6 +205,7 @@ export function Imposters(): ReactNode {
   const remove = useDeleteImposter();
   const [creating, setCreating] = useState(false);
   const [importing, setImporting] = useState(false);
+  const [importingSpec, setImportingSpec] = useState(false);
   const [exporting, setExporting] = useState(false);
   const [confirming, setConfirming] = useState<Imposter | null>(null);
   // Only to qualify what the list shows.
@@ -351,6 +353,26 @@ export function Imposters(): ReactNode {
           >
             Import
           </button>
+          {/* WireMock Cloud's Import button (#553): an OpenAPI document compiled into an imposter
+              by `POST /specs/compile`, which stores nothing (D-72), then created through the same
+              `POST /imposters` as everything else. Beside Import rather than folded into it: that
+              panel takes this console's own export format, and a box that accepted both would have
+              to guess which one it was looking at.
+
+              Named for the format it takes rather than "Import OpenAPI", because the distinction
+              a reader needs here is *which document* each button accepts, and the shorter label
+              leans on "OpenAPI" being read as a format name rather than a vendor. It buys no
+              disambiguation from its neighbour: "Import" is a prefix of this name either way, and
+              WCAG 2.5.3 (Label in Name) is satisfied by both, the accessible name being the
+              visible label in each case. */}
+          <button
+            className="btn"
+            type="button"
+            data-testid="open-openapi-import"
+            onClick={() => setImportingSpec(true)}
+          >
+            Import from OpenAPI spec
+          </button>
           <button
             className="btn primary"
             type="button"
@@ -374,6 +396,8 @@ export function Imposters(): ReactNode {
             onClose={() => setImporting(false)}
           />
         ) : null}
+
+        {importingSpec ? <OpenApiImport onClose={() => setImportingSpec(false)} /> : null}
 
         {create.isError ? (
           <ErrorNote error={create.error} context="The imposter was not created" />

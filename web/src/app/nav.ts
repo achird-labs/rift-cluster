@@ -6,18 +6,21 @@ export const ISSUE_URL = (issue: number): string =>
 /**
  * The nav bar's sections, in render order.
  *
- * The bar is horizontal, so a group is no longer a heading over a stack — it is a run of entries
- * between two hairlines. The grouping still decides the order and still shows in the layout; it
- * just stops spending a line of vertical space on a label. The unbuilt group is last on purpose:
- * it is a roadmap, so it reads after the things that work.
+ * The bar is horizontal, so a group is not a heading over a stack — it is a run of entries between
+ * two hairlines. The grouping still decides the order and still shows in the layout; it just does
+ * not spend a line of vertical space on a label.
+ *
+ * Two groups and five entries, which is the whole console since #553 (RFC-007 §3.2): the four
+ * screens about mocks, then the one about the fleet they run on. There is no "planned" run any
+ * more — RFC-006 §4's greyed roadmap chips carried screens that were promised and unbuilt, and
+ * every screen the reduced console promises is built.
  */
-export const NAV_GROUPS = ["mocks", "fleet", "planned"] as const;
+export const NAV_GROUPS = ["mocks", "fleet"] as const;
 export type NavGroup = (typeof NAV_GROUPS)[number];
 
 export const GROUP_LABEL: Record<NavGroup, string> = {
   mocks: "Mocks",
   fleet: "Fleet",
-  planned: "Not yet shipped",
 };
 
 /**
@@ -26,23 +29,23 @@ export const GROUP_LABEL: Record<NavGroup, string> = {
  * Constrained to a substring of `label`, and asserted so in `nav.test.ts`. The entry keeps its full
  * label as its accessible name, and WCAG 2.5.3 (Label in Name) requires the visible text to appear
  * in that name — otherwise "click Fleet" names a control no speech-input user can address. Omitted
- * where the label already fits.
+ * where the label already fits, which since #553 is every entry; the mechanism stays for the next
+ * label that does not.
  */
 export type ShortLabel = string;
 
 /**
- * A screen this slice built.
+ * A screen this console ships.
  *
  * No `requires`: since #550 there is one credential and one identity, so there is no role that
- * could be offered a smaller nav than another. Every live entry is offered to whoever is signed in.
+ * could be offered a smaller nav than another. Every entry is offered to whoever is signed in.
  */
-export type LiveEntry = {
-  kind: "live";
+export type NavEntry = {
   id: string;
   label: string;
   short?: ShortLabel;
   route: Route;
-  group: Exclude<NavGroup, "planned">;
+  group: NavGroup;
   /**
    * A geometric mark, not an icon font: `default-src 'self'` blocks a CDN and self-hosting an icon
    * set is weight the console does not need. It is decorative — every entry carries its label as
@@ -51,37 +54,21 @@ export type LiveEntry = {
   glyph: string;
 };
 
-/** A screen RFC-006 §4 names but nothing has built yet. It is shown, greyed, with its issue. */
-export type PlannedEntry = {
-  kind: "planned";
-  id: string;
-  label: string;
-  issue: number;
-  note: string;
-  glyph: string;
-};
-
-export type NavEntry = LiveEntry | PlannedEntry;
-
-/** The group an entry renders under. Planned entries are always last, together. */
+/** The group an entry renders under. */
 export function groupOf(entry: NavEntry): NavGroup {
-  return entry.kind === "planned" ? "planned" : entry.group;
+  return entry.group;
 }
 
 /**
- * The full RFC-006 §4 screen list, built and unbuilt together — "a visible roadmap, not a 404".
+ * The five screens (RFC-007 §3.2, #553), in the order the bar draws them.
  *
- * The unbuilt half is the point. Omitting those entries would present C4's two screens as the
- * whole console; a 404 on a nav click would be worse still. A greyed entry carrying its issue
- * number answers "where is X?" without anyone having to ask.
- *
- * The list currently has no planned entries: `specs` was the last one, and #549 removed the stored
- * spec surface it was promising. The mechanism stays — an empty roadmap is a state, not a reason to
- * delete the shape RFC-006 §4 asks for — and `PlannedEntry` is what the next unbuilt screen uses.
+ * **Router** is the screen that edits `/front-door/routes`. The feature has been called the "front
+ * door" since upstream issue #19; RFC-007 §6 names it for what it does, and the console label
+ * follows. The API path is unchanged — renaming a path every client has to follow is its own
+ * decision (#554).
  */
 export const NAV: readonly NavEntry[] = [
   {
-    kind: "live",
     id: "imposters",
     label: "Imposters",
     route: { screen: "imposters" },
@@ -89,25 +76,6 @@ export const NAV: readonly NavEntry[] = [
     glyph: "▤",
   },
   {
-    kind: "live",
-    id: "routes",
-    label: "Front door routes",
-    short: "Front door",
-    route: { screen: "routes" },
-    group: "mocks",
-    glyph: "▤",
-  },
-  {
-    kind: "live",
-    id: "scenarios",
-    label: "Flow state & scenarios",
-    short: "Flow state",
-    route: { screen: "scenarios", port: null, flow: null },
-    group: "mocks",
-    glyph: "▤",
-  },
-  {
-    kind: "live",
     id: "requests",
     label: "Requests",
     route: { screen: "requests", port: null },
@@ -115,20 +83,50 @@ export const NAV: readonly NavEntry[] = [
     glyph: "▤",
   },
   {
-    kind: "live",
+    id: "scenarios",
+    label: "Scenarios",
+    route: { screen: "scenarios", port: null, flow: null },
+    group: "mocks",
+    glyph: "▤",
+  },
+  {
+    id: "routes",
+    label: "Router",
+    route: { screen: "routes" },
+    group: "mocks",
+    glyph: "▤",
+  },
+  {
     id: "cluster",
-    label: "Cluster & fleet",
-    short: "Fleet",
+    label: "Cluster",
     route: { screen: "cluster" },
     group: "fleet",
     glyph: "◈",
   },
 ];
 
-export function liveEntries(): LiveEntry[] {
-  return NAV.filter((entry): entry is LiveEntry => entry.kind === "live");
+/** Every entry. Kept as a function so call sites read the same as before the roadmap run went. */
+export function liveEntries(): NavEntry[] {
+  return [...NAV];
 }
 
-export function plannedEntries(): PlannedEntry[] {
-  return NAV.filter((entry): entry is PlannedEntry => entry.kind === "planned");
+/**
+ * Whether an entry's `short` may stand in for its `label` — WCAG 2.5.3, Label in Name.
+ *
+ * The bar prints `short` and names the control with `label`, so a `short` that is not contained in
+ * `label` produces a link whose visible text is not in its accessible name: "click Fleet" then
+ * addresses nothing, for every speech-input user.
+ *
+ * Case-insensitively, which is the criterion rather than a loosening of it — speech input matches
+ * without regard to case, so demanding an exact substring would reject a label that satisfies
+ * 2.5.3 and push the fix toward a lowercased word in the bar.
+ *
+ * A named predicate rather than a loop body in the test, because **no entry carries a `short`
+ * today**: a rule expressed only as `for (…) if (short === undefined) continue` passes on an empty
+ * set and would keep passing after it stopped being true. This can be checked against a fixture,
+ * and is, in `nav.test.ts`.
+ */
+export function shortLabelStandsIn(entry: { label: string; short?: ShortLabel }): boolean {
+  if (entry.short === undefined) return true;
+  return entry.short.length > 0 && entry.label.toLowerCase().includes(entry.short.toLowerCase());
 }

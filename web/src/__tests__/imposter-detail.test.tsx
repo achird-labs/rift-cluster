@@ -253,7 +253,7 @@ describe("bind status per node", () => {
     await screen.findByTestId(`bind-node-${B}`);
 
     expect(screen.getByTestId("bind-status-note").textContent).toMatch(
-      /still serves this imposter through the front door/i,
+      /still serves this imposter through the router/i,
     );
   });
 

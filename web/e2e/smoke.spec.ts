@@ -12,7 +12,7 @@ const SCREENS = [
   { hash: "/imposters", heading: /imposters/i },
   { hash: "/cluster", heading: /cluster & fleet/i },
   { hash: "/requests", heading: /request log/i },
-  { hash: "/routes", heading: /front-door routes/i },
+  { hash: "/routes", heading: /^router$/i },
   { hash: "/scenarios", heading: /scenarios & state/i },
 ] as const;
 

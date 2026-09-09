@@ -317,7 +317,7 @@ function OwnershipTab({
             </ul>
           )}
           <p className="hint" data-testid="bind-status-note">
-            A node that cannot bind still serves this imposter through the front door — dispatch
+            A node that cannot bind still serves this imposter through the router — dispatch
             targets the imposter object, not its socket. What a failed bind breaks is the
             direct-to-port path, on that node only.
           </p>
