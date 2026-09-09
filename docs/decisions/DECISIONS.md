@@ -590,7 +590,7 @@ fleet's tail opens upstream's own `savedRequests/stream` on each node. Retained 
 The fleet-wide request tail carries a `port → JournalCursor` map over a coverage set capped by
 `fleet_journal_port_cap` (default 100) and reports `coverage: {covered, total, omitted}` on every
 response, so a partial view is never mistaken for the whole. A `(timestamp, tiebreak)` watermark
-was rejected — clocks are not ordered across nodes (Ch.7) — and a fourth, hybrid shape was
+was rejected — clocks are not ordered across nodes — and a fourth, hybrid shape was
 rejected *visibly* here so it is not rediscovered.
 
 ### D-33 — An unclustered node is indistinguishable from the open-source binary
@@ -2725,10 +2725,10 @@ leave none.
 
 ### D-74 — Verification is per node: the request journal is upstream's own, `numberOfRequests` is the answering node's count, and `Rift-Cluster-Partial` is stamped only on reads that genuinely fan out
 
-- **Status:** active
+- **Status:** amended
 - **Decided:** 2026-09-08 · RFC-007 §3.2 · #552
 - **Supersedes:** D-32, D-37, D-38, D-39
-- **Amends:** docs/architecture/05-read-path.md, RFC-007 §2.1
+- **Amends:** docs/architecture/05-read-path.md, RFC-007 §2.1, RFC-006 §4, RFC-001 §10, RFC-001 §12
 - **Implemented by:** #552
 - **Code:** crates/rift-cluster-server/src/admin_front.rs, crates/rift-cluster-server/src/openapi.rs, crates/rift-cluster/src/decorate.rs, crates/rift-cluster/src/control.rs, crates/rift-cluster/src/raft/store.rs, crates/rift-cluster/src/stores/mod.rs
 
@@ -2805,15 +2805,43 @@ slow peer it silently becomes a floor, and the `Rift-Cluster-Partial` bit that s
 most clients never read. A per-node count is smaller and always exactly true, and a caller that
 wants the total can compute it from `/_fleet/members` and know what it counted.
 
-**Amendment (2026-09-08, #552 review — two data-plane changes the removal carries, stated so
-they are not read as regressions):** *(a) retention.* A node used to keep `10_000 / voter_count`
-entries per port so the merged view held about 10,000; each node now keeps upstream's own
-`MAX_RECORDED_REQUESTS = 10_000` per port (`rift-mock-core/src/imposter/journal.rs`), so a
-three-node fleet retains up to three times as many entries in total and each node's read is cut
-at its own cap. *(b) a config-changing `PUT /imposters/{port}` drops that port's recorded
-requests on every node.* Upstream's journal is a field of the imposter core
-(`imposter/core/mod.rs`), and a replace builds a fresh `LocalJournal` with the new core
-(`manager.rs`, `replace_imposter`); the removed shards lived outside the core and survived a
-rebuild. The stub-level writes (`PUT .../stubs`, add/replace/delete by id) edit in place and keep
-the journal — which is what the chaos reorder scenario's `numberOfRequests == 1` assertion now
-proves, more strongly than before: a reorder that rebuilt the core would read `0`.
+**Amendment (2026-09-08, #552 review — the one data-plane change the removal carries, stated so it
+is not read as a regression, plus one behaviour that only looks like one):**
+
+*(a) Retention, in both of its dimensions.* A shard used to hold
+`(fleet_capacity / voters).max(min_shard_cap).max(1)` entries per port — `max(10_000 / N, 500)` —
+so a three-voter fleet kept about 3,333 each and the merged view held about 10,000. The general
+form matters above 20 voters, where the `MIN_SHARD_CAP = 500` floor takes over and the fleet's
+total stops dividing. Each node now keeps upstream's own `MAX_RECORDED_REQUESTS = 10_000` per port
+(`rift-mock-core/src/imposter/journal.rs`), so a three-node fleet retains up to three times as many
+entries in total and each node's read is cut at its own cap.
+
+The shard also had a **second** retention dimension that upstream's journal does not:
+`DEFAULT_MAX_AGE = 600 s`, an age sweep that dropped entries older than ten minutes whether or not
+the cap was near. Upstream's `LocalJournal` evicts by count alone (`record_indexed` pops the front
+only at `MAX_RECORDED_REQUESTS`), so recorded requests are now unbounded in *time*: a long-lived
+imposter holds its last 10,000 requests however old they are, where the shard would have held none
+older than ten minutes. That, not the count, is the larger memory consequence.
+
+*(b) A wholesale replace drops the port's recorded requests — and did so before this change too.*
+Stated because it looks like a consequence of moving the journal back inside the imposter core, and
+is not. `replace_imposter` is `delete_imposter_inner` + `create_imposter_staged` (`manager.rs`), so
+the port does start on a fresh `LocalJournal` — but `delete_imposter_inner` already cleared an
+*injected* journal on the way through (`if let Some(journal) = &self.request_journal {
+journal.clear(port) }`), and the removed `ClusterJournal`'s `clear` emptied that port's entries and
+zeroed its count. A replace therefore dropped the port's recorded requests on every node under the
+merge as well. The mechanism moved; the behaviour did not.
+
+Which writes replace is worth stating exactly, because "a config-changing write" is wrong in both
+directions. `apply_config` replaces on an imposter-level field change *other than* `enabled` — an
+`enabled`-only diff toggles in place and keeps the journal (upstream #817, `manager.rs`) — and also
+on a **degenerate** stub diff, `StubReconcile::Degenerate`, which fires when
+`changed_slots * 2 > states.len() + desired.len()` (`imposter/reconcile.rs`). Since every stub route
+terminates on the front and is applied through `apply_config` on each node, a
+`DELETE /imposters/{port}/stubs/0` against a one-stub imposter is degenerate and rebuilds the core.
+Below that threshold the stub set is patched in place and the journal survives, which is what the
+chaos reorder scenario's `numberOfRequests == 1` assertion pins
+(`tests/cluster-chaos/tests/scenarios.rs`, the assertion closing `test_reconcile_reorder`):
+a reorder that rebuilt the core would read `0`. The assertion is not stronger than it was before —
+under the merge a rebuild zeroed the local shard on every node, so the counterfactual read `0` then
+too — it is simply the pin that keeps the in-place path in place.

@@ -110,12 +110,18 @@ Three rules, in priority order:
 > screen shows the one fleet, and every control is offered unconditionally: whoever logged in
 > holds the fleet's one credential and can do everything with it. The `Sources` and `Specs` rows
 > are likewise history (D-72, #549).
+>
+> **Amended by D-74** (RFC-007 §3.2, #552): the fleet journal merge is gone, so the **Request log**
+> row's convergence is reversed. `GET /imposters/:port/requests` is a per-node read again — the
+> screen labels the view as this node's own and pages with upstream's scalar `x-rift-next-index`, not an
+> opaque vector cursor — and `Rift-Cluster-Partial` no longer rides that route at all; it rides
+> `/_fleet/members` and `/_fleet/health` only.
 
 | Screen | Backend | Availability |
 |---|---|---|
 | **Imposters** — list, per-imposter detail, enable/disable; filter/sort/bulk (#252) | `GET/POST/DELETE /imposters*` (terminated routes — `classify()` and the `Terminated` enum in `admin_front.rs`; reads proxied to the engine). Filtering and sorting are **client-side** over the list already fetched — no query parameter is added, because `GET /imposters` returns the tenant's whole set and a server-side filter would give "what is in this list" a second source of truth. Bulk actions are **N calls, not a batch endpoint**: one request per imposter, reported per item (see below) | v1, bulk #252 |
 | **Stub editor** — form ⟷ raw JSON, monaco, lint-on-save | stub CRUD incl. by-id routes (`admin_front.rs`); lint via `rift-lint` in-browser (§4.1) | v1 |
-| **Request log** — recorded requests, match diagnostics | v1 read `GET /imposters/:port/requests` per node and labelled it **per-node view**. #147 H landed the promised convergence: the same route now answers the fleet's **merged** journal (doc-07), paged with the server's opaque `?since=` vector cursor, and the per-node label is deleted — a label renders only for an incomplete merge (`Rift-Cluster-Partial`). Same screen, no redesign, exactly as promised | v1 → merged (#147 H) |
+| **Request log** — recorded requests, match diagnostics | `GET /imposters/:port/requests`, read **per node**. v1 labelled it a per-node view; #147 H merged the fleet's journals on the same route and paged them with an opaque `?since=` vector cursor; D-74 (#552) removed the merge, and the route is upstream's own per-node journal once more, paged with upstream's scalar `x-rift-next-index`/`x-rift-truncated`. The per-node label is back — the table, the empty state and the clear dialog all say *this node* — and `Rift-Cluster-Partial` does not ride this route | v1 → merged (#147 H) → per node again (D-74, #552) |
 | **Cluster** — members, leader, ring epoch, readiness, pending ops | §5.2's admin-port fleet reads (projection of `cluster_api.rs:63-191`) | v1 |
 | **Front-door routes** — table editor | `GET/PUT /front-door/routes`, `DELETE /front-door/routes/:id` (`admin_front.rs`) | v1 |
 | ~~**Tenants / principals / roles / tokens / audit**~~ | ~~RFC-002 §5 admin surface + `GET /admin/audit`~~ | removed by D-71/D-73 |

@@ -141,11 +141,19 @@ table in Chapter 9):
 > **Amended by D-74** (2026-09-08): verification reads are no longer cluster-merged. `GET
 > /imposters/:port/requests`, its `savedRequests` spelling and `numberOfRequests` answer for the
 > node the read reached, and the request-anatomy diagram and the local-append zone above are
-> amended with them. Two data-plane consequences ride along (D-74's amendment): each node now
-> retains upstream's `MAX_RECORDED_REQUESTS = 10_000` entries per port rather than a
-> `10_000 / voter_count` share of a merged cap, and a config-changing `PUT /imposters/:port` drops
-> that port's recorded requests on every node, because upstream's journal is a field of the
-> imposter core that a replace rebuilds — stub-level writes edit in place and keep it.
+> amended with them. One data-plane consequence rides along (D-74's amendment): retention. Each
+> node now retains upstream's `MAX_RECORDED_REQUESTS = 10_000` entries per port rather than a
+> `max(10_000 / voter_count, 500)` share of a merged cap, and — the larger change — the shard's
+> second retention dimension is gone: it also dropped entries older than `DEFAULT_MAX_AGE = 600 s`,
+> where upstream's journal evicts by count alone, so a long-lived imposter's recordings are now
+> unbounded in time. What *has not* changed is the replace: a wholesale replace of an imposter
+> still drops that port's recorded requests on every node, because upstream's
+> `delete_imposter_inner` cleared an injected journal too — the mechanism moved into the core, the
+> behaviour did not. There is no `PUT /imposters/:port` route (`ImposterRoute::Root` dispatches
+> `GET` and `DELETE` only); the write with those semantics is the collection
+> `PUT /imposters` (`Terminated::ReplaceAllImposters` → `apply_config`), which replaces a port only
+> on an imposter-level field change other than `enabled` or on a degenerate stub diff, and
+> otherwise patches the stub set in place and keeps the journal.
 
 `GET /imposters`, `GET .../stubs` read the local applied state machine — every
 node serves them, consistent at its applied revision, comparable fleet-wide via

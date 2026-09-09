@@ -61,11 +61,17 @@ Phases 4–5 the strict sequencing and proxyOnce suites
 (`test_sequence_redis_strict`, `test_proxy_once_*` including the documented
 duplicate bound under owner kill). These phase-2+ names are RFC-001 §10's
 *planned* names and no test exists under them: the claims landed in the
-container tier as C15 (flow state) and C10–C11 (proxyOnce) below. RFC-001's
-phase-3 journal names (`test_journal_merge_exact`, `test_journal_clear`,
-`test_journal_cursor_merge`) are permanently unallocated — D-74 (#552) removed
-the fleet journal merge they were to pin, and a per-node journal is upstream's
-own suite's business.
+container tier as C15 (flow state) and C10–C11 (proxyOnce) below. All four of
+RFC-001 §10's phase-3 journal names (`test_journal_merge_exact`,
+`test_journal_clear`, `test_count_merge`, `test_journal_cursor_merge`) are
+permanently unallocated — D-74 (#552) removed the fleet journal merge they were
+to pin, `test_count_merge`'s claim (`numberOfRequests` = N on every node) is the
+one D-74 reverses outright, and a per-node journal is upstream's own suite's
+business. What replaced them is per-node and lives in
+`crates/rift-cluster-server/tests/write_path.rs`:
+`number_of_requests_is_the_answering_nodes_own_count_not_a_fleet_sum`,
+`a_proxied_clear_empties_only_the_journal_of_the_node_it_reached` and the two
+`Rift-Cluster-Partial` pins beside them.
 The sequencing claims landed as **C33** (#476), which is the
 container-tier counterpart to the whole of `rift-cluster`'s `tests/sequencer.rs`
 gate; `test_sequence_redis_strict` itself stays unwritten, and now permanently

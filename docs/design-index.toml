@@ -59,7 +59,7 @@ status = "amended"
 verified_sha = ""
 verified_on = ""
 code = ["web/src/**", "crates/rift-cluster-server/src/console.rs", "crates/rift-cluster-server/src/session.rs", "crates/rift-cluster-server/src/fleet.rs"]
-note = "§4, §5.3, §8.3, §8.4, §9.2 and §9.3 amended by D-73 (#550) and carry callouts; §8 as a whole is retired by D-71 (#547)."
+note = "§4, §5.3, §8.3, §8.4, §9.2 and §9.3 amended by D-73 (#550) and carry callouts; §4 is amended again by D-74 (#552), which reverses the Request-log row's merge; §8 as a whole is retired by D-71 (#547)."
 
 ["docs/rfc/RFC-007-distributed-core.md"]
 status = "current"
@@ -126,7 +126,7 @@ status = "amended"
 verified_sha = "e0df0c376"
 verified_on = "2026-08-29"
 code = ["crates/rift-cluster/src/raft/store.rs", "crates/rift-cluster/src/stores/flow.rs"]
-note = "Amended in place by D-74 (#552): the journal row, the failure-matrix row and the Rift-Cluster-Partial paragraph now describe a per-node journal; verified_sha predates that edit. Re-verify against the D-74 text."
+note = "Amended in place by D-74 (#552): the journal row, the failure-matrix row and the Rift-Cluster-Partial paragraph now describe a per-node journal. `status` is prose for a reader — check_index reads only verified_sha and code — and the standing doc-stale warning is NOT about that edit, which moved doc and code together: it is raft/store.rs and stores/flow.rs changing in #565/#567 and #563 since e0df0c376. Re-verify the whole chapter, then --mark-verified."
 
 ["docs/architecture/10-operations.md"]
 status = "current"
@@ -145,7 +145,7 @@ code = ["crates/rift-cluster-base/**", "Cargo.toml"]
 status = "current"
 verified_sha = "e0df0c376"
 verified_on = "2026-08-29"
-code = ["tests/cluster-chaos/**", "crates/rift-cluster/tests/**"]
+code = ["tests/cluster-chaos/**", "crates/rift-cluster/tests/**", "crates/rift-cluster-server/tests/**"]
 
 ["docs/architecture/13-front-door-and-sources.md"]
 status = "amended"
