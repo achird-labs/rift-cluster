@@ -4,6 +4,30 @@
 //! is dead code there — that is inherent to `mod common`, not an oversight.
 #![allow(dead_code)]
 
+/// Serialises this binary's fleet tests — one live fleet at a time.
+///
+/// Every test that calls `compose::start` stands up real listeners and, in the
+/// multi-node cases, a Raft fleet whose election timers are fixed at 150–300 ms
+/// against a 50 ms heartbeat (D-42). libtest runs as many tests at once as the
+/// runner has cores, so unguarded fleets starve each other's timers: a follower
+/// that misses a scheduling slot for 300 ms campaigns, the leader steps down,
+/// and a write issued in that gap answers `503 no quorum / leader unreachable`.
+/// That is issue #561 — eleven `write_path` tests seen failing on loaded CI
+/// runners and on `master` itself, every one of them passing in isolation.
+///
+/// This mirrors `crates/rift-cluster/tests/cluster.rs`, which has serialised its
+/// harness this way since it hit the same thing; its `tests/README.md` states
+/// the rule as "you do not need `--test-threads=1`; the lock enforces it". The
+/// same holds here, which is what keeps CI's `build` job on an unmodified
+/// workspace-wide test command — issue #495 closed with "no `--test-threads`
+/// flag added to `build`" as an acceptance criterion, and this honours it.
+///
+/// Each test binary compiles its own copy of `common`, so this is one lock per
+/// binary — exactly the scope wanted, since test *binaries* already run one at a
+/// time within a single test invocation. `tokio::sync::Mutex` does not poison,
+/// so a panicking test releases the guard and the next one proceeds.
+pub static TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// Port allocation for this crate's integration tests (issue #110).
 ///
 /// Every test file here used to reserve a port by binding `127.0.0.1:0`, reading

@@ -16,6 +16,7 @@ use tempfile::TempDir;
 
 mod common;
 
+use common::TEST_LOCK;
 use common::ports::reserve_port;
 use common::seen::Seen;
 
@@ -61,6 +62,52 @@ async fn wait_ready(server: &ComposedServer) {
     }
 }
 
+/// Block until this node names the *same* current leader on three consecutive
+/// samples.
+///
+/// It does not mean `server` is itself the leader, and does not need to: a write
+/// to a follower forwards. What it narrows is the gap *between* leaders.
+///
+/// One sample would not: `current_leader` goes `Some` again the instant a new
+/// term is established, so a fleet still settling after a voter's death can
+/// answer `Some(2)` and then `Some(3)` 50 ms later, and a write sent between
+/// those two answers is refused by a node about to stop being leader.
+///
+/// **Best-effort, deliberately.** `current_leader` is `None` only from a campaign
+/// until the winner's first `AppendEntries`, which is tens of milliseconds, so at
+/// a 50 ms sampling interval a whole election can pass between two samples and
+/// leave the streak unbroken when the same node wins. Three samples span 100 ms,
+/// less than the 150 ms minimum election timeout (D-42). So this narrows the
+/// window rather than closing it: the retry on the leaderless refusal is the
+/// actual net, and this only keeps the common case from needing it.
+async fn await_stable_leader(server: &ComposedServer) {
+    // Its own budget, not the caller's retry deadline. Sharing that one made a
+    // spent retry budget re-enter here and panic "no leader settled" even with a
+    // leader present and stable, sending whoever read it to elections instead of
+    // to the barrier.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let node = server.node().expect("node is clustered");
+    let mut streak = None;
+    loop {
+        let sample = node.status().current_leader;
+        streak = match (sample, streak) {
+            (Some(id), Some((previous, count))) if id == previous => Some((id, count + 1)),
+            (Some(id), _) => Some((id, 1u8)),
+            (None, _) => None,
+        };
+        if let Some((_, count)) = streak
+            && count >= 3
+        {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no leader settled within {deadline:?}; last sample: {sample:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
 fn minimal_imposter(port: u16) -> serde_json::Value {
     json!({
         "port": port,
@@ -98,6 +145,7 @@ async fn wait_served(port: u16, want: &str) -> bool {
 
 #[tokio::test]
 async fn post_imposter_commits_binds_and_carries_cluster_headers() {
+    let _serial = TEST_LOCK.lock().await;
     let state = TempDir::new().expect("tempdir");
     let server = compose::start(cluster_cli(&state, &["--cluster-allow-solo"]))
         .await
@@ -170,6 +218,7 @@ async fn post_imposter_commits_binds_and_carries_cluster_headers() {
 /// applied record rather than to each other.
 #[tokio::test]
 async fn the_imposter_read_publishes_the_rift_knobs_with_their_provenance() {
+    let _serial = TEST_LOCK.lock().await;
     let state = TempDir::new().expect("tempdir");
     let server = compose::start(cluster_cli(&state, &["--cluster-allow-solo"]))
         .await
@@ -253,6 +302,7 @@ async fn the_imposter_read_publishes_the_rift_knobs_with_their_provenance() {
 /// console renders one panel per imposter, so this is the common case, not an edge one.
 #[tokio::test]
 async fn an_imposter_with_no_rift_block_reads_as_three_inherited_defaults() {
+    let _serial = TEST_LOCK.lock().await;
     let state = TempDir::new().expect("tempdir");
     let server = compose::start(cluster_cli(&state, &["--cluster-allow-solo"]))
         .await
@@ -301,6 +351,7 @@ async fn an_imposter_with_no_rift_block_reads_as_three_inherited_defaults() {
 /// URL; the EE decoration must not put it back on the way out.
 #[tokio::test]
 async fn the_imposter_read_never_exposes_the_redis_connection_url() {
+    let _serial = TEST_LOCK.lock().await;
     let state = TempDir::new().expect("tempdir");
     let server = compose::start(cluster_cli(&state, &["--cluster-allow-solo"]))
         .await
@@ -354,6 +405,7 @@ async fn the_imposter_read_never_exposes_the_redis_connection_url() {
 
 #[tokio::test]
 async fn stub_crud_terminates_and_replicates_order() {
+    let _serial = TEST_LOCK.lock().await;
     let state = TempDir::new().expect("tempdir");
     let server = compose::start(cluster_cli(&state, &["--cluster-allow-solo"]))
         .await
@@ -428,6 +480,7 @@ async fn stub_crud_terminates_and_replicates_order() {
 
 #[tokio::test]
 async fn delete_imposter_returns_the_removed_config_and_unbinds() {
+    let _serial = TEST_LOCK.lock().await;
     let state = TempDir::new().expect("tempdir");
     let server = compose::start(cluster_cli(&state, &["--cluster-allow-solo"]))
         .await
@@ -485,6 +538,7 @@ async fn delete_imposter_returns_the_removed_config_and_unbinds() {
 
 #[tokio::test]
 async fn a_config_without_a_port_is_refused_with_the_typed_envelope() {
+    let _serial = TEST_LOCK.lock().await;
     let state = TempDir::new().expect("tempdir");
     let server = compose::start(cluster_cli(&state, &["--cluster-allow-solo"]))
         .await
@@ -515,6 +569,7 @@ async fn a_config_without_a_port_is_refused_with_the_typed_envelope() {
 /// happen.
 #[tokio::test]
 async fn an_unknown_flow_state_knob_is_refused_before_commit() {
+    let _serial = TEST_LOCK.lock().await;
     let state = TempDir::new().expect("tempdir");
     let server = compose::start(cluster_cli(&state, &["--cluster-allow-solo"]))
         .await
@@ -560,6 +615,7 @@ async fn an_unknown_flow_state_knob_is_refused_before_commit() {
 /// can find out why rather than reading "unknown value".
 #[tokio::test]
 async fn the_tenant_context_scope_is_refused_by_name() {
+    let _serial = TEST_LOCK.lock().await;
     let state = TempDir::new().expect("tempdir");
     let server = compose::start(cluster_cli(&state, &["--cluster-allow-solo"]))
         .await
@@ -601,6 +657,7 @@ async fn the_tenant_context_scope_is_refused_by_name() {
 /// administrator (#550) there is no role to gate on and it is admitted like `imposter`.
 #[tokio::test]
 async fn an_explicit_fleet_context_scope_is_admitted() {
+    let _serial = TEST_LOCK.lock().await;
     let state = TempDir::new().expect("tempdir");
     let server = compose::start(cluster_cli(&state, &["--cluster-allow-solo"]))
         .await
@@ -626,6 +683,7 @@ async fn an_explicit_fleet_context_scope_is_admitted() {
 
 #[tokio::test]
 async fn the_api_key_gates_terminated_routes_like_upstream() {
+    let _serial = TEST_LOCK.lock().await;
     let state = TempDir::new().expect("tempdir");
     let server = compose::start(cluster_cli(
         &state,
@@ -660,6 +718,7 @@ async fn the_api_key_gates_terminated_routes_like_upstream() {
 
 #[tokio::test]
 async fn a_follower_write_forwards_to_the_leader_and_the_barrier_holds() {
+    let _serial = TEST_LOCK.lock().await;
     let leader_state = TempDir::new().expect("tempdir");
     let leader = compose::start(cluster_cli(&leader_state, &["--cluster-allow-solo"]))
         .await
@@ -707,6 +766,7 @@ async fn a_follower_write_forwards_to_the_leader_and_the_barrier_holds() {
 
 #[tokio::test]
 async fn writes_without_a_quorum_answer_unavailable() {
+    let _serial = TEST_LOCK.lock().await;
     let leader_state = TempDir::new().expect("tempdir");
     let leader = compose::start(cluster_cli(&leader_state, &["--cluster-allow-solo"]))
         .await
@@ -735,12 +795,25 @@ async fn writes_without_a_quorum_answer_unavailable() {
             .send()
             .await
             .expect("post without quorum");
-        let status = response.status().as_u16();
+        let seen = Seen::of(response).await;
+        let status = seen.status;
         if status == 503 {
-            let body: serde_json::Value = response.json().await.expect("json");
+            let body: serde_json::Value = serde_json::from_str(&seen.body).expect("json");
             assert_eq!(
                 body["errors"][0]["type"], "unavailable",
                 "the stable type slug, never a hand-rolled shape: {body}"
+            );
+            // Pins the wording `is_leaderless_refusal` matches on, against a real
+            // refusal rather than a hand-built one. That predicate reads the
+            // message text because `terminate`'s "cluster node is shutting down"
+            // 503 carries the identical status and `ErrorKind`; if this message
+            // is ever reworded, the retry in
+            // `barrier_none_does_not_wait_on_an_unreachable_peer` silently stops
+            // firing and #561's flake comes back with every gate still green.
+            assert!(
+                is_leaderless_refusal(&seen),
+                "the no-quorum refusal must stay recognisable to the retry that \
+                 depends on its wording: {seen}"
             );
             break;
         }
@@ -758,6 +831,7 @@ async fn writes_without_a_quorum_answer_unavailable() {
 
 #[tokio::test]
 async fn a_restarted_node_rebinds_its_committed_imposters() {
+    let _serial = TEST_LOCK.lock().await;
     let state = TempDir::new().expect("tempdir");
     let port = reserve_port();
 
@@ -794,6 +868,7 @@ async fn a_restarted_node_rebinds_its_committed_imposters() {
 
 #[tokio::test]
 async fn replace_all_upserts_then_prunes() {
+    let _serial = TEST_LOCK.lock().await;
     let state = TempDir::new().expect("tempdir");
     let server = compose::start(cluster_cli(&state, &["--cluster-allow-solo"]))
         .await
@@ -855,6 +930,7 @@ async fn replace_all_upserts_then_prunes() {
 
 #[tokio::test]
 async fn index_addressed_stub_edits_terminate_via_the_stored_config() {
+    let _serial = TEST_LOCK.lock().await;
     let state = TempDir::new().expect("tempdir");
     let server = compose::start(cluster_cli(&state, &["--cluster-allow-solo"]))
         .await
@@ -937,6 +1013,7 @@ async fn index_addressed_stub_edits_terminate_via_the_stored_config() {
 
 #[tokio::test]
 async fn barrier_none_answers_without_waiting_for_the_fleet() {
+    let _serial = TEST_LOCK.lock().await;
     let state = TempDir::new().expect("tempdir");
     let server = compose::start(cluster_cli(
         &state,
@@ -984,6 +1061,7 @@ async fn barrier_none_answers_without_waiting_for_the_fleet() {
 /// miss it, so the body is asserted too: a `201` must carry the imposter.
 #[tokio::test]
 async fn barrier_none_on_a_follower_renders_the_write_it_just_committed() {
+    let _serial = TEST_LOCK.lock().await;
     let barrier_none: &[&str] = &["--cluster-write-barrier", "none"];
 
     let leader_state = TempDir::new().expect("tempdir");
@@ -1048,8 +1126,31 @@ async fn barrier_none_on_a_follower_renders_the_write_it_just_committed() {
 /// The barrier timeout is raised well above the assertion window so the two
 /// levels are far apart rather than adjacent: waiting on the fleet here would
 /// cost ~15 s, waiting locally costs a state-machine apply.
+///
+/// **A 503 here is not this test's subject (issue #561).** Killing a voter can
+/// cost the survivors an election, and a write that lands in the leaderless gap
+/// is refused for a reason that has nothing to do with the barrier — it never
+/// commits, so there is no barrier to have waited on. This used to be a single
+/// un-retried write, which made the test assert, incidentally, that no election
+/// happens in that window; on a loaded runner one does, and the `201` assertion
+/// below became the most frequent red in CI's `build` job. Leadership is now
+/// waited for and only that refusal is retried.
+///
+/// **The regression this test is for shows up as a slow `201`, not an error**, so
+/// retrying a 503 cannot hide it. The barrier runs after the commit, outside
+/// `WRITE_DEADLINE`; a `WriteBarrier::None` arm that waited on the fleet was
+/// injected deliberately and answered `201` after 15.1 s against the 15 s
+/// fleet-barrier timeout, failing the elapsed assertion below. That assertion is
+/// the discriminator; the status filter only keeps the leaderless gap out.
+///
+/// The 5 s bound is deliberately on the winning attempt alone, not on the loop's
+/// total wall-clock. Bounding the total is what made this test load-sensitive:
+/// the elapsed time of an election the test did not cause is not evidence about
+/// the barrier. The 30 s deadline is a backstop against a hang, not an
+/// assertion about latency.
 #[tokio::test]
 async fn barrier_none_does_not_wait_on_an_unreachable_peer() {
+    let _serial = TEST_LOCK.lock().await;
     let barrier_none: &[&str] = &[
         "--cluster-write-barrier",
         "none",
@@ -1087,16 +1188,38 @@ async fn barrier_none_does_not_wait_on_an_unreachable_peer() {
     followers.pop().expect("two followers").shutdown().await;
 
     let admin = leader.admin_addr();
-    let port = reserve_port();
-    let started = std::time::Instant::now();
-    let response = reqwest::Client::new()
-        .post(format!("http://{admin}/imposters"))
-        .json(&minimal_imposter(port))
-        .send()
-        .await
-        .expect("post imposter");
-    let elapsed = started.elapsed();
-    let seen = Seen::of(response).await;
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let (seen, elapsed) = loop {
+        // Killing a voter can cost the survivors an election, and a write issued
+        // in the leaderless gap answers 503 — a fact about *when* it was sent,
+        // not about the barrier. Wait for leadership to settle, then send.
+        await_stable_leader(&leader).await;
+
+        // A fresh port per attempt: a 503 is "parked for replay", so the refused
+        // write may still commit later, and reusing the port would have the
+        // replay collide with the retry.
+        let port = reserve_port();
+        let started = std::time::Instant::now();
+        let response = reqwest::Client::new()
+            .post(format!("http://{admin}/imposters"))
+            .json(&minimal_imposter(port))
+            .send()
+            .await
+            .expect("post imposter");
+        let elapsed = started.elapsed();
+        let seen = Seen::of(response).await;
+
+        if !is_leaderless_refusal(&seen) {
+            break (seen, elapsed);
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "30 s of retries and the fleet never accepted a write: two of three \
+             voters are alive, so this is a genuine loss of quorum, not an \
+             election blip: {seen}"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    };
 
     assert_eq!(
         seen.status, 201,
@@ -1116,6 +1239,7 @@ async fn barrier_none_does_not_wait_on_an_unreachable_peer() {
 
 #[tokio::test]
 async fn the_injection_gate_fails_closed_on_terminated_routes() {
+    let _serial = TEST_LOCK.lock().await;
     let state = TempDir::new().expect("tempdir");
     let server = compose::start(cluster_cli(&state, &["--cluster-allow-solo"]))
         .await
@@ -1144,6 +1268,7 @@ async fn the_injection_gate_fails_closed_on_terminated_routes() {
 
 #[tokio::test]
 async fn the_api_key_still_guards_proxied_routes() {
+    let _serial = TEST_LOCK.lock().await;
     let state = TempDir::new().expect("tempdir");
     let server = compose::start(cluster_cli(
         &state,
@@ -1177,6 +1302,7 @@ async fn the_api_key_still_guards_proxied_routes() {
 
 #[tokio::test]
 async fn a_dead_follower_is_named_in_the_warnings_header() {
+    let _serial = TEST_LOCK.lock().await;
     let leader_state = TempDir::new().expect("tempdir");
     let leader = compose::start(cluster_cli(
         &leader_state,
@@ -1259,6 +1385,7 @@ fn cluster_cli_at(state: &TempDir, bind: &str, extra: &[&str]) -> EeCli {
 /// same revision back, single application.
 #[tokio::test]
 async fn an_idempotency_key_makes_retries_exactly_once() {
+    let _serial = TEST_LOCK.lock().await;
     let state = TempDir::new().expect("tempdir");
     let server = compose::start(cluster_cli(&state, &["--cluster-allow-solo"]))
         .await
@@ -1329,6 +1456,7 @@ async fn an_idempotency_key_makes_retries_exactly_once() {
 /// returns, with no client retry.
 #[tokio::test]
 async fn a_parked_write_replays_when_quorum_returns() {
+    let _serial = TEST_LOCK.lock().await;
     let leader_bind = common::ports::reserve_addr();
     let leader_state = TempDir::new().expect("tempdir");
     let leader = compose::start(cluster_cli_at(
@@ -1409,6 +1537,7 @@ async fn a_parked_write_replays_when_quorum_returns() {
 /// and the write applies in the background.
 #[tokio::test]
 async fn async_mode_answers_202_and_applies_in_the_background() {
+    let _serial = TEST_LOCK.lock().await;
     let state = TempDir::new().expect("tempdir");
     let server = compose::start(cluster_cli(
         &state,
@@ -1485,6 +1614,7 @@ async fn async_mode_answers_202_and_applies_in_the_background() {
 /// the same Idempotency-Key stays exactly-once for the whole sequence.
 #[tokio::test]
 async fn a_keyed_replace_all_retries_exactly_once() {
+    let _serial = TEST_LOCK.lock().await;
     let state = TempDir::new().expect("tempdir");
     let server = compose::start(cluster_cli(&state, &["--cluster-allow-solo"]))
         .await
@@ -1542,6 +1672,7 @@ async fn a_keyed_replace_all_retries_exactly_once() {
 /// the write once quorum returns.
 #[tokio::test]
 async fn a_restarted_node_replays_its_own_parked_intents() {
+    let _serial = TEST_LOCK.lock().await;
     let (leader_bind, follower_bind) =
         (common::ports::reserve_addr(), common::ports::reserve_addr());
     let leader_state = TempDir::new().expect("tempdir");
@@ -1637,6 +1768,7 @@ async fn a_restarted_node_replays_its_own_parked_intents() {
 /// stubs intact (the toggle applies in place, never a replace).
 #[tokio::test]
 async fn disable_replicates_survives_restart_and_preserves_state() {
+    let _serial = TEST_LOCK.lock().await;
     let bind = common::ports::reserve_addr();
     let state = TempDir::new().expect("tempdir");
     let server = compose::start(cluster_cli_at(&state, &bind, &["--cluster-allow-solo"]))
@@ -1718,6 +1850,7 @@ async fn disable_replicates_survives_restart_and_preserves_state() {
 /// the OTHER node's engine serving within the write barrier.
 #[tokio::test]
 async fn disable_on_one_node_pauses_the_fleet() {
+    let _serial = TEST_LOCK.lock().await;
     let leader_state = TempDir::new().expect("tempdir");
     let leader = compose::start(cluster_cli(&leader_state, &["--cluster-allow-solo"]))
         .await
@@ -1781,6 +1914,7 @@ async fn disable_on_one_node_pauses_the_fleet() {
 /// front — the typed shape, not a committed no-op dressed as success.
 #[tokio::test]
 async fn disabling_a_ghost_port_is_a_404() {
+    let _serial = TEST_LOCK.lock().await;
     let state = TempDir::new().expect("tempdir");
     let server = compose::start(cluster_cli(&state, &["--cluster-allow-solo"]))
         .await
@@ -1809,6 +1943,7 @@ async fn disabling_a_ghost_port_is_a_404() {
 /// original application — same revision both times.
 #[tokio::test]
 async fn a_keyed_toggle_retries_exactly_once() {
+    let _serial = TEST_LOCK.lock().await;
     let state = TempDir::new().expect("tempdir");
     let server = compose::start(cluster_cli(&state, &["--cluster-allow-solo"]))
         .await
@@ -1884,6 +2019,7 @@ const GREET_RHAI: &str = r#"fn respond(ctx) { pass() }"#;
 
 #[tokio::test]
 async fn file_scripts_resolve_before_replication() {
+    let _serial = TEST_LOCK.lock().await;
     let state = TempDir::new().expect("tempdir");
     let scripts = TempDir::new().expect("scripts dir");
     std::fs::write(scripts.path().join("greet.rhai"), GREET_RHAI).expect("write script");
@@ -1927,6 +2063,7 @@ async fn file_scripts_resolve_before_replication() {
 
 #[tokio::test]
 async fn ref_scripts_resolve_before_replication() {
+    let _serial = TEST_LOCK.lock().await;
     let state = TempDir::new().expect("tempdir");
     let scripts = TempDir::new().expect("scripts dir");
     std::fs::write(scripts.path().join("greet.rhai"), GREET_RHAI).expect("write script");
@@ -1975,6 +2112,7 @@ async fn ref_scripts_resolve_before_replication() {
 
 #[tokio::test]
 async fn add_stub_resolves_ref_against_the_stored_registry() {
+    let _serial = TEST_LOCK.lock().await;
     let state = TempDir::new().expect("tempdir");
     let scripts = TempDir::new().expect("scripts dir");
     std::fs::write(scripts.path().join("greet.rhai"), GREET_RHAI).expect("write script");
@@ -2056,6 +2194,7 @@ async fn add_stub_resolves_ref_against_the_stored_registry() {
 
 #[tokio::test]
 async fn script_resolution_failure_is_upstream_400_and_nothing_is_stored() {
+    let _serial = TEST_LOCK.lock().await;
     let state = TempDir::new().expect("tempdir");
     let scripts = TempDir::new().expect("scripts dir");
     let scripts_dir = scripts.path().to_string_lossy().into_owned();
@@ -2142,6 +2281,7 @@ async fn script_resolution_failure_is_upstream_400_and_nothing_is_stored() {
 
 #[tokio::test]
 async fn batch_resolution_failure_refuses_the_whole_put() {
+    let _serial = TEST_LOCK.lock().await;
     let state = TempDir::new().expect("tempdir");
     let scripts = TempDir::new().expect("scripts dir");
     let scripts_dir = scripts.path().to_string_lossy().into_owned();
@@ -2192,6 +2332,7 @@ async fn batch_resolution_failure_refuses_the_whole_put() {
 
 #[tokio::test]
 async fn the_injection_gate_still_wins_over_resolution() {
+    let _serial = TEST_LOCK.lock().await;
     let state = TempDir::new().expect("tempdir");
     // Injection OFF and no scripts dir: a file: script surface must be refused
     // by the gate (invalid injection), never reach resolution.
@@ -2216,6 +2357,7 @@ async fn the_injection_gate_still_wins_over_resolution() {
 
 #[tokio::test]
 async fn replace_stub_routes_resolve_scripts() {
+    let _serial = TEST_LOCK.lock().await;
     let state = TempDir::new().expect("tempdir");
     let scripts = TempDir::new().expect("scripts dir");
     std::fs::write(scripts.path().join("greet.rhai"), GREET_RHAI).expect("write script");
@@ -2330,6 +2472,7 @@ async fn replace_stub_routes_resolve_scripts() {
 
 #[tokio::test]
 async fn ref_against_absent_imposter_is_unknown_ref_400() {
+    let _serial = TEST_LOCK.lock().await;
     let state = TempDir::new().expect("tempdir");
     let server = compose::start(cluster_cli(
         &state,
@@ -2367,6 +2510,7 @@ async fn ref_against_absent_imposter_is_unknown_ref_400() {
 
 #[tokio::test]
 async fn batch_put_resolves_file_scripts() {
+    let _serial = TEST_LOCK.lock().await;
     let state = TempDir::new().expect("tempdir");
     let scripts = TempDir::new().expect("scripts dir");
     std::fs::write(scripts.path().join("greet.rhai"), GREET_RHAI).expect("write script");
@@ -2429,6 +2573,7 @@ fn revision_of(response: &reqwest::Response) -> String {
 
 #[tokio::test]
 async fn if_match_preconditions_guard_single_imposter_writes() {
+    let _serial = TEST_LOCK.lock().await;
     let state = TempDir::new().expect("tempdir");
     let server = compose::start(cluster_cli(&state, &["--cluster-allow-solo"]))
         .await
@@ -2586,6 +2731,7 @@ async fn if_match_preconditions_guard_single_imposter_writes() {
 /// refusal.
 #[tokio::test]
 async fn an_async_conditioned_conflict_is_parked_then_refused() {
+    let _serial = TEST_LOCK.lock().await;
     use rift_cluster::rpc::{AlwaysHealthy, RpcClient, RpcClientConfig, Signer};
     use std::sync::Arc;
 
@@ -2688,6 +2834,7 @@ async fn an_async_conditioned_conflict_is_parked_then_refused() {
 
 #[tokio::test]
 async fn a_stale_if_match_cannot_clobber_through_a_follower() {
+    let _serial = TEST_LOCK.lock().await;
     let leader_state = TempDir::new().expect("tempdir");
     let leader = compose::start(cluster_cli(&leader_state, &["--cluster-allow-solo"]))
         .await
@@ -2818,6 +2965,7 @@ fn assert_validation_refusal(status: u16, body: &serde_json::Value) {
 
 #[tokio::test]
 async fn inline_scripts_are_validated_before_replication() {
+    let _serial = TEST_LOCK.lock().await;
     let state = TempDir::new().expect("tempdir");
     let scripts = TempDir::new().expect("scripts dir");
     let server = script_cluster(&state, &scripts).await;
@@ -2846,6 +2994,7 @@ async fn inline_scripts_are_validated_before_replication() {
 /// bind time on every node instead.
 #[tokio::test]
 async fn file_scripts_are_validated_after_resolution() {
+    let _serial = TEST_LOCK.lock().await;
     let state = TempDir::new().expect("tempdir");
     let scripts = TempDir::new().expect("scripts dir");
     std::fs::write(scripts.path().join("broken.rhai"), BROKEN_RHAI).expect("write script");
@@ -2885,6 +3034,7 @@ async fn file_scripts_are_validated_after_resolution() {
 
 #[tokio::test]
 async fn batch_validation_failure_names_the_imposter_index() {
+    let _serial = TEST_LOCK.lock().await;
     let state = TempDir::new().expect("tempdir");
     let scripts = TempDir::new().expect("scripts dir");
     let server = script_cluster(&state, &scripts).await;
@@ -2921,6 +3071,7 @@ async fn batch_validation_failure_names_the_imposter_index() {
 
 #[tokio::test]
 async fn stub_routes_validate_scripts() {
+    let _serial = TEST_LOCK.lock().await;
     let state = TempDir::new().expect("tempdir");
     let scripts = TempDir::new().expect("scripts dir");
     let server = script_cluster(&state, &scripts).await;
@@ -3000,6 +3151,7 @@ async fn stub_routes_validate_scripts() {
 
 #[tokio::test]
 async fn broken_inject_scripts_are_refused() {
+    let _serial = TEST_LOCK.lock().await;
     let state = TempDir::new().expect("tempdir");
     let scripts = TempDir::new().expect("scripts dir");
     let server = script_cluster(&state, &scripts).await;
@@ -3030,6 +3182,7 @@ async fn broken_inject_scripts_are_refused() {
 /// the new pass.
 #[tokio::test]
 async fn valid_and_script_free_configs_still_land() {
+    let _serial = TEST_LOCK.lock().await;
     let state = TempDir::new().expect("tempdir");
     let scripts = TempDir::new().expect("scripts dir");
     let server = script_cluster(&state, &scripts).await;
@@ -3066,6 +3219,7 @@ async fn valid_and_script_free_configs_still_land() {
 /// from upstream's incoming-stub-only validation introduces.
 #[tokio::test]
 async fn index_addressed_edits_survive_valid_scripted_siblings() {
+    let _serial = TEST_LOCK.lock().await;
     let state = TempDir::new().expect("tempdir");
     let scripts = TempDir::new().expect("scripts dir");
     let server = script_cluster(&state, &scripts).await;
@@ -3141,6 +3295,7 @@ async fn index_addressed_edits_survive_valid_scripted_siblings() {
 /// submit fail.
 #[tokio::test]
 async fn a_parked_intent_replays_without_waiting_for_the_periodic_sweep() {
+    let _serial = TEST_LOCK.lock().await;
     use rift_cluster::control::{ControlOp, ControlRequest};
 
     let state = TempDir::new().expect("tempdir");
@@ -3191,6 +3346,7 @@ async fn a_parked_intent_replays_without_waiting_for_the_periodic_sweep() {
 /// #67 guarded only the `replay` spelling of this; the flag itself was open.
 #[tokio::test]
 async fn a_configfile_is_refused_under_cluster() {
+    let _serial = TEST_LOCK.lock().await;
     let dir = TempDir::new().expect("tempdir");
     let configfile = dir.path().join("saved.json");
     std::fs::write(
@@ -3247,6 +3403,7 @@ async fn a_configfile_is_refused_under_cluster() {
 /// a refactor could silently restore the load.
 #[tokio::test]
 async fn a_datadir_loads_no_imposters_under_cluster() {
+    let _serial = TEST_LOCK.lock().await;
     let data = TempDir::new().expect("tempdir");
     // `<datadir>/{port}.json` — upstream's layout (`read_and_parse_datadir`).
     // Getting this wrong makes the test pass by loading nothing, which is
@@ -3303,6 +3460,7 @@ async fn a_datadir_loads_no_imposters_under_cluster() {
 /// the write path would accept, from the same applied state the precondition is checked against.
 #[tokio::test]
 async fn the_imposter_read_hands_the_editor_its_if_match_token() {
+    let _serial = TEST_LOCK.lock().await;
     let state = TempDir::new().expect("tempdir");
     let server = compose::start(cluster_cli(&state, &["--cluster-allow-solo"]))
         .await
@@ -3433,6 +3591,7 @@ async fn the_imposter_read_hands_the_editor_its_if_match_token() {
 /// surfaced this originally.
 #[tokio::test]
 async fn a_space_stub_body_that_is_not_a_stub_is_refused_through_the_front() {
+    let _serial = TEST_LOCK.lock().await;
     let state = TempDir::new().expect("tempdir");
     let server = compose::start(cluster_cli(&state, &["--cluster-allow-solo"]))
         .await
@@ -3601,6 +3760,7 @@ async fn stub_ids_on(admin: &str, port: u16) -> Vec<String> {
 /// heard of — all behind a `201`.
 #[tokio::test]
 async fn a_space_stub_replicates_and_survives_an_unrelated_reconcile() {
+    let _serial = TEST_LOCK.lock().await;
     let leader_state = TempDir::new().expect("tempdir");
     let leader = compose::start(cluster_cli(&leader_state, &["--cluster-allow-solo"]))
         .await
@@ -3690,6 +3850,7 @@ async fn a_space_stub_replicates_and_survives_an_unrelated_reconcile() {
 /// same node do not — because a per-node journal is the whole of what D-74 leaves.
 #[tokio::test]
 async fn a_space_teardown_removes_only_that_spaces_stubs_fleet_wide_and_they_stay_gone() {
+    let _serial = TEST_LOCK.lock().await;
     let leader_state = TempDir::new().expect("tempdir");
     let leader = compose::start(cluster_cli(&leader_state, &["--cluster-allow-solo"]))
         .await
@@ -3807,6 +3968,7 @@ async fn a_space_teardown_removes_only_that_spaces_stubs_fleet_wide_and_they_sta
 /// by-id deletes, where a missing target means the caller asserted something untrue.
 #[tokio::test]
 async fn tearing_down_a_space_with_no_stubs_succeeds() {
+    let _serial = TEST_LOCK.lock().await;
     let state = TempDir::new().expect("tempdir");
     let server = compose::start(cluster_cli(&state, &["--cluster-allow-solo"]))
         .await
@@ -3842,6 +4004,7 @@ async fn tearing_down_a_space_with_no_stubs_succeeds() {
 /// space the URL never mentioned.
 #[tokio::test]
 async fn a_space_stub_body_cannot_choose_its_own_space() {
+    let _serial = TEST_LOCK.lock().await;
     let state = TempDir::new().expect("tempdir");
     let server = compose::start(cluster_cli(&state, &["--cluster-allow-solo"]))
         .await
@@ -4024,6 +4187,7 @@ async fn wait_scenario_state(admin: &str, port: u16, want: &str) {
 /// run against the same fleet, which is exactly where this was found.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_recreated_imposter_starts_its_scenario_from_scratch_on_every_node() {
+    let _serial = TEST_LOCK.lock().await;
     let (_fs, founder, _js, joiner) = two_node_cluster().await;
     let founder_admin = founder.admin_addr().to_string();
     let joiner_admin = joiner.admin_addr().to_string();
@@ -4101,6 +4265,7 @@ async fn a_recreated_imposter_starts_its_scenario_from_scratch_on_every_node() {
 /// and does not reset its scenario on any node. Only a delete clears.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn replacing_an_imposters_stubs_keeps_its_scenario_state() {
+    let _serial = TEST_LOCK.lock().await;
     let (_fs, founder, _js, joiner) = two_node_cluster().await;
     let founder_admin = founder.admin_addr().to_string();
     let joiner_admin = joiner.admin_addr().to_string();
@@ -4162,6 +4327,7 @@ async fn replacing_an_imposters_stubs_keeps_its_scenario_state() {
 /// leaves it in place and a re-creation resumes it. Only `i<port>:` is dropped.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_fleet_scoped_flow_survives_deleting_its_imposter() {
+    let _serial = TEST_LOCK.lock().await;
     let (_fs, founder, _js, joiner) = two_node_cluster().await;
     let founder_admin = founder.admin_addr().to_string();
     let joiner_admin = joiner.admin_addr().to_string();
@@ -4403,6 +4569,7 @@ async fn two_nodes_with_a_recording_imposter() -> RecordingFleet {
 /// nodes bind the same port and a direct dial names whichever won it.
 #[tokio::test]
 async fn number_of_requests_is_the_answering_nodes_own_count_not_a_fleet_sum() {
+    let _serial = TEST_LOCK.lock().await;
     let RecordingFleet {
         leader,
         follower,
@@ -4442,6 +4609,7 @@ async fn number_of_requests_is_the_answering_nodes_own_count_not_a_fleet_sum() {
 /// dialog says "on this node only", and this is the test that keeps it honest.
 #[tokio::test]
 async fn a_proxied_clear_empties_only_the_journal_of_the_node_it_reached() {
+    let _serial = TEST_LOCK.lock().await;
     let RecordingFleet {
         leader,
         follower,
@@ -4496,6 +4664,7 @@ async fn a_proxied_clear_empties_only_the_journal_of_the_node_it_reached() {
 /// be satisfied by a header nothing ever sets.
 #[tokio::test]
 async fn cluster_partial_is_absent_from_the_imposter_read_and_the_spaces_listing() {
+    let _serial = TEST_LOCK.lock().await;
     let RecordingFleet {
         leader,
         follower,
@@ -4549,6 +4718,7 @@ async fn cluster_partial_is_absent_from_the_imposter_read_and_the_spaces_listing
 /// succeed would answer complete, correctly.
 #[tokio::test]
 async fn cluster_partial_rides_members_and_health_when_a_voter_is_down() {
+    let _serial = TEST_LOCK.lock().await;
     let RecordingFleet {
         leader,
         follower,
@@ -4589,4 +4759,175 @@ async fn cluster_partial_rides_members_and_health_when_a_voter_is_down() {
     }
 
     leader.shutdown().await;
+}
+
+/// Whether an admin write's response means "no leader was reachable at that
+/// instant" — the one outcome a fleet test may retry rather than assert on.
+///
+/// **The status alone is not enough**, which is the whole reason this is a
+/// function rather than an inline `== 503`. `POST /imposters` has two 503s and
+/// they carry the same `ErrorKind::Unavailable`: the write submit's `no quorum /
+/// leader unreachable` (`admin_front.rs`, the `NodeError::Unavailable` arm) and
+/// `terminate`'s `cluster node is shutting down`, which fires when the front's
+/// `Weak` handle on the node has expired. Only the first is a transient election
+/// gap. Retrying the second would swallow a node-lifecycle defect for 30 s and
+/// then report it as a loss of quorum, sending whoever triages it into Raft.
+///
+/// Every other status falls through to the assertions, `504` included — that one
+/// means `submit` did not commit inside `WRITE_DEADLINE`, i.e. a parked write,
+/// which is not this test's subject either.
+///
+/// Note what is **not** the reason: a barrier that wrongly waits on the dead peer
+/// does not answer 504 at all. The barrier runs *after* the commit, outside
+/// `WRITE_DEADLINE` (`admin_front.rs` says so where the constant is defined), so
+/// that regression answers a **slow 201** — measured at 15.1 s against the 15 s
+/// fleet-barrier timeout when the regression was deliberately injected. The
+/// elapsed bound is what catches it, not the status; this predicate's job is only
+/// to keep the retry from eating the leaderless gap.
+fn is_leaderless_refusal(seen: &Seen) -> bool {
+    seen.status == 503 && seen.body.contains("no quorum / leader unreachable")
+}
+
+/// Whether a line is the serialisation guard, bound to a name that keeps it
+/// alive. `let _ = ..lock().await` reads as the guard and drops it on the spot,
+/// so the binding name is checked, not just the call.
+fn is_serial_guard(line: &str) -> bool {
+    let line = line.trim();
+    line.starts_with("let _serial = ") && line.contains("TEST_LOCK.lock().await")
+}
+
+/// The serialisation convention enforced rather than merely documented.
+///
+/// Every test here stands up its own fleet on real localhost ports, and libtest
+/// runs as many tests at once as the runner has cores. Unguarded, they starve
+/// each other's Raft timers — 150 ms/300 ms election against a 50 ms heartbeat
+/// (D-42) — and quorum-sensitive assertions fail on a busy host while passing in
+/// isolation (issue #561). A test added later without the guard would reintroduce
+/// that silently, which is what this pins.
+#[test]
+fn every_test_in_this_file_serialises_its_fleet() {
+    const SOURCE: &str = include_str!("write_path.rs");
+    let lines: Vec<&str> = SOURCE.lines().collect();
+    let mut offenders: Vec<String> = Vec::new();
+    let mut seen = 0usize;
+
+    let mut guard_lines: Vec<usize> = Vec::new();
+
+    for (index, line) in lines.iter().enumerate() {
+        // Trimmed, not anchored at column 0: a test nested inside a `mod` block
+        // is indented, and matching the raw line would skip it silently — no
+        // offender reported and `seen` unchanged, so nothing to notice.
+        if !line.trim_start().starts_with("#[tokio::test") {
+            continue;
+        }
+        seen += 1;
+        // Bounded, and `pub` is matched. An unbounded search for a bare
+        // `async fn ` walks straight past `pub async fn` and lands on the *next*
+        // test's signature — which is guarded — so the unguarded one is reported
+        // as fine while `seen` still counts it, defeating the floor as well.
+        const SIGNATURE_WINDOW: usize = 8;
+        let signature = |l: &str| {
+            let l = l.trim_start();
+            l.starts_with("async fn ") || l.starts_with("pub async fn ")
+        };
+        let Some(offset) = lines[index..]
+            .iter()
+            .take(SIGNATURE_WINDOW)
+            .position(|l| signature(l))
+        else {
+            offenders.push(format!(
+                "line {}: no `async fn` within {SIGNATURE_WINDOW} lines of the attribute",
+                index + 1
+            ));
+            continue;
+        };
+        let name = lines[index + offset]
+            .trim_start()
+            .trim_start_matches("pub ")
+            .trim_start_matches("async fn ")
+            .split('(')
+            .next()
+            .expect("split always yields at least one item");
+        match lines[index + offset + 1..]
+            .iter()
+            .enumerate()
+            .find(|(_, l)| !l.trim().is_empty() && !l.trim().starts_with("//"))
+        {
+            Some((at, first)) if is_serial_guard(first) => {
+                guard_lines.push(index + offset + 1 + at);
+            }
+            Some((_, first)) => offenders.push(format!("{name}: opens with `{}`", first.trim())),
+            None => offenders.push(format!("{name}: empty body")),
+        }
+    }
+
+    // Nothing but those guards may take the lock. `tokio::sync::Mutex` is not
+    // reentrant, so a helper that acquired it as well would deadlock against the
+    // test that called it — and a deadlock is a CI *hang*, not a red test, which
+    // is the failure shape most worth spending a check to prevent. Lines that
+    // merely quote the call (this file's own assertion messages) carry a `"`.
+    for (index, line) in lines.iter().enumerate() {
+        if line.contains("TEST_LOCK.lock()") && !line.contains('"') && !guard_lines.contains(&index)
+        {
+            offenders.push(format!(
+                "line {}: takes TEST_LOCK outside a test's opening guard — `{}`",
+                index + 1,
+                line.trim()
+            ));
+        }
+    }
+
+    // An anti-vacuity floor, not a census: if the scan above ever matches
+    // nothing, every assertion below it passes against a file with no guards at
+    // all. A floor catches that without needing a bump for each test added.
+    assert!(
+        seen >= 60,
+        "the attribute scan found only {seen} tests — it has stopped matching, \
+         so this guard proves nothing"
+    );
+    assert!(
+        offenders.is_empty(),
+        "every #[tokio::test] here must open with `let _serial = TEST_LOCK.lock().await;` \
+         (see crates/rift-cluster-server/tests/README.md); these do not: {offenders:#?}"
+    );
+}
+
+#[test]
+fn only_a_leaderless_503_is_retried() {
+    fn seen(status: u16, body: &str) -> Seen {
+        Seen {
+            status,
+            headers: reqwest::header::HeaderMap::new(),
+            body: body.to_owned(),
+        }
+    }
+
+    assert!(
+        is_leaderless_refusal(&seen(
+            503,
+            r#"{"errors":[{"message":"no quorum / leader unreachable (parked for replay): no quorum"}]}"#
+        )),
+        "the write submit's own Unavailable refusal is the one retryable outcome"
+    );
+    assert!(
+        !is_leaderless_refusal(&seen(
+            503,
+            r#"{"errors":[{"message":"cluster node is shutting down"}]}"#
+        )),
+        "`terminate`'s 503 carries the same status and the same ErrorKind, and is a \
+         node-lifecycle defect: retrying it would hide it for 30 s and then blame quorum"
+    );
+    assert!(
+        !is_leaderless_refusal(&seen(504, "no quorum / leader unreachable")),
+        "504 means the submit did not commit inside WRITE_DEADLINE — a parked write, \
+         not an election blip — and is not retryable even carrying the leaderless \
+         wording. (A barrier wrongly waiting on the dead peer answers a slow 201, \
+         which the elapsed bound catches; it never reaches this predicate.)"
+    );
+    for status in [200u16, 201, 400, 409, 500, 502] {
+        assert!(
+            !is_leaderless_refusal(&seen(status, "no quorum / leader unreachable")),
+            "{status} must not be retried whatever the body says"
+        );
+    }
 }
