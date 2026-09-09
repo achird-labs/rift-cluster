@@ -40,6 +40,24 @@ decision must list the open issue that builds it.
 
 Upstream Rift's own RFCs are a different numbering space; cite them as `rift RFC-712`, never bare.
 
+**Callout verbs.** A spec section a decision changes carries a callout at its head, and the verb
+is one of exactly four. `design-check` reads these and nothing else, so a callout that uses
+another word is invisible to it:
+
+| Callout | Means |
+|---|---|
+| `> **Amended by D-n**` | the section still holds, with the stated change |
+| `> **Superseded by D-n**` | the section is replaced by something else, named |
+| `> **Reversed by D-n**` | the section's conclusion was wrong and the opposite is now true |
+| `> **Retired by D-n**` | the section's subject was removed and has no successor; the text stays as history |
+
+`Retired by` was added on 2026-09-09 (#554). RFC-007's children had already written it about
+twenty times — it is what a removal does to a section, and neither "amended" nor "superseded" says
+that — but it was not in the grammar and the checker did not accept it. Those callouts passed only
+because no `Amends:` field named their sections, so nothing looked. Naming the relation the
+project actually has is the smaller change; rewriting twenty true callouts into "superseded",
+which promises a successor that does not exist, would have been the larger and the falser one.
+
 **Pinning a decision in a test.** Any of the tokens above in the doc comment (`///`) or the
 comment lines directly above a `#[test]`/`#[tokio::test]` attribute counts as a pin — that test is
 then listed as evidence for the decision. Write the *claim* the test discriminates, not just the ID:
@@ -60,8 +78,8 @@ async fn quorum_is_joint_over_committed_and_effective_voters() { … }
    `Status: amended`) or supersede it (new entry, `Supersedes:` / `Superseded by:` on both).
    Superseded text stays, struck through in the title, because code and history cite it.
 3. If it changes what an RFC or chapter says, list the section under `Amends:` and put
-   `> **Amended by D-n** (date): <one line>` at the top of that section. `design-check` fails
-   without it.
+   `> **Amended by D-n** (date): <one line>` — or the `Superseded`/`Reversed`/`Retired` form, per
+   the callout table above — at the top of that section. `design-check` fails without it.
 4. Cite it from the code that embodies it, and pin it with at least one test.
 
 ---
@@ -106,6 +124,12 @@ fast and bodies transfer once per node.
 JSON entries. The content-addressed principle survives for *blobs* (datasets, specs) — see D-18,
 D-23.
 
+**Amendment (D-72, 2026-09-07, #549):** the blob half of that is gone with the blob store, so
+nothing content-addressed remains. D-18 and D-23 are superseded; every config body — imposter,
+stubs, route table — rides the Raft log as a small JSON entry, and there is no second transport.
+The entry stays `amended` rather than `superseded` because its surviving claim is the one that
+built the system: config travels as a body on the log, not as a gossip digest.
+
 ### D-5 — Two-level, order-aware reconcile (LCS edit script) on top of by-id/positional stub CRUD
 - **Status:** amended
 - **Decided:** 2026-07-01 · RFC-001 v2
@@ -134,11 +158,16 @@ additionally drops any `i<port>:` namespace the tables no longer name, which is 
 delete committed while the node was down. Single-node Rift gets this for free by dropping the
 imposter's store instance; one shared `FlowNet` per node (D-7) has to do it explicitly. What is
 *not* cleared, by the same rule: a `PutImposter` over an existing port (a config change keeps its
-state — the first paragraph of this entry), a `fleet`-scoped (`f:`) or `tenant`-scoped
-(`t<tenant>:`) context (shared by construction, not any one imposter's to drop), and any other
-port's namespace (ports are fleet-unique across tenants, so `i<port>:` never names another
-tenant's). Sequencer cursors already go with the imposter via upstream's `reset_scope` hook (D-8,
-D-57); proxyOnce markers via the apply arm (#226).
+state — the first paragraph of this entry), a `fleet`-scoped (`f:`) context (shared by
+construction, not any one imposter's to drop), and any other port's namespace. Sequencer cursors
+already go with the imposter via upstream's `reset_scope` hook (D-8, D-57); proxyOnce markers via
+the apply arm (#226).
+
+> This amendment was written against the tree #567 merged into, which still had a `tenant`-scoped
+> (`t<tenant>:`) context. #566 (D-73) removed it the next day: `ContextScope` is `Imposter | Fleet`
+> and `prefix_for` renders `i<port>:` or `f:` and nothing else
+> (`crates/rift-cluster/src/stores/flow_config.rs`). The rule is unchanged — a shared namespace is
+> not any one imposter's to drop — there is simply one shared namespace instead of two.
 
 ### D-6 — Redis impls of the new traits are cluster; existing `RedisFlowStore` (incl. U-1 CAS) stays OSS
 - **Status:** amended
@@ -204,8 +233,8 @@ promote #212 trivially), and weakens U-7's story.
 
 ### ~~D-12 — Strict sequencing/proxyOnce ship Redis-backed first; gossip-native single-writer versions are demand-gated~~
 - **Status:** superseded
-- **Superseded by:** D-47
 - **Decided:** 2026-07-01 · RFC-001 v2
+- **Superseded by:** D-47
 - **Amends:** RFC-001 §7.5.3
 - **Code:** crates/rift-cluster/src/stores/proxy.rs, crates/rift-cluster-server/src/compose.rs
 
@@ -250,8 +279,10 @@ single owner outage would stall every connection pinned to it.
 - **Amends:** RFC-001 §7.1, RFC-001 §7.2, RFC-001 §7.4
 - **Code:** crates/rift-cluster/src/raft/node.rs, crates/rift-cluster/src/raft/store.rs
 
-Membership + imposter configs + the `enabled` bit + tenancy/RBAC records + admin intents in one
-Raft log; **flow state stays off consensus** (D-17). Putting membership itself into the log is the
+Membership + imposter configs + the `enabled` bit + the route table + admin intents in one
+Raft log; **flow state stays off consensus** (D-17). (As decided, the log also carried tenancy and
+RBAC records; D-73 removed them — the claim is about *what is agreed*, and that set is now
+membership and configuration.) Putting membership itself into the log is the
 move that pays for everything else: the roster becomes a linearizable value, so at any log index
 every node computes byte-identical membership and therefore byte-identical ownership. The settle
 delay, the generations, the epoch-mismatch retries are deleted, not mitigated.
@@ -1171,7 +1202,8 @@ member's applied index rather than reading the leader's replication view.
 > **Amended by D-55** (2026-08-28, #504): closed by rule C — the channel is
 > `POST /internal/v1/applied`, in-crate; what was missing was plumbing, not a channel or a layer.
 
-**Correction (#504), twice over.** This rejection originally also claimed no channel existed for
+The callout above covers a rejection that was wrong twice over, and #504 corrected both halves.
+This rejection originally also claimed no channel existed for
 disseminating the *applied* index. It then said the obstacle was layering — that blob GC lives in
 `rift-cluster` while the fleet fan-out lives in `rift-cluster-server`. **Both are wrong.**
 `raft::network::CLUSTER_APPLIED_PATH` (`/internal/v1/applied`) reports how far a node's state
@@ -1325,14 +1357,18 @@ whose own doc reads "predicates and recorded requests see the true path unless t
 otherwise". Transparency-by-default is already the route table's rule.
 
 **Why withdrawn rather than "not yet".** Both rows are expressible *today*, per imposter, as
-operator-authored routes — with two properties a hard-wired scheme could not have had: they are
-tenant-scoped (routes belong to tenants and are compiled in per `routes_installed_for`, chapter 8)
-and they are replicated control-plane state (`ControlOp::PutRoutes`, R1/R3). All a built-in scheme
-would add over a route is the *implicit* any-port mapping — no route per imposter — and that
-implicit form is precisely what the path prefix already provides as the no-route fallback
+operator-authored routes, and they are replicated control-plane state (`ControlOp::PutRoutes`,
+R1/R3) — a property a hard-wired scheme could not have had. All a built-in scheme would add over a
+route is the *implicit* any-port mapping — no route per imposter — and that implicit form is
+precisely what the path prefix already provides as the no-route fallback
 (`gateway::dispatch_gateway_path`). A second and third implicit scheme would be three spellings of
-one thing, and each one is another path the tenancy rule has to account for beside the single
-fallback it has now.
+one thing.
+
+> The original of this paragraph claimed a second property: that routes are *tenant-scoped*,
+> "compiled in per `routes_installed_for`, chapter 8". D-73 (#550) removed the tenant dimension:
+> there is one fleet-wide route table, `routes_installed_for` no longer exists, and every stored
+> route is compiled into the listener (`raft/store.rs::desired_routes`). The withdrawal stands on
+> the replication property alone, which is the half that was doing the work.
 
 D-11 is untouched and is not a dependency in either direction: the plain listener *and* the route
 table are both upstream already, so nothing has to move first. (§6.3 says only that the plain
@@ -2309,7 +2345,7 @@ separate question of what the run actually measured underneath it.
 - **Decided:** 2026-09-01
 - **Refines:** D-54
 - **Superseded by:** D-73
-- **Amends:** docs/architecture/13-front-door-and-sources.md
+- **Amends:** docs/architecture/13-router.md
 - **Implemented by:** #536
 
 `routes_installed_for` is the single definition of which tenants' routes are compiled into the
@@ -2441,6 +2477,15 @@ that turned out to be cheap to close properly.
 variant — but it silently changes what an already-committed `JournalClearGen` entry means, so a log
 replay would start deleting stubs it never deleted when it was written.
 
+**Amendment (D-74, 2026-09-08, #552):** `ControlOp::JournalClearGen` no longer exists — it raised a
+*replicated* clear generation that only the merge-on-read consulted, and there is no merge. The
+teardown commits `StubEdit::DeleteBySpace` alone; the space's recorded requests are cleared by
+upstream's own `teardown_space`, on the node that took the request
+(`crates/rift-cluster-server/src/admin_front.rs`). Both mentions of the op above are history. The
+rejected alternative is retained because its reasoning — an op's meaning must not change under a
+replay of entries already written — is the general rule, and it is why the delete got a variant of
+its own.
+
 
 ### ~~D-70 — The console reads a structural claim from the cheapest source that carries it; absence from every source is still unknown~~
 
@@ -2495,10 +2540,10 @@ and an unknown are different claims.
 
 ### D-71 — The cluster is the distributed core: membership, replicated configuration and the router; everything else is Rift's own or removed
 
-- **Status:** pending
+- **Status:** active
 - **Decided:** 2026-09-06 · RFC-007 · #544
-- **Implemented by:** #544 (open) — children #545–#555
-- **Code:** crates/rift-cluster/src/control.rs, crates/rift-cluster-server/src/admin_front.rs, crates/rift-cluster/src/raft/node.rs
+- **Implemented by:** #556, #557, #558, #559, #560, #562, #563, #564, #566, #567, #568, #570, #571; #569 (open), #572 (open), #573 (open) and this pass's own PR (open) — see "Still open" below
+- **Code:** crates/rift-cluster/src/control.rs, crates/rift-cluster-server/src/admin_front.rs, crates/rift-cluster/src/raft/node.rs, deploy/compose/smoke.sh
 
 RiftCluster is **a replicated fleet of Rift nodes that forms and heals itself, replicates
 imposters, stubs and the route table through Raft, routes a request arriving at any node to the
@@ -2509,10 +2554,18 @@ deployment path are the whole product. RFC-007 §3 draws the boundary; §2 is th
 behind it.
 
 **Removed, not flagged off.** Tenancy and RBAC, the audit projection and its exporter, the MCP
-server, the cluster metric families and dashboards, per-route hit counters, tracking sources and
-datasets and stored specs with the blob store that carried them, and the fleet journal merge. Each
-removal is a child of #544; each child marks the decisions it retires `superseded` by this entry
-in the same PR (RFC-007 Appendix A lists them), so the register never describes code that is gone.
+server, the operator metrics product — the fleet gauges, dashboards, recording and alert rules,
+the observability overlay and the CI lanes that read them — per-route hit counters, tracking
+sources and datasets and stored specs with the blob store that carried them, and the fleet journal
+merge. The `rift_cluster_*` families a chaos scenario reads to pin a core claim stayed, as
+correctness instrumentation rather than an operator surface
+(`crates/rift-cluster/src/metrics.rs`).
+
+Each removal is a child of #544, and each child marks the decisions it retires `superseded` in the
+same PR — by **that child's own decision** (D-72 for #549, D-73 for #550, D-74 for #552), not by
+this entry, which records the scope and lists the children. The one exception is D-70, which #545
+retired without registering a decision of its own and which therefore names D-71 directly.
+RFC-007 Appendix A is the full list.
 
 **The flow-state tier stays.** Owner-authoritative scenarios and flow KV on the HRW ring, fencing,
 the durable flow shard, the sequencer, proxyOnce claims and spaces (D-3, D-7–D-10, D-13, D-17,
@@ -2526,9 +2579,40 @@ same day by the project owner: a Redis in the request path is precisely the exte
 the fleet exists to avoid, and the cluster's tier is the stronger of the two. RFC-007 v1.1
 records the same change.
 
+**What landed, by child.** RFC-007 §9 carries the same mapping with the surfaces named.
+
+| Child issue | Surface | PR |
+|---|---|---|
+| #555 | In-repo core smoke check | #557 |
+| #545 | Route hits | #559 |
+| #546 | Audit log, export loop, sink | #563 |
+| #547 | MCP server | #560 |
+| #548 | Cluster metric families and the observability pack | #562 |
+| #549 | Tracking sources, datasets, stored specs, blob store (D-72) | #564 |
+| #550 | Tenancy, RBAC, principals (D-73) | #566 |
+| ~~#551~~ | ~~Clustered flow state~~ — **withdrawn**, the tier stays (see the amendment above) | — |
+| #552 | Fleet journal merge (D-74) | #568 |
+| #553 | Console trimmed | #569 (open) |
+| #554 | Design docs retired; the router named | this PR (open) |
+
+The RFC itself landed as #556 and was amended to v1.1 by #558. Three PRs outside the child list
+belong to the epic because they fix defects the removals exposed or the lanes they broke: #567
+(issue #565 — a committed imposter delete left the port's flow state behind), #570 (the compose
+verification lane, dropped when the observability overlay went), and #571 (the `--imposters`
+bootstrap keyed on a canonical digest, after the spec surface was reduced to one shot).
+
+**Still open — finish this entry when they merge.** Four PRs were open when this entry went
+`active`: **#569** (console, issue #553), **#572** (the gateway leg strips every admin credential —
+a defect found reviewing #566), **#573** (the cold-start sweep only clears ports the sync dropped —
+a defect found reviewing #567), and the PR carrying this docs pass (issue #554). Drop each
+`(open)` mark from the `Implemented by:` line as it merges, and put that PR's number where this
+paragraph and the table say "this PR".
+
 **Verified live, before and after.** No removal merges until the surface being removed has been
 driven on a running fleet and recorded, and every kept surface has been re-driven afterwards
-(RFC-007 §5). The baseline on the day of decision was 57/57 on the compose fleet.
+(RFC-007 §5). The baseline on the day of decision was 57/57 on the compose fleet;
+`deploy/compose/smoke.sh` (#557) is that protocol's in-repo half and is the check every child ran
+before and after.
 
 *Rejected:* freezing the peripheral surfaces in place. Frozen code still compiles, still tests,
 still cites decisions, and still leaks — D-68 exists because tenancy reached the router.

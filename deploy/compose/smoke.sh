@@ -19,6 +19,14 @@
 # peripheral surfaces leave — a section here that depends on one of them is a
 # bug in this script. Flow state is core (D-17, D-20): its section stays.
 #
+# That makes this the executable statement of **D-71**: the sections below are
+# the distributed core, and the fact that every one of them still passes with
+# tenancy, RBAC, the audit log, MCP, the operator metrics product, route hits,
+# tracking sources and the fleet journal merge all removed is the evidence the
+# narrowing took nothing the product needed. It is a shell script, so
+# `design-check` counts it as a citation and not as a test pin; the gate is the
+# CI lane that runs it, not a `#[test]`.
+#
 # A script rather than a `cargo test` for the same reason `verify.sh` is: it
 # needs a container runtime, so it cannot run in the workspace's `cargo test`
 # and must not be able to fail CI for an unrelated reason.

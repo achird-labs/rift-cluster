@@ -77,6 +77,12 @@ DOCPATH_RE = re.compile(r"(?<![*?\[{$/])\bdocs/[A-Za-z0-9_./-]+?\.md\b")
 UPSTREAM_RFC_RE = re.compile(r"\b(?:rift|upstream)\s+RFC-\d+", re.I)
 
 STATUSES = {"active", "amended", "superseded", "pending"}
+
+# The verbs a `> **<verb> by D-n**` callout may use at the head of an amended spec section.
+# Defined in the register's citation grammar; anything else is prose the checker cannot read.
+# `Retired` is the one for a section whose subject was removed with no successor — the shape
+# RFC-007's children used ~20 times before it was part of the grammar.
+CALLOUT_VERBS = "Amended|Superseded|Reversed|Retired"
 TEST_ATTR_RE = re.compile(r"^\s*#\[(?:tokio::)?test(?:\(|\])|^\s*#\[rstest\]|^\s*#\[test_log::test")
 TEST_FN_RE = re.compile(r"^\s*(?:pub\s+)?(?:async\s+)?fn\s+([A-Za-z0-9_]+)")
 TS_TEST_RE = re.compile(r"^\s*(?:it|test)\(\s*['\"`](.+?)['\"`]")
@@ -469,7 +475,13 @@ def check_conflict_markers(root: Path) -> list[Finding]:
 
 
 def check_callouts(root: Path, decisions: dict[str, Decision]) -> list[Finding]:
-    """Every `Amends: RFC-00N §x.y` needs an `Amended by D-n` callout inside that section."""
+    """Every `Amends: RFC-00N §x.y` needs an amendment callout inside that section.
+
+    The accepted verbs are `Amended by`, `Superseded by`, `Reversed by` and `Retired by` --
+    `CALLOUT_VERBS`. They are the four relations a decision can have to a spec section, and the
+    grammar in the register defines them; a callout using any other word is a claim the reader
+    has to interpret and the checker cannot see.
+    """
     findings: list[Finding] = []
     rfcs = rfc_sections(root)
     for d in decisions.values():
@@ -489,13 +501,13 @@ def check_callouts(root: Path, decisions: dict[str, Decision]) -> list[Finding]:
                     continue
                 start, end = sections[sec]
                 body = (root / path).read_text(encoding="utf-8").splitlines()[start - 1 : end]
-                if not any(re.search(rf"(?:Amended|Superseded|Reversed) by[^\n]*\b{re.escape(d.id)}\b", ln, re.I) for ln in body):
+                if not any(re.search(rf"(?:{CALLOUT_VERBS}) by[^\n]*\b{re.escape(d.id)}\b", ln, re.I) for ln in body):
                     findings.append(Finding("error", "amendment-callout-missing", f"{d.id} amends {target}, but {path} §{sec} (lines {start}–{end}) has no '> **Amended by {d.id}**' callout", path, start))
             elif target.startswith("docs/"):
                 p = root / target
                 if not p.exists():
                     findings.append(Finding("error", "amends-unresolved", f"{d.id} amends {target}, which does not exist", REGISTER, d.line))
-                elif not re.search(rf"(?:Amended|Superseded|Reversed) by[^\n]*\b{re.escape(d.id)}\b", p.read_text(encoding="utf-8"), re.I):
+                elif not re.search(rf"(?:{CALLOUT_VERBS}) by[^\n]*\b{re.escape(d.id)}\b", p.read_text(encoding="utf-8"), re.I):
                     findings.append(Finding("error", "amendment-callout-missing", f"{d.id} amends {target}, which has no 'Amended by {d.id}' callout", target, 1))
     return findings
 
