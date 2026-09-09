@@ -56,9 +56,15 @@ info:
     holds for a credential the *caller* presents, not only for one the
     front would inject: an `Authorization` whose value is the configured
     key is dropped before the request is proxied, as is the `rift_session`
-    cookie. Any other bearer and every other cookie ride through untouched,
-    so an app under test can still authenticate to its own mock and an
-    imposter can still predicate on that. Not documented here.
+    cookie. Any other bearer rides through untouched, and so does every
+    `Cookie` header that did not carry that pair — byte for byte, not
+    re-serialized — so an app under test can still authenticate to its own
+    mock and an imposter can still predicate on either. Two narrow
+    exceptions on `Cookie`, both confined to headers this already rewrites:
+    a header that cannot be read as text is dropped whole (it cannot be
+    proved token-free), and a header that *did* carry the session pair also
+    loses any `;`-separated segment with no `=`, which there can only be a
+    fragment of the token's own value. Not documented here.
 servers:
   - url: /
 security:
