@@ -1622,15 +1622,24 @@ impl RedbStateMachine {
             .await
     }
 
-    /// [`Self::reconcile_engine`] with a seam between its engine sync and its
-    /// orphan sweep. Production passes a ready future; the test that pins the
-    /// sweep's bound (#567 review) commits an imposter there, on a second
-    /// state-machine handle, exactly where the apply loop can in `compose`.
-    /// One body for both, so the ordering under test is the ordering shipped.
+    /// [`Self::reconcile_engine`] with a seam inside its orphan sweep, between
+    /// the sweep's two reads. Production passes a ready future; the test that
+    /// pins the sweep's bound (#567 review) commits an imposter there, on a
+    /// second state-machine handle, exactly where the apply loop can in
+    /// `compose`. One body for both, so the ordering under test is the
+    /// ordering shipped.
+    ///
+    /// **That point, not "between the sync and the sweep" (#573 review).** The
+    /// sweep's verdict is decided by two reads — the held set and the desired
+    /// set — and a concurrent apply changes the verdict only while it sits
+    /// between them. An apply landing before the first read or after the second
+    /// is seen by both or by neither. So this is the worst case, and it is
+    /// strictly later than the old seam: a commit here is also a commit after
+    /// the engine sync, which is what the earlier placement tested.
     #[allow(clippy::result_large_err)]
     async fn reconcile_engine_interleaved(
         &self,
-        between_sync_and_sweep: impl Future<Output = ()>,
+        between_sweep_reads: impl Future<Output = ()>,
     ) -> StorageResult<()> {
         // Both tables read fresh, in one call: a restart's local `ImposterManager`
         // and `ArcSwap<CompiledRoutes>` both start empty (they are process-local,
@@ -1675,16 +1684,13 @@ impl RedbStateMachine {
             AttributedAction::unattributed(routes_action),
         ])
         .await;
-        between_sync_and_sweep.await;
         if config_synced {
-            // Read AFTER the sync, never reused from the snapshot taken above:
-            // that read and this point are a whole `apply_config` apart —
-            // seconds, on a cold start with listeners to bind — and the apply
-            // loop runs concurrently on its own handle. An imposter committed
-            // inside that interval is missing from the snapshot while being
-            // perfectly alive. See [`Self::sweep_orphaned_imposter_state`].
-            let desired_ports: BTreeSet<u16> = self.configured_ports()?.into_iter().collect();
-            self.sweep_orphaned_imposter_state(&desired_ports).await;
+            self.sweep_orphaned_imposter_state(between_sweep_reads)
+                .await?;
+        } else {
+            // Still awaited on the refuse path, so an interleaving a test asks
+            // for is never silently dropped along with the sweep.
+            between_sweep_reads.await;
         }
 
         // Blocker 2: rehydrate this node's local journal from the durable generations table —
@@ -2445,6 +2451,10 @@ impl RedbStateMachine {
                 }
                 match engine.apply_config(desired).await {
                     Ok(report) => {
+                        // Read before `record_report` reaps the map, because the
+                        // ports this needs are exactly the ones it is about to
+                        // drop (#573 review). See the clear below.
+                        let previously_failed = self.previously_failed_ports();
                         self.record_report(&report, &desired_ports);
                         // The delete-path half of D-5 (#565): the ports the
                         // engine actually removed — `deleted`, never
@@ -2467,11 +2477,29 @@ impl RedbStateMachine {
                         // a port the fleet still wants keeps its state, and one
                         // node's staging failure cannot make it disagree with
                         // its peers about the flows it owns.
+                        //
+                        // Unioned with the ports carrying a recorded apply
+                        // failure, for the other half of that filter (#573
+                        // review): a port whose re-create was refused has left
+                        // the engine's map, so when the operator then *deletes*
+                        // it, `apply_config` computes `removed_ports` from a
+                        // map that no longer names it, reports nothing deleted,
+                        // and the state the filter above deliberately kept
+                        // would survive for the life of the process — the #565
+                        // bug, reached through a failed edit. `record_report`
+                        // reaps its own stale entries for exactly this reason
+                        // ("a bind-failed port that is later deleted keeps its
+                        // stale entry forever"); the flow state has to leave
+                        // with them. The `desired_ports` filter still gates
+                        // both halves, so a port that is merely failing stays
+                        // untouched — only one the applied set has stopped
+                        // naming is cleared.
                         self.clear_imposter_state(
                             report
                                 .deleted
                                 .iter()
                                 .copied()
+                                .chain(previously_failed)
                                 .filter(|port| !desired_ports.contains(port)),
                         )
                         .await;
@@ -2602,8 +2630,8 @@ impl RedbStateMachine {
     }
 
     /// The reconcile-time half of #565: drop the imposter-scoped namespaces
-    /// this node's shard holds for ports outside `desired_ports` — the ports
-    /// `sm_configs` names, read *after* [`Self::reconcile_engine`]'s sync.
+    /// this node's shard holds for ports `sm_configs` no longer names, both
+    /// sets read *after* [`Self::reconcile_engine`]'s sync.
     ///
     /// The live path clears from the engine's `deleted` report, which needs the
     /// engine to have *had* the imposter. On a cold start it did not: the engine
@@ -2625,6 +2653,19 @@ impl RedbStateMachine {
     /// writes `sm_configs` before it drives the engine, so a port the fleet
     /// committed before this read is in the set.
     ///
+    /// **The held set is read first and the desired set second — that order,
+    /// not the other one (#573 review).** Neither read is instantaneous (one
+    /// clones every key in the shard, the other walks the whole config table)
+    /// and the apply loop is running between them, so one of the two is
+    /// necessarily the older observation. Held-then-desired makes the older
+    /// one the *accusation*: every port judged here was held at the earlier
+    /// instant and is acquitted by a strictly fresher `sm_configs`. The
+    /// reverse order re-opens #567 in miniature — an apply committing
+    /// `PutImposter{P}` between the reads writes `sm_configs` before it drives
+    /// the engine, so P is durably applied and served fleet-wide, this node is
+    /// an HRW owner throughout, and a desired set read before that commit
+    /// would convict a live imposter on a held set read after it.
+    ///
     /// The tables, not the engine's `list_imposters`, deliberately: the two
     /// differ exactly on the ports the engine could not stage — a bind failure,
     /// a config `create_imposter_staged` refuses — and those are ports the fleet
@@ -2638,32 +2679,65 @@ impl RedbStateMachine {
     /// this shard before this node applies that entry; sweeping then would drop
     /// that copy, which nothing repairs until takeover.
     ///
-    /// The residual, stated as it is. The ring is Raft membership, so a
-    /// restarted voter is an HRW owner the whole time it is catching up, and
-    /// `flow_net.bind` runs in `compose` long before `spawn_reconciler`: a flow
-    /// written for an imposter this node has not yet applied *can* land in this
-    /// shard as the authoritative copy, not merely a replica, and if it lands
-    /// before this read it is dropped. Readiness does not gate that; what bounds
-    /// it is that `compose` reconciles only once `last_applied` has reached the
-    /// leader's applied index, so the exposure is the entries committed during
-    /// one apply round-trip — not the seconds a pre-sync snapshot spanned.
-    async fn sweep_orphaned_imposter_state(&self, desired_ports: &BTreeSet<u16>) {
+    /// The residual, stated as it is, and it is exactly one thing: a flow that
+    /// lands for an imposter this node has **not yet applied**, before the
+    /// desired-set read below. The ring is Raft membership, so a restarted
+    /// voter is an HRW owner the whole time it is catching up, and
+    /// `flow_net.bind` runs in `compose` long before `spawn_reconciler`: such a
+    /// flow *can* land in this shard as the authoritative copy, not merely a
+    /// replica, and it is then held with no config to acquit it. Readiness does
+    /// not gate that; what bounds it is that `compose` reconciles only once
+    /// `last_applied` has reached the leader's applied index, so the exposure is
+    /// the entries committed during one apply round-trip — not the seconds a
+    /// pre-sync snapshot spanned. Nothing else remains: with the read order
+    /// above, an imposter this node *has* applied by the desired-set read is in
+    /// that set and is kept, whenever its flow arrived.
+    #[allow(clippy::result_large_err)]
+    async fn sweep_orphaned_imposter_state(
+        &self,
+        between_sweep_reads: impl Future<Output = ()>,
+    ) -> StorageResult<()> {
         let Some(flow_net) = &self.flow_net else {
-            return;
+            between_sweep_reads.await;
+            return Ok(());
         };
-        let orphaned: Vec<u16> = flow_net
-            .imposter_ports_held()
+        // The accusation, read first — see the read-order paragraph above.
+        let held = flow_net.imposter_ports_held();
+        between_sweep_reads.await;
+        if held.is_empty() {
+            return Ok(());
+        }
+        // The acquittal, read second, and therefore never staler than the set
+        // it is judging.
+        let desired_ports: BTreeSet<u16> = self.configured_ports()?.into_iter().collect();
+        let orphaned: Vec<u16> = held
             .into_iter()
             .filter(|port| !desired_ports.contains(port))
             .collect();
         if orphaned.is_empty() {
-            return;
+            return Ok(());
         }
         tracing::info!(
             ports = ?orphaned,
             "reconcile found flow state for imposters that no longer exist; dropping it"
         );
         self.clear_imposter_state(orphaned).await;
+        Ok(())
+    }
+
+    /// The ports carrying an apply failure recorded *before* the report now
+    /// being folded in — the second half of the live clear's port set (#573
+    /// review), read while [`Self::record_report`] has not yet reaped them.
+    ///
+    /// Port `0` is excluded: it is the set-level slot (a whole `apply_config`
+    /// the engine refused), not a port, and there is no `i0:` namespace.
+    fn previously_failed_ports(&self) -> Vec<u16> {
+        self.apply_failures
+            .lock()
+            .keys()
+            .copied()
+            .filter(|port| *port != 0)
+            .collect()
     }
 
     /// Fold a successful sync's report into the failure map, under one lock:
@@ -4169,17 +4243,22 @@ mod tests {
         engine.shutdown().await;
     }
 
-    /// #567 review — the sweep's bound. The reconcile reads the config set,
-    /// drives the engine to it (seconds, on a cold start), then sweeps; the
-    /// apply loop keeps running on its own handle the whole time, and this
-    /// node is a ring member throughout. An imposter committed between the
-    /// read and the sweep is alive on every node, and a flow written for it
-    /// can already be in this shard. The sweep must not take that flow: it
-    /// measures the tables as they stand *after* the sync, not the snapshot
-    /// the sync was driven from. The same interleaving on the pre-#567 sweep
-    /// dropped `i18099:checkout`.
+    /// #567 / #573 review — the sweep's bound, pinned at its worst case. The
+    /// reconcile reads the config set, drives the engine to it (seconds, on a
+    /// cold start), then sweeps; the apply loop keeps running on its own handle
+    /// the whole time, and this node is a ring member throughout. An imposter
+    /// committed while that is going on is alive on every node, and a flow
+    /// written for it can already be in this shard. The sweep must not take
+    /// that flow.
+    ///
+    /// The interleaving point is the one that decides it: **between the sweep's
+    /// two reads**, which is where a concurrent apply can be seen by one read
+    /// and not the other. It kills both mutations of this code — reverting the
+    /// desired set to the pre-sync snapshot (#567), and reading the desired set
+    /// before the held set instead of after (#573). Either one drops
+    /// `i18099:checkout`, whose imposter is committed here and served fleet-wide.
     #[tokio::test]
-    async fn reconcile_keeps_flow_state_of_an_imposter_committed_during_its_sync() {
+    async fn reconcile_keeps_flow_state_of_an_imposter_committed_inside_its_sweep() {
         let engine = Arc::new(ImposterManager::new());
         let (_td, mut sm, shard) = fresh_sm_with_flow_net(engine.clone()).await;
         sm.apply(vec![entry(1, put(1, 18098, json!([])))])
@@ -4205,7 +4284,7 @@ mod tests {
         assert_eq!(engine.count(), 2, "both committed imposters are served");
         assert!(
             shard.get("i18099:checkout", "checkout").is_some(),
-            "an imposter committed while the reconcile was syncing is alive; its state stays"
+            "an imposter committed between the sweep's two reads is alive; its state stays"
         );
         assert!(
             shard.get("i18098:checkout", "checkout").is_some(),
@@ -4269,6 +4348,77 @@ mod tests {
         .await
         .expect("apply delete");
         assert!(shard.get("i18101:checkout", "checkout").is_none());
+
+        engine.shutdown().await;
+    }
+
+    /// #573 review — the same failed re-create, with **no repair** before the
+    /// delete. `replace_imposter`'s teardown has already dropped the port from
+    /// the engine's map, so when the operator gives up and deletes it,
+    /// `apply_config` computes its removal set (`map ∖ desired`) from a map
+    /// that no longer names the port: `report.deleted` is empty, and a clear
+    /// filtered on `deleted` alone finds nothing to do. The state the previous
+    /// test deliberately keeps would then outlive the imposter for the life of
+    /// the process, and an identically re-created imposter would meet
+    /// yesterday's scenario — the #565 bug, reached through a failed edit. So
+    /// the clear also names the ports carrying a recorded apply failure. The
+    /// still-desired failing port here is the other half of the claim: the
+    /// union is gated by the same desired-set filter, so a port that is merely
+    /// failing keeps everything.
+    #[tokio::test]
+    async fn a_delete_after_a_failed_re_create_still_drops_the_flow_state() {
+        let engine = Arc::new(ImposterManager::new());
+        let (_td, mut sm, shard) = fresh_sm_with_flow_net(engine.clone()).await;
+        sm.apply(vec![
+            entry(1, put(1, 18104, json!([]))),
+            entry(2, put(2, 18105, json!([]))),
+        ])
+        .await
+        .expect("apply puts");
+        for flow in ["i18104:checkout", "i18105:checkout", "f:checkout"] {
+            seed_flow(&shard, flow).await;
+        }
+
+        // Both ports take an edit the engine accepts into the desired set and
+        // then refuses at staging: each leaves the engine's map and each lands
+        // in `apply_failures`, with its flow state kept (the filter above).
+        sm.apply(vec![
+            entry(3, put_unstageable(3, 18104)),
+            entry(4, put_unstageable(4, 18105)),
+        ])
+        .await
+        .expect("apply the unstageable edits");
+        assert_eq!(engine.count(), 0, "the engine serves neither port");
+        assert_eq!(
+            sm.apply_failures().keys().copied().collect::<Vec<_>>(),
+            vec![18104, 18105],
+            "both edits are recorded apply failures"
+        );
+        assert!(shard.get("i18104:checkout", "checkout").is_some());
+        assert!(shard.get("i18105:checkout", "checkout").is_some());
+
+        // The operator gives up on 18104 and deletes it. The engine has nothing
+        // to remove, so this reports no deletion at all.
+        sm.apply(vec![entry(
+            5,
+            request(5, ControlOp::DeleteImposter { port: 18104 }),
+        )])
+        .await
+        .expect("apply delete");
+
+        assert!(
+            shard.get("i18104:checkout", "checkout").is_none(),
+            "a deleted port loses its flow state even though the failed edit had \
+             already taken it out of the engine's map"
+        );
+        assert!(
+            shard.get("i18105:checkout", "checkout").is_some(),
+            "a port the config set still names keeps its state, failing or not"
+        );
+        assert!(
+            shard.get("f:checkout", "checkout").is_some(),
+            "the fleet namespace names no port and is never cleared"
+        );
 
         engine.shutdown().await;
     }
