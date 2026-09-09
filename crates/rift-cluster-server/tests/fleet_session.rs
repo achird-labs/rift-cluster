@@ -670,6 +670,93 @@ async fn deleting_a_session_clears_the_cookie() {
     server.shutdown().await;
 }
 
+/// `PUT /admin/fleet/name` over the wire (issue #373): the terminated handler parses the body it
+/// documents, commits `FleetNamePut`, answers `200`, and the name reads back from the node's
+/// applied state. The unit tests either side prove the pieces; nothing else drives the route.
+#[tokio::test]
+async fn put_fleet_name_round_trips_through_the_route() {
+    let state = TempDir::new().expect("tempdir");
+    let server = compose::start(cluster_cli(&state, &[]))
+        .await
+        .expect("solo cluster starts");
+    wait_ready(&server).await;
+    let node = server.node().expect("clustered");
+    let admin = server.admin_addr().to_string();
+    let client = reqwest::Client::new();
+
+    for name in ["rift-prod-eu", "rift-prod-eu (blue)"] {
+        let seen = Seen::of(
+            client
+                .put(format!("http://{admin}/admin/fleet/name"))
+                .header("authorization", API_KEY)
+                .json(&serde_json::json!({ "name": name }))
+                .send()
+                .await
+                .expect("put fleet name"),
+        )
+        .await;
+        assert_eq!(seen.status, 200, "{seen}");
+        assert_eq!(
+            node.fleet_name().expect("fleet name reads").as_deref(),
+            Some(name),
+            "the committed name must be readable from applied state"
+        );
+    }
+
+    server.shutdown().await;
+}
+
+/// A malformed `PUT /admin/fleet/name` body is a `4xx` and commits nothing — not JSON, the
+/// wrong type, a missing field, and the two values `ControlOp::validate` refuses (blank, and over
+/// `MAX_FLEET_NAME_CHARS`).
+#[tokio::test]
+async fn put_fleet_name_refuses_a_malformed_body_without_committing() {
+    let state = TempDir::new().expect("tempdir");
+    let server = compose::start(cluster_cli(&state, &[]))
+        .await
+        .expect("solo cluster starts");
+    wait_ready(&server).await;
+    let node = server.node().expect("clustered");
+    let admin = server.admin_addr().to_string();
+    let client = reqwest::Client::new();
+
+    let too_long = "n".repeat(rift_cluster::control::MAX_FLEET_NAME_CHARS + 1);
+    let bodies: [(&str, String); 5] = [
+        ("not JSON", "this is not json".to_owned()),
+        ("wrong type", serde_json::json!({ "name": 5 }).to_string()),
+        ("missing field", serde_json::json!({}).to_string()),
+        ("blank", serde_json::json!({ "name": "   " }).to_string()),
+        (
+            "too long",
+            serde_json::json!({ "name": too_long }).to_string(),
+        ),
+    ];
+    for (label, body) in bodies {
+        let seen = Seen::of(
+            client
+                .put(format!("http://{admin}/admin/fleet/name"))
+                .header("authorization", API_KEY)
+                .header("content-type", "application/json")
+                .body(body)
+                .send()
+                .await
+                .expect("put fleet name"),
+        )
+        .await;
+        assert!(
+            (400..500).contains(&seen.status),
+            "a {label} body must be a 4xx: {seen}"
+        );
+        assert_eq!(
+            node.fleet_name().expect("fleet name reads"),
+            None,
+            "a refused {label} body must not have committed a name"
+        );
+    }
+
+    server.shutdown().await;
+}
+
 /// **The one credential mints a session, and the cookie alone reads every node** (#550, D-73).
 ///
 /// This is the test the proxy leg needs. `admin_front` authenticates a cookie itself, then hands
@@ -685,6 +772,10 @@ async fn deleting_a_session_clears_the_cookie() {
 /// differently. Two nodes, and the login happens on exactly one of them: the signing key is
 /// replicated state, so a cookie minted on the founder must verify on the joiner with no second
 /// login and no shared process state beyond the Raft log.
+///
+/// The same two nodes then pin rotation: a `SessionKeyPut` committed through the founder kills
+/// the cookie on the joiner too. `rotating_the_signing_key_invalidates_every_session` proves the
+/// mechanism solo; this is the only test in which "every session" spans a second node.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_api_key_mints_a_session_and_the_cookie_is_accepted_on_every_node() {
     let founder_state = TempDir::new().expect("tempdir");
@@ -781,6 +872,43 @@ async fn the_api_key_mints_a_session_and_the_cookie_is_accepted_on_every_node() 
             seen.status, 200,
             "the cookie must read the listing on {admin}: {seen}"
         );
+    }
+
+    // Rotation is the only revocation D-73 leaves, and it has to reach every node: a cookie that
+    // dies on the founder but keeps reading the joiner is a session that was never revoked. There
+    // is no rotation endpoint by design, so this goes through the founder's control plane the way
+    // an operator tool would, and the cookie is then watched die on both nodes.
+    seed(
+        founder.node().expect("clustered"),
+        0x5e55_10f0,
+        ControlOp::SessionKeyPut {
+            key: "f".repeat(64),
+        },
+    )
+    .await;
+    for admin in [&founder_admin, &joiner_admin] {
+        // The joiner applies the rotation through the log, which is not instantaneous — so the
+        // answer waited for is the refusal, and a `200` is what must stop appearing.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let seen = Seen::of(
+                client
+                    .get(format!("http://{admin}/imposters/{port}"))
+                    .header("cookie", &cookie)
+                    .send()
+                    .await
+                    .expect("read after rotation"),
+            )
+            .await;
+            if seen.status == 401 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{admin} still accepts a cookie minted under the rotated-out signing key: {seen}"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
     }
 
     joiner.shutdown().await;

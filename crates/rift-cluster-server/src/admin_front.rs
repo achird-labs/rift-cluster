@@ -5989,6 +5989,51 @@ mod tests {
         );
     }
 
+    /// Pins D-73's fleet-scope prefix agreement. The listing enumerates whatever prefix
+    /// `imposter_scope` resolves, and a `fleet`-scoped imposter's rows live under `f:` — so the
+    /// store and `terminate_spaces_list` must agree on that prefix or the listing scans
+    /// `i<port>:` and reports a populated namespace as empty.
+    /// `spaces_list_for_a_fleet_scoped_imposter_is_served` runs on an unbound `FlowNet` and
+    /// asserts `spaces == []`, which the wrong prefix also produces; this is the test that goes
+    /// red when the two disagree.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn spaces_list_for_a_fleet_scoped_imposter_finds_the_rows_the_store_wrote() {
+        use rift_cluster_base::seams::FlowStoreProvider as _;
+
+        let (front, node, net, _dir) = test_front_with_bound_flow().await;
+        seed_imposter(&node, 4546, serde_json::json!({ "contextScope": "fleet" })).await;
+
+        let config: ImposterConfig = serde_json::from_value(serde_json::json!({
+            "port": 4546,
+            "protocol": "http",
+            "_rift": { "flowState": { "contextScope": "fleet" } },
+        }))
+        .expect("config parses");
+        let store = rift_cluster::stores::ClusteredFlowStoreProvider::new(Arc::clone(&net))
+            .provide(&config)
+            .expect("the clustered provider always provides");
+        tokio::task::spawn_blocking(move || {
+            store.set("checkout", "step", serde_json::json!("paid"))
+        })
+        .await
+        .expect("blocking op")
+        .expect("write through the owner");
+
+        let (status, body) = read_spaces(&front, 4546).await;
+
+        assert_eq!(status, 200, "body: {body}");
+        let doc: serde_json::Value = serde_json::from_str(&body).expect("json body");
+        assert!(doc.get("unavailable").is_none(), "{body}");
+        let rows = doc["spaces"].as_array().expect("a spaces array");
+        assert_eq!(
+            rows.len(),
+            1,
+            "the row the fleet-scoped store wrote must be found under the fleet prefix: {body}"
+        );
+        assert_eq!(rows[0]["space"], "checkout", "{body}");
+        assert_eq!(rows[0]["entryCount"], 1, "{body}");
+    }
+
     /// Issue #224: `?match=` must keep `terminate`'s scoped-vs-unscoped dispatch on the
     /// pure-proxy path (`terminate_clear_saved_requests`), never `build_and_run`/
     /// `build_mutation`'s Raft-committing one — so a scoped clear never becomes a `ControlOp`.
