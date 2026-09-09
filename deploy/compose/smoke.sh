@@ -24,11 +24,8 @@
 # and must not be able to fail CI for an unrelated reason.
 set -uo pipefail
 
-cd "$(dirname "$0")"
-export RIFT_SMOKE_KEY="${RIFT_SMOKE_KEY:-rift-smoke-key}"
-K="$RIFT_SMOKE_KEY"
-COMPOSE=(docker compose -f docker-compose.yml -f smoke.overlay.yml)
-
+# Before the `cd`, deliberately: `--help` reads this file back through `$0`, and
+# after changing directory a relatively-invoked `$0` names nothing.
 BUILD=1; KEEP=0; ATTACH=0
 for arg in "$@"; do
   case "$arg" in
@@ -39,6 +36,19 @@ for arg in "$@"; do
     *) echo "unknown flag: $arg" >&2; exit 2 ;;
   esac
 done
+
+# Roughly half the assertions below read JSON through `jq`. Without it they all
+# compare against the empty string and fail, and a run with no jq installed looks
+# exactly like a fleet that replicates nothing — the most misleading failure this
+# script has. `set -e` is deliberately off here (see `eq`), so this is a hard
+# exit rather than a first failing command. After argument parsing, so `--help`
+# works on a machine without jq.
+command -v jq >/dev/null || { echo "smoke.sh requires jq" >&2; exit 2; }
+
+cd "$(dirname "$0")"
+export RIFT_SMOKE_KEY="${RIFT_SMOKE_KEY:-rift-smoke-key}"
+K="$RIFT_SMOKE_KEY"
+COMPOSE=(docker compose -f docker-compose.yml -f smoke.overlay.yml)
 
 # Node n: admin 2525, probes 2526, router 2527, each published as n<port>.
 admin()  { echo "http://127.0.0.1:${1}2525"; }

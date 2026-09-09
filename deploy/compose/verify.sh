@@ -1,13 +1,39 @@
 #!/usr/bin/env bash
 # Stand the compose cluster up and assert it actually forms, then tear it down.
 #
-#     deploy/compose/verify.sh
+#     deploy/compose/verify.sh              # build the image, start 3 nodes, assert
+#     deploy/compose/verify.sh --no-build   # reuse an image already in the docker store
 #
 # This is the check that the manifests in this directory *work*, as opposed to
 # merely parsing. It is deliberately a script rather than a test in the Rust
 # suite: it needs a container runtime, so it cannot run in the workspace's
 # `cargo test` and must not be able to fail CI for an unrelated reason.
+#
+# CI runs it in the `compose-smoke` job (`.github/workflows/ci.yml`), which is
+# what stops this file rotting: it went one whole release cycle with no invoker
+# at all after the lane that used to run it was retired, and nothing noticed
+# because a script nobody runs cannot go red. `--no-build` exists for that lane —
+# `cluster-smoke-prepare` has already built the image once (D-58) and a rebuild
+# there would cost the ten minutes that job exists to pay only once.
 set -euo pipefail
+
+# Before the `cd` below, deliberately: `--help` reads this file back through
+# `$0`, and after changing directory a relatively-invoked `$0` no longer names
+# anything. `smoke.sh` parses in the same order, for the same reason.
+BUILD=1
+for arg in "$@"; do
+  case "$arg" in
+    --no-build) BUILD=0 ;;
+    -h|--help)  sed -n '2,5p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) echo "unknown flag: $arg" >&2; exit 2 ;;
+  esac
+done
+
+# Every assertion below reads `/_fleet/members` through `jq`. Without it every
+# read yields the empty string, every comparison fails, and the script reports a
+# broken cluster — a diagnosis that would send the reader after the wrong thing.
+# After argument parsing, so `--help` works on a machine without jq.
+command -v jq >/dev/null || { echo "verify.sh requires jq" >&2; exit 2; }
 
 cd "$(dirname "$0")"
 COMPOSE=(docker compose -f docker-compose.yml)
@@ -22,8 +48,13 @@ trap cleanup EXIT
 # host that has the checkout, the build does not.
 RIFT_UPSTREAM_VERSION="$(git -C ../../vendor/rift describe --tags --always 2>/dev/null || echo unknown)"
 export RIFT_UPSTREAM_VERSION
-echo "--- building and starting 3 nodes (upstream pin: ${RIFT_UPSTREAM_VERSION}) ---"
-"${COMPOSE[@]}" up -d --build
+if [ "$BUILD" -eq 1 ]; then
+  echo "--- building and starting 3 nodes (upstream pin: ${RIFT_UPSTREAM_VERSION}) ---"
+  "${COMPOSE[@]}" up -d --build
+else
+  echo "--- starting 3 nodes on the image already in the store ---"
+  "${COMPOSE[@]}" up -d --no-build
+fi
 
 # Readiness, not liveness: a node answers /healthz long before it has joined,
 # so waiting on that would prove nothing about the cluster forming.
@@ -61,18 +92,43 @@ echo "PASS: 3/3 ready"
 # the script before the retry loop could retry. An empty read is not mistaken
 # for success — it fails the comparison and the loop goes round again.
 members() { curl -fsS --max-time 5 "http://127.0.0.1:${1}/_fleet/members" 2>/dev/null; }
+ADMIN_PORTS=(12525 22525 32525)
+
+# One node's whole answer as `voters|leaders|reachable`, or the empty string when
+# it could not be read. Three facts from one request rather than three, so the
+# node cannot be observed mid-change between them.
+#
+# `.members[] | select(.is_leader)` counted, not `.current_leader` tested: a fleet
+# where two members each believe they lead is a split brain that a non-null
+# leader id reads straight past. These are the shapes `smoke.sh` asserts at its
+# `== cluster ==` section, deliberately identical so the two files cannot drift
+# into checking different things.
+fleet_shape() {
+  members "$1" | jq -r '
+      "\(.voters | length)"
+      + "|\([.members[] | select(.is_leader)] | length)"
+      + "|\([.members[] | select(.reachable)] | length)"
+    ' 2>/dev/null || true
+}
+
 echo "--- asserting the three agree on one cluster ---"
-voters=""
+shapes=""
 for _ in $(seq 1 20); do
-  voters="$(members 12525 | jq -r '.voters | length' 2>/dev/null || true)"
-  [ "$voters" = "3" ] && break
+  shapes=""
+  for port in "${ADMIN_PORTS[@]}"; do
+    shape="$(fleet_shape "$port")"; shapes="${shapes}${shapes:+ }${shape:-?|?|?}"
+  done
+  [ "$shapes" = "3|1|3 3|1|3 3|1|3" ] && break
   sleep 2
 done
-echo "rift-1 reports voters=${voters:-<none>}"
-if [ "$voters" = "3" ]; then
-  echo "PASS: single 3-voter cluster"
+echo "voters|leaders|reachable, per node: ${shapes:-<none>}"
+if [ "$shapes" = "3|1|3 3|1|3 3|1|3" ]; then
+  echo "PASS: every node sees 3 voters, exactly one leader and 3 reachable members"
 else
-  echo "FAIL: expected 3 voters, got '${voters:-<none>}'"
+  echo "FAIL: expected '3|1|3 3|1|3 3|1|3' (voters|leaders|reachable per node),"
+  echo "      got '${shapes:-<none>}'"
+  echo "      a '?|?|?' is a node that could not be read at all; a '0' in the"
+  echo "      middle column is a fleet still electing, a '2' is a split brain"
   "${COMPOSE[@]}" logs --tail=40
   exit 1
 fi
@@ -161,7 +217,11 @@ case "$banner" in
   *"cluster"*) ;;
   *) echo "FAIL: --version does not name the edition"; exit 1 ;;
 esac
-if [ "$RIFT_UPSTREAM_VERSION" != "unknown" ]; then
+# Only when this run built the image. Under `--no-build` the bytes came from
+# somewhere else — in CI, from `cluster-smoke-prepare`, which deliberately does
+# not pass `RIFT_UPSTREAM_VERSION` — so the pin read out of the checkout above is
+# not a claim this script has any basis to make about the image it just started.
+if [ "$BUILD" -eq 1 ] && [ "$RIFT_UPSTREAM_VERSION" != "unknown" ]; then
   case "$banner" in
     *"$RIFT_UPSTREAM_VERSION"*) echo "PASS: image reports upstream ${RIFT_UPSTREAM_VERSION}" ;;
     *) echo "FAIL: image did not report upstream pin ${RIFT_UPSTREAM_VERSION}"; exit 1 ;;

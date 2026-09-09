@@ -237,6 +237,15 @@ true|cluster-smoke|crates/rift-cluster/src/lib.rs
 true|cluster-smoke|crates/rift-cluster-server/src/main.rs
 true|cluster-smoke|deploy/compose/docker-compose.yml
 true|cluster-smoke|tests/cluster-chaos/src/lib.rs
+# `deploy/` also gates the `compose-smoke` job, which rides this verdict rather
+# than declaring a second watched set (see the job's comment in ci.yml). These
+# three are that lane's own inputs — the two scripts it runs and the document
+# that describes them — so they are pinned separately from the manifest above: a
+# narrowing of the `deploy/` prefix would leave the lane skipped on exactly the
+# changes it exists to check, and every case would still be green without them.
+true|cluster-smoke|deploy/compose/verify.sh
+true|cluster-smoke|deploy/compose/smoke.sh
+true|cluster-smoke|deploy/README.md
 # One watched path is enough, however much unwatched noise rides along.
 true|cluster-smoke|README.md docs/adr/ADR-001-raft-control-plane.md vendor/rift
 # Pins the whole-line boundary: a sibling directory is NOT the submodule.

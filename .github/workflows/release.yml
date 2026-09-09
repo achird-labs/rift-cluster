@@ -594,8 +594,10 @@ jobs:
       # The quick start in `deploy/README.md`, run as written (#269). The step
       # above proves one published container serves a console; this proves the
       # *documented* three-node file actually forms a cluster on the tag that was
-      # just pushed — readiness on all three, exactly one leader read from
-      # `rift_cluster_members`, and the console on every node.
+      # just pushed — readiness on all three; three voters, exactly one member
+      # claiming leadership and three reachable members, read from
+      # `GET /_fleet/members` on every node (the `rift_cluster_members` gauges this
+      # used to sum were retired by D-71, #548); and the console on every node.
       #
       # It has to live here and nowhere else. `cluster.yml` names a published
       # image, so no PR lane can run it: before this job the tag does not exist.

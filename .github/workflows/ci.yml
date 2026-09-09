@@ -616,6 +616,115 @@ jobs:
             --prepare '${{ needs.cluster-smoke-prepare.result }}' \
             --shards '${{ needs.cluster-smoke-shard.result }}'
 
+  # The invoker for `deploy/compose/verify.sh` and `deploy/compose/smoke.sh`.
+  #
+  # Those two scripts are how the shipped manifests are known to work — verify.sh
+  # that the cluster *forms*, smoke.sh (RFC-007 §5) that it *works*: replication,
+  # routing, catch-up, failover, join/leave, flow state. Both spent a release
+  # cycle with no CI lane at all: the job that ran verify.sh was retired with the
+  # observability pack (#562), and the guard test that pinned the invoker was
+  # deleted in the same commit. A script nobody runs cannot go red, so the whole
+  # deploy/ surface was verified only by whoever remembered to run it by hand.
+  # `the_compose_verification_scripts_have_a_ci_invoker` in the chaos suite is
+  # what makes deleting this job fail rather than pass quietly.
+  #
+  # **Not a required check**, deliberately: it stands two real fleets up and is
+  # subject to every container-runtime flake `cluster-smoke` is, without the
+  # sharding that keeps that one's wall clock bearable. `.github/rulesets/
+  # master.json` is untouched. Its value is that a broken manifest is red on the
+  # PR that broke it, not that it can block a merge.
+  #
+  # It rides `cluster-smoke-prepare`'s filter verdict rather than declaring a
+  # narrower `deploy/`-only one. `deploy/` is already inside that job's watched
+  # set (see the case table in `scripts/cluster-smoke-paths.sh`), so reusing it
+  # can only over-run, never skip a deploy change — and a second watched set
+  # would be a second thing to keep honest for no coverage gained. Riding it is
+  # also what makes the image below exist: `prepare` builds and uploads it only
+  # when its own filter says run.
+  compose-smoke:
+    needs: cluster-smoke-prepare
+    if: needs.cluster-smoke-prepare.outputs.run == 'true'
+    runs-on: ubuntu-latest
+    # Two full fleets, the second one restarting nodes and adding a fourth.
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # verify.sh reads the upstream pin out of the submodule; smoke.sh does
+          # the same for its startup banner.
+          submodules: recursive
+
+      # Same hazard and same fix as `cluster-smoke-shard`'s identical step — see
+      # the reasoning there. The set is this lane's own, and it is a superset of
+      # the shards': `docker-compose.yml` publishes 39090 and
+      # `smoke.overlay.yml` publishes rift-4's 42525-42527, all four inside
+      # Linux's ephemeral range. Reserving the chaos tier's ports here as well
+      # costs nothing and is what lets
+      # `ci_reserves_every_published_port_that_linux_could_hand_out` hold over
+      # every reservation in this file rather than having to know which job it is
+      # looking at.
+      - name: Reserve the compose fleets' published ports from the ephemeral range
+        run: |
+          set -euo pipefail
+          sudo sysctl -w net.ipv4.ip_local_reserved_ports=34790,36300,36400,36700,39090,42525-42527,45251-45253,45261-45263,46525,48474,49901
+          # Assert the read-back rather than echoing it: `sysctl <key>` exits 0
+          # whatever the value is.
+          test "$(sysctl -n net.ipv4.ip_local_reserved_ports)" = "34790,36300,36400,36700,39090,42525-42527,45251-45253,45261-45263,46525,48474,49901"
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: chaos-images
+          path: ${{ runner.temp }}
+
+      # The image `cluster-smoke-prepare` built, so this lane pays nothing for it
+      # (D-58, D-60, D-64). `rift-cluster-server:local` is the tag the compose
+      # file's `x-node` anchor defaults to, so nothing has to be pointed at it —
+      # `RIFT_CLUSTER_IMAGE` is named below anyway so the coupling is visible
+      # here rather than only in the manifest.
+      - name: Load the prepared image
+        run: |
+          set -euo pipefail
+          gunzip -c "${RUNNER_TEMP}/chaos-images.tar.gz" | docker load
+          # Read back, for the reason the prepare job's own assertion gives: a
+          # missing image would otherwise surface as compose trying to pull a tag
+          # that has only ever existed on a runner's disk.
+          docker image inspect rift-cluster-server:local >/dev/null
+
+      # `--no-build`: the image is already here, and a compose `--build` on this
+      # runner has no layer cache behind it, so it would rebuild from cold — the
+      # ten minutes D-58 exists to spend once.
+      - name: The manifests form a cluster (verify.sh)
+        env:
+          RIFT_CLUSTER_IMAGE: rift-cluster-server:local
+        run: deploy/compose/verify.sh --no-build
+
+      # The core smoke check (RFC-007 §5). It layers `smoke.overlay.yml` on the
+      # same base file for the admin key, the router listener and the fourth node
+      # behind the `join` profile. `RIFT_SMOKE_KEY` is left at its default: the
+      # key's value proves nothing here, only that the same one is accepted on
+      # every node.
+      #
+      # `--keep` so the fleet is still there for the log dump below. Without it
+      # the teardown trap runs first and a failed assertion is diagnosable only
+      # from the one line `eq` printed: smoke.sh tallies failures and exits at the
+      # end rather than aborting, so unlike verify.sh it dumps no logs of its own
+      # for anything past the readiness wait. Nothing has to clean up after —
+      # the runner is discarded, and this is the last step that touches docker.
+      - name: The core promises hold on a real fleet (smoke.sh)
+        env:
+          RIFT_CLUSTER_IMAGE: rift-cluster-server:local
+        run: deploy/compose/smoke.sh --no-build --keep
+
+      # Only the smoke fleet can still be up here: verify.sh tears its own down on
+      # every exit, and prints its own `logs --tail=40` on the two failures that
+      # end it early. `|| true` because a verify.sh failure leaves nothing to ask.
+      - name: Cluster logs on failure
+        if: failure()
+        run: |
+          docker compose -f deploy/compose/docker-compose.yml \
+                         -f deploy/compose/smoke.overlay.yml \
+                         --profile join logs --tail=100 || true
+
   # Parity (issue #37): upstream's own behavioural suites, run against
   # `rift-cluster-server` with `--cluster` off. This is what turns "composition,
   # not a fork: `--cluster` off is byte-identical to rift" from an assertion

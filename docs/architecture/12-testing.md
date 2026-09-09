@@ -39,6 +39,21 @@ nightly soak (`nightly-chaos.yml`) iterates each scenario 60–100× under a 2 h
 cap. Both cadences are deliberate deviations from RFC-001 §12's 3×/100× bars,
 recorded with their reasoning in the harness README.
 
+Beside the tier, on the same path filter and the same prebuilt image, the
+**`compose-smoke`** lane runs the two scripts that verify the *shipped*
+manifests: `deploy/compose/verify.sh` (the cluster forms) and
+`deploy/compose/smoke.sh` (it works — RFC-007 §5: replication, routing,
+catch-up, failover, join/leave, flow state). Neither can be a `cargo test`,
+because both need a container runtime; the cost of that is the failure mode a
+script has and a test does not, which is having no invoker at all and therefore
+never being able to go red. That is exactly what happened when #562 retired the
+lane and deleted the guard test pinning it in one commit, so the lane is itself
+pinned — `the_compose_verification_scripts_have_a_ci_invoker` reads `ci.yml` and
+fails if the job or either invocation goes. It is not a required check: two real
+fleets carry every runtime flake `cluster-smoke` does without the sharding that
+makes that one's wall clock bearable, and its job is to be red on the PR that
+broke a manifest, not to block a merge.
+
 ## Phase exit criteria (functional)
 
 Phase 1 — membership + config-sync (the write path of Chapter 4):

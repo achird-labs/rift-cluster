@@ -18,6 +18,13 @@
 # window where nothing else looks at it.
 set -euo pipefail
 
+# The full run reads `/_fleet/members` through `jq`. Without it every read is the
+# empty string, every comparison fails, and the release lane would report a
+# broken published image rather than a missing tool. `--check` does not need it,
+# but the preflight is unconditional on purpose: a mode-dependent prerequisite is
+# one a reader discovers by hitting it.
+command -v jq >/dev/null || { echo "verify-pulled.sh requires jq" >&2; exit 2; }
+
 cd "$(dirname "$0")"
 
 PULLED="cluster.yml"
@@ -276,15 +283,37 @@ run_stack() {
   # diagnostic below. An empty read is not mistaken for success — it fails the
   # comparison and the loop goes round again.
   members() { curl -fsS --max-time 5 "http://127.0.0.1:${1}/_fleet/members" 2>/dev/null; }
-  echo "--- asserting one cluster of three voters ---"
-  voters=""
+
+  # One node's whole answer as `voters|leaders|reachable`, read from every node
+  # rather than from rift-1 alone: a fleet where only the node being asked has
+  # the full picture is exactly the half-formed state this check exists to catch,
+  # and asking one node cannot tell it from a healthy one.
+  #
+  # `.members[] | select(.is_leader)` counted, not `.current_leader` tested — two
+  # members each believing they lead is a split brain that a non-null leader id
+  # reads straight past. Same three shapes `verify.sh` and `smoke.sh` assert, so
+  # the three files cannot drift into checking different things.
+  fleet_shape() {
+    members "$1" | jq -r '
+        "\(.voters | length)"
+        + "|\([.members[] | select(.is_leader)] | length)"
+        + "|\([.members[] | select(.reachable)] | length)"
+      ' 2>/dev/null || true
+  }
+
+  echo "--- asserting one cluster of three voters, one leader, three reachable ---"
+  shapes=""
   for _ in $(seq 1 20); do
-    voters="$(members 12525 | jq -r '.voters | length' 2>/dev/null || true)"
-    [ "$voters" = "3" ] && break
+    shapes=""
+    for port in 12525 22525 32525; do
+      shape="$(fleet_shape "$port")"; shapes="${shapes}${shapes:+ }${shape:-?|?|?}"
+    done
+    [ "$shapes" = "3|1|3 3|1|3 3|1|3" ] && break
     sleep 2
   done
-  [ "$voters" = "3" ] || fail "expected 3 voters, got '${voters:-<none>}'"
-  echo "PASS: single 3-voter cluster"
+  [ "$shapes" = "3|1|3 3|1|3 3|1|3" ] ||
+    fail "expected '3|1|3 3|1|3 3|1|3' (voters|leaders|reachable per node), got '${shapes:-<none>}'"
+  echo "PASS: single 3-voter cluster, one leader, three reachable, on every node"
 
   echo "--- asserting every node names the same leader ---"
   agreed=""
