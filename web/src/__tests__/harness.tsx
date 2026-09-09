@@ -34,6 +34,13 @@ export type Reply = ({ json: unknown; status?: number } | { status: number; json
  * URL (the server-cursor tests) can still model that exact string and have it win over the fallback.
  * The failure-on-unmatched-path behaviour is unchanged: a path that matches neither is still a hard
  * failure, not a silent 404.
+ *
+ * A key may also be written `"<METHOD> <path>"`, and that form wins over the bare path. `/imposters`
+ * is both the listing and the create, and until a test could say which it meant, one modelling the
+ * create had to either break the listing or key its reply under a path the console never asks for —
+ * `"/imposters "`, with a trailing space, which silently matched nothing and let the create fall
+ * through to whatever the listing answered. A `202` create or a refusing one cannot be modelled at
+ * all that way.
  */
 /** One call as it was actually sent, for tests that assert on the verb or the payload. */
 export type SentRequest = {
@@ -53,16 +60,22 @@ export function stubFetch(routes: Record<string, Reply>): {
     "fetch",
     vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
       const path = typeof input === "string" ? input : input.toString();
+      const method = init?.method ?? "GET";
       calls.push(path);
       requests.push({
         path,
-        method: init?.method ?? "GET",
+        method,
         body: init?.body,
         // Normalised to a plain record so a test can assert on `If-Match` without caring whether
         // the caller passed a `Headers`, an array of pairs, or an object literal.
         headers: Object.fromEntries(new Headers(init?.headers).entries()),
       });
-      const reply = routes[path] ?? routes[path.split("?")[0] ?? path];
+      const base = path.split("?")[0] ?? path;
+      const reply =
+        routes[`${method} ${path}`] ??
+        routes[`${method} ${base}`] ??
+        routes[path] ??
+        routes[base];
       if (reply === undefined) {
         return Promise.reject(new Error(`test stub has no reply for ${path}`));
       }

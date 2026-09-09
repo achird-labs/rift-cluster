@@ -6,7 +6,7 @@ import { Imposters } from "../screens/Imposters.tsx";
 import { RequestLog } from "../screens/RequestLog.tsx";
 import { RouteTableScreen } from "../screens/Routes.tsx";
 import { Scenarios } from "../screens/Scenarios.tsx";
-import { GROUP_LABEL, ISSUE_URL, NAV, NAV_GROUPS, type NavGroup, groupOf } from "./nav.ts";
+import { GROUP_LABEL, NAV, NAV_GROUPS, type NavGroup, groupOf } from "./nav.ts";
 import { ToastHost } from "../components/toast.tsx";
 import { SignOut } from "./SignOut.tsx";
 import { useFleetView } from "./queries.ts";
@@ -71,43 +71,11 @@ function Nav({ current }: { current: Route }): ReactNode {
     <nav className="nav" aria-label="Console sections">
       {NAV_GROUPS.map((group: NavGroup) => {
         const entries = NAV.filter((entry) => groupOf(entry) === group);
-        // An empty group draws nothing — not even its separator. Today that is only the roadmap
-        // run, which is empty whenever every promised screen has shipped.
+        // An empty group draws nothing — not even its separator.
         if (entries.length === 0) return null;
         return (
           <div className="nav-group" key={group} role="group" aria-label={GROUP_LABEL[group]}>
             {entries.map((entry) => {
-              if (entry.kind === "planned") {
-                return (
-                  // No `aria-disabled` here: it has no defined meaning on a non-interactive
-                  // element, and putting it on a container whose only child IS interactive claims
-                  // the issue link is unavailable when it works. The entry is simply not a nav
-                  // link — it is a label plus a reference — which is what "greyed, not a 404" is.
-                  <div
-                    key={entry.id}
-                    data-testid={`nav-${entry.id}`}
-                    data-planned="true"
-                    className="nav-item pending"
-                  >
-                    <span className="glyph" aria-hidden="true">
-                      {entry.glyph}
-                    </span>
-                    <span className="planned-label">{entry.label}</span>
-                    <a
-                      className="issue"
-                      href={ISSUE_URL(entry.issue)}
-                      target="_blank"
-                      rel="noreferrer"
-                      title={entry.note}
-                    >
-                      <span className="visually-hidden">
-                        {entry.label} is not built yet — issue{" "}
-                      </span>
-                      #{entry.issue}
-                    </a>
-                  </div>
-                );
-              }
               const hash = toHash(entry.route);
               return (
                 <a

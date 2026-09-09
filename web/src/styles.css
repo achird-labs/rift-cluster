@@ -405,34 +405,6 @@ code,
   color: var(--surface);
 }
 
-/*
- * A screen RFC-006 §4 names but nothing has built yet. Greyed and non-interactive, with its issue
- * number as the one live link — a visible roadmap, not a 404 and not an omission.
- */
-.nav-item.pending {
-  color: var(--ink-3);
-  cursor: default;
-}
-
-.nav-item.pending:hover {
-  background: none;
-  color: var(--ink-3);
-}
-
-.nav-item .issue {
-  font: 500 10px/1 var(--mono);
-  color: var(--ink-3);
-  border: 1px solid var(--line);
-  border-radius: 4px;
-  padding: 3px 5px;
-  text-decoration: none;
-}
-
-.nav-item .issue:hover {
-  color: var(--ink);
-  border-color: var(--line-2);
-}
-
 .nav-item .glyph {
   width: 12px;
   text-align: center;
@@ -1485,7 +1457,7 @@ input[type="radio"] {
   color: var(--ink-2);
 }
 
-/* ── Front-door routes (C6) ────────────────────────────────────────────────
+/* ── Router (C6) ────────────────────────────────────────────────
    The list is ordered by RouteTable::effective_order — priority, then host rank,
    then prefix length, then header count, then id — NOT by authoring order.
    Showing authoring order would be showing something that decides nothing. */
@@ -2615,7 +2587,7 @@ input[type="radio"] {
   text-transform: uppercase;
 }
 
-/* ── Front door: tester and notes ──────────────────────────────────────────
+/* ── Router: tester and notes ──────────────────────────────────────────
    The two explanatory cards sit side by side under the table; the tester is a rail, because it
    annotates the table rather than being another row of it. */
 

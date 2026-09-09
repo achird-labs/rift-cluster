@@ -158,16 +158,51 @@ additionally drops any `i<port>:` namespace the tables no longer name, which is 
 delete committed while the node was down. Single-node Rift gets this for free by dropping the
 imposter's store instance; one shared `FlowNet` per node (D-7) has to do it explicitly. What is
 *not* cleared, by the same rule: a `PutImposter` over an existing port (a config change keeps its
-state — the first paragraph of this entry), a `fleet`-scoped (`f:`) context (shared by
-construction, not any one imposter's to drop), and any other port's namespace. Sequencer cursors
-already go with the imposter via upstream's `reset_scope` hook (D-8, D-57); proxyOnce markers via
-the apply arm (#226).
+state — the first paragraph of this entry), the `fleet`-scoped (`f:`) context (shared by
+construction, not any one imposter's to drop), and any other port's namespace (ports are
+fleet-unique, so `i<port>:` names exactly one imposter). Sequencer cursors already go with the
+imposter via upstream's `reset_scope` hook (D-8, D-57); proxyOnce markers via the apply arm (#226).
 
-> This amendment was written against the tree #567 merged into, which still had a `tenant`-scoped
-> (`t<tenant>:`) context. #566 (D-73) removed it the next day: `ContextScope` is `Imposter | Fleet`
-> and `prefix_for` renders `i<port>:` or `f:` and nothing else
-> (`crates/rift-cluster/src/stores/flow_config.rs`). The rule is unchanged — a shared namespace is
-> not any one imposter's to drop — there is simply one shared namespace instead of two.
+**Amendment (2026-09-09, the #567 and #573 reviews — what "deleted" means to the clear):** the rule
+above was applied to a wider set than "a deleted imposter" in two places, and — once narrowed — to
+a set that was then too narrow in a third.
+
+*The live clear is filtered against the desired set.* Upstream's `replace_imposter` tears the old
+imposter down and re-creates it; when the re-create is refused at staging, the port is reported
+`deleted` *and* `failed`. The engine is truthfully serving nothing there — but the config set still
+names the port, so this is a failed **edit** on one node, not a removal: the next successful sync
+re-creates the imposter, and nothing would have put its state back. A port the fleet still wants
+keeps its state; only a port the applied set omits is cleared.
+
+*…and unioned with the ports carrying a recorded apply failure.* That filter alone leaks. The
+refused re-create has already taken the port out of the engine's map, so when the operator gives up
+and deletes it, upstream computes the removal set (`map ∖ desired`) from a map that no longer names
+the port: nothing is reported deleted, the state kept by the paragraph above survives for the life
+of the process, and an identically re-created imposter meets yesterday's scenario — the #565 bug,
+reached through a failed edit. The per-port apply-failure map is already reaped on exactly this
+ground ("a bind-failed port that is later deleted keeps its stale entry forever"); the flow state
+leaves with it. Both halves of the union stay gated by the desired set, so a port that is merely
+failing keeps everything.
+
+*The reconcile sweep measures the tables after the sync, not the snapshot the sync was driven from,
+and reads its two sets in that order: the namespaces it holds first, the desired ports second.* The
+original claim — that no imposter can be created in the window because the node is not yet `Ready`
+— was false: the ring is Raft membership, so a restarted voter is an HRW owner the whole time it
+catches up, and `compose` binds the flow net long before it spawns the reconciler. The read that
+fed the engine sync and the sweep were a whole `apply_config` apart (seconds, on a cold start with
+listeners to bind) while the apply loop ran concurrently, so an imposter committed in between was
+alive on every node with its flow namespace swept on this one. Re-reading `sm_configs` after the
+sync closes most of that; reading it *after* the held set closes the rest. Neither read is
+instantaneous and no barrier separates them, so one of the two is necessarily the older
+observation — and it must be the accusation, never the acquittal. Apply commits `sm_configs`
+before it drives the engine, so a `PutImposter{P}` landing between the reads is durably applied and
+served fleet-wide: a desired set read *first* would convict it on a held set read second. The
+comparison is against the **tables, not the engine's imposter list** — the two differ exactly on
+ports the engine failed to stage, which by the paragraphs above keep their state. The residual,
+stated: a flow that lands for an imposter this node has not yet applied, before the desired-set
+read, is dropped. That is all of it — an imposter this node has applied by that read is in the set
+and is kept, whenever its flow arrived — and what bounds it is that `compose` reconciles only once
+`last_applied` has reached the leader's applied index: one apply round-trip, not seconds.
 
 ### D-6 — Redis impls of the new traits are cluster; existing `RedisFlowStore` (incl. U-1 CAS) stays OSS
 - **Status:** amended
@@ -2553,7 +2588,7 @@ and an unknown are different claims.
 
 - **Status:** active
 - **Decided:** 2026-09-06 · RFC-007 · #544
-- **Implemented by:** #556, #557, #558, #559, #560, #562, #563, #564, #566, #567, #568, #570, #571, #573; #569 (open), #572 (open) and this pass's own PR (open) — see "Still open" below
+- **Implemented by:** #556, #557, #558, #559, #560, #562, #563, #564, #566, #567, #568, #569, #570, #571, #573; #572 (open) and this pass's own PR (open) — see "Still open" below
 - **Code:** crates/rift-cluster/src/control.rs, crates/rift-cluster-server/src/admin_front.rs, crates/rift-cluster/src/raft/node.rs, deploy/compose/smoke.sh
 
 RiftCluster is **a replicated fleet of Rift nodes that forms and heals itself, replicates
@@ -2614,9 +2649,9 @@ bootstrap keyed on a canonical digest, after the spec surface was reduced to one
 gateway leg strips every admin credential — found reviewing #566) and #573 (the cold-start sweep
 only clears ports the sync itself dropped — found reviewing #567). RFC-007 §9 lists the same five.
 
-**Still open — finish this entry when they merge.** Three PRs are open as this entry is written:
-**#569** (console, issue #553), **#572** (the gateway leg strips every admin credential — a defect
-found reviewing #566), and the PR carrying this docs pass (issue #554). Drop each `(open)` mark
+**Still open — finish this entry when they merge.** Two PRs are open as this entry is written:
+**#572** (the gateway leg strips every admin credential — a defect found reviewing #566), and the
+PR carrying this docs pass (issue #554). Drop each `(open)` mark
 from the `Implemented by:` line as it merges, and put that PR's number where this paragraph and
 the table say "this PR".
 

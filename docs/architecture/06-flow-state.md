@@ -76,11 +76,24 @@ node**, from the state machine's apply loop — the same per-node, once-per-entr
 discipline as the config reconcile, so it also covers a delete replayed on join
 or installed by a snapshot; a cold-start reconcile additionally sweeps any
 `i<port>:` namespace the committed configs no longer name, for a delete that
-committed while the node was down. `f:` is not any one imposter's and is never dropped by a
-delete, and a config change on the port (a `PutImposter`) is not a delete and
-keeps the state. (There was a third prefix, `t<tenant>:`, under the same rule;
-D-73 (#550) removed the tenant scope, so `ContextScope` is `Imposter | Fleet`
-and `prefix_for` renders `i<port>:` or `f:` and nothing else.)
+committed while the node was down.
+
+That sweep runs *after* its engine sync and reads the namespaces it holds
+**first**, the committed config set **second** (the D-5 amendment). The apply
+loop runs concurrently on its own handle throughout, and the ring is Raft
+membership — a restarted voter is an HRW owner the whole time it catches up —
+so an older config set judging a newer held set would drop the state of an
+imposter committed in between and alive fleet-wide. Held-then-config leaves one
+residual: a flow that lands for an imposter this node has not yet applied,
+before the config read, bounded by the single apply round-trip the reconcile
+already waits out.
+
+`f:` names no imposter, is shared by construction, and is never dropped by a
+delete. A config change on the port (a `PutImposter`) is not a delete and keeps
+the state — including one whose re-create the engine refuses at staging, which
+leaves the port serving nothing on this node while the committed set still names
+it. An actual delete of such a port still clears it, from the recorded apply
+failure rather than the engine's (empty) removal report.
 
 Scope is per-imposter and not a cluster-wide setting, because it is a property
 of what an imposter's contexts *mean* — the same reason `readConsistency` is

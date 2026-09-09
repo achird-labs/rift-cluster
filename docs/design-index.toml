@@ -171,10 +171,10 @@ code = ["deploy/**"]
 
 ["docs/design/console/README.md"]
 status = "amended"
-verified_sha = ""
-verified_on = ""
+verified_sha = "5c6876acf"
+verified_on = "2026-09-08"
 code = ["web/src/**"]
-note = "The Administration screen and the route table's not-installed treatment are retired by D-73 (#550) and carry callouts; the prototype HTML is a design artifact and still renders them."
+note = "Rewritten for the five screens by #553 (D-71): Imposters with Import from OpenAPI spec and Record, Requests per node, Scenarios, Router, Cluster, and the single-key login. The prototype HTML is a design artifact that predates the trim and still renders retired screens; the D-70 callout stays on the Router section."
 
 ["README.md"]
 status = "current"
@@ -188,7 +188,7 @@ status = "current"
 verified_sha = "d755d2c9f"
 verified_on = "2026-09-09"
 code = ["web/src/**", "web/vite.config.ts", "web/package.json"]
-note = "Rewritten in #554 for the five-screen, one-credential console: no tenant switcher, no RBAC table, no merged journal, and the real CSP (which carries wasm-unsafe-eval and style-src unsafe-inline). The route screen is still labelled Front door until #569 lands RFC-007 §6's rename. Review of that pass moved scripts/e2e-console.sh out of the pnpm block: the pnpm commands run from web/, the script from the repository root."
+note = "Rewritten in #554 for the five-screen, one-credential console: no tenant switcher, no RBAC table, no merged journal, and the real CSP (which carries wasm-unsafe-eval and style-src unsafe-inline). The route screen is the Router, as #569 landed RFC-007 §6's rename. Review of that pass moved scripts/e2e-console.sh out of the pnpm block: the pnpm commands run from web/, the script from the repository root."
 
 ["docs/rift-cluster-server.md"]
 status = "current"

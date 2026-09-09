@@ -1,10 +1,10 @@
 /** @vitest-environment jsdom */
-import { screen, waitFor } from "@testing-library/react";
+import { screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { Shell } from "../app/Shell.tsx";
-import { plannedEntries } from "../app/nav.ts";
+import { NAV } from "../app/nav.ts";
 import { renderInApp, stubFetch } from "./harness.tsx";
 
 const QUIET = {
@@ -18,27 +18,36 @@ afterEach(() => {
   window.location.hash = "";
 });
 
-describe("nav — a visible roadmap, not a 404", () => {
-  it("greys out nothing, because nothing is currently promised-but-unbuilt", async () => {
-    // `specs` was the last planned chip and #549 removed the stored-spec surface behind it, so the
-    // roadmap is empty. Asserted both ways rather than deleted: `plannedEntries()` says the model
-    // holds none, and the rendered bar says none leaked in as a greyed entry that no longer links
-    // anywhere real. `Shell` still renders `PlannedEntry`, which is what the next unbuilt screen
-    // reaches for — RFC-006 §4 asks for a visible roadmap, and an empty one is a state, not a
-    // reason to delete the shape.
+describe("nav — the five screens, in two runs", () => {
+  it("draws every nav entry as a link, named by its label, and nothing greyed (#553)", async () => {
+    // The roadmap chips RFC-006 §4 asked for are gone with the trim: every screen the reduced
+    // console promises is built, so the bar is five links and no `[data-planned]` element. Asserted
+    // from the rendered DOM rather than the model alone, so a chip cannot leak back in through the
+    // renderer without this failing.
     stubFetch(QUIET);
     renderInApp(<Shell />);
 
     await screen.findByTestId("nav-imposters");
-    expect(plannedEntries()).toEqual([]);
+    const bar = screen.getByRole("navigation", { name: /console sections/i });
+    const links = within(bar).getAllByRole("link");
+    expect(links.map((link) => link.textContent?.replace(/^\S\s*/, "").trim())).toEqual(
+      NAV.map((entry) => entry.label),
+    );
+    expect(links.map((link) => link.textContent)).toEqual(
+      expect.arrayContaining([expect.stringContaining("Router")]),
+    );
     expect(document.querySelectorAll('[data-planned="true"]').length).toBe(0);
+    expect(within(bar).getAllByRole("group").map((g) => g.getAttribute("aria-label"))).toEqual([
+      "Mocks",
+      "Fleet",
+    ]);
   });
 
   it("navigates between the live screens without a page load", async () => {
     stubFetch(QUIET);
     renderInApp(<Shell />);
 
-    await userEvent.setup().click(await screen.findByRole("link", { name: /cluster & fleet/i }));
+    await userEvent.setup().click(await screen.findByRole("link", { name: /^cluster$/i }));
     await waitFor(() => expect(window.location.hash).toBe("#/cluster"));
   });
 
