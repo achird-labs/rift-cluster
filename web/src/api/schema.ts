@@ -781,7 +781,7 @@ export interface paths {
         post: operations["createSession"];
         /**
          * Clear the session cookie
-         * @description Terminates. Acts on the cookie the caller already holds, so it is exempt from `apiKeyAuth` the same way `createSession` is — there is no credential to check before clearing a cookie. Not a Raft write: the server only ever mints this cookie at `POST /session`, never adopts a client-presented one, so there is no session-fixation case to guard against here.
+         * @description Terminates. Acts on the cookie the caller already holds, so it is exempt from `apiKeyAuth` the same way `createSession` is — there is no credential to check before clearing a cookie. It is not exempt from the CSRF header: a logout is a state-changing request the browser attaches the cookie to, so without `X-Rift-CSRF` it is refused with `403` rather than letting a cross-site page force an operator out. Not a Raft write: the server only ever mints this cookie at `POST /session`, never adopts a client-presented one, so there is no session-fixation case to guard against here.
          */
         delete: operations["deleteSession"];
         options?: never;
@@ -3627,7 +3627,10 @@ export interface operations {
     deleteSession: {
         parameters: {
             query?: never;
-            header?: never;
+            header?: {
+                /** @description RFC-006 §5.3/§9.2 CSRF defense: a cookie-authenticated state-changing request (anything that would mutate state, sent with the `rift_session` cookie rather than an `Authorization` bearer) that omits this header is refused with `403`, checked before authorization runs. Send any non-empty value — `SameSite=Strict` already stops the cookie riding cross-site, so this header exists only to defeat the narrower case (a same-site-adjacent or misconfigured-CORS request) by requiring a custom header cross-origin HTML cannot attach without a preflight. Bearer-authenticated requests are exempt: a bearer cannot be attached to a request by a victim's browser in the first place, which is the entire attack this header defends against — so requiring it there would add friction without closing a real hole. */
+                "X-Rift-CSRF"?: components["parameters"]["CsrfHeader"];
+            };
             path?: never;
             cookie?: never;
         };
@@ -3642,6 +3645,7 @@ export interface operations {
                 };
                 content?: never;
             };
+            403: components["responses"]["Forbidden"];
             503: components["responses"]["Unavailable"];
         };
     };

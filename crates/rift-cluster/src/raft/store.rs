@@ -277,9 +277,15 @@ struct DedupEntry {
 /// entry undecodable, removing a field here is *backward*-compatible on its own: this
 /// struct sets no `deny_unknown_fields`, so a payload built before the removal still
 /// parses and its extra keys are dropped — but a **changed tuple arity** is not, and
-/// #550 changed several. The removal is a fleet-wide break overall (the `ControlOp`
-/// variants and their encodings are gone), so a fleet upgrading across this commit
-/// starts from a fresh `cluster-state-dir`.
+/// #550 changed several. A *renamed* field is a third silent-empty shape, and #550
+/// has one: `routes_revisions` (a per-tenant map) became `routes_revision`
+/// (`Option<u64>`, `#[serde(default)]`), so an old payload's map is ignored as an
+/// unknown key and the new field decodes to `None` — the safe direction that field's
+/// own doc explains (every stale precondition is refused until the next write
+/// re-stamps it), but silent. The removal is a fleet-wide break overall (the
+/// `ControlOp` variants are gone, and redb refuses the old tables — see `ControlOp`'s
+/// doc), so a fleet upgrading across this commit starts from a fresh
+/// `cluster-state-dir`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct SnapshotPayload {
     /// `(port, stored-imposter JSON)` rows of `sm_configs`.

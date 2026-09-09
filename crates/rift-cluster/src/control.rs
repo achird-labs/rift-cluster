@@ -51,13 +51,24 @@ pub struct ControlRequest {
 /// an `AuditSinkPut`, `SourcePut`, `SpecPut`, `TenantPut`, `TenantDelete`,
 /// `PrincipalPut`, `PrincipalCreate`, `PrincipalDelete`, `BindingPut`,
 /// `BindingDelete` or `JournalClearGen` (#552, D-74) entry fails to start rather
-/// than skipping it. **#550 additionally
-/// removed the `tenant` field from every surviving variant**, which changes the
-/// encoding of ops that still exist, so this is a break for the whole log rather
-/// than for the removed variants alone. Pre-release that is the right trade, and
-/// clean removal is why it was taken; a fleet upgrading across this commit starts
-/// from a fresh `cluster-state-dir`. A *post*-release removal would have to keep
-/// the variant as an ignored arm.
+/// than skipping it. **#550 also removed
+/// the `tenant` field from every surviving variant**, and that is *not* a decoding
+/// break on its own: this enum sets no `deny_unknown_fields`, so an old entry's extra
+/// `tenant` key is dropped and the op decodes — pinned on *this* type by
+/// [`tests::an_old_entrys_tenant_field_is_ignored`], because a claim D-73 leans on
+/// operationally should not rest on a test of some other wire shape, and across *every*
+/// surviving variant by [`tests::every_surviving_variant_ignores_an_old_entrys_tenant_field`],
+/// because `deny_unknown_fields` is per-container and one variant proves nothing about the
+/// next. What actually refuses an
+/// old state directory is redb: every state-machine table's key or value type lost
+/// its tenant component, and redb answers `TableTypeMismatch` when a table is opened
+/// under a definition whose types differ from the ones it was created with. That
+/// guard exists on disk only. The wire has none — a mixed-version fleet straddling
+/// #550 would exchange ops that decode on both sides and apply against different key
+/// shapes — so **a mixed-version fleet across D-73 is unsupported**: every node
+/// upgrades at once, from a fresh `cluster-state-dir`. Pre-release that is the right
+/// trade, and clean removal is why it was taken; a *post*-release removal would have
+/// to keep the variant as an ignored arm and version the wire.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ControlOp {
     PutImposter {
@@ -100,18 +111,28 @@ pub enum ControlOp {
     ///
     /// **This op deliberately carries a secret into the replicated log — the only one that
     /// does.** It is admissible because of what the secret means outside the fleet: this key is
-    /// fleet-internal and meaningless anywhere else. It cannot be stored hashed the way a
-    /// principal's API key is (`argon2id`, RFC-002 §3.2), because verifying an HMAC needs the key
-    /// itself, not a one-way digest of it — a hash would make the cookie unverifiable by anyone,
-    /// including us. (The hashed comparison is what an API key gets; there are no principal keys
-    /// to hash since #566, D-73, and the fleet's own `--api-key` never enters the log at all.) A
-    /// secret with power over a *third-party* system has no op that carries it: the
-    /// credential-bearing source ops were removed with the tracking sources (#549, D-72).
+    /// fleet-internal and meaningless anywhere else. It cannot be stored hashed at all, because
+    /// verifying an HMAC needs the key itself, not a one-way digest of it — a hash would make the
+    /// cookie unverifiable by anyone, including us. A secret with power over a *third-party*
+    /// system has no op that carries it: the credential-bearing source ops were removed with the
+    /// tracking sources (#549, D-72).
     ///
     /// So it sits inside the same trust boundary as the state directory, which already holds all
+<<<<<<< HEAD
     /// committed config. Rotation is the containment: writing a new key invalidates every
     /// outstanding session at once — and with one credential it is the *only* revocation the
     /// fleet has. Recorded in `docs/architecture/10-operations.md`.
+||||||| a6ee623
+    /// So it sits inside the same trust boundary as the state directory, which already holds every
+    /// principal's argon2 record and all committed config. Rotation is the containment: writing a
+    /// new key invalidates every outstanding session at once. Recorded in
+    /// `docs/architecture/08-tenancy-security.md`.
+=======
+    /// committed config. Rotation is the containment — and since D-73 it is the *only* one:
+    /// writing a new key invalidates every outstanding session at once, and there is no
+    /// per-session revocation because there is no per-session server state to revoke. Recorded in
+    /// `docs/architecture/08-tenancy-security.md`.
+>>>>>>> origin/master
     SessionKeyPut {
         /// 32 random bytes, hex-encoded. Hex rather than raw so the op stays printable in a log
         /// dump and survives JSON without a base64 alphabet decision.
@@ -1126,6 +1147,137 @@ mod tests {
             let err = validate(&fleet_name(bad))
                 .expect_err("a fleet name carrying control characters must be rejected");
             assert!(err.contains("control"), "{bad:?} -> {err}");
+        }
+    }
+
+    /// Pins the decoding half of [`ControlOp`]'s doc and of D-73's amendment: dropping the
+    /// `tenant` field from every variant is **not** a wire break. This enum carries no
+    /// `deny_unknown_fields`, so a log entry written before #550 — carrying `tenant` next to
+    /// the fields this build knows — still decodes, and the stale key is simply ignored. The
+    /// guard that *does* refuse an old fleet is redb's per-table `TableTypeMismatch`, on disk;
+    /// it is important that nobody reads a mixed-version fleet's silence on the wire as safety.
+    ///
+    /// Written against `ControlOp` itself rather than borrowing `raft::network`'s join-reply
+    /// tests: those pin `JoinAccepted`, and a `deny_unknown_fields` added to *this* type would
+    /// leave them green while every pre-#550 entry stopped replaying.
+    #[test]
+    fn an_old_entrys_tenant_field_is_ignored() {
+        let old = json!({
+            "PutImposter": {
+                "config": { "port": 4545, "protocol": "http" },
+                "tenant": "default",
+            }
+        });
+        let op: ControlOp =
+            serde_json::from_value(old).expect("a pre-#550 entry's extra `tenant` key is ignored");
+        match op {
+            ControlOp::PutImposter { config } => assert_eq!(config.port, Some(4545)),
+            other => panic!("expected PutImposter, got {other:?}"),
+        }
+
+        // The other direction, so "it decodes" cannot mean the enum decodes anything at all: a
+        // *missing* required field is still an error, not a silent default. Bound and grepped,
+        // like every other negative assertion in this module: `serde_json` also answers `Err`
+        // for `unknown variant \`PatchStubs\``, and #546/#549/#550 each removed variants — one
+        // more rename and a bare `expect_err` would assert nothing while staying green, in
+        // exactly the "it decodes anything" direction this case exists to rule out.
+        let missing = json!({ "PatchStubs": { "port": 4545 } });
+        let err = serde_json::from_value::<ControlOp>(missing)
+            .expect_err("a variant missing a required field must not decode");
+        assert!(
+            err.to_string().contains("missing field `edit`"),
+            "must fail on the missing field, not on the variant name having moved: {err}"
+        );
+    }
+
+    /// [`ControlOp`]'s doc claims #550 dropped `tenant` from **every** surviving variant, so
+    /// every one of them must ignore the stale key — not just the `PutImposter` that
+    /// [`tests::an_old_entrys_tenant_field_is_ignored`] happens to spell out.
+    /// `deny_unknown_fields` is per-container: adding it to `PatchStubs` alone would leave that
+    /// test green while every pre-#550 `PatchStubs` entry stopped replaying — the same
+    /// one-level-down defeat its own rationale describes, one level further down.
+    ///
+    /// Each op is serialized, given a `tenant` key, decoded, and re-serialized: the round trip
+    /// must land back on the byte-identical clean value, so "it decoded" cannot mean it decoded
+    /// into something else.
+    #[test]
+    fn every_surviving_variant_ignores_an_old_entrys_tenant_field() {
+        // Adding a variant breaks this match, which is the reminder to extend the list below.
+        // `DeleteAll` is absent from it on purpose: a unit variant serializes as the bare tag
+        // string, so there is no object for a stale key to sit in.
+        fn _every_variant_is_accounted_for(op: &ControlOp) {
+            match op {
+                ControlOp::PutImposter { .. }
+                | ControlOp::PatchStubs { .. }
+                | ControlOp::DeleteImposter { .. }
+                | ControlOp::DeleteAll
+                | ControlOp::SetEnabled { .. }
+                | ControlOp::PutRoutes { .. }
+                | ControlOp::DeleteRoute { .. }
+                | ControlOp::SessionKeyPut { .. }
+                | ControlOp::FleetNamePut { .. }
+                | ControlOp::ProxyRecorded { .. }
+                | ControlOp::ProxyRecordedClear { .. } => {}
+            }
+        }
+
+        let survivors = vec![
+            ControlOp::PutImposter { config: config(1) },
+            ControlOp::PatchStubs {
+                port: 1,
+                edit: StubEditScript(vec![]),
+            },
+            ControlOp::DeleteImposter { port: 1 },
+            ControlOp::SetEnabled {
+                port: 1,
+                enabled: true,
+            },
+            ControlOp::PutRoutes {
+                table: RouteTable::default(),
+            },
+            ControlOp::DeleteRoute { id: "r".to_owned() },
+            ControlOp::SessionKeyPut {
+                key: "00".repeat(SESSION_KEY_BYTES),
+            },
+            ControlOp::FleetNamePut {
+                name: "prod".to_owned(),
+            },
+            ControlOp::ProxyRecorded {
+                port: 1,
+                sig_hash: "0123456789abcdef".to_owned(),
+                resp: RecordedResponse {
+                    status: 200,
+                    headers: vec![],
+                    body: vec![],
+                    latency_ms: None,
+                    timestamp_secs: 0,
+                },
+                stub: None,
+            },
+            ControlOp::ProxyRecordedClear { port: 1 },
+        ];
+
+        for op in survivors {
+            let clean = serde_json::to_value(&op).expect("a ControlOp serializes");
+            let mut with_tenant = clean.clone();
+            let (tag, fields) = with_tenant
+                .as_object_mut()
+                .and_then(|object| object.iter_mut().next())
+                .expect("externally tagged: one key, the variant tag");
+            let tag = tag.clone();
+            fields
+                .as_object_mut()
+                .unwrap_or_else(|| panic!("`{tag}` must be a struct variant to be listed here"))
+                .insert("tenant".to_owned(), json!("default"));
+
+            let back: ControlOp = serde_json::from_value(with_tenant).unwrap_or_else(|e| {
+                panic!("a pre-#550 `{tag}` entry's stale `tenant` key must be ignored: {e}")
+            });
+            assert_eq!(
+                serde_json::to_value(&back).expect("a ControlOp serializes"),
+                clean,
+                "`{tag}` must decode back to exactly itself"
+            );
         }
     }
 }

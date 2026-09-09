@@ -25,6 +25,11 @@ const SECRET: &str = "fleet-session-secret";
 /// whether or not the gate works.
 const API_KEY: &str = "fleet-session-api-key";
 
+/// A credential that is *not* this fleet's — an app under test authenticating to its own mock.
+/// Deliberately shares no prefix or suffix with [`API_KEY`], so an assertion that it survived
+/// cannot be satisfied by a partial match on the key.
+const APP_BEARER: &str = "Bearer someone-elses-token";
+
 /// A single-node fleet: the shape most of these tests need.
 fn cluster_cli(state: &TempDir, extra: &[&str]) -> EeCli {
     let mut args = vec!["--cluster-allow-solo"];
@@ -622,7 +627,10 @@ async fn fleet_members_carries_the_fleet_name() {
     server.shutdown().await;
 }
 
-/// `DELETE /session` clears the cookie.
+/// `DELETE /session` clears the cookie — and, like every other state-changing request the browser
+/// attaches the cookie to, only when `X-Rift-CSRF` is present. A cross-site page must not be able
+/// to force an operator's logout; the route is unauthenticated, so the gate is the only thing
+/// standing between it and one.
 #[tokio::test]
 async fn deleting_a_session_clears_the_cookie() {
     let state = TempDir::new().expect("tempdir");
@@ -633,9 +641,28 @@ async fn deleting_a_session_clears_the_cookie() {
     let admin = server.admin_addr().to_string();
     let client = reqwest::Client::new();
 
+    // Without the header: refused, and no clearing `Set-Cookie` either.
     let seen = Seen::of(
         client
             .delete(format!("http://{admin}/session"))
+            .send()
+            .await
+            .expect("logout without csrf"),
+    )
+    .await;
+    assert_eq!(
+        seen.status, 403,
+        "a logout without X-Rift-CSRF is a forgeable request and must be refused: {seen}"
+    );
+    assert!(
+        seen.header("set-cookie").is_none(),
+        "a refused logout must not clear the cookie: {seen}"
+    );
+
+    let seen = Seen::of(
+        client
+            .delete(format!("http://{admin}/session"))
+            .header("x-rift-csrf", "1")
             .send()
             .await
             .expect("logout"),
@@ -644,6 +671,93 @@ async fn deleting_a_session_clears_the_cookie() {
     assert_eq!(seen.status, 204, "{seen}");
     let raw = seen.header("set-cookie").expect("logout clears the cookie");
     assert!(raw.contains("Max-Age=0"), "cookie is not cleared: {raw}");
+
+    server.shutdown().await;
+}
+
+/// `PUT /admin/fleet/name` over the wire (issue #373): the terminated handler parses the body it
+/// documents, commits `FleetNamePut`, answers `200`, and the name reads back from the node's
+/// applied state. The unit tests either side prove the pieces; nothing else drives the route.
+#[tokio::test]
+async fn put_fleet_name_round_trips_through_the_route() {
+    let state = TempDir::new().expect("tempdir");
+    let server = compose::start(cluster_cli(&state, &[]))
+        .await
+        .expect("solo cluster starts");
+    wait_ready(&server).await;
+    let node = server.node().expect("clustered");
+    let admin = server.admin_addr().to_string();
+    let client = reqwest::Client::new();
+
+    for name in ["rift-prod-eu", "rift-prod-eu (blue)"] {
+        let seen = Seen::of(
+            client
+                .put(format!("http://{admin}/admin/fleet/name"))
+                .header("authorization", API_KEY)
+                .json(&serde_json::json!({ "name": name }))
+                .send()
+                .await
+                .expect("put fleet name"),
+        )
+        .await;
+        assert_eq!(seen.status, 200, "{seen}");
+        assert_eq!(
+            node.fleet_name().expect("fleet name reads").as_deref(),
+            Some(name),
+            "the committed name must be readable from applied state"
+        );
+    }
+
+    server.shutdown().await;
+}
+
+/// A malformed `PUT /admin/fleet/name` body is a `4xx` and commits nothing — not JSON, the
+/// wrong type, a missing field, and the two values `ControlOp::validate` refuses (blank, and over
+/// `MAX_FLEET_NAME_CHARS`).
+#[tokio::test]
+async fn put_fleet_name_refuses_a_malformed_body_without_committing() {
+    let state = TempDir::new().expect("tempdir");
+    let server = compose::start(cluster_cli(&state, &[]))
+        .await
+        .expect("solo cluster starts");
+    wait_ready(&server).await;
+    let node = server.node().expect("clustered");
+    let admin = server.admin_addr().to_string();
+    let client = reqwest::Client::new();
+
+    let too_long = "n".repeat(rift_cluster::control::MAX_FLEET_NAME_CHARS + 1);
+    let bodies: [(&str, String); 5] = [
+        ("not JSON", "this is not json".to_owned()),
+        ("wrong type", serde_json::json!({ "name": 5 }).to_string()),
+        ("missing field", serde_json::json!({}).to_string()),
+        ("blank", serde_json::json!({ "name": "   " }).to_string()),
+        (
+            "too long",
+            serde_json::json!({ "name": too_long }).to_string(),
+        ),
+    ];
+    for (label, body) in bodies {
+        let seen = Seen::of(
+            client
+                .put(format!("http://{admin}/admin/fleet/name"))
+                .header("authorization", API_KEY)
+                .header("content-type", "application/json")
+                .body(body)
+                .send()
+                .await
+                .expect("put fleet name"),
+        )
+        .await;
+        assert!(
+            (400..500).contains(&seen.status),
+            "a {label} body must be a 4xx: {seen}"
+        );
+        assert_eq!(
+            node.fleet_name().expect("fleet name reads"),
+            None,
+            "a refused {label} body must not have committed a name"
+        );
+    }
 
     server.shutdown().await;
 }
@@ -663,6 +777,10 @@ async fn deleting_a_session_clears_the_cookie() {
 /// differently. Two nodes, and the login happens on exactly one of them: the signing key is
 /// replicated state, so a cookie minted on the founder must verify on the joiner with no second
 /// login and no shared process state beyond the Raft log.
+///
+/// The same two nodes then pin rotation: a `SessionKeyPut` committed through the founder kills
+/// the cookie on the joiner too. `rotating_the_signing_key_invalidates_every_session` proves the
+/// mechanism solo; this is the only test in which "every session" spans a second node.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_api_key_mints_a_session_and_the_cookie_is_accepted_on_every_node() {
     let founder_state = TempDir::new().expect("tempdir");
@@ -761,6 +879,43 @@ async fn the_api_key_mints_a_session_and_the_cookie_is_accepted_on_every_node() 
         );
     }
 
+    // Rotation is the only revocation D-73 leaves, and it has to reach every node: a cookie that
+    // dies on the founder but keeps reading the joiner is a session that was never revoked. There
+    // is no rotation endpoint by design, so this goes through the founder's control plane the way
+    // an operator tool would, and the cookie is then watched die on both nodes.
+    seed(
+        founder.node().expect("clustered"),
+        0x5e55_10f0,
+        ControlOp::SessionKeyPut {
+            key: "f".repeat(64),
+        },
+    )
+    .await;
+    for admin in [&founder_admin, &joiner_admin] {
+        // The joiner applies the rotation through the log, which is not instantaneous — so the
+        // answer waited for is the refusal, and a `200` is what must stop appearing.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let seen = Seen::of(
+                client
+                    .get(format!("http://{admin}/imposters/{port}"))
+                    .header("cookie", &cookie)
+                    .send()
+                    .await
+                    .expect("read after rotation"),
+            )
+            .await;
+            if seen.status == 401 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{admin} still accepts a cookie minted under the rotated-out signing key: {seen}"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
     joiner.shutdown().await;
     founder.shutdown().await;
 }
@@ -821,9 +976,56 @@ async fn a_keyed_fleet_refuses_an_unauthenticated_request_on_every_surface() {
     server.shutdown().await;
 }
 
+/// The recorded requests in a `savedRequests` body — a bare array or an object carrying one.
+fn recorded_requests(seen: &Seen) -> Vec<serde_json::Value> {
+    match seen.json() {
+        serde_json::Value::Array(requests) => requests,
+        serde_json::Value::Object(doc) => doc
+            .get("requests")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_else(|| {
+                panic!("an object savedRequests body has a `requests` array: {seen}")
+            }),
+        _ => panic!("savedRequests body is neither an array nor an object: {seen}"),
+    }
+}
+
+/// One header of a recorded request, by name, case-insensitively — the journal preserves the
+/// casing the client sent, so a `get("authorization")` would be a test that passes on the wrong
+/// spelling. `None` means the header is absent, which is what every credential assertion below
+/// is really asking.
+fn recorded_header(request: &serde_json::Value, name: &str) -> Option<String> {
+    request
+        .get("headers")?
+        .as_object()?
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case(name))
+        .map(|(_, value)| value.to_string())
+}
+
 /// `/__rift/{port}/*` is data-plane traffic and stays open on a keyed fleet — and, critically,
-/// the admin credential is never injected onto it: the gateway leg reaches the imposter, where an
-/// `Authorization` header would land in its predicates and its recorded request log.
+/// **no** admin credential reaches the imposter on it (D-73), by any of the three routes one
+/// could take. The gateway leg reaches the imposter, where each would land in its predicates,
+/// its recorded request log, and any proxying stub's outbound request, so this drives all three
+/// through one recording imposter:
+///
+/// 1. the configured key is never *injected* on this leg (the client sends nothing);
+/// 2. the `rift_session` cookie the browser attaches on its own is stripped from `Cookie` —
+///    console and gateway share an origin, so this is not hypothetical;
+/// 3. an `Authorization` the *client* sent carrying the fleet's own key is dropped. Upstream
+///    exempts `/__rift/*` from its key gate, so nothing else would stop a CI script that stamps
+///    the key onto every rift call from leaking it into an app-under-test's journal.
+///
+/// And the boundary that keeps (3) from being "drop every `Authorization`": someone else's
+/// bearer **must** survive, because an app under test authenticates to its own mock and an
+/// imposter legitimately predicates on that. A strip that took the header unconditionally would
+/// pass every assertion above and break real scenarios; this fails it.
+///
+/// `recordRequests` is on, and the recorded requests are asserted to *exist* before their
+/// headers are inspected. Upstream defaults recording off and `record_request` returns before it
+/// looks at a header, so without both of those this test passed against an empty journal
+/// whatever the front forwarded — deleting the injection guard left it green.
 #[tokio::test]
 async fn the_gateway_stays_open_and_never_carries_the_admin_key() {
     let state = TempDir::new().expect("tempdir");
@@ -842,6 +1044,7 @@ async fn the_gateway_stays_open_and_never_carries_the_admin_key() {
             .json(&serde_json::json!({
                 "port": port,
                 "protocol": "http",
+                "recordRequests": true,
                 "stubs": [{ "responses": [{ "is": { "statusCode": 204 } }] }],
             }))
             .send()
@@ -851,10 +1054,26 @@ async fn the_gateway_stays_open_and_never_carries_the_admin_key() {
     .await;
     assert_eq!(seen.status, 201, "{seen}");
 
-    // No credential: the gateway must answer anyway.
+    // A real, verifying session token — the thing that must not leak.
+    let login = Seen::of(
+        client
+            .post(format!("http://{admin}/session"))
+            .json(&serde_json::json!({ "apiKey": API_KEY }))
+            .send()
+            .await
+            .expect("login"),
+    )
+    .await;
+    assert_eq!(login.status, 200, "{login}");
+    let token = session_cookie(&login);
+
+    // Request 1 — the browser shape. No admin credential presented as one; the session cookie
+    // rides in `Cookie` next to an app cookie the imposter is entitled to see. The gateway must
+    // answer regardless.
     let seen = Seen::of(
         client
             .get(format!("http://{admin}/__rift/{port}/anything"))
+            .header("cookie", format!("rift_session={token}; other=keep"))
             .send()
             .await
             .expect("gateway request"),
@@ -865,7 +1084,36 @@ async fn the_gateway_stays_open_and_never_carries_the_admin_key() {
         "gateway traffic must not be gated by the admin key: {seen}"
     );
 
-    // And the imposter never saw an `Authorization` header.
+    // Request 2 — the CI-script shape: the caller stamps the fleet's *own* key onto every rift
+    // call, including this one. Still open (upstream exempts the prefix), and the key must not
+    // ride through.
+    let seen = Seen::of(
+        client
+            .get(format!("http://{admin}/__rift/{port}/anything"))
+            .header("authorization", API_KEY)
+            .send()
+            .await
+            .expect("gateway request carrying the fleet key"),
+    )
+    .await;
+    assert_eq!(
+        seen.status, 204,
+        "presenting the admin key must not change how the open gateway answers: {seen}"
+    );
+
+    // Request 3 — an app under test authenticating to its own mock. Not this fleet's credential,
+    // so it is none of the front's business and must arrive intact.
+    let seen = Seen::of(
+        client
+            .get(format!("http://{admin}/__rift/{port}/anything"))
+            .header("authorization", APP_BEARER)
+            .send()
+            .await
+            .expect("gateway request carrying an app's own bearer"),
+    )
+    .await;
+    assert_eq!(seen.status, 204, "{seen}");
+
     let seen = Seen::of(
         client
             .get(format!("http://{admin}/imposters/{port}/savedRequests"))
@@ -876,9 +1124,130 @@ async fn the_gateway_stays_open_and_never_carries_the_admin_key() {
     )
     .await;
     assert_eq!(seen.status, 200, "{seen}");
+
+    // Vacuity guard: the journal holds all three requests, so every header assertion below is
+    // about a request that was actually recorded — and each carries a `headers` object, so an
+    // absent header is absence and not a missing map.
+    let recorded = recorded_requests(&seen);
+    assert_eq!(
+        recorded.len(),
+        3,
+        "exactly the three gateway requests must have been recorded: {seen}"
+    );
+    for (i, request) in recorded.iter().enumerate() {
+        assert!(
+            request.get("headers").and_then(|h| h.as_object()).is_some(),
+            "recorded request {i} carries its headers: {seen}"
+        );
+    }
+
+    // Neither admin credential's *value* anywhere in the journal. The strongest form of the
+    // claim and the one that does not depend on a header name: it covers request 2's key even if
+    // some future rewrite moved it.
     assert!(
-        !seen.body.to_lowercase().contains("authorization"),
-        "the admin key leaked into the imposter's recorded request: {seen}"
+        !seen.body.contains(API_KEY),
+        "the admin key's value reached the imposter's recorded requests: {seen}"
+    );
+    assert!(
+        !seen.body.contains(&token),
+        "the session token reached the imposter's recorded requests: {seen}"
+    );
+
+    // Request 1: the client sent no `Authorization`, so one appearing here could only have been
+    // injected by the front.
+    assert_eq!(
+        recorded_header(&recorded[0], "authorization"),
+        None,
+        "an Authorization header the client never sent reached the imposter: {seen}"
+    );
+
+    // Request 2: the client *did* send one and it was the fleet's key, so the header must be
+    // gone entirely — not blanked, not rewritten.
+    assert_eq!(
+        recorded_header(&recorded[1], "authorization"),
+        None,
+        "the caller's own Authorization carried the fleet key through to the imposter: {seen}"
+    );
+
+    // Request 3: someone else's bearer is untouched. Dropping every `Authorization` would satisfy
+    // both assertions above and fail this one.
+    let app_bearer = recorded_header(&recorded[2], "authorization")
+        .unwrap_or_else(|| panic!("an app's own bearer must reach its mock: {seen}"));
+    assert!(
+        app_bearer.contains("someone-elses-token"),
+        "an app's own bearer must reach its mock intact: {app_bearer}"
+    );
+
+    // The app cookie survives on request 1 — an imposter legitimately predicates on cookies, so
+    // the strip must take the one pair and not the header.
+    let cookie = recorded_header(&recorded[0], "cookie")
+        .unwrap_or_else(|| panic!("the app cookie must reach the imposter: {seen}"));
+    assert!(cookie.contains("other=keep"), "{cookie}");
+    assert!(
+        !cookie.contains("rift_session"),
+        "the session cookie pair must be stripped from the gateway leg: {cookie}"
+    );
+
+    server.shutdown().await;
+}
+
+/// D-73's authentication rule at the wire: a *present* `Authorization` is judged on its own, and
+/// a value that is not even readable as a string is a refusal — never an absence that lets a
+/// cookie on the same request authenticate it instead. The cookie is shown to be valid on its own
+/// first, so the `401` is provably the header's doing.
+#[tokio::test]
+async fn an_unreadable_authorization_header_is_refused_even_beside_a_valid_cookie() {
+    let state = TempDir::new().expect("tempdir");
+    let server = compose::start(cluster_cli(&state, &[]))
+        .await
+        .expect("solo cluster starts");
+    wait_ready(&server).await;
+    let admin = server.admin_addr().to_string();
+    let client = reqwest::Client::new();
+
+    let login = Seen::of(
+        client
+            .post(format!("http://{admin}/session"))
+            .json(&serde_json::json!({ "apiKey": API_KEY }))
+            .send()
+            .await
+            .expect("login"),
+    )
+    .await;
+    assert_eq!(login.status, 200, "{login}");
+    let cookie = format!("rift_session={}", session_cookie(&login));
+
+    let seen = Seen::of(
+        client
+            .get(format!("http://{admin}/_fleet/health"))
+            .header("cookie", &cookie)
+            .send()
+            .await
+            .expect("cookie-only read"),
+    )
+    .await;
+    assert_eq!(
+        seen.status, 200,
+        "the cookie alone must authenticate: {seen}"
+    );
+
+    // RFC 9110 obs-text: legal on the wire, never a `&str`.
+    let opaque = reqwest::header::HeaderValue::from_bytes(&[0xff, 0xfe])
+        .expect("obs-text is a legal header value");
+    let seen = Seen::of(
+        client
+            .get(format!("http://{admin}/_fleet/health"))
+            .header("cookie", &cookie)
+            .header("authorization", opaque)
+            .send()
+            .await
+            .expect("unreadable-bearer read"),
+    )
+    .await;
+    assert_eq!(
+        seen.status, 401,
+        "an unreadable Authorization must be refused, not treated as absent so the cookie \
+         authenticates: {seen}"
     );
 
     server.shutdown().await;

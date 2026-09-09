@@ -371,7 +371,8 @@ async fn the_served_page_has_no_external_subresource_and_no_inline_script() {
 ///
 /// It is the login UI (RFC-006 §5.3): requiring a credential to fetch the page that collects the
 /// credential is a closed loop. The bundle carries no secrets, and every API call it then makes goes
-/// through the same `authorize_action` chokepoint as any other client. Pinned as a test so the
+/// through the same `authenticate` chokepoint as any other client (D-73 removed `authorize_action`
+/// along with roles; authentication is now the whole gate). Pinned as a test so the
 /// posture is a decision on record rather than an oversight someone later "fixes" in either
 /// direction without noticing which one this is.
 #[tokio::test]

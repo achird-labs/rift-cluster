@@ -739,7 +739,7 @@ async fn handle(state: Arc<FrontState>, req: Request<Incoming>) -> Response<Fron
     if path == "/session" {
         return match *req.method() {
             Method::POST => session_login(&state, req).await,
-            Method::DELETE => session_logout(),
+            Method::DELETE => session_logout(&req),
             _ => typed_error(
                 StatusCode::METHOD_NOT_ALLOWED,
                 ErrorKind::BadData,
@@ -944,13 +944,9 @@ async fn read_routes(state: &Arc<FrontState>, _req: &Request<Incoming>) -> Respo
     response
 }
 
-/// Authenticate the request and authorize `action` against it (RFC-002 §4.3,
-/// §8.1, §8.4) — the single gate every admin request passes through, whether
-/// it will be terminated, proxied, or is the front door's own read.
-///
-/// Fail closed throughout: a state-machine read that errors becomes a `500`,
-/// never a fallthrough to allow.
-/// The `Cookie` name a session token rides in (RFC-006 §5.3, issue #185).
+/// The `Cookie` name a session token rides in (RFC-006 §5.3, issue #185). Also the one pair
+/// [`strip_session_cookie`] removes from gateway traffic — the token is an admin credential and
+/// must never reach an imposter (D-73).
 const SESSION_COOKIE_NAME: &str = "rift_session";
 
 /// The CSRF header [`csrf_gate`] requires on a state-changing, cookie-authenticated request. Any
@@ -995,35 +991,63 @@ fn authenticate(state: &FrontState, req: &Request<Incoming>) -> Result<(), Respo
         ));
     };
 
-    let provided = req
-        .headers()
-        .get("authorization")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
-    if api_key_matches(provided, expected) {
-        return Ok(());
-    }
-    // Only when the caller presented no bearer at all: a *wrong* `Authorization` is a refusal,
-    // never an invitation to look for a second credential on the same request.
-    if provided.is_empty() {
-        match resolve_cookie(&node, req) {
+    match bearer_verdict(req.headers(), expected) {
+        BearerVerdict::Accepted => Ok(()),
+        // A *wrong* `Authorization` is a refusal, never an invitation to look for a second
+        // credential on the same request.
+        BearerVerdict::Refused => Err(unauthorized()),
+        // Only when the caller presented no bearer at all is the cookie consulted.
+        BearerVerdict::Absent => match resolve_cookie(&node, req) {
             Ok(true) => {
                 csrf_gate(req)?;
-                return Ok(());
+                Ok(())
             }
-            Ok(false) => {}
+            Ok(false) => Err(unauthorized()),
             // `resolve_cookie`'s `Err` is already the rendered response (a `500` from a
             // state-machine read failure) — propagate it as-is rather than re-wrapping it.
-            Err(response) => return Err(response),
-        }
+            Err(response) => Err(response),
+        },
     }
-    Err(unauthorized())
+}
+
+/// What the `Authorization` header, on its own, says about a request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BearerVerdict {
+    /// No `Authorization` header at all — the only state in which a cookie may be consulted.
+    Absent,
+    /// The header carries the configured key.
+    Accepted,
+    /// The header is present and is not the key — including a value that is not even
+    /// readable as a string. Presence is the caller's whole claim: a header that will not
+    /// `to_str` used to be coerced to `""` and fell through to the cookie branch, which is
+    /// precisely the second-credential lookup the `Refused` arm exists to forbid.
+    Refused,
+}
+
+/// Judge the `Authorization` header alone, before any cookie is looked at. Pure, so the
+/// presence-versus-parseability distinction is pinned by a unit test rather than by a wire test
+/// that happens to send a well-formed header.
+fn bearer_verdict(headers: &hyper::HeaderMap, expected: &str) -> BearerVerdict {
+    match headers.get(hyper::header::AUTHORIZATION) {
+        None => BearerVerdict::Absent,
+        Some(presented) => match presented.to_str() {
+            Ok(provided) if api_key_matches(provided, expected) => BearerVerdict::Accepted,
+            Ok(_) | Err(_) => BearerVerdict::Refused,
+        },
+    }
 }
 
 /// Constant-time equality for the admin API key, matching open-source Rift's own
 /// `api_key_matches` (`rift-http-proxy/src/admin_api/server.rs`) byte for byte — including its
-/// fail-closed arm on a blank configured key, which is what stops a whitespace-only `MB_APIKEY`
-/// from authenticating a request that carried no header at all (it reaches here as `""`).
+/// fail-closed arm on a blank configured key.
+///
+/// That arm no longer has the job it once did on the bearer path: since [`bearer_verdict`]
+/// branches on *presence*, a request with no `Authorization` at all returns `Absent` and never
+/// reaches here, so there is no `""`-versus-`""` coincidence left to refuse. It still earns its
+/// keep on `session_login`, which compares the *presented* key against a whitespace-only
+/// `MB_APIKEY` and must refuse rather than mint a cookie for it. [`strip_admin_bearer`] needs
+/// the same refusal but cannot borrow it — it compares header bytes, not a `&str`, so it
+/// restates the blank check itself.
 ///
 /// A plain `!=` short-circuits at the first differing byte, letting a network attacker recover
 /// the key from response-timing differences. The length check inside `ct_eq` is not secret.
@@ -1060,6 +1084,11 @@ fn resolve_cookie(node: &RaftNode, req: &Request<Incoming>) -> Result<bool, Resp
 
 /// The `rift_session` cookie's raw value, if the request carries one. No percent-decoding: the
 /// token alphabet (base64url plus `.`) never needs it.
+///
+/// `get`, not `get_all` — deliberately asymmetric with [`strip_session_cookie`], which sweeps
+/// every `Cookie` header. Each is wrong in the safe direction for its own job: reading only the
+/// first header can miss a token and *deny* a session, while stripping only the first could miss
+/// one and *leak* it. Do not "fix" the asymmetry by narrowing the strip.
 fn session_cookie(req: &Request<Incoming>) -> Option<String> {
     let raw = req.headers().get(hyper::header::COOKIE)?.to_str().ok()?;
     raw.split(';').find_map(|pair| {
@@ -1117,11 +1146,11 @@ struct SessionLoginBody {
 
 /// `POST /session`: exchange an API key for a session cookie (RFC-006 §5.3, issue #185).
 ///
-/// Credential verification is exactly `authenticate`'s bearer path — `principal::resolve_bindings`,
-/// the same argon2id lookup — called here directly rather than reimplemented, so there is only
-/// ever one way to check an API key on this front (the issue's explicit requirement). What is
-/// new is only what happens *after* a key checks out: minting a signed cookie instead of
-/// authorizing the one request that presented it.
+/// Credential verification is exactly `authenticate`'s bearer path — the same constant-time
+/// [`api_key_matches`] against the configured `--api-key` (D-73) — called here directly rather
+/// than reimplemented, so there is only ever one way to check an API key on this front (the
+/// issue's explicit requirement). What is new is only what happens *after* a key checks out:
+/// minting a signed cookie instead of authorizing the one request that presented it.
 async fn session_login(state: &Arc<FrontState>, req: Request<Incoming>) -> Response<FrontBody> {
     let Some(node) = state.node.upgrade() else {
         return typed_error(
@@ -1191,12 +1220,28 @@ async fn session_login(state: &Arc<FrontState>, req: Request<Incoming>) -> Respo
 
 /// `DELETE /session`: clear the session cookie (RFC-006 §5.3, issue #185).
 ///
-/// Unconditional and unauthenticated on purpose: logging out never fails, whether or not the
-/// caller holds a live session — there is no server-side state to invalidate (a session is
-/// nothing but a signed claim the fleet did not have to remember making), only a cookie the
-/// browser is told to stop sending. Requiring a valid session first would turn "log out of an
-/// already-expired session" into a `401` instead of the no-op it should be.
-fn session_logout() -> Response<FrontBody> {
+/// Unauthenticated on purpose: logging out never fails for want of a live session — there is no
+/// server-side state to invalidate (a session is nothing but a signed claim the fleet did not
+/// have to remember making), only a cookie the browser is told to stop sending. Requiring a
+/// valid session first would turn "log out of an already-expired session" into a `401` instead
+/// of the no-op it should be.
+///
+/// It is **not** exempt from [`csrf_gate`], though. The gate normally runs inside `authenticate`
+/// on the cookie branch, which this route never reaches, so it is applied here by hand: a
+/// state-changing request the browser will attach the cookie to is exactly what a cross-site
+/// page could otherwise forge, and a forced logout is a denial of service on the operator, small
+/// but real. The console's client stamps the header on every mutation already, so nothing there
+/// changes; a curl user adds `-H 'x-rift-csrf: 1'`.
+///
+/// The gate is unconditional, including on a fleet with no `--api-key`: `DELETE /session` is
+/// `403` without the header on an open plane too, where there is no session to forge a logout
+/// of. That is deliberate rather than overlooked — the alternative is a route whose contract
+/// changes shape with a flag, and the header costs a caller one line — but it does mean an
+/// open-plane `curl -X DELETE .../session` needs the header just like a keyed one.
+fn session_logout(req: &Request<Incoming>) -> Response<FrontBody> {
+    if let Err(refused) = csrf_gate(req) {
+        return refused;
+    }
     let mut response = match buffered_response(StatusCode::NO_CONTENT, Bytes::new(), None) {
         Ok(response) => response,
         Err(response) => return response,
@@ -1742,7 +1787,17 @@ enum ProxyLeg {
     /// `/__rift/{port}/*` data-plane gateway traffic (RFC-002 §7's open plane). Upstream exempts
     /// this prefix from its own key gate for the reason the credential must not be injected here
     /// either: the request is forwarded to the imposter, where an `Authorization` header would
-    /// land in its predicates and its recorded request log.
+    /// land in its predicates and its recorded request log. Not injecting one is only half of
+    /// it, though — the *caller's* credentials must not ride the leg either, so this leg strips
+    /// both of them: the fleet's own key when the client presented it
+    /// ([`strip_admin_bearer`]), and the `rift_session` cookie the browser attaches on its own
+    /// ([`strip_session_cookie`]).
+    ///
+    /// Both strips return `()`, which is a deliberate limit worth naming: every sanitizer here
+    /// can *clean* a request but none can *refuse* one. A future rule that must answer "this
+    /// request may not be proxied at all" has no way to say so, and the cheap move would be to
+    /// bolt it on as a third silent statement that quietly drops a header instead. If that rule
+    /// arrives, give these a `Result` and let the caller answer — do not extend the list.
     Gateway,
 }
 
@@ -1784,11 +1839,14 @@ async fn proxy(
     //
     // Never on the gateway leg: `/__rift/*` is forwarded to the imposter, and an admin
     // credential landing in an app-under-test's predicates and request log is precisely why
-    // upstream exempts that prefix from its own key gate.
-    if leg == ProxyLeg::Admin {
-        match state.api_key.as_deref().map(HeaderValue::from_str) {
-            Some(Ok(value)) => {
-                parts.headers.insert("authorization", value);
+    // upstream exempts that prefix from its own key gate. The gateway leg has the opposite
+    // duty — see `strip_admin_bearer` and `strip_session_cookie`.
+    match leg {
+        ProxyLeg::Admin => match state.api_key.as_deref().map(HeaderValue::from_str) {
+            Some(Ok(mut value)) => {
+                // The key is a secret: keep it out of `Debug` output and any header dump.
+                value.set_sensitive(true);
+                parts.headers.insert(hyper::header::AUTHORIZATION, value);
             }
             // An unspellable key cannot be presented, so the loopback would refuse the request
             // with a 401 the caller cannot act on. Remove rather than forward the client's own
@@ -1796,14 +1854,18 @@ async fn proxy(
             // though it were open would be the silent-fallback shape.
             Some(Err(e)) => {
                 tracing::error!(error = %e, "configured --api-key is not a spellable header value");
-                parts.headers.remove("authorization");
+                parts.headers.remove(hyper::header::AUTHORIZATION);
             }
             // Open plane: upstream's gate is off too, so there is nothing to present. The
             // client's own header is dropped rather than forwarded, so a caller cannot reach
             // the loopback with a credential this front never examined.
             None => {
-                parts.headers.remove("authorization");
+                parts.headers.remove(hyper::header::AUTHORIZATION);
             }
+        },
+        ProxyLeg::Gateway => {
+            strip_admin_bearer(&mut parts.headers, state.api_key.as_deref());
+            strip_session_cookie(&mut parts.headers);
         }
     }
     match state.proxy.request(Request::from_parts(parts, body)).await {
@@ -1815,6 +1877,135 @@ async fn proxy(
             ErrorKind::Unavailable,
             &format!("local admin backend unreachable: {e}"),
         ),
+    }
+}
+
+/// Remove an `Authorization` header that carries the fleet's configured admin key, and only
+/// that one, before the gateway leg reaches an imposter (D-73).
+///
+/// Not injecting the key is only half of "no admin credential reaches a mock". Upstream exempts
+/// `/__rift/*` from its own key gate, so a header the *client* sent was forwarded verbatim — and
+/// a CI script or `curl` alias that stamps `Authorization: <the fleet key>` onto every rift call
+/// would land the fleet's admin key in the imposter's `savedRequests`, its predicates, and any
+/// proxying stub's outbound request. Exactly the leak [`strip_session_cookie`] closes, one
+/// header over.
+///
+/// **Only the fleet's own key goes.** An app under test legitimately sends its own bearer to its
+/// mock and an imposter legitimately predicates on it, so every other value is forwarded
+/// untouched. If *any* value on the header is the key the whole header goes, since a
+/// multi-valued `Authorization` carrying the key alongside something else is not a shape any
+/// honest client produces.
+///
+/// **The compare is on raw bytes and never calls `to_str`.** An earlier form here folded
+/// `to_str`'s `Err` into "not the key", justified by "a value that will not `to_str` cannot be
+/// the key (the key is a `&str`)". That premise is false, and it made this the one credential
+/// classifier on this front that failed *open*: `HeaderValue::to_str` demands visible ASCII, a
+/// Rust `&str` is arbitrary UTF-8, and hyper accepts obs-text (0x80–0xFF) in a header value. So
+/// an `--api-key` holding any non-ASCII byte — `clé-…`, a pasted non-breaking space, a
+/// non-Latin keyboard — arrived in a header `to_str` refused, matched nothing, and rode through
+/// to the imposter. Comparing `as_bytes()` *removes* that decision rather than reversing it: it
+/// is exact on every byte a key can contain. Reversing it — dropping whatever cannot be read —
+/// would be wrong the other way, since an app's own unreadable bearer is none of this front's
+/// business. (The siblings differ because their question differs: [`bearer_verdict`] and
+/// [`strip_session_cookie`] fail closed on an unreadable value because they are judging *this*
+/// fleet's credential; here an unreadable value is usually somebody else's.)
+///
+/// **What the constant-time compare hides, and what it does not.** It is `subtle`'s compare, as
+/// in [`api_key_matches`], for the usual reason and one extra: this is an *unauthenticated,
+/// unrated* surface, so a byte-by-byte compare would let a caller with no credential at all
+/// recover the key from gateway latency. Two leaks remain, both accepted:
+///
+/// * `<[u8]>::ct_eq` returns early on a length mismatch, and this leg is a *new* caller of that
+///   compare on an unauthenticated path — so an anonymous caller can binary-search the admin
+///   key's **length** by timing `/__rift/{port}/x`. A length is not a key, and the admin `401`
+///   already answers the same question.
+/// * The strip is itself a full-key oracle by design: anyone who can read an imposter's journal
+///   learns whether what they sent was *exactly* the key, because that is the one value missing
+///   from it. All-or-nothing, granting nothing over guessing against the admin `401` — and
+///   precisely why this compare must never become per-byte or prefix-based, which would turn an
+///   all-or-nothing oracle into a search.
+fn strip_admin_bearer(headers: &mut hyper::HeaderMap, api_key: Option<&str>) {
+    // No configured key — or a blank one — means there is no fleet credential for a caller to
+    // be leaking. The `trim` arm is [`api_key_matches`]' fail-closed one, restated here because
+    // the byte compare below does not go through it: a whitespace-only configured key must not
+    // match the whitespace-only header somebody happens to send.
+    let Some(expected) = api_key.filter(|key| !key.trim().is_empty()) else {
+        return;
+    };
+    let carries_key = headers
+        .get_all(hyper::header::AUTHORIZATION)
+        .iter()
+        .any(|value| bool::from(value.as_bytes().ct_eq(expected.as_bytes())));
+    if carries_key {
+        headers.remove(hyper::header::AUTHORIZATION);
+    }
+}
+
+/// Remove the `rift_session` pair from every `Cookie` header, leaving the other cookies —
+/// and every header that never carried the pair — exactly as they arrived (D-73).
+///
+/// The console and the gateway share an origin, so a same-site browser request to
+/// `/__rift/{port}/…` — an `<img>` on a console page, a fetch from a script the operator is
+/// trying out — carries the live session token in `Cookie`, and the imposter would record it,
+/// match on it, and forward it through any proxying stub. That is the same leak the
+/// `Authorization` injection guard on the admin leg exists to prevent, arriving by a different
+/// header. Only the one pair goes: an app under test legitimately sends cookies to its mock and
+/// an imposter legitimately predicates on them, so the header survives whenever anything else is
+/// in it and is dropped only when the token was all it carried.
+///
+/// **A header that did not carry the pair is forwarded byte for byte**, not re-serialized. An
+/// imposter predicates on `headers.Cookie` as one whole string, not a parsed jar, so any
+/// rewriting of a header this function has no business in — even re-spacing `a=1;b=2` to
+/// `a=1; b=2` — can silently flip a predicate and then mislead whoever reads the journal, which
+/// shows the sanitized text rather than what the client sent.
+///
+/// **Nameless segments go, but only out of a header that carried the pair.** A cookie-string is
+/// a sequence of `name=value` pairs (RFC 6265 §4.2.1), so a segment with no `=` is not a cookie.
+/// Inside the token's own header it can only be a fragment of the token's *value* —
+/// `rift_session=aa;bb` splits into the pair and a bare `bb`, which an earlier `is_none_or` here
+/// forwarded as a surviving piece of the very value being stripped. RFC 6265 forbids `;` in a
+/// value and this fleet's tokens are base64url plus `.`, so it is not reachable with a
+/// server-minted cookie, but this function's contract is exhaustion rather than luck. Outside
+/// that header a nameless segment is something the client really sent —
+/// `document.cookie = "justavalue"` replays as a bare segment — and dropping it would be the
+/// silent rewrite the paragraph above forbids.
+///
+/// A `Cookie` value that is not readable as a string cannot be inspected for the token and is
+/// dropped whole — fail closed: a header this cannot prove clean is not forwarded.
+fn strip_session_cookie(headers: &mut hyper::HeaderMap) {
+    let kept: Vec<HeaderValue> = headers
+        .get_all(hyper::header::COOKIE)
+        .iter()
+        .filter_map(|value| {
+            let raw = value.to_str().ok()?;
+            let pairs: Vec<&str> = raw.split(';').map(str::trim).collect();
+            let carried_token = pairs.iter().any(|pair| {
+                pair.split_once('=')
+                    .is_some_and(|(name, _)| name.trim() == SESSION_COOKIE_NAME)
+            });
+            if !carried_token {
+                // Nothing to remove, so nothing is rewritten — not even re-spaced.
+                return Some(value.clone());
+            }
+            let remaining: Vec<&str> = pairs
+                .into_iter()
+                .filter(|pair| {
+                    pair.split_once('=')
+                        .is_some_and(|(name, _)| name.trim() != SESSION_COOKIE_NAME)
+                })
+                .collect();
+            if remaining.is_empty() {
+                return None;
+            }
+            // Each piece is a substring of a value hyper already accepted, and `; ` is
+            // header-legal, so this cannot fail; if it somehow did, dropping the header is the
+            // fail-closed answer anyway.
+            HeaderValue::from_str(&remaining.join("; ")).ok()
+        })
+        .collect();
+    headers.remove(hyper::header::COOKIE);
+    for value in kept {
+        headers.append(hyper::header::COOKIE, value);
     }
 }
 
@@ -3165,12 +3356,13 @@ async fn terminate_try_imposter(
     // (`bind_failure_does_not_fail_apply`), because a bind failure must not wedge the replicated
     // log.
     //
-    // Without this gate that gap is an escalation, not an edge case. An Editor holds both
-    // `ImposterWrite` and `ImposterTry`, so they could create an imposter on a port already held
-    // by something else on this box — the metrics listener, the probe listener, the cluster RPC
-    // port — and then use the try to send a request of their choosing to it and read the reply.
-    // Every containment property this endpoint claims is downstream of "the thing that answers is
-    // the imposter you own"; this is where that is actually established.
+    // Without this gate that gap is a confinement failure, not an edge case. The administrator
+    // (D-73: there is exactly one, and the try is theirs to use) could create an imposter on a
+    // port already held by something else on this box — the metrics listener, the probe
+    // listener, the cluster RPC port — and then use the try to send a request of their choosing
+    // to it and read the reply. Every containment property this endpoint claims is downstream of
+    // "the thing that answers is the imposter the record names"; this is where that is actually
+    // established.
     //
     // The positive form (`is_locally_bound`) is required: `bind_failure(..).is_none()` is also
     // true for a port this node serves nothing on, which is precisely the dangerous case.
@@ -3179,11 +3371,11 @@ async fn terminate_try_imposter(
     // only that the engine *held* the port, not that a loopback dial would reach it — an imposter
     // binds `0.0.0.0` by default, and BSD accepts that alongside a foreign `127.0.0.1:{port}`
     // socket, so the more-specific socket still won the connection while this check reported true.
-    // Since #344 there is no dial to misroute: the exchange is dispatched in-process, straight to
-    // the `Arc<Imposter>` this same `is_locally_bound` call resolved, over an in-memory connection
-    // that never touches a socket. The BSD wildcard/REUSEPORT case and the `localhost`-vs-`::1`
-    // variants a loopback dial could not tell apart are all closed at once, by construction —
-    // `a_try_answers_from_this_nodes_engine_not_from_whoever_holds_loopback` pins it.
+    // Since #344 there is no dial to misroute: `perform_try` dispatches the exchange in-process
+    // through `RaftNode::dispatch_to_imposter`, straight to the `Arc<Imposter>` this same
+    // `is_locally_bound` call resolved, over an in-memory connection that never touches a socket.
+    // The BSD wildcard/REUSEPORT case and the `localhost`-vs-`::1` variants a loopback dial could
+    // not tell apart are all closed at once, by construction.
     if !node.is_locally_bound(port) {
         return typed_error(
             StatusCode::BAD_GATEWAY,
@@ -4147,6 +4339,260 @@ fn set_header(response: &mut Response<FrontBody>, name: &'static str, value: &st
 mod tests {
     use super::*;
 
+    /// Pins D-73's authentication rule at the seam where it was wrong: an `Authorization` header
+    /// that is *present* but not readable as a string is a refusal, not an absence. It used to be
+    /// coerced to `""`, which fell through to the cookie branch — a second credential looked up on
+    /// a request whose first one was unacceptable, the exact thing `authenticate`'s own comment
+    /// says never happens.
+    #[test]
+    fn a_present_but_unreadable_authorization_is_refused_not_treated_as_absent() {
+        let expected = "the-key";
+        let mut headers = hyper::HeaderMap::new();
+        assert_eq!(bearer_verdict(&headers, expected), BearerVerdict::Absent);
+
+        headers.insert(
+            hyper::header::AUTHORIZATION,
+            HeaderValue::from_static("the-key"),
+        );
+        assert_eq!(bearer_verdict(&headers, expected), BearerVerdict::Accepted);
+
+        headers.insert(
+            hyper::header::AUTHORIZATION,
+            HeaderValue::from_static("not-the-key"),
+        );
+        assert_eq!(bearer_verdict(&headers, expected), BearerVerdict::Refused);
+
+        // Opaque bytes: legal on the wire (RFC 9110 obs-text), never a `&str`.
+        headers.insert(
+            hyper::header::AUTHORIZATION,
+            HeaderValue::from_bytes(&[0xff, 0xfe]).expect("obs-text is a legal header value"),
+        );
+        assert_eq!(
+            bearer_verdict(&headers, expected),
+            BearerVerdict::Refused,
+            "an unparseable header is a presented credential, not a missing one"
+        );
+
+        // And an empty one is presented too — the old `unwrap_or("")` made these two
+        // indistinguishable, which is the bug.
+        headers.insert(hyper::header::AUTHORIZATION, HeaderValue::from_static(""));
+        assert_eq!(bearer_verdict(&headers, expected), BearerVerdict::Refused);
+    }
+
+    fn cookie_headers(values: &[&'static str]) -> hyper::HeaderMap {
+        let mut headers = hyper::HeaderMap::new();
+        for value in values {
+            headers.append(hyper::header::COOKIE, HeaderValue::from_static(value));
+        }
+        headers
+    }
+
+    fn cookies_of(headers: &hyper::HeaderMap) -> Vec<&str> {
+        headers
+            .get_all(hyper::header::COOKIE)
+            .iter()
+            .map(|v| v.to_str().expect("readable"))
+            .collect()
+    }
+
+    /// The gateway leg's half of D-73: only the `rift_session` pair leaves; every other cookie an
+    /// app under test sends its mock stays, because an imposter legitimately predicates on them.
+    #[test]
+    fn strip_session_cookie_removes_only_the_session_pair() {
+        let mut headers = cookie_headers(&["theme=dark; rift_session=tok.en.sig; other=keep"]);
+        strip_session_cookie(&mut headers);
+        assert_eq!(cookies_of(&headers), vec!["theme=dark; other=keep"]);
+
+        // A look-alike name is a different cookie and is kept; surrounding whitespace on the
+        // real name is not a disguise.
+        let mut headers = cookie_headers(&["rift_session_v2=keep;  rift_session =tok"]);
+        strip_session_cookie(&mut headers);
+        assert_eq!(cookies_of(&headers), vec!["rift_session_v2=keep"]);
+    }
+
+    #[test]
+    fn strip_session_cookie_drops_a_header_that_carried_only_the_token() {
+        let mut headers = cookie_headers(&["rift_session=tok.en.sig"]);
+        strip_session_cookie(&mut headers);
+        assert!(
+            headers.get(hyper::header::COOKIE).is_none(),
+            "an emptied Cookie header must go, not be forwarded as a blank"
+        );
+    }
+
+    #[test]
+    fn strip_session_cookie_leaves_a_header_without_the_token_untouched() {
+        let mut headers = cookie_headers(&["a=1; b=2"]);
+        strip_session_cookie(&mut headers);
+        assert_eq!(cookies_of(&headers), vec!["a=1; b=2"]);
+
+        let mut headers = hyper::HeaderMap::new();
+        strip_session_cookie(&mut headers);
+        assert!(headers.is_empty());
+    }
+
+    /// Every `Cookie` header is inspected, not just the first, and one that cannot be read as a
+    /// string is dropped whole: it cannot be proved token-free, so it is not forwarded.
+    #[test]
+    fn strip_session_cookie_handles_every_cookie_header_and_drops_unreadable_ones() {
+        let mut headers = cookie_headers(&["rift_session=tok", "k=v"]);
+        headers.append(
+            hyper::header::COOKIE,
+            HeaderValue::from_bytes(&[0xff]).expect("obs-text is a legal header value"),
+        );
+        strip_session_cookie(&mut headers);
+        assert_eq!(cookies_of(&headers), vec!["k=v"]);
+    }
+
+    /// A `;` inside the token's value splits it into the pair and a nameless remainder, which an
+    /// earlier `is_none_or` forwarded as a surviving fragment of the very header being stripped.
+    /// Not reachable with a server-minted token (RFC 6265 forbids `;` in a value, and this
+    /// fleet's tokens are base64url plus `.`), but the function's contract is exhaustion.
+    #[test]
+    fn strip_session_cookie_keeps_no_fragment_of_a_semicolon_bearing_value() {
+        let mut headers = cookie_headers(&["rift_session=aa;bb"]);
+        strip_session_cookie(&mut headers);
+        assert!(
+            headers.get(hyper::header::COOKIE).is_none(),
+            "no piece of the token's own header may survive it: {:?}",
+            cookies_of(&headers)
+        );
+
+        // Same header, with real cookies beside the fragment: those stay, the fragment goes.
+        let mut headers = cookie_headers(&["a=1; rift_session=aa;bb; b=2"]);
+        strip_session_cookie(&mut headers);
+        assert_eq!(cookies_of(&headers), vec!["a=1; b=2"]);
+    }
+
+    /// The other side of that rule, and the reason it is scoped to the token's own header: a
+    /// nameless segment in a header that never carried the pair is something the client really
+    /// sent (`document.cookie = "justavalue"` replays as one), and an imposter predicates on
+    /// `headers.Cookie` as a whole string. Dropping it would make an app under test mismatch
+    /// against a value it never sent, with the journal showing the sanitized text.
+    #[test]
+    fn strip_session_cookie_leaves_a_nameless_segment_it_did_not_create() {
+        let mut headers = cookie_headers(&["a=1; loose; b=2"]);
+        strip_session_cookie(&mut headers);
+        assert_eq!(
+            cookies_of(&headers),
+            vec!["a=1; loose; b=2"],
+            "a header with no session pair is not this function's to rewrite"
+        );
+
+        let mut headers = cookie_headers(&["justavalue"]);
+        strip_session_cookie(&mut headers);
+        assert_eq!(cookies_of(&headers), vec!["justavalue"]);
+    }
+
+    /// And it is forwarded *byte for byte*, not re-serialized: even re-spacing a header this
+    /// function has no business in can flip a predicate keyed on the raw `Cookie` string.
+    #[test]
+    fn strip_session_cookie_does_not_reformat_a_header_it_leaves_alone() {
+        let mut headers = cookie_headers(&["a=1;b=2;  c=3 ;"]);
+        strip_session_cookie(&mut headers);
+        assert_eq!(cookies_of(&headers), vec!["a=1;b=2;  c=3 ;"]);
+    }
+
+    /// The other half of "no admin credential reaches an imposter" (D-73): an `Authorization`
+    /// the *client* sent is dropped when — and only when — its value is the fleet's own key.
+    #[test]
+    fn strip_admin_bearer_takes_the_fleet_key_and_nothing_else() {
+        let bearer = |value: &'static str| {
+            let mut headers = hyper::HeaderMap::new();
+            headers.insert(
+                hyper::header::AUTHORIZATION,
+                HeaderValue::from_static(value),
+            );
+            headers
+        };
+
+        let mut headers = bearer("the-fleet-key");
+        strip_admin_bearer(&mut headers, Some("the-fleet-key"));
+        assert!(
+            headers.get(hyper::header::AUTHORIZATION).is_none(),
+            "the fleet's own key must not ride the gateway leg"
+        );
+
+        // An app under test authenticating to its own mock. None of the front's business.
+        let mut headers = bearer("Bearer someone-elses-token");
+        strip_admin_bearer(&mut headers, Some("the-fleet-key"));
+        assert_eq!(
+            headers
+                .get(hyper::header::AUTHORIZATION)
+                .and_then(|v| v.to_str().ok()),
+            Some("Bearer someone-elses-token"),
+        );
+
+        // A near miss is not the key. The compare is exact, not a prefix.
+        let mut headers = bearer("the-fleet-key-2");
+        strip_admin_bearer(&mut headers, Some("the-fleet-key"));
+        assert!(headers.get(hyper::header::AUTHORIZATION).is_some());
+
+        // Open plane: no configured key, so there is no fleet credential to be leaking, and a
+        // blank one must not match every blank header either.
+        let mut headers = bearer("whatever");
+        strip_admin_bearer(&mut headers, None);
+        assert!(headers.get(hyper::header::AUTHORIZATION).is_some());
+        let mut headers = bearer("");
+        strip_admin_bearer(&mut headers, Some("   "));
+        assert!(
+            headers.get(hyper::header::AUTHORIZATION).is_some(),
+            "a whitespace-only configured key matches nothing, so nothing is stripped"
+        );
+
+        // Multi-valued: if any value is the key, the whole header goes.
+        let mut headers = bearer("Bearer app");
+        headers.append(
+            hyper::header::AUTHORIZATION,
+            HeaderValue::from_static("the-fleet-key"),
+        );
+        strip_admin_bearer(&mut headers, Some("the-fleet-key"));
+        assert!(headers.get(hyper::header::AUTHORIZATION).is_none());
+    }
+
+    /// The one credential classifier on this front that used to fail *open*. `to_str` demands
+    /// visible ASCII; a Rust `&str` is arbitrary UTF-8 and hyper accepts obs-text (0x80–0xFF) in
+    /// a header value, so an `--api-key` with any non-ASCII byte — `clé-…`, a pasted
+    /// non-breaking space — produced a header the old `to_str().is_ok_and(...)` folded into
+    /// "not the key", and the fleet's admin key rode through to the imposter's `savedRequests`.
+    /// The compare is on bytes now, so the premise cannot come back.
+    #[test]
+    fn strip_admin_bearer_takes_a_key_that_is_not_visible_ascii() {
+        // "clé-secret" — `to_str` refuses this value; it is still exactly the key.
+        let key = "cl\u{e9}-secret";
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert(
+            hyper::header::AUTHORIZATION,
+            HeaderValue::from_bytes(key.as_bytes()).expect("obs-text is a legal header value"),
+        );
+        assert!(
+            headers
+                .get(hyper::header::AUTHORIZATION)
+                .expect("just inserted")
+                .to_str()
+                .is_err(),
+            "the premise of this test: hyper takes this value and `to_str` will not read it"
+        );
+        strip_admin_bearer(&mut headers, Some(key));
+        assert!(
+            headers.get(hyper::header::AUTHORIZATION).is_none(),
+            "a non-ASCII admin key must be stripped like any other; it is the fleet's credential"
+        );
+
+        // The boundary the fix must not move: an *app's* unreadable bearer is not the fleet's
+        // key and is still none of this front's business.
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert(
+            hyper::header::AUTHORIZATION,
+            HeaderValue::from_bytes(&[0xff, 0xfe]).expect("obs-text is a legal header value"),
+        );
+        strip_admin_bearer(&mut headers, Some(key));
+        assert!(
+            headers.get(hyper::header::AUTHORIZATION).is_some(),
+            "failing closed here would drop an app's own credential to its own mock"
+        );
+    }
+
     /// Issue #359. The two-segment space read is the only shape that carries an owner.
     #[test]
     fn space_read_target_matches_only_the_space_read() {
@@ -4802,6 +5248,53 @@ mod tests {
         );
     }
 
+    /// Pins D-73's fleet-scope prefix agreement. The listing enumerates whatever prefix
+    /// `imposter_scope` resolves, and a `fleet`-scoped imposter's rows live under `f:` — so the
+    /// store and `terminate_spaces_list` must agree on that prefix or the listing scans
+    /// `i<port>:` and reports a populated namespace as empty.
+    /// `spaces_list_for_a_fleet_scoped_imposter_is_served` runs on an unbound `FlowNet` and
+    /// asserts `spaces == []`, which the wrong prefix also produces; this is the test that goes
+    /// red when the two disagree.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn spaces_list_for_a_fleet_scoped_imposter_finds_the_rows_the_store_wrote() {
+        use rift_cluster_base::seams::FlowStoreProvider as _;
+
+        let (front, node, net, _dir) = test_front_with_bound_flow().await;
+        seed_imposter(&node, 4546, serde_json::json!({ "contextScope": "fleet" })).await;
+
+        let config: ImposterConfig = serde_json::from_value(serde_json::json!({
+            "port": 4546,
+            "protocol": "http",
+            "_rift": { "flowState": { "contextScope": "fleet" } },
+        }))
+        .expect("config parses");
+        let store = rift_cluster::stores::ClusteredFlowStoreProvider::new(Arc::clone(&net))
+            .provide(&config)
+            .expect("the clustered provider always provides");
+        tokio::task::spawn_blocking(move || {
+            store.set("checkout", "step", serde_json::json!("paid"))
+        })
+        .await
+        .expect("blocking op")
+        .expect("write through the owner");
+
+        let (status, body) = read_spaces(&front, 4546).await;
+
+        assert_eq!(status, 200, "body: {body}");
+        let doc: serde_json::Value = serde_json::from_str(&body).expect("json body");
+        assert!(doc.get("unavailable").is_none(), "{body}");
+        let rows = doc["spaces"].as_array().expect("a spaces array");
+        assert_eq!(
+            rows.len(),
+            1,
+            "the row the fleet-scoped store wrote must be found under the fleet prefix: {body}"
+        );
+        assert_eq!(rows[0]["space"], "checkout", "{body}");
+        assert_eq!(rows[0]["entryCount"], 1, "{body}");
+    }
+
+    /// `query_param` is what hands the cursor token to the decoder, so the ways it can quietly
+    /// return the wrong string are the ways a walk silently restarts or skips (issue #225).
     #[test]
     fn the_query_value_reader_finds_exactly_the_named_parameter() {
         assert_eq!(query_param(Some("port=4545"), "port"), Some("4545"));

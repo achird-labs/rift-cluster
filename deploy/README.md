@@ -244,6 +244,21 @@ entirely rather than setting it to `""`. `deploy/compose/smoke.overlay.yml` is
 the worked example of the closed shape; `deploy/compose/verify.sh` and
 `verify-pulled.sh` run against the open one and need no key.
 
+One consequence of the cookie exchange is easy to miss: the cookie is set `Secure`,
+so **console login needs HTTPS** (a `localhost` origin is the browser's one
+exception). Over plain HTTP on any other origin `POST /session` answers `200`, the
+browser discards the cookie, and every request after it is `401` — terminate TLS in
+front of the admin port before pointing a browser at it. `curl` with the raw
+`Authorization` key is unaffected.
+
+Pick that hostname so it serves **only** the admin origin. Cookies are scoped by
+host and ignore the port, so an imposter with `"protocol": "https"` on another
+port of the same hostname is same-site with the console and the browser hands it
+the live `rift_session` cookie, which it will record and predicate on. The front
+strips that cookie from `/__rift/{port}/…` traffic, but an imposter bound on its
+own port never passes through the front, and no cookie attribute can scope by
+port. Give imposters hostnames of their own.
+
 ## The rule these manifests exist to encode
 
 On SIGTERM a node **fails readiness first**, keeps serving in-flight work for

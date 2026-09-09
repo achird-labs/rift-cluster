@@ -2068,18 +2068,34 @@ impl rift_cluster_base::seams::FlowStoreProvider for ClusteredFlowStoreProvider 
         &self,
         config: &rift_cluster_base::seams::ImposterConfig,
     ) -> Option<Arc<dyn rift_cluster_base::seams::FlowStore>> {
-        // `validate` refuses bad values pre-commit, so an Err here means a
-        // config written by a different (newer) build reached this node.
-        // Defaults + a loud log beat both a panic on the apply path and a
-        // silent fall-through to the process-local builtin.
-        let flow_config = FlowConfig::from_imposter(config).unwrap_or_else(|reason| {
-            tracing::error!(
-                port = config.port,
-                %reason,
-                "flowState carried a value this build cannot parse; using defaults"
-            );
-            FlowConfig::default()
-        });
+        // `validate` refuses bad values pre-commit, so an `Err` here is a config committed by
+        // an *older* build whose vocabulary this one no longer has — the reachable case being
+        // `"contextScope": "tenant"`, admissible before #550 and refused by name since (D-73).
+        //
+        // Two answers are wrong here, and this used to give one of them. `None` hands the
+        // imposter upstream's process-local built-in store, so fleet-wide state silently becomes
+        // per-node. `FlowConfig::default()` aliases the scope to `Imposter`, silently changing
+        // which imposters share state — the one thing the key exists to decide, and exactly the
+        // aliasing `FlowConfig::from_imposter` refuses. The seam has no error channel of its own,
+        // so the refusal travels in the only one there is: a store whose every operation fails,
+        // naming the port and the reason, so the first stub that touches flow state errors
+        // instead of running against a namespace the operator never chose. A panic is not an
+        // option either — this runs on the apply path and would wedge the replicated log.
+        let flow_config = match FlowConfig::from_imposter(config) {
+            Ok(flow_config) => flow_config,
+            Err(reason) => {
+                tracing::error!(
+                    port = config.port,
+                    %reason,
+                    "flowState carries a value this build refuses; the imposter's flow store is \
+                     unavailable until the config is rewritten"
+                );
+                return Some(Arc::new(RefusedFlowStore {
+                    port: config.port,
+                    reason,
+                }));
+            }
+        };
 
         let store = ClusteredFlowStore {
             net: Arc::clone(&self.net),
@@ -2090,9 +2106,123 @@ impl rift_cluster_base::seams::FlowStoreProvider for ClusteredFlowStoreProvider 
     }
 }
 
+/// The store [`ClusteredFlowStoreProvider::provide`] hands an imposter whose `flowState` this
+/// build cannot honour (D-73): every operation is an error naming the port and the reason.
+/// Deliberately not a no-op store — a no-op answers `Ok(None)`/`Ok(())` and lets a scenario run
+/// as though its state were being kept.
+///
+/// **Known gap, tracked as #576.** This refusal is invisible to the admin API: the only signals
+/// are the `tracing::error!` above and a stub failing at request time. `GET /imposters/{port}`
+/// still reads healthy, with no entry in `RedbStateMachine::apply_failures` — an operator sees a
+/// port that is up and a scenario that mysteriously errors.
+///
+/// **The channel exists; the earlier note here was wrong.** That note said closing this "means a
+/// channel this seam does not have", because `provide` runs inside the engine while
+/// `apply_failures` is "one layer up". Re-checked for #576, and only the first half survives.
+/// `FlowStoreProvider::provide` does return a bare `Option`, so the *seam* carries no error — but
+/// `apply_failures` is not a layer up: `RedbStateMachine::drive_one` writes it (via
+/// `record_report`) in the same `&self` call that awaits `apply_config`, which is what reaches
+/// `provide`. And this provider already shares an `Arc` with that state machine: `compose.rs`
+/// hands the one `flow_net` to both, and `SequencingRegistry` is the same shape solved the same
+/// way one line over, with a comment saying so ("the apply loop is what keeps it current"). So
+/// the report can travel on an `Arc` both ends already hold, with no upstream change. This is
+/// the D-52/#505 shape again — the search stopped at the seam's return type.
+///
+/// Two facts #576 should carry into the fix, found by that re-check: `record_report` *removes*
+/// every `report.created` port from `apply_failures`, and a refused-flow-store imposter is
+/// created and bound as far as the engine is concerned, so a refusal must be folded in **after**
+/// `record_report`, not written from `provide` directly; and `Rift-Bind-Failures` is the wrong
+/// surface for it either way (`bind_failure` gates on `!is_bound()` and its doc forbids routing
+/// non-bind failures through it) — `apply_failures` reaches the operator as the `local-engine=`
+/// entry in `Rift-Warnings`, on the very mutation that committed the bad config.
+///
+/// Not taken here because it is a wiring change across `compose.rs`, the state machine and this
+/// provider, which is #576's job and not this PR's.
+struct RefusedFlowStore {
+    /// Upstream's `ImposterConfig::port` is optional (a port may be assigned at bind time), so
+    /// the message says so rather than inventing `0`.
+    port: Option<u16>,
+    reason: String,
+}
+
+impl RefusedFlowStore {
+    fn refuse<T>(&self) -> anyhow::Result<T> {
+        let port = self
+            .port
+            .map_or_else(|| "<unassigned>".to_owned(), |p| p.to_string());
+        Err(anyhow::anyhow!(
+            "flow state for imposter {port} is unavailable — its flowState carries a value this \
+             build refuses: {}",
+            self.reason
+        ))
+    }
+}
+
+impl rift_cluster_base::seams::FlowStore for RefusedFlowStore {
+    fn get(&self, _flow_id: &str, _key: &str) -> anyhow::Result<Option<Value>> {
+        self.refuse()
+    }
+
+    fn set(&self, _flow_id: &str, _key: &str, _value: Value) -> anyhow::Result<()> {
+        self.refuse()
+    }
+
+    fn exists(&self, _flow_id: &str, _key: &str) -> anyhow::Result<bool> {
+        self.refuse()
+    }
+
+    fn delete(&self, _flow_id: &str, _key: &str) -> anyhow::Result<()> {
+        self.refuse()
+    }
+
+    fn increment(&self, _flow_id: &str, _key: &str) -> anyhow::Result<i64> {
+        self.refuse()
+    }
+
+    fn set_ttl(&self, _flow_id: &str, _ttl_seconds: i64) -> anyhow::Result<()> {
+        self.refuse()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// D-73: a committed config declaring the `tenant` scope — admissible before #550, refused by
+    /// name since — must not be silently re-scoped. `provide` used to fall back to
+    /// `FlowConfig::default()`, i.e. `Imposter`, performing the exact aliasing
+    /// `FlowConfig::from_imposter` refuses. Now the store it hands back refuses every operation
+    /// and says why; and it *does* hand one back, because `None` would be upstream's
+    /// process-local built-in — the other silent answer.
+    #[test]
+    fn a_config_this_build_cannot_parse_gets_a_refusing_store_not_a_defaulted_one() {
+        use rift_cluster_base::seams::FlowStoreProvider as _;
+
+        let net = FlowNet::new(FlowShard::in_memory(crate::stores::ShardConfig::default()));
+        let config: rift_cluster_base::seams::ImposterConfig =
+            serde_json::from_value(serde_json::json!({
+                "port": 4545,
+                "protocol": "http",
+                "_rift": { "flowState": { "contextScope": "tenant" } },
+            }))
+            .expect("the config parses; only this module's vocabulary refuses it");
+
+        let store = ClusteredFlowStoreProvider::new(net)
+            .provide(&config)
+            .expect("a store is always provided — None would defer to the process-local builtin");
+
+        let err = store
+            .set("checkout", "step", serde_json::json!("paid"))
+            .expect_err("a write against a refused scope must fail, not land in `i4545:`");
+        let message = err.to_string();
+        assert!(message.contains("4545"), "names the port: {message}");
+        assert!(message.contains("tenant"), "names the reason: {message}");
+
+        assert!(store.get("checkout", "step").is_err(), "reads refuse too");
+        assert!(store.exists("checkout", "step").is_err());
+        assert!(store.increment("checkout", "n").is_err());
+        assert!(store.set_ttl("checkout", 60).is_err());
+    }
 
     /// `imposter_port` charges only `i<port>:` ids: the fleet (`f:`) and placeholder
     /// namespaces are excluded by construction — pinned so a future prefix cannot start

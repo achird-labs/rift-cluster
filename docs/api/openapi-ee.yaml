@@ -53,8 +53,19 @@ info:
     `/__rift/{port}/*` is served on the admin port too, as data-plane
     gateway traffic proxied straight to the imposter on that port. It is
     deliberately outside this contract and auth-exempt — the admin key is
-    neither required on it nor forwarded to the imposter behind it — so
-    it is not documented here.
+    neither required on it nor forwarded to the imposter behind it. That
+    holds for a credential the *caller* presents, not only for one the
+    front would inject: an `Authorization` whose value is the configured
+    key is dropped before the request is proxied, as is the `rift_session`
+    cookie. Any other bearer rides through untouched, and so does every
+    `Cookie` header that did not carry that pair — byte for byte, not
+    re-serialized — so an app under test can still authenticate to its own
+    mock and an imposter can still predicate on either. Two narrow
+    exceptions on `Cookie`, both confined to headers this already rewrites:
+    a header that cannot be read as text is dropped whole (it cannot be
+    proved token-free), and a header that *did* carry the session pair also
+    loses any `;`-separated segment with no `=`, which there can only be a
+    fragment of the token's own value. Not documented here.
 servers:
   - url: /
 security:
@@ -2524,14 +2535,19 @@ paths:
       description: >
         Terminates. Acts on the cookie the caller already holds, so it is
         exempt from `apiKeyAuth` the same way `createSession` is — there
-        is no credential to check before clearing a cookie. Not a Raft
-        write: the server only ever
+        is no credential to check before clearing a cookie. It is not
+        exempt from the CSRF header: a logout is a state-changing request
+        the browser attaches the cookie to, so without `X-Rift-CSRF` it is
+        refused with `403` rather than letting a cross-site page force an
+        operator out. Not a Raft write: the server only ever
         mints this cookie at `POST /session`, never adopts a
         client-presented one, so there is no session-fixation case to
         guard against here.
       tags: [session]
       x-rift-origin: ee
       security: []
+      parameters:
+        - $ref: '#/components/parameters/CsrfHeader'
       responses:
         '204':
           description: Session cookie cleared; no body.
@@ -2543,6 +2559,8 @@ paths:
               schema:
                 type: string
                 example: 'rift_session=; Max-Age=0; Path=/'
+        '403':
+          $ref: '#/components/responses/Forbidden'
         '503':
           $ref: '#/components/responses/Unavailable'
 
