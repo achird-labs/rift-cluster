@@ -53,8 +53,9 @@ pub struct ControlRequest {
 /// `BindingDelete` entry fails to start rather than skipping it. **#550 also removed
 /// the `tenant` field from every surviving variant**, and that is *not* a decoding
 /// break on its own: this enum sets no `deny_unknown_fields`, so an old entry's extra
-/// `tenant` key is dropped and the op decodes (`raft::network`'s join-reply tests pin
-/// that no `deny_unknown_fields` sneaks onto a wire shape). What actually refuses an
+/// `tenant` key is dropped and the op decodes — pinned on *this* type by
+/// [`tests::an_old_entrys_tenant_field_is_ignored`], because a claim D-73 leans on
+/// operationally should not rest on a test of some other wire shape. What actually refuses an
 /// old state directory is redb: every state-machine table's key or value type lost
 /// its tenant component, and redb answers `TableTypeMismatch` when a table is opened
 /// under a definition whose types differ from the ones it was created with. That
@@ -1223,5 +1224,37 @@ mod tests {
                 .expect_err("a fleet name carrying control characters must be rejected");
             assert!(err.contains("control"), "{bad:?} -> {err}");
         }
+    }
+
+    /// Pins the decoding half of [`ControlOp`]'s doc and of D-73's amendment: dropping the
+    /// `tenant` field from every variant is **not** a wire break. This enum carries no
+    /// `deny_unknown_fields`, so a log entry written before #550 — carrying `tenant` next to
+    /// the fields this build knows — still decodes, and the stale key is simply ignored. The
+    /// guard that *does* refuse an old fleet is redb's per-table `TableTypeMismatch`, on disk;
+    /// it is important that nobody reads a mixed-version fleet's silence on the wire as safety.
+    ///
+    /// Written against `ControlOp` itself rather than borrowing `raft::network`'s join-reply
+    /// tests: those pin `JoinAccepted`, and a `deny_unknown_fields` added to *this* type would
+    /// leave them green while every pre-#550 entry stopped replaying.
+    #[test]
+    fn an_old_entrys_tenant_field_is_ignored() {
+        let old = json!({
+            "PutImposter": {
+                "config": { "port": 4545, "protocol": "http" },
+                "tenant": "default",
+            }
+        });
+        let op: ControlOp =
+            serde_json::from_value(old).expect("a pre-#550 entry's extra `tenant` key is ignored");
+        match op {
+            ControlOp::PutImposter { config } => assert_eq!(config.port, Some(4545)),
+            other => panic!("expected PutImposter, got {other:?}"),
+        }
+
+        // The other direction, so "it decodes" cannot mean the enum decodes anything at all: a
+        // *missing* required field is still an error, not a silent default.
+        let missing = json!({ "PatchStubs": { "port": 4545 } });
+        serde_json::from_value::<ControlOp>(missing)
+            .expect_err("a variant missing a required field must not decode");
     }
 }

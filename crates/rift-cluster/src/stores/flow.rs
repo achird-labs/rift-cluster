@@ -2087,6 +2087,16 @@ impl rift_cluster_base::seams::FlowStoreProvider for ClusteredFlowStoreProvider 
 /// build cannot honour (D-73): every operation is an error naming the port and the reason.
 /// Deliberately not a no-op store — a no-op answers `Ok(None)`/`Ok(())` and lets a scenario run
 /// as though its state were being kept.
+///
+/// **Known gap, left open on purpose.** This refusal is invisible to the admin API: the only
+/// signals are the `tracing::error!` above and a stub failing at request time. `GET
+/// /imposters/{port}` still reads healthy, with no entry in
+/// `RedbStateMachine::apply_failures` and so no `Rift-Bind-Failures` marker — an operator sees a
+/// port that is up and a scenario that mysteriously errors. Closing it means a channel this seam
+/// does not have: `FlowStoreProvider::provide` is called from inside the engine while it builds
+/// the imposter, and `apply_failures` is owned by the state machine's apply loop, which is one
+/// layer up and has already handed the config down. Wiring a report back through the seam is a
+/// change to the upstream seam's shape, not a line in this function, so it is not taken here.
 struct RefusedFlowStore {
     /// Upstream's `ImposterConfig::port` is optional (a port may be assigned at bind time), so
     /// the message says so rather than inventing `0`.
