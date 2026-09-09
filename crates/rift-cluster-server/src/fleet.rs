@@ -91,8 +91,9 @@ pub(crate) fn classify(method: &Method, path: &str) -> Option<FleetRoute> {
 
 /// How long the members fan-out waits for every peer before answering with what it has.
 ///
-/// Matches the journal merge's own peer budget: this is the same trade — an operator read that
-/// answers promptly with stated coverage beats one that hangs on an unreachable node.
+/// The same figure as the front's `FLEET_PEER_BUDGET` for the spaces listing, and the same trade:
+/// an operator read that answers promptly with stated coverage beats one that hangs on an
+/// unreachable node. (The fleet journal merge, whose budget this once mirrored, is gone — D-74.)
 const MEMBER_PEER_BUDGET: Duration = Duration::from_secs(2);
 
 /// A rendered body, and whether it is complete.

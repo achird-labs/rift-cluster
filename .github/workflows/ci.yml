@@ -348,9 +348,7 @@ jobs:
         if: steps.changed.outputs.run == 'true'
         run: |
           set -euo pipefail
-          for tag in rift-cluster-server:local; do
-            docker image inspect "$tag" >/dev/null
-          done
+          docker image inspect rift-cluster-server:local >/dev/null
 
       # `gzip -1`: the layers are already compressed, so anything harder spends
       # CPU to save nothing. What matters is that all four shards load the same
@@ -429,9 +427,7 @@ jobs:
           gunzip -c "${RUNNER_TEMP}/chaos-images.tar.gz" | docker load
           # Same read-back assertion as the build step's, for the same reason —
           # and here it is what lets the harness trust RIFT_CHAOS_PREBUILT_IMAGE.
-          for tag in rift-cluster-server:local; do
-            docker image inspect "$tag" >/dev/null
-          done
+          docker image inspect rift-cluster-server:local >/dev/null
 
       # Serial WITHIN a shard by necessity: the compose file publishes fixed host
       # ports, so two stacks cannot coexist on one runner. Across shards it is

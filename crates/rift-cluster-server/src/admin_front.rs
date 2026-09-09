@@ -117,7 +117,9 @@ const WRITE_DEADLINE: Duration = Duration::from_secs(10);
 
 /// Total budget for a read that genuinely fans out to every other roster peer — since D-74 that
 /// is the spaces listing and nothing else on this front. Bounded so one slow or unreachable peer
-/// degrades an answer to `Rift-Cluster-Partial: true` rather than hanging the client on it.
+/// degrades the answer rather than hanging the client on it: the caller reports the shortfall in
+/// the body as `partial: true` (beside `unavailable`), not through `Rift-Cluster-Partial`, which
+/// is reserved for `/_fleet/members` and `/_fleet/health`.
 const FLEET_PEER_BUDGET: Duration = Duration::from_secs(2);
 
 type FrontBody = BoxBody<Bytes, hyper::Error>;
@@ -396,9 +398,10 @@ pub(crate) enum Terminated {
     DeleteStubById(u16, String),
     SetEnabled(u16, bool),
     /// `DELETE /imposters/{port}/savedProxyResponses` (issue #226): a Raft-committed
-    /// `ControlOp::ProxyRecordedClear` — the proxy-recording sibling of the unscoped
-    /// `ClearSavedRequests` commit above, for the same reason: pre-#226 this proxied to
-    /// one node's in-process store, which cleared nothing the fleet's claim table holds.
+    /// `ControlOp::ProxyRecordedClear`. Pre-#226 this proxied to one node's in-process store,
+    /// which cleared nothing the fleet's claim table holds. Its one-time sibling, the
+    /// `savedRequests` clear, went the other way with D-74 (#552): the journal is per node again,
+    /// so that DELETE is an ordinary proxied route and no longer terminates here.
     /// Recorded *stubs* stay, deliberately — they are imposter config, deleted through
     /// the stub-edit surfaces; this clears the exactly-once markers so signatures record
     /// afresh. GET on the same path stays proxied: the listing is upstream's own surface.
@@ -703,9 +706,10 @@ async fn handle(state: Arc<FrontState>, req: Request<Incoming>) -> Response<Fron
                                 json_content_type(),
                             )
                             .unwrap_or_else(|response| response);
-                            // Same header, same meaning, as the journal merge stamps (#361): the
-                            // members list is folded across peers, and a voter that did not answer
-                            // leaves a row this node could not fill.
+                            // The one production stamp of `Rift-Cluster-Partial` (D-74), serving
+                            // both `/_fleet/members` and `/_fleet/health`: each body is folded
+                            // across peers, and a voter that did not answer leaves a row (or an
+                            // addend) this node could not fill.
                             if body.partial {
                                 set_header(&mut response, HEADER_PARTIAL, "true");
                             }
@@ -1527,14 +1531,15 @@ async fn decorate_flow_state_resolved(
     response
 }
 
-/// Move the headers an earlier decoration set onto a rebuilt response.
+/// Move the proxied response's own headers onto a rebuilt response.
 ///
-/// [`buffered_response`] starts from an **empty** header map. That is right for the first
-/// decoration in a chain and wrong for any later one, and this is the decoration that can run
-/// after another: on a single-imposter read [`decorate_space_owner`] may already have rebuilt the
-/// response, and every header an earlier stage set — the revision token, a bind-failure marker —
-/// would be dropped on the floor by a rebuild that started empty, leaving an answer that has
-/// silently lost what it was saying about itself.
+/// [`buffered_response`] starts from an **empty** header map. That is right for a response this
+/// front composes from nothing and wrong for one it *rewrites*: the knobs decoration rebuilds the
+/// body of an answer the embedded engine already produced, and every header that answer carried
+/// — the revision token, a bind-failure marker, upstream's own cache and vary headers — would be
+/// dropped on the floor by a rebuild that started empty, leaving an answer that has silently lost
+/// what it was saying about itself. (Before D-74 the same helper also carried headers across a
+/// chain of front decorations; the single-imposter read now has exactly this one.)
 ///
 /// `content-type` is left as the rebuild set it, and `content-length` is deliberately not carried:
 /// the body it described is not the body being sent.
@@ -1559,8 +1564,9 @@ fn carry_over_headers(response: &mut Response<FrontBody>, previous: &hyper::Head
 /// break rift-verify against an EE cluster, which is what this repo's `parity` job exists to catch.
 ///
 /// Not *byte*-identical: the document round-trips through `serde_json::Value` without
-/// `preserve_order`, so key order comes out normalised. Already true of this path — the
-/// `numberOfRequests` decoration re-serialises the same way — and no consumer depends on it.
+/// `preserve_order`, so key order comes out normalised. This is the only rewrite the
+/// single-imposter read goes through since D-74 (#552) removed the `numberOfRequests` fleet-sum
+/// decoration, and no consumer depends on key order.
 fn rewrite_flow_state_resolved(bytes: &[u8], knobs: &ResolvedKnobs) -> Result<Vec<u8>, String> {
     let mut doc: serde_json::Value = serde_json::from_slice(bytes)
         .map_err(|e| format!("the imposter body was not JSON: {e}"))?;
@@ -4273,13 +4279,16 @@ mod tests {
         );
     }
 
-    /// Issue #370 — regression. The knobs decoration is the first that runs *after* another one, so
-    /// it is the first that can destroy what an earlier one set.
+    /// Issue #370 — regression. The knobs decoration rebuilds the response through
+    /// `buffered_response`, whose header map starts empty, so it is the stage that can destroy
+    /// what the proxied response already carried.
     ///
-    /// `decorate_number_of_requests` stamps `Rift-Cluster-Partial` on the single-imposter read when
-    /// the fleet fan-out could not reach a peer, and the knobs decoration rebuilds the response
-    /// through `buffered_response`, whose header map starts empty. Losing the stamp would leave a
-    /// count that is knowingly missing a node's slot looking authoritative.
+    /// When this was written, `decorate_number_of_requests` ran first and stamped
+    /// `Rift-Cluster-Partial` on the single-imposter read; D-74 (#552) removed that decoration,
+    /// and the header no longer rides this read at all. The two headers below are now stand-ins
+    /// for whatever the proxied response carried — `Rift-Cluster-Revision` is the one that
+    /// matters in production — and the claim is unchanged: nothing set on the response before the
+    /// rebuild may be lost by it.
     ///
     /// Asserted on both branches, because the rebuild happens on the failure path too.
     #[tokio::test]

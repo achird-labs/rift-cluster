@@ -10,9 +10,10 @@ import type { components } from "../../api/schema.ts";
  * two states left are `LogState`'s `rows` and `unknown`.
  *
  * `Coverage`/`coverageFor`/`describeCoverage` lived here to carry the merge's `Rift-Cluster-Partial`
- * bit onto the screen. That header no longer rides a requests read at all — it survives only on the
- * reads that genuinely fan out (`/_fleet/*` and the spaces listing) — so keeping the type would mean
- * a screen branching on a fact nothing can ever report.
+ * bit onto the screen. That header no longer rides a requests read at all — it survives on exactly
+ * two reads, `/_fleet/members` and `/_fleet/health` — so keeping the type would mean a screen
+ * branching on a fact nothing can ever report. (The spaces listing fans out too but keeps
+ * reporting its own incompleteness in the body, as `partial` beside `unavailable`.)
  */
 
 export type Cursor = { offset: number; size: number };

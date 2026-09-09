@@ -251,9 +251,9 @@ export function useRequestLog(port: number): UseQueryResult<RequestLogState> {
        * Deltas, but never forever: every `BASELINE_EVERY` polls the cursor is dropped and the whole
        * journal is re-read.
        *
-       * The engine stamps `x-rift-next-index` on every 200, so a cursor, once held, is never
-       * offered back as `null` — accumulating on it unconditionally means this screen never
-       * reconciles with the node again. Three things then drift, and none of them announce
+       * The engine stamps `x-rift-next-index` on every 200 its journal backend can cursor, so a
+       * cursor, once held, is re-issued poll after poll — accumulating on it unconditionally means
+       * this screen never reconciles with the node again. Three things then drift, and none announce
        * themselves: a clear issued anywhere *other* than this tab (another operator, the CLI, an
        * SDK) leaves every pre-clear row on screen for good, because the clear neither regresses the
        * token nor sets `truncated`; rows the node has since evicted under retention stay here
@@ -267,11 +267,30 @@ export function useRequestLog(port: number): UseQueryResult<RequestLogState> {
       const resumable =
         held?.kind === "rows" && held.cursor !== null && held.pollsSinceBaseline < BASELINE_EVERY;
       const since = resumable && held?.kind === "rows" ? held.cursor : null;
-      const path = since === null ? requestsPath(port) : `${requestsPath(port)}?since=${since}`;
+      // The token is opaque and round-tripped verbatim, so it is escaped rather than trusted to
+      // be URL-safe: nothing on this side knows the alphabet the engine's backend chose.
+      const path =
+        since === null
+          ? requestsPath(port)
+          : `${requestsPath(port)}?since=${encodeURIComponent(since)}`;
       try {
         const read = await apiGetDecorated<unknown>(path);
         const local = readLog(read.data);
         if (local.kind === "unknown") return local;
+        /*
+         * A cursored ask is a delta only if the engine *answered* it as one. Upstream stamps
+         * `x-rift-next-index` on a read its journal backend can cursor and omits the header
+         * entirely when it cannot (`handle_get_requests`: "backends without stable indices emit
+         * neither") — and such a backend ignores `since` and answers the whole journal. Nothing in
+         * the body says which of the two arrived, and appending the whole journal would duplicate
+         * every row already on screen. So `resuming` is derived from the answer, not the question:
+         * a cursored ask answered without a cursor is not merged. The rows already held stay as
+         * they are, the cursor is dropped, and the next poll is a full read that replaces them —
+         * the same re-baseline the counter below forces periodically, brought forward.
+         */
+        if (since !== null && held?.kind === "rows" && read.next === null) {
+          return { ...held, cursor: null };
+        }
         const resuming = since !== null && held?.kind === "rows";
         /*
          * A cursored fetch is the delta this node is handing over on top of what the screen already

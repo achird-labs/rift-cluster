@@ -4085,7 +4085,7 @@ async fn c10_proxy_once_survives_owner_and_leader_kills() {
         // Now a claim the cluster cannot serialize is refused (503) and never forwarded, so a
         // refused fire provably costs the origin nothing and is discounted. What remains,
         // `chargeable`, is the number of fires that could have reached the origin at all, and it
-        // collapses to the contract's own bound — 1 + ownership changes in flight (Ch.6/Ch.7) —
+        // collapses to the contract's own bound — 1 + ownership changes in flight (Ch.6 §proxyOnce) —
         // whenever the outage refuses rather than forwards. Anything above it is genuine
         // duplication: a double recording, a replay that proxied, or a refusal that forwarded
         // after all, which is the regression this assertion now also catches.

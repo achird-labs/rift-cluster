@@ -259,6 +259,32 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/imposters/{port}/savedRequests/stream": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The imposter's port number. */
+                port: components["parameters"]["Port"];
+            };
+            cookie?: never;
+        };
+        /**
+         * Live tail of recorded requests, on the node you reached (SSE, upstream)
+         * @description Proxied to the embedded engine's own admin API. The live sibling of `GET /imposters/{port}/savedRequests`, and per node for the same reason (D-74): it tails **this node's** journal — the requests this node served — and answers `text/event-stream`.
+         *     **Per node, by design (D-74).** Until #552 this route was terminated by the cluster front (issue #348) and re-ran the fleet merge on every wake, with a vector-cursor `id:`, a `clusterTailLatencyMs` bound on how late a peer's entry could arrive, and a `partial` event on each transition of the merged read's degraded state. All three were properties of the merge; with the journal back in the engine there is no peer to be late or partial about, so the stream is upstream's own frames verbatim. A client that wants the fleet's tail opens one stream per node.
+         *     **Events** are the engine's. `hello` first, carrying `engineVersion`, the bus position `seq`, `types` (always `["requests"]` on this alias) and `port`. Then `request` events whose `data` is `{port, flowId, request}` plus `index` when the journal backend has stable indices — the same scalar `since` position the polling read uses, and omitted entirely when it does not, so its absence is a capability probe rather than a value. `lagged` when the subscriber fell behind the bus, carrying `missed`. `: ping` every 15 s.
+         *     The alias pre-binds the port and streams request events only; upstream ignores `types` and `port` here. `match` is upstream's own parameter, parsed by upstream, and filters the frames. `GET /events` is the engine's unfiltered firehose and is likewise per node.
+         */
+        get: operations["streamSavedRequests"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/imposters/{port}/verify": {
         parameters: {
             query?: never;
@@ -2499,6 +2525,50 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["Imposter"];
+                };
+            };
+            400: components["responses"]["BadData"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            /** @description No such imposter on this port. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    streamSavedRequests: {
+        parameters: {
+            query?: {
+                /**
+                 * @description Repeatable filter clause; every clause supplied must match (AND). The grammar is closed — `method=<Verb>`, `path=<Path>`, `flow_id=<Value>`, or `header:<Name>=<Value>` — and a value outside it answers 400 rather than being ignored, because a filter that silently degraded to "match everything" would cross-contaminate correlated scenarios.
+                 * @example [
+                 *       "method=POST",
+                 *       "header:Content-Type=application/json"
+                 *     ]
+                 */
+                match?: components["parameters"]["JournalMatch"];
+            };
+            header?: never;
+            path: {
+                /** @description The imposter's port number. */
+                port: components["parameters"]["Port"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description An open SSE stream. Ends only when the client disconnects or the node stops. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "text/event-stream": string;
                 };
             };
             400: components["responses"]["BadData"];

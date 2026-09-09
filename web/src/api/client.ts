@@ -263,10 +263,11 @@ export async function apiGetWithRevision<T = unknown>(
  * The three response headers a read can carry facts on, from **two different sources** since D-74
  * (#552).
  *
- * `Rift-Cluster-Partial` is the cluster's own, stamped by `decorate.rs` on a read that genuinely
- * fans out across the fleet — `/_fleet/members`, `/_fleet/health`, the spaces listing. The other
- * two are **upstream's**, emitted by the embedded engine on its own journal reads and carrying its
- * own scalar index; the cluster proxies them verbatim and never parses them.
+ * `Rift-Cluster-Partial` is the cluster's own, stamped on exactly two reads — `/_fleet/members`
+ * and `/_fleet/health`. (The spaces listing fans out too but keeps reporting its own
+ * incompleteness in the body, as `partial` beside `unavailable`.) The other two are **upstream's**,
+ * emitted by the embedded engine on its own journal reads and carrying its own scalar index; the
+ * cluster proxies them verbatim and never parses them.
  *
  * They share a type because they share a mechanism — a fact the body cannot carry, read off the
  * response — not because any one read carries all three. A journal read is never partial (it fans

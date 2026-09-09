@@ -1,4 +1,4 @@
-//! The clustered `proxyOnce` recording store (#226, Ch.7 §proxyOnce, D-40): exactly-once
+//! The clustered `proxyOnce` recording store (#226, Ch.6 §proxyOnce, D-40): exactly-once
 //! recording fleet-wide, through upstream's `ProxyRecordingStore` seam (U-16, rift#911).
 //! Cluster-native, not Redis-first: D-12's Redis-backed-first ordering was amended once this
 //! shipped on consensus (see D-12's amendment); no Redis proxyOnce backend exists.
@@ -7,7 +7,7 @@
 //!
 //! - **Ownership.** Each `(port, signature)` has one owner on the HRW ring
 //!   (`KeyClass::Proxy`, D-20). Claims are owner-local memory — *Pending dies with the owner*, so
-//!   the duplicate-upstream bound is 1 + ownership changes in flight (Ch.6/Ch.7). A
+//!   the duplicate-upstream bound is 1 + ownership changes in flight (Ch.6 §proxyOnce). A
 //!   partitioned owner refuses claims (`is_isolated`, fail closed); membership fencing and
 //!   `NotOwner` redirects copy `FlowNet::owner_write`.
 //! - **Recorded is consensus.** `complete()`/`record()` route to the owner, which validates
@@ -1105,7 +1105,7 @@ impl ProxyRecordingStore for ClusterProxyStore {
             // proxyAlways with no generated stub publishes nothing: there is no stub to
             // replicate and the mode never replays from `lookup`. Upstream's in-memory
             // response list exists to feed later stub generation, which the clustered
-            // store does not model — documented in Ch.7.
+            // store does not model — documented in Ch.6 §proxyOnce.
             PortMode::Always | PortMode::Transparent => Ok(()),
         }
     }

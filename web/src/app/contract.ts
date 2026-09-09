@@ -53,7 +53,7 @@ export const IMPOSTER_COLUMNS = [
   { key: "protocol", label: "Protocol", numeric: false },
   { key: "name", label: "Name", numeric: false },
   { key: "stubs", label: "Stubs", numeric: true },
-  { key: "numberOfRequests", label: "Requests", numeric: true },
+  { key: "numberOfRequests", label: "Requests · this node", numeric: true },
   { key: "recordRequests", label: "Recording", numeric: false },
   { key: "enabled", label: "State", numeric: false },
   // `as const` keeps the keys as literals, which is what lets `ImposterField`'s `assertNever`

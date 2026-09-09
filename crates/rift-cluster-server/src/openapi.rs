@@ -386,6 +386,11 @@ mod parity {
             ("DELETE", "/imposters/{port}/requests"),
             ("GET", "/imposters/{port}/savedRequests"),
             ("DELETE", "/imposters/{port}/savedRequests"),
+            // The SSE tail is proxied too, and is listed here rather than dropped: #348 had
+            // terminated it as the merge's live sibling, so leaving it out of this table while
+            // also removing it from the contract would make both sides agree about a route the
+            // front still serves — the one shape the parity oracle cannot see.
+            ("GET", "/imposters/{port}/savedRequests/stream"),
             ("POST", "/imposters/{port}/verify"),
             // `savedProxyResponses` DELETE is gone from this table (issue #226): it terminates
             // as `ControlOp::ProxyRecordedClear` — a proxied clear could never purge the

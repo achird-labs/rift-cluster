@@ -43,14 +43,15 @@ pub struct ControlRequest {
 
 /// Application-level operation carried by the Raft log (ADR-001 §4.1).
 ///
-/// **Removing a variant is a log-format break, and #546, #549 and #550 each took one
-/// deliberately.** This enum is externally-tagged `serde_json` with no envelope
+/// **Removing a variant is a log-format break, and #546, #549, #550 and #552 each took
+/// one deliberately.** This enum is externally-tagged `serde_json` with no envelope
 /// version and no `#[serde(other)]` catch-all — `raft::store` writes entries with
 /// `serde_json::to_vec` and reads them back with `from_slice` — so a variant that
 /// is gone here cannot be decoded at all: a node replaying a log that still holds
 /// an `AuditSinkPut`, `SourcePut`, `SpecPut`, `TenantPut`, `TenantDelete`,
-/// `PrincipalPut`, `PrincipalCreate`, `PrincipalDelete`, `BindingPut` or
-/// `BindingDelete` entry fails to start rather than skipping it. **#550 additionally
+/// `PrincipalPut`, `PrincipalCreate`, `PrincipalDelete`, `BindingPut`,
+/// `BindingDelete` or `JournalClearGen` (#552, D-74) entry fails to start rather
+/// than skipping it. **#550 additionally
 /// removed the `tenant` field from every surviving variant**, which changes the
 /// encoding of ops that still exist, so this is a break for the whole log rather
 /// than for the removed variants alone. Pre-release that is the right trade, and
@@ -124,7 +125,7 @@ pub enum ControlOp {
     FleetNamePut {
         name: String,
     },
-    /// One `proxyOnce`/`proxyAlways` recording, as consensus fact (#226, Ch.7 §proxyOnce, D-40).
+    /// One `proxyOnce`/`proxyAlways` recording, as consensus fact (#226, Ch.6 §proxyOnce, D-40).
     ///
     /// Carries **both** the replayable response and — when predicate generation built one —
     /// the recorded stub, in a single op. Deliberately not two ops riding one front-door
