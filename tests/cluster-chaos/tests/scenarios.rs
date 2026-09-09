@@ -27,10 +27,11 @@ use cluster_chaos::{
     PULL_ON_MISS_IMPOSTER_PORT, SEQUENCING_HOST_PORTS, SEQUENCING_IMPOSTER_PORT, add_toxic,
     append_stub, backend_failing_health_check, chaos_artifact, claims_leadership, clear_toxics,
     config_revision, exec_probe, fleet_members, get_data_plane, get_data_plane_with, get_json,
-    imposter_ports, metric, probe, published_host_ports, put_imposter, put_imposter_config,
-    put_imposter_with_key, put_routes, put_stubs, toxic_count, voter_count, wait_admin_reachable,
-    wait_backend_ejected, wait_converged, wait_converged_on, wait_ports_free_in,
-    wait_revisions_agree, wait_revisions_agree_on, wait_single_leader, wait_voters,
+    host_ports_in, imposter_ports, metric, probe, published_host_ports, put_imposter,
+    put_imposter_config, put_imposter_with_key, put_routes, put_stubs, toxic_count, voter_count,
+    wait_admin_reachable, wait_backend_ejected, wait_converged, wait_converged_on,
+    wait_ports_free_in, wait_revisions_agree, wait_revisions_agree_on, wait_single_leader,
+    wait_voters,
 };
 
 /// The imposter port a scenario configures. Inside the container network
@@ -263,14 +264,19 @@ fn the_port_barrier_names_the_port_that_is_still_held() {
         .expect("the barrier clears once the port is released");
 }
 
-/// The barrier must wait on exactly what compose publishes — read out of the
-/// compose files, not out of the constants it is checking.
+/// The constants must name exactly what compose publishes — read out of the
+/// compose files, not out of the constants being checked.
 ///
 /// Deriving both sides from `NODES` and friends would only prove the constants
 /// agree with themselves: a `ports:` entry added to an overlay with no matching
-/// constant would sail past, unwaited-on and unreserved, which is precisely the
-/// hole #117 came through. Set equality in both directions, so an unpublished
-/// constant is caught too.
+/// constant would sail past **unreserved**, which is precisely the hole #117 came
+/// through. Set equality in both directions, so an unpublished constant is caught
+/// too.
+///
+/// What `published_host_ports` feeds is the CI-side reservation check
+/// (`ci_reserves_every_published_port_that_linux_could_hand_out`), not the
+/// pre-stack barrier: since #580 the barrier derives its own set per stack from
+/// the compose files, through the same `host_ports_in` this test uses.
 #[test]
 fn the_barrier_covers_exactly_what_compose_publishes() {
     let mut published: Vec<u16> = compose_files()
@@ -286,9 +292,11 @@ fn the_barrier_covers_exactly_what_compose_publishes() {
 
     assert_eq!(
         published, waited,
-        "the ports compose publishes and the ports the barrier waits on have \
-         diverged. Left-only: a published port nobody waits on or reserves -- the \
-         #117 hole. Right-only: a constant naming a port nothing publishes."
+        "the ports compose publishes and the ports the constants name have diverged. \
+         Left-only: a published port nothing reserves -- the #117 hole, since \
+         `published_host_ports` is what `ci_reserves_every_published_port_that_linux_\
+         could_hand_out` checks the sysctl against. Right-only: a constant naming a \
+         port nothing publishes."
     );
 
     // If the scraper silently matched nothing, set equality could still hold
@@ -505,42 +513,6 @@ fn normalise(path: &std::path::Path) -> String {
 
 fn read_compose(path: &std::path::Path) -> String {
     std::fs::read_to_string(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
-}
-
-/// Host ports from the `ports:` blocks of a compose file (`"12525:2525"` -> 12525).
-///
-/// Deliberately a literal scrape rather than a YAML parse: the value of this
-/// check is that it reads the shipped text the way a person would, with no
-/// dependency that could normalise away the thing being checked.
-fn host_ports_in(compose: &str) -> Vec<u16> {
-    let mut ports = Vec::new();
-    let mut in_ports = false;
-    for line in compose.lines() {
-        let trimmed = line.trim();
-        if trimmed == "ports:" {
-            in_ports = true;
-            continue;
-        }
-        if trimmed.is_empty() || trimmed.starts_with('#') {
-            continue;
-        }
-        if !trimmed.starts_with('-') {
-            in_ports = false;
-            continue;
-        }
-        if !in_ports {
-            continue;
-        }
-        let spec = trimmed.trim_start_matches('-').trim();
-        let spec = spec.split('#').next().unwrap_or(spec).trim();
-        let spec = spec.trim_matches('"').trim_matches('\'');
-        if let Some((host, _container)) = spec.split_once(':')
-            && let Ok(port) = host.trim().parse::<u16>()
-        {
-            ports.push(port);
-        }
-    }
-    ports
 }
 
 /// Linux hands out 32768-60999 as ephemeral source ports, so any published port
