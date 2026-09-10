@@ -204,6 +204,45 @@ read, is dropped. That is all of it — an imposter this node has applied by tha
 and is kept, whenever its flow arrived — and what bounds it is that `compose` reconciles only once
 `last_applied` has reached the leader's applied index: one apply round-trip, not seconds.
 
+**Amendment (2026-09-09, #574 — two handles drive one engine, and nothing separated them):** the
+paragraphs above are all about *what a set means*. This one is about **who may drive one at the same
+time**, which nothing above constrained and — the part that was missed — nothing upstream constrained
+either. Two handles drive one engine: the apply loop has openraft's clone of the state machine,
+`compose`'s reconciler has the reader clone, and `apply_config` (U-6) deletes every live imposter the
+set it is given omits.
+
+**Upstream takes no lock across `apply_config` at all** — not manager-wide, not around the delete and
+create passes (`manager.rs`, `apply_config`). It says so itself, in the bind path: *"two `apply_config`
+calls can run against the same engine concurrently — the raft apply loop and the startup reconcile
+poll drive it through separate state-machine handles with no lock between them."* So the two calls
+were not merely computing their arguments at unsynchronised times; their **bodies interleaved**, the
+reconcile's delete pass running against the apply's create pass, with only `try_claim`'s
+check-then-store and a `PortInUse` loser to arbitrate a collision.
+
+The concrete loss: a reconcile that read its desired set before an apply committed port P, and drove
+the engine after that apply had driven it, applied a set that never named P. P is torn down, reported
+`deleted`, and — by the 2026-09-08 amendment above — its flow state is cleared. Fleet-wide P is alive
+and served; on this node it is gone, and the imposter returns only on the next committed config op
+(each carries the whole set), while the flow state does not return at all.
+
+Every engine drive therefore takes an engine-drive lock, and the reconcile holds it **across its
+desired-set read and the drive that set feeds**, not merely around the drive. That is strictly more
+than serialising the two calls: apply builds its set from a mid-write-transaction view, so it is
+always at least as fresh as any concurrent reader's, applies are strictly sequential on openraft's
+state-machine worker, and the reconcile's read is inside the same critical section as its drive —
+so the drive that lands *last* always carries the *freshest* set, with no residual ordering hole.
+It releases that lock **before the orphan sweep**: the
+sweep's correctness is the read *order* established above, not exclusion, and the apply loop must
+be free to make progress across it — which is what the sweep's own seam exists to exercise. The
+residual stated in the previous amendment is unchanged; this closes a different window, in the sync
+half rather than the sweep.
+
+*Rejected:* a generation counter re-checked before acting on `report.deleted`. It can only detect
+the teardown after `apply_config` has performed it, so the imposter is still momentarily gone and
+the node still answers 404 for it until something re-drives — detection where exclusion was
+available. *Also rejected:* routing the reconcile through the log, which would need a leader and a
+replicated entry for a node-local operation.
+
 ### D-6 — Redis impls of the new traits are cluster; existing `RedisFlowStore` (incl. U-1 CAS) stays OSS
 - **Status:** amended
 - **Decided:** 2026-07-01 · RFC-001 v2

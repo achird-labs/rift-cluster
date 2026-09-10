@@ -782,6 +782,40 @@ pub struct RedbStateMachine {
     /// refusal that names no single port). This is node status, not replicated
     /// state — every replica has its own bind outcomes.
     apply_failures: Arc<Mutex<BTreeMap<u16, String>>>,
+    /// Serialises engine drives against each other, and — the point of it —
+    /// against the *read that computed one* (#574).
+    ///
+    /// Two handles drive one engine. The apply loop owns openraft's clone;
+    /// `compose`'s reconciler owns the reader clone. Both build a whole desired
+    /// config set and hand it to `apply_config` (U-6), which deletes every live
+    /// imposter the set omits.
+    ///
+    /// **Upstream takes no lock across `apply_config` at all**, and says so in
+    /// its own bind path: "two `apply_config` calls can run against the same
+    /// engine concurrently — the raft apply loop and the startup reconcile poll
+    /// drive it through separate state-machine handles with no lock between
+    /// them." So before this the two calls were not even ordered: their bodies
+    /// interleaved, the reconcile's delete pass against the apply's create pass,
+    /// with only `try_claim`'s check-then-store and a `PortInUse` loser to
+    /// arbitrate. This lock orders the calls *and* — because the reconcile takes
+    /// it before its desired-set read — puts that read in the same critical
+    /// section as the drive it feeds, which is what stops a stale set from
+    /// tearing down a port a concurrent apply just created (#574).
+    ///
+    /// `tokio::sync::Mutex`, not `parking_lot`: it is held across `.await`.
+    ///
+    /// **Cost, and it lands at startup.** Uncontended once the reconcile has run.
+    /// *During* it the apply loop parks for the whole of `apply_config`: N serial
+    /// creates, each a real listener bind, plus one uncached self-signed keypair
+    /// per HTTPS imposter without an inline cert, on the calling thread. That is
+    /// new — upstream's lock-free path meant the two never parked on each other
+    /// before. It is not the #444 hazard: this parks an `.await`ing future rather
+    /// than pinning a runtime worker, and `RaftCore` is a separate task, so
+    /// heartbeats and leadership are unaffected. What is delayed is `last_applied`
+    /// and client-write responses *on this node* — which `compose` gates behind
+    /// `GATE_RECONCILED` anyway, so the node is not serving yet. On the live apply
+    /// path the delete side can also drain connections per port before returning.
+    engine_drive: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl std::fmt::Debug for RedbStateMachine {
@@ -806,6 +840,7 @@ impl RedbStateMachine {
             flow_net: None,
             routes: None,
             apply_failures: Arc::new(Mutex::new(BTreeMap::new())),
+            engine_drive: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
@@ -1537,16 +1572,22 @@ impl RedbStateMachine {
     /// engine-side failures land in [`Self::apply_failures`] as usual.
     #[allow(clippy::result_large_err)]
     pub async fn reconcile_engine(&self) -> StorageResult<()> {
-        self.reconcile_engine_interleaved(std::future::ready(()))
+        self.reconcile_engine_interleaved(std::future::ready(()), std::future::ready(()))
             .await
     }
 
-    /// [`Self::reconcile_engine`] with a seam inside its orphan sweep, between
-    /// the sweep's two reads. Production passes a ready future; the test that
-    /// pins the sweep's bound (#567 review) commits an imposter there, on a
-    /// second state-machine handle, exactly where the apply loop can in
-    /// `compose`. One body for both, so the ordering under test is the
-    /// ordering shipped.
+    /// [`Self::reconcile_engine`] with two seams: one between its desired-set
+    /// read and the drive that set feeds (#574), and one inside its orphan sweep
+    /// between the sweep's two reads (#567/#573). Production passes ready futures
+    /// for both; the tests commit an imposter at each point, on a second
+    /// state-machine handle, exactly where the apply loop can in `compose`. One
+    /// body for both, so the ordering under test is the ordering shipped.
+    ///
+    /// **`between_read_and_drive` runs while `engine_drive` is held**, which is
+    /// the whole point of that seam: it proves the apply it lets loose *cannot*
+    /// land between this reconcile's read and its drive, rather than merely that
+    /// it usually does not. A test seam that ran outside the lock would be
+    /// testing the scheduler.
     ///
     /// **That point, not "between the sync and the sweep" (#573 review).** The
     /// sweep's verdict is decided by two reads — the held set and the desired
@@ -1558,8 +1599,45 @@ impl RedbStateMachine {
     #[allow(clippy::result_large_err)]
     async fn reconcile_engine_interleaved(
         &self,
+        between_read_and_drive: impl Future<Output = ()>,
         between_sweep_reads: impl Future<Output = ()>,
     ) -> StorageResult<()> {
+        // Taken here, before the read below, and held through the drive that read
+        // feeds — #574. `apply_config` deletes every live imposter the set it is
+        // given omits, so a set read before a concurrent apply committed a port
+        // and applied after that apply drove the engine tears the port down and
+        // reports it `deleted`, clearing its flow state. Upstream holds no lock
+        // across `apply_config` (see `engine_drive`), so this orders the two
+        // calls *and* keeps this read in the same critical section as its drive.
+        //
+        // Dropped before the sweep, deliberately: the sweep's correctness is its
+        // read *order* (D-5, the #573 amendment), not exclusion, and the apply
+        // loop must be free to make progress across it — the sweep's own seam
+        // exists to let a test commit there.
+        let sweep_after = {
+            let _drive = self.engine_drive.lock().await;
+            self.sync_engine_under_drive_lock(between_read_and_drive)
+                .await?
+        };
+        if sweep_after {
+            self.sweep_orphaned_imposter_state(between_sweep_reads)
+                .await?;
+        } else {
+            // Still awaited on the refuse path, so an interleaving a test asks
+            // for is never silently dropped along with the sweep.
+            between_sweep_reads.await;
+        }
+        Ok(())
+    }
+
+    /// The engine-sync half of [`Self::reconcile_engine_interleaved`], with
+    /// `engine_drive` already held by the caller. Returns whether the sweep
+    /// should follow.
+    #[allow(clippy::result_large_err)]
+    async fn sync_engine_under_drive_lock(
+        &self,
+        between_read_and_drive: impl Future<Output = ()>,
+    ) -> StorageResult<bool> {
         // Both tables read fresh, in one call: a restart's local `ImposterManager`
         // and `ArcSwap<CompiledRoutes>` both start empty (they are process-local,
         // rebuilt from persisted `sm_configs`/`sm_routes`), and a live commit only
@@ -1596,23 +1674,21 @@ impl RedbStateMachine {
         // does nothing either, rather than clear against a set the engine
         // itself was not trusted with.
         let config_synced = matches!(config_action, EngineAction::Sync(_));
+        // The #574 seam: an apply committed and driven here must not be able to
+        // undo the drive below. Awaited while `engine_drive` is held, so a test's
+        // concurrent apply parks on the lock rather than racing us.
+        between_read_and_drive.await;
         // Unattributed: this materializes a whole table on restart, not one
         // caller's write, so there is no principal to name.
-        self.drive_engine(vec![
+        //
+        // `_locked`: the guard is the caller's, and re-taking it here would
+        // deadlock — `tokio::sync::Mutex` is not reentrant.
+        self.drive_engine_locked(vec![
             AttributedAction::unattributed(config_action),
             AttributedAction::unattributed(routes_action),
         ])
         .await;
-        if config_synced {
-            self.sweep_orphaned_imposter_state(between_sweep_reads)
-                .await?;
-        } else {
-            // Still awaited on the refuse path, so an interleaving a test asks
-            // for is never silently dropped along with the sweep.
-            between_sweep_reads.await;
-        }
-
-        Ok(())
+        Ok(config_synced)
     }
 
     /// Test-only: overwrite a raw `sm_configs` row, bypassing validation — the
@@ -2237,7 +2313,17 @@ impl RedbStateMachine {
     /// `ImposterManager`), and vice versa. Neither handle's absence gates the
     /// other's actions — unlike the pre-#131 shape, which could return early
     /// only because every action was engine-bound.
+    /// Takes [`Self::engine_drive`] for the whole batch. The reconcile takes it
+    /// itself, one level up, so that its *read* is inside the same critical
+    /// section as its drive (#574) — hence the `_locked` split rather than a
+    /// guard here only.
     async fn drive_engine(&self, actions: Vec<AttributedAction>) {
+        let _drive = self.engine_drive.lock().await;
+        self.drive_engine_locked(actions).await;
+    }
+
+    /// [`Self::drive_engine`] with the caller already holding `engine_drive`.
+    async fn drive_engine_locked(&self, actions: Vec<AttributedAction>) {
         for AttributedAction { principal, action } in actions {
             // U-10: re-open the attribution scope the admin request task could
             // not carry across the task boundary, so the listener upstream
@@ -3298,6 +3384,7 @@ impl RedbStateMachine {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+    use std::time::Duration;
 
     use arc_swap::ArcSwap;
     use openraft::storage::{RaftStateMachine, Snapshot};
@@ -3305,6 +3392,7 @@ mod tests {
     use openraft::{
         CommittedLeaderId, Entry, EntryPayload, LogId, RaftSnapshotBuilder, StorageError,
     };
+    use parking_lot::Mutex;
     use redb::{ReadableDatabase, ReadableTable, TableDefinition};
 
     use super::{SESSION_KEY_ROW, SM_SESSION_KEY_TABLE};
@@ -3823,6 +3911,23 @@ mod tests {
         (td, sm, shard)
     }
 
+    /// [`RedbStateMachine::reconcile_engine`] under a deadline.
+    ///
+    /// Since #574 the reconcile holds a non-reentrant `tokio::sync::Mutex` across
+    /// its read and its drive, which makes two plausible edits **hang** rather
+    /// than fail: driving the engine through `drive_engine` instead of
+    /// `drive_engine_locked` from inside the guard, or moving the orphan sweep
+    /// inside it — the sweep's seam awaits an `apply` on the same task, and
+    /// `apply` ends by taking the very lock that task holds. A hung job is a
+    /// worse outcome than a red test and gives a reader nothing to read, so every
+    /// reconcile in these tests goes through here.
+    #[allow(clippy::result_large_err)]
+    async fn reconcile_bounded(sm: &RedbStateMachine) -> super::StorageResult<()> {
+        tokio::time::timeout(Duration::from_secs(20), sm.reconcile_engine())
+            .await
+            .expect("the reconcile never returned — engine_drive is being taken twice on one task")
+    }
+
     /// One live entry under `flow_id`, as an owner would have written it.
     async fn seed_flow(shard: &FlowShard, flow_id: &str) {
         shard
@@ -3961,7 +4066,7 @@ mod tests {
             seed_flow(&shard, flow).await;
         }
 
-        sm.reconcile_engine().await.expect("reconcile");
+        reconcile_bounded(&sm).await.expect("reconcile");
         assert_eq!(engine.count(), 1, "the engine is rebuilt from the tables");
         assert!(
             shard.get("i18097:checkout", "checkout").is_none(),
@@ -3977,7 +4082,7 @@ mod tests {
         );
 
         // Idempotent: a second reconcile finds nothing orphaned.
-        sm.reconcile_engine().await.expect("reconcile again");
+        reconcile_bounded(&sm).await.expect("reconcile again");
         assert!(shard.get("i18096:checkout", "checkout").is_some());
 
         engine.shutdown().await;
@@ -4012,13 +4117,21 @@ mod tests {
 
         // The apply loop's handle: `compose` gives openraft its own clone.
         let mut applier = sm.clone();
-        sm.reconcile_engine_interleaved(async move {
-            applier
-                .apply(vec![entry(2, put(2, 18099, json!([])))])
-                .await
-                .expect("apply put during reconcile");
-        })
+        // Bounded: this seam awaits an `apply` **on the reconcile's own task**, and
+        // `apply` ends by taking `engine_drive`. If the sweep is ever moved inside
+        // that guard (#574), this self-deadlocks — a hung job rather than a red
+        // test, and the timeout is what makes the difference.
+        tokio::time::timeout(
+            Duration::from_secs(20),
+            sm.reconcile_engine_interleaved(std::future::ready(()), async move {
+                applier
+                    .apply(vec![entry(2, put(2, 18099, json!([])))])
+                    .await
+                    .expect("apply put during reconcile");
+            }),
+        )
         .await
+        .expect("the reconcile never returned — the sweep is running inside the drive lock")
         .expect("reconcile");
 
         assert_eq!(engine.count(), 2, "both committed imposters are served");
@@ -4033,6 +4146,123 @@ mod tests {
         assert!(
             shard.get("i18100:checkout", "checkout").is_none(),
             "the namespace of a delete this node missed is still swept"
+        );
+
+        engine.shutdown().await;
+    }
+
+    /// Pins D-5 (2026-09-09 amendment): the reconcile's desired-set read and the
+    /// drive it feeds are one critical section.
+    ///
+    /// #574 — a config committed while the reconcile is between those two must
+    /// survive it.
+    ///
+    /// Two handles drive one engine: the apply loop has openraft's clone, the
+    /// reconciler has the reader clone. `apply_config` deletes every live imposter
+    /// its argument omits, so before the exclusion this was: reconcile reads a set
+    /// without P → apply commits P and drives the engine, creating it → the
+    /// reconcile's stale set is applied second, tears P down, reports it `deleted`
+    /// and clears its flow state. Fleet-wide P is alive; on this node it is gone,
+    /// and nothing puts the flow state back.
+    ///
+    /// The assertion that discriminates is the one **inside** the seam: with the
+    /// drive lock held across the read and the drive, the concurrent apply cannot
+    /// have reached the engine yet. Delete the lock and that is the assertion that
+    /// fails — the survival checks afterwards can pass by luck of scheduling,
+    /// which is exactly how this class of bug hides.
+    #[tokio::test]
+    async fn a_config_committed_during_the_reconcile_sync_survives_it() {
+        let engine = Arc::new(ImposterManager::new());
+        let (_td, mut sm, shard) = fresh_sm_with_flow_net(engine.clone()).await;
+        sm.apply(vec![entry(1, put(1, 18201, json!([])))])
+            .await
+            .expect("apply put");
+        for flow in ["i18201:checkout", "i18202:checkout"] {
+            seed_flow(&shard, flow).await;
+        }
+
+        let mut applier = sm.clone();
+        let observed = Arc::new(Mutex::new(None));
+        let seen = Arc::clone(&observed);
+        let probe = Arc::clone(&engine);
+        // The spawned apply is joined *after* the reconcile returns, never inside
+        // the seam: the seam runs while `engine_drive` is held, so awaiting the
+        // apply there waits for a lock this task itself owns — a deadlock, and a
+        // CI hang rather than a red test. Parking it is the observation; joining
+        // it is cleanup.
+        let commit = Arc::new(Mutex::new(None));
+        let commit_slot = Arc::clone(&commit);
+        // Distinguishes "the apply started and is parked on the lock" from "the
+        // apply was never polled". Both leave `count()` at 1, so without this the
+        // observation below would hold even if the task had not run at all — true
+        // for the wrong reason, which is the same as untested.
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let reconcile = sm.reconcile_engine_interleaved(
+            async move {
+                // The apply loop's own handle, exactly as `compose` gives openraft.
+                *commit_slot.lock() = Some(tokio::spawn(async move {
+                    let _ = started_tx.send(());
+                    applier
+                        .apply(vec![entry(2, put(2, 18202, json!([])))])
+                        .await
+                        .expect("apply put during the reconcile's sync");
+                }));
+                started_rx
+                    .await
+                    .expect("the concurrent apply task was polled");
+                // Long enough that an *unparked* apply would have driven the
+                // engine — this is the mutant's window to fail in, not a bound on
+                // the real tree, where `count()` cannot move without the lock.
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                *seen.lock() = Some(probe.count());
+                assert!(
+                    !commit_slot.lock().as_ref().expect("spawned").is_finished(),
+                    "the concurrent apply completed while the reconcile still holds \
+                     the drive lock — it is not excluded at all"
+                );
+            },
+            std::future::ready(()),
+        );
+        tokio::time::timeout(Duration::from_secs(20), reconcile)
+            .await
+            .expect("the reconcile never returned — engine_drive is being taken twice on one task")
+            .expect("reconcile");
+        let joined = commit
+            .lock()
+            .take()
+            .expect("the seam spawned the concurrent apply");
+        // Bounded: if the reconcile ever stops releasing the drive lock, this is a
+        // red test rather than a CI job that hangs until the runner's timeout.
+        tokio::time::timeout(Duration::from_secs(10), joined)
+            .await
+            .expect("the parked apply never landed — the reconcile is not releasing engine_drive")
+            .expect("the concurrent apply joins once the lock is released");
+
+        assert_eq!(
+            *observed.lock(),
+            Some(1),
+            "the apply must still be parked on the drive lock while the reconcile \
+             sits between its read and its drive — if it has already driven the \
+             engine, the reconcile's stale set is about to delete what it created"
+        );
+        assert_eq!(
+            engine.count(),
+            2,
+            "both committed imposters are served once the reconcile releases the lock"
+        );
+        assert!(
+            shard.get("i18202:checkout", "checkout").is_some(),
+            "the imposter committed during the sync is alive fleet-wide; its flow \
+             state must not be cleared on this node"
+        );
+        assert!(
+            shard.get("i18201:checkout", "checkout").is_some(),
+            "a live imposter's state is untouched"
+        );
+        assert!(
+            sm.apply_failures().is_empty(),
+            "no engine failure was recorded: {:?}",
+            sm.apply_failures()
         );
 
         engine.shutdown().await;
@@ -5836,7 +6066,7 @@ mod tests {
         routes.store(Arc::new(CompiledRoutes::default()));
         assert!(routes.load().is_empty(), "simulated cold start");
 
-        sm.reconcile_engine().await.expect("reconcile");
+        reconcile_bounded(&sm).await.expect("reconcile");
 
         assert!(
             !routes.load().is_empty(),
@@ -6041,7 +6271,7 @@ mod tests {
         );
         let (_, sm) = new(&path).await.expect("reopen store");
         let sm = sm.with_engine(engine);
-        sm.reconcile_engine().await.expect("reconcile");
+        reconcile_bounded(&sm).await.expect("reconcile");
 
         let seen = recorder.0.lock().clone();
         assert!(
