@@ -1563,6 +1563,11 @@ export interface components {
     };
     requestBodies: never;
     headers: {
+        /**
+         * @description Present when the answering node has something to say that did not change the outcome. A comma-separated list of `key=value` items. `local-engine=<reason>` means THIS node failed to realize the addressed imposter's committed config — a stored record that will not parse, a refused enable/disable or stub patch, an unreadable TLS cert, or a `flowState` this build will not honour (D-76). The record is committed fleet-wide either way, and other nodes may be serving it normally; this is a per-node observation.
+         *     Distinct from `Rift-Cluster-Bind-Failures`, which asserts the narrower "holds the imposter but never bound its port". Both may appear for one port. On a write the list may also carry `unapplied=<node-ids>`.
+         */
+        RiftClusterWarnings: string;
         /** @description The committed log revision this response reflects, as `<subject>@<revision>`. For an imposter or stub write the subject is the imposter's port (`4545@17`). For a front-door route-table read or write it is the literal `routes` (`routes@17`); on a read it is the revision of the table in that same response's body. Treat the whole token as opaque: feed it back verbatim as If-Match on a later write to the same record rather than constructing one from this template — a constructed value naming the wrong subject answers `400`. */
         RiftClusterRevision: string;
         /** @description The op id a write committed (or parked) under. Present only on a terminated write's SUCCESS response (`200`/`201`/`202`/`204`) — a refusal (`refusal_response`, e.g. `400`/`404`/`409`) sets no headers at all, so those responses carry no op id. For a single-op mutation this is the same id the client's Idempotency-Key deterministically derives; a multi-op mutation (e.g. a batch `PUT /imposters`) instead carries a per-index derived id on each success, while its `202` parked path carries the base id — the "same id Idempotency-Key derives" equivalence holds only for single-op writes. */
@@ -1746,6 +1751,7 @@ export interface operations {
             200: {
                 headers: {
                     "Rift-Cluster-Revision": components["headers"]["RiftClusterRevision"];
+                    "Rift-Cluster-Warnings": components["headers"]["RiftClusterWarnings"];
                     [name: string]: unknown;
                 };
                 content: {
@@ -1754,9 +1760,10 @@ export interface operations {
             };
             401: components["responses"]["Unauthorized"];
             403: components["responses"]["Forbidden"];
-            /** @description No such imposter on this port. */
+            /** @description No such imposter on this port — or one this node could not realize, in which case `Rift-Cluster-Warnings` names the reason and other nodes may be serving it. */
             404: {
                 headers: {
+                    "Rift-Cluster-Warnings": components["headers"]["RiftClusterWarnings"];
                     [name: string]: unknown;
                 };
                 content: {

@@ -3136,3 +3136,56 @@ what a working client sees; a rename is the same promise broken from the other d
 reader hunting for why the two names disagree looks in the register, which is where this project
 says decisions live, and finds nothing — the same "decided in a thread, never written down" this
 register exists to prevent.
+
+### D-76 — An engine-side refusal an operator cannot see is a defect; a refused flow store is **derived** per read, not recorded
+
+- **Status:** active
+- **Decided:** 2026-09-09 · #576
+- **Amends:** RFC-001 §7.4.6
+- **Implemented by:** #576
+- **Code:** crates/rift-cluster/src/raft/store.rs, crates/rift-cluster/src/stores/flow.rs, crates/rift-cluster-server/src/admin_front.rs
+
+`FlowStoreProvider::provide` returns a bare `Option`, so when it refuses a config — since D-73 that
+means a `flowState` this build will not honour, reachably `contextScope: "tenant"` — the refusal
+reached nobody. The signals were a `tracing::error!` and a stub failing at request time, while
+`GET /imposters/{port}` read healthy. An operator saw a port that was up and a scenario that
+mysteriously errored, with nothing to correlate. That is log-and-continue on a config path.
+
+**The refusal is derived from the applied config on each read, and recording it instead does not
+work.** This is the load-bearing half of the decision, because recording looks equivalent and is
+the thing that was tried first. `provide` runs synchronously inside the engine's create path, so a
+`Sync` could fold the verdict into `apply_failures` after `record_report`. But three writers delete
+from that map: `record_report` reaps every port its report names, and the `SetEnabled` and `Patch`
+arms `remove` on success. Neither of those two arms is a `Sync`, so nothing re-asserts the verdict —
+and the next whole-set sync sees an unchanged config, reports the port in no bucket at all, and
+never re-fires the fold. One `POST /imposters/{port}/disable` therefore erased the marker for the
+life of the process while the store went on refusing: #576's own defect, restored by a pause, and
+reachable through two ordinary admin calls.
+
+Deriving is immune to all of that for the same reason `bind_failure` is — it asks the current state
+rather than remembering an answer — and it makes the agreement with `provide` **structural** rather
+than pinned by a test: both call `FlowConfig::from_imposter` on the same stored config, so they
+cannot drift. A stored record that will not parse yields `None`, deliberately: that is a different
+failure with its own reporting, and calling it a flow-store refusal would name the wrong cause.
+
+**Reported as `local-engine=<reason>` in `rift-cluster-warnings`, never as
+`rift-cluster-bind-failures`.** The port is bound; `bind_failure` gates on `!is_bound()` and its own
+doc forbids routing non-bind failures through it, because that header asserts "still serving
+in-process" and here that is false. The write path already stamps `local-engine=`, and the derived
+refusal joins it there too — the operator pausing a refused imposter is the most likely person to
+need the warning, and under the recorded design was the one guaranteed not to get it. The read
+carries it as well, because the reachable case is a row committed by an *older* build: no mutation
+of this build can create one, so an operator may never issue a write against it at all.
+
+*Rejected:* recording the verdict at sync time — see above; the gate would also have had to track
+which `ApplyReport` bucket a constructed imposter lands in, and `provide` can fire for a port that
+is reported only as `failed` (a bind degrade under `serve_unbound`), so the gate was wrong as well
+as fragile. *Rejected:* a refusal ledger on `FlowNet` written from `provide` — mutable shared state
+on the replication net for something a pure function already decides, with its own cleanup on
+delete. *Rejected:* `RefuseSync` for a bad `flowState` row — that refuses the **whole** sync, so on
+a cold start one stale row would leave every imposter on the node unserved; the refusal is per port,
+and the port can still serve its non-flow stubs.
+
+**Residual, stated:** `apply_failures` holds one string per port, so a port that is both bind-failed
+and flow-refused reports the drive failure and not the refusal until the bind heals. The recorded
+source wins on that read, deliberately: a live drive failure is the more urgent fact.

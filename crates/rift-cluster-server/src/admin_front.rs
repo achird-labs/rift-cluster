@@ -850,6 +850,9 @@ async fn handle(state: Arc<FrontState>, req: Request<Incoming>) -> Response<Fron
     if let Some(target) = target {
         // Read the marker's inputs before `state` and `req` move into `proxy`.
         let degraded = local_bind_failure(&state, &target.params);
+        // And this node's own engine failure for the addressed port (#576, D-76),
+        // read before the move for the same reason.
+        let local_engine = local_engine_failure(&state, &target.params);
         // Likewise the editor's token (C5, #188): the same applied state the write path's
         // precondition will check, read before the move for the same reason.
         let token = imposter_read_token(&state, req.method(), &path, &target.params);
@@ -888,6 +891,9 @@ async fn handle(state: Arc<FrontState>, req: Request<Incoming>) -> Response<Fron
         }
         if let Some(reason) = degraded {
             set_header(&mut response, HEADER_BIND_FAILURES, &reason);
+        }
+        if let Some(reason) = local_engine {
+            set_header(&mut response, HEADER_WARNINGS, &reason);
         }
         if let Some(token) = token {
             set_header(&mut response, HEADER_REVISION, &token);
@@ -1776,6 +1782,51 @@ fn local_bind_failure(state: &FrontState, params: &[(&'static str, String)]) -> 
     // such a read as bind divergence would point an operator at the wrong cause entirely.
     let reason = node.bind_failure(port)?;
     Some(format!("{port}={reason}"))
+}
+
+/// `local-engine=<reason>` when this node's engine failed to realize the addressed imposter, else
+/// `None` (#576, D-76).
+///
+/// The **companion** to [`local_bind_failure`], not a replacement, and the split is the point.
+/// That one reports only a port the engine holds but never bound — "serving in-process only". This
+/// one reports the rest of `apply_failures`: a stored record that will not parse, a refused
+/// `SetEnabled`, a rejected stub patch, and since #576 a refused flow store. For those the port may
+/// be perfectly bound and serving, which is exactly why `rift-cluster-bind-failures` is the wrong home for
+/// them — it asserts a bind outcome, and asserting one here would point an operator at the socket
+/// when the socket is fine.
+///
+/// Same header and same `local-engine=` key the *write* path already stamps, so a client learns one
+/// vocabulary rather than two. The write path is not enough on its own: the reachable case for a
+/// refused flow store is a config committed by an *older* build (`contextScope: "tenant"`, D-73),
+/// so no mutation of this build ever carried it and there is no write response to warn on. Without
+/// a read-side marker the operator's next look — `GET /imposters/{port}` — reads healthy.
+///
+/// Deliberately not conditioned on the proxied status, because both statuses mislead on their own.
+/// A refused flow store *is* in the engine's map, so that read is a `200` that looks healthy. A
+/// failure that stopped the imposter entering the map — an unresolvable TLS acceptor — makes it a
+/// `404`, which reads as "no such imposter" on a node whose peers all serve it. The marker is what
+/// separates either from the real thing.
+fn local_engine_failure(state: &FrontState, params: &[(&'static str, String)]) -> Option<String> {
+    let port: u16 = port_param(params)?;
+    let Some(node) = state.node.upgrade() else {
+        // Loud rather than quiet, for the reason `local_bind_failure` gives above: here a dead
+        // handle would mean "no marker", i.e. a possibly diverged node answering with nothing
+        // saying so. Which is the exact shape #576 exists to remove.
+        tracing::warn!(
+            port,
+            "cluster node handle is gone; cannot report whether this port's config was realized"
+        );
+        return None;
+    };
+    // Two sources, and the second is why the first is not enough. `apply_failures` records what a
+    // *drive* did and is reaped by later drives; a refused flow store is a standing property of the
+    // applied config, so it is derived per read (D-76). Recorded first: a live drive failure is the
+    // more urgent fact, and a port with both is far more likely to be diagnosed from the drive.
+    let reason = node.apply_failures().get(&port).cloned().or_else(|| {
+        node.flow_store_refusal(port)
+            .map(|r| format!("flow store refused: {r}"))
+    })?;
+    Some(format!("local-engine={reason}"))
 }
 
 /// Which leg of the local proxy a request is on — and therefore whether the admin credential
@@ -2836,8 +2887,17 @@ async fn run_mutation(
     // The commit is fleet truth, but THIS node's engine may still have failed
     // to realize it (a bind, a refused toggle): §7.4.6 — success with a named
     // warning, never a silent divergence the client cannot see.
+    //
+    // The derived flow-store refusal joins it (D-76), and this is the case that made recording
+    // the verdict unworkable: the mutations that can touch a refused imposter — `disable`, a stub
+    // patch — are exactly the ones whose engine arms `remove` the port's `apply_failures` entry on
+    // success. So the operator pausing a refused imposter is the *most* likely person to need this
+    // warning and used to be the one guaranteed not to get it.
     if let Some(port) = mutation.port
-        && let Some(failure) = node.apply_failures().get(&port)
+        && let Some(failure) = node.apply_failures().get(&port).cloned().or_else(|| {
+            node.flow_store_refusal(port)
+                .map(|r| format!("flow store refused: {r}"))
+        })
     {
         warnings.push(format!("local-engine={failure}"));
     }

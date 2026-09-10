@@ -1743,6 +1743,14 @@ impl RaftNode {
         self.sm_reader.dispatch_to_imposter(port, req)
     }
 
+    /// Why `port`'s flow store is unusable, or `None` when it is fine (#576, D-76). Derived from
+    /// the applied config on each call — see [`RedbStateMachine::flow_store_refusal`] for why it is
+    /// not recorded.
+    #[must_use]
+    pub fn flow_store_refusal(&self, port: u16) -> Option<String> {
+        self.sm_reader.flow_store_refusal(port)
+    }
+
     /// Every port this node's engine holds, split by bound vs. failed (issue #369, blocker B4). See
     /// [`RedbStateMachine::local_bind_report`] — a single in-memory pass over the engine's own
     /// imposter set, not a redb transaction, which is what makes it safe to call on every 5-second

@@ -366,6 +366,8 @@ paths:
           headers:
             Rift-Cluster-Revision:
               $ref: '#/components/headers/RiftClusterRevision'
+            Rift-Cluster-Warnings:
+              $ref: '#/components/headers/RiftClusterWarnings'
           content:
             application/json:
               schema:
@@ -376,7 +378,11 @@ paths:
           $ref: '#/components/responses/Forbidden'
         '404':
           description: >
-            No such imposter on this port.
+            No such imposter on this port — or one this node could not realize, in which
+            case `Rift-Cluster-Warnings` names the reason and other nodes may be serving it.
+          headers:
+            Rift-Cluster-Warnings:
+              $ref: '#/components/headers/RiftClusterWarnings'
           content:
             application/json:
               schema:
@@ -2946,6 +2952,22 @@ components:
       example: ['method=POST', 'header:Content-Type=application/json']
 
   headers:
+    RiftClusterWarnings:
+      description: >
+        Present when the answering node has something to say that did not change the
+        outcome. A comma-separated list of `key=value` items. `local-engine=<reason>`
+        means THIS node failed to realize the addressed imposter's committed config —
+        a stored record that will not parse, a refused enable/disable or stub patch, an
+        unreadable TLS cert, or a `flowState` this build will not honour (D-76). The
+        record is committed fleet-wide either way, and other nodes may be serving it
+        normally; this is a per-node observation.
+
+        Distinct from `Rift-Cluster-Bind-Failures`, which asserts the narrower "holds the
+        imposter but never bound its port". Both may appear for one port. On a write the
+        list may also carry `unapplied=<node-ids>`.
+      schema:
+        type: string
+        example: 'local-engine=flow store refused: flowState.contextScope must be "imposter" or "fleet"'
     RiftClusterRevision:
       description: >
         The committed log revision this response reflects, as
