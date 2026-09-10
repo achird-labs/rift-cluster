@@ -259,6 +259,30 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/events": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * The engine's unfiltered event firehose, on the node you reached (SSE, upstream)
+         * @description Proxied to the embedded engine's own admin API, which dispatches this route *before* its router — so it is served on every node and is not one of the paths the cluster front terminates.
+         *     **Per node, like every other verification read (D-74).** It carries the events of the imposters *this* node served; there is no fleet merge behind it. A client that wants the whole fleet opens one stream per node.
+         *     **Events** are the engine's own. `hello` first, carrying `engineVersion`, the bus position `seq` and `types`. Then the event frames themselves, and `lagged` — carrying `missed` — when the subscriber falls behind the bus. `: ping` every 15 s.
+         *     The narrower per-imposter alias is `GET /imposters/{port}/savedRequests/stream`, which pre-binds a port and streams request events only. This route is unfiltered.
+         *     Declared here since #576's sibling #575: it was served and documented nowhere, which also kept it out of the generated client's path union. The parity oracle now derives the route set from the vendored router's own source, so a route in this position fails the build.
+         */
+        get: operations["streamEvents"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/imposters/{port}/savedRequests/stream": {
         parameters: {
             query?: never;
@@ -2546,6 +2570,28 @@ export interface operations {
                     "application/json": components["schemas"]["Error"];
                 };
             };
+        };
+    };
+    streamEvents: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description An open SSE stream. Ends only when the client disconnects or the node stops. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "text/event-stream": string;
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
         };
     };
     streamSavedRequests: {

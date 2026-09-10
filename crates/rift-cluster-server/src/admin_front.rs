@@ -404,7 +404,8 @@ pub(crate) enum Terminated {
     /// so that DELETE is an ordinary proxied route and no longer terminates here.
     /// Recorded *stubs* stay, deliberately — they are imposter config, deleted through
     /// the stub-edit surfaces; this clears the exactly-once markers so signatures record
-    /// afresh. GET on the same path stays proxied: the listing is upstream's own surface.
+    /// afresh. There is no GET on this path to leave proxied: upstream dispatches DELETE only
+    /// here, so a GET is a 404 (corrected in #575 — this used to claim a proxied listing).
     ClearSavedProxyResponses(u16),
     /// `DELETE /imposters/{port}/spaces/{flow}` (issue #537, D-69): a space teardown has two
     /// independent halves. The *flow-state* half — already clustered via `ClusteredFlowStore` —

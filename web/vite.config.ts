@@ -26,6 +26,9 @@ export const ADMIN_PROXY_PREFIXES = [
   "/config",
   "/logs",
   "/metrics",
+  // The engine's event firehose (SSE). Declared in the contract by #575, which is what made this
+  // list owe it an entry — the guard below caught the omission the moment the route was published.
+  "/events",
   // Gateway traffic. Not an admin route, but the console links to imposter endpoints and a
   // relative link would otherwise resolve against the dev server.
   "/__rift",
