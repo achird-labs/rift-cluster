@@ -265,6 +265,12 @@ async fn a_bind_failed_node_still_serves_its_imposter_through_the_front_door() {
         healthy.header("rift-cluster-bind-failures").is_none(),
         "a healthy imposter is not marked degraded: {healthy}"
     );
+    // The other half of D-76: a marker that appeared on every read would carry no
+    // information. A healthy port gets neither header.
+    assert!(
+        healthy.header("rift-cluster-warnings").is_none(),
+        "a healthy imposter carries no engine-failure warning either: {healthy}"
+    );
 
     // The operator surface names the failure per port — the `(port, node)` view RFC-001 §7.4.6
     // asks for, answered by each node about itself because a bind outcome is a node-local
@@ -353,6 +359,22 @@ async fn a_non_bind_failure_is_not_reported_as_bind_divergence() {
     assert!(
         read.header("rift-cluster-bind-failures").is_none(),
         "a TLS failure must not be reported as a bind failure: {read}"
+    );
+    // ...and it must not vanish either. Pins D-76: before it, an engine failure
+    // that was not a *bind* failure reached no read-side surface at all. Here the
+    // imposter never entered the engine's map, so the read is a 404 — which on a
+    // node whose peers all serve the port reads as "no such imposter". The marker
+    // is what separates that from the real thing. (A refused flow store, #576's
+    // own case, is the mirror image: it *is* in the map, so its read is a 200 that
+    // looks healthy. Both statuses mislead alone, which is why the marker is not
+    // conditioned on one.)
+    let warnings = read
+        .header("rift-cluster-warnings")
+        .unwrap_or_else(|| panic!("the engine failure must reach the read: {read}"));
+    assert!(
+        warnings.contains("local-engine="),
+        "the read must name it as an engine failure, in the same vocabulary the write \
+         path uses: {warnings}"
     );
 
     let listing = cluster_imposters(&server).await;

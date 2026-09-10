@@ -1270,6 +1270,32 @@ impl RedbStateMachine {
         self.apply_failures.lock().clone()
     }
 
+    /// Why `port`'s flow store is unusable, or `None` when it is fine (#576, D-76).
+    ///
+    /// **Derived from the applied config on every read, never recorded.** That is the whole design,
+    /// and the first attempt got it wrong: folding the verdict into [`Self::apply_failures`] at
+    /// sync time looks equivalent and is not, because three other writers delete entries from that
+    /// map — [`Self::record_report`] reaps every port the report names, and the `SetEnabled` and
+    /// `Patch` arms `remove` on success. Neither of those two is a `Sync`, so nothing re-asserts
+    /// the verdict, and the next whole-set sync sees an unchanged config and reports the port in no
+    /// bucket at all. One `POST /imposters/{port}/disable` therefore erased the marker for the life
+    /// of the process while the refusal stayed live — #576's own defect, restored by a pause.
+    ///
+    /// Deriving is immune to all of it, for the same reason [`Self::bind_failure`] is: it asks the
+    /// current state rather than remembering an answer. It also makes the agreement with
+    /// `ClusteredFlowStoreProvider::provide` structural instead of pinned-by-test — both call
+    /// `FlowConfig::from_imposter` on the same stored config, so they cannot drift.
+    ///
+    /// A stored record that will not parse yields `None` here, deliberately: that is a different
+    /// failure with its own reporting (`RefuseSync` records it in `apply_failures`), and answering
+    /// "the flow store is refused" for it would name the wrong cause.
+    #[must_use]
+    pub fn flow_store_refusal(&self, port: u16) -> Option<String> {
+        let stored = self.read_config(port).ok().flatten()?;
+        let config: ImposterConfig = serde_json::from_str(&stored).ok()?;
+        crate::stores::FlowConfig::from_imposter(&config).err()
+    }
+
     /// Why the local engine is serving `port` **in-process only** — it holds the imposter but never
     /// bound its port (RFC-001 §7.4.6, issue #143). `None` when the port is healthy, when this node
     /// is not serving it at all, or when there is no local engine.
@@ -4583,6 +4609,180 @@ mod tests {
             vec![ControlResponse::applied(3)],
             "an expired dedup entry no longer collapses the replay"
         );
+    }
+
+    /// A `sm_configs` row whose `flowState` this build refuses, as a raw insert —
+    /// which is the only way to make one, and that is the point.
+    ///
+    /// `control::validate` runs on the **apply** path too, so a live
+    /// `PutImposter` carrying `contextScope: "tenant"` is refused on every node
+    /// and never reaches `sm_configs`. The only config that can reach
+    /// `FlowStoreProvider::provide` and be refused is one a pre-#550 build
+    /// committed, read back by a cold-start reconcile, a snapshot install, or any
+    /// later whole-set sync.
+    fn inject_tenant_scoped_config(sm: &RedbStateMachine, port: u16) {
+        let config = json!({
+            "port": port,
+            "protocol": "http",
+            "host": "127.0.0.1",
+            "stubs": [],
+            "_rift": { "flowState": { "contextScope": "tenant" } },
+        });
+        let stored = json!({
+            "config_json": config.to_string(),
+            "enabled": true,
+            "revision": 1,
+        });
+        sm.inject_raw_config(port, &stored.to_string());
+    }
+
+    /// Pins D-76: a refused flow store is visible, and stays visible.
+    ///
+    /// The refusal is **derived** from the applied config, not recorded at sync time. The first
+    /// attempt did record it, and this test is written against the way that failed: three writers
+    /// delete from `apply_failures` — `record_report` reaps every port its report names, and the
+    /// `SetEnabled`/`Patch` arms `remove` on success — and neither of the latter two is a `Sync`,
+    /// so nothing re-asserted the verdict. One `disable` erased the marker permanently while the
+    /// refusal stayed live.
+    #[tokio::test]
+    async fn a_refused_flow_store_is_visible_and_survives_a_pause() {
+        let engine = Arc::new(ImposterManager::new());
+        let (_td, mut sm, _shard) = fresh_sm_with_flow_net(engine.clone()).await;
+        inject_tenant_scoped_config(&sm, 18301);
+
+        reconcile_bounded(&sm).await.expect("reconcile");
+
+        assert_eq!(
+            engine.count(),
+            1,
+            "the imposter is still served — the refusal is its flow store, not its listener"
+        );
+        let reason = sm
+            .flow_store_refusal(18301)
+            .expect("the refusal must be visible");
+        assert!(
+            reason.contains("contextScope"),
+            "it must name what was refused, not merely that something was: {reason}"
+        );
+        assert!(
+            sm.bind_failure(18301).is_none(),
+            "the port bound, so this must not read as a bind divergence"
+        );
+
+        // The mutation that used to erase it. `SetEnabled` is not a `Sync`, and its arm removes the
+        // port's `apply_failures` entry on success.
+        sm.apply(vec![entry(
+            1,
+            request(
+                1,
+                ControlOp::SetEnabled {
+                    port: 18301,
+                    enabled: false,
+                },
+            ),
+        )])
+        .await
+        .expect("pause the imposter");
+        assert!(
+            sm.flow_store_refusal(18301).is_some(),
+            "pausing a refused imposter must not make the refusal disappear — the store is still \
+             refusing, and this is #576's own defect restored"
+        );
+
+        engine.shutdown().await;
+    }
+
+    /// It is a property of the config, so rewriting the config clears it — with no reap involved.
+    #[tokio::test]
+    async fn rewriting_a_refused_flow_state_clears_the_refusal() {
+        let engine = Arc::new(ImposterManager::new());
+        let (_td, mut sm, _shard) = fresh_sm_with_flow_net(engine.clone()).await;
+        inject_tenant_scoped_config(&sm, 18302);
+        reconcile_bounded(&sm).await.expect("reconcile");
+        assert!(sm.flow_store_refusal(18302).is_some(), "precondition");
+
+        sm.apply(vec![entry(1, put(1, 18302, json!([])))])
+            .await
+            .expect("the operator rewrites the config");
+
+        assert!(
+            sm.flow_store_refusal(18302).is_none(),
+            "a config this build can honour must clear the refusal"
+        );
+
+        engine.shutdown().await;
+    }
+
+    /// A port with no config, and one whose stored record will not parse, are both `None` — the
+    /// latter deliberately, because that failure has its own reporting and naming it a flow-store
+    /// refusal would point at the wrong cause.
+    #[tokio::test]
+    async fn only_a_refusable_flow_state_reads_as_a_refusal() {
+        let engine = Arc::new(ImposterManager::new());
+        let (_td, sm, _shard) = fresh_sm_with_flow_net(engine.clone()).await;
+        assert!(
+            sm.flow_store_refusal(18310).is_none(),
+            "a port with no committed config has no refusal to report"
+        );
+        sm.inject_raw_config(18311, "not json");
+        assert!(
+            sm.flow_store_refusal(18311).is_none(),
+            "an unparseable record is a different failure, reported as itself"
+        );
+        engine.shutdown().await;
+    }
+
+    /// The derived verdict and the one `ClusteredFlowStoreProvider::provide` actually reaches are
+    /// the same function on the same config, so they cannot drift. Pinned anyway, because the whole
+    /// design rests on it: a verdict that disagreed would name a store the imposter does not have.
+    #[test]
+    fn the_derived_refusal_matches_what_the_provider_decides() {
+        use rift_cluster_base::seams::FlowStoreProvider as _;
+
+        let refused: ImposterConfig = serde_json::from_value(json!({
+            "port": 18303,
+            "protocol": "http",
+            "host": "127.0.0.1",
+            "stubs": [],
+            "_rift": { "flowState": { "contextScope": "tenant" } },
+        }))
+        .expect("config parses");
+        let honoured: ImposterConfig = serde_json::from_value(json!({
+            "port": 18304,
+            "protocol": "http",
+            "host": "127.0.0.1",
+            "stubs": [],
+            "_rift": { "flowState": { "contextScope": "fleet" } },
+        }))
+        .expect("config parses");
+
+        let net = FlowNet::new(FlowShard::in_memory(ShardConfig::default()));
+        let provider = crate::stores::flow::ClusteredFlowStoreProvider::new(net);
+
+        for (config, want_refused) in [(&refused, true), (&honoured, false)] {
+            assert_eq!(
+                crate::stores::FlowConfig::from_imposter(config).is_err(),
+                want_refused,
+                "the derived verdict disagrees with the fixture"
+            );
+            // Both kinds of store error on use here — this `FlowNet` was never bound to a node, and
+            // an unbound net refuses clustered ops loudly by design. So the discriminator is the
+            // refusal's own wording; `is_err()` would hold for both and prove nothing. (Caught by
+            // this test failing on the honoured config the first time it ran.)
+            let store = provider
+                .provide(config)
+                .expect("a store is always provided");
+            let message = store
+                .get("f", "k")
+                .expect_err("an unbound net errors either way")
+                .to_string();
+            assert_eq!(
+                message.contains("this build refuses"),
+                want_refused,
+                "provider verdict and derived verdict must agree for {:?}: {message}",
+                config.port
+            );
+        }
     }
 
     /// One unparseable stored record must refuse the whole engine sync — a

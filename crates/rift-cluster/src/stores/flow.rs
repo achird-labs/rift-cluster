@@ -2111,33 +2111,18 @@ impl rift_cluster_base::seams::FlowStoreProvider for ClusteredFlowStoreProvider 
 /// Deliberately not a no-op store — a no-op answers `Ok(None)`/`Ok(())` and lets a scenario run
 /// as though its state were being kept.
 ///
-/// **Known gap, tracked as #576.** This refusal is invisible to the admin API: the only signals
-/// are the `tracing::error!` above and a stub failing at request time. `GET /imposters/{port}`
-/// still reads healthy, with no entry in `RedbStateMachine::apply_failures` — an operator sees a
-/// port that is up and a scenario that mysteriously errors.
+/// **Visible to an operator since #576 (D-76), and not through this seam.** `provide` returns a
+/// bare `Option`, so the seam still carries no error — it does not need to. The verdict is a pure
+/// function of the stored config, so `RedbStateMachine::flow_store_refusal` asks
+/// `FlowConfig::from_imposter` the same question on demand, and the admin front reports it as
+/// `local-engine=<reason>` in `rift-cluster-warnings` on both the port read and a mutation.
 ///
-/// **The channel exists; the earlier note here was wrong.** That note said closing this "means a
-/// channel this seam does not have", because `provide` runs inside the engine while
-/// `apply_failures` is "one layer up". Re-checked for #576, and only the first half survives.
-/// `FlowStoreProvider::provide` does return a bare `Option`, so the *seam* carries no error — but
-/// `apply_failures` is not a layer up: `RedbStateMachine::drive_one` writes it (via
-/// `record_report`) in the same `&self` call that awaits `apply_config`, which is what reaches
-/// `provide`. And this provider already shares an `Arc` with that state machine: `compose.rs`
-/// hands the one `flow_net` to both, and `SequencingRegistry` is the same shape solved the same
-/// way one line over, with a comment saying so ("the apply loop is what keeps it current"). So
-/// the report can travel on an `Arc` both ends already hold, with no upstream change. This is
-/// the D-52/#505 shape again — the search stopped at the seam's return type.
-///
-/// Two facts #576 should carry into the fix, found by that re-check: `record_report` *removes*
-/// every `report.created` port from `apply_failures`, and a refused-flow-store imposter is
-/// created and bound as far as the engine is concerned, so a refusal must be folded in **after**
-/// `record_report`, not written from `provide` directly; and `Rift-Bind-Failures` is the wrong
-/// surface for it either way (`bind_failure` gates on `!is_bound()` and its doc forbids routing
-/// non-bind failures through it) — `apply_failures` reaches the operator as the `local-engine=`
-/// entry in `Rift-Warnings`, on the very mutation that committed the bad config.
-///
-/// Not taken here because it is a wiring change across `compose.rs`, the state machine and this
-/// provider, which is #576's job and not this PR's.
+/// **Derived per read, deliberately not recorded** — worth knowing before anyone "optimises" it
+/// into the apply path. Folding it into `apply_failures` at sync time was tried and does not hold:
+/// `record_report` reaps every port its report names, and the `SetEnabled`/`Patch` arms `remove` on
+/// success without being a `Sync`, so a single `disable` erased the marker for the life of the
+/// process while this store went on refusing. Deriving cannot be reaped, and it makes the agreement
+/// with this provider structural rather than pinned by a test.
 struct RefusedFlowStore {
     /// Upstream's `ImposterConfig::port` is optional (a port may be assigned at bind time), so
     /// the message says so rather than inventing `0`.

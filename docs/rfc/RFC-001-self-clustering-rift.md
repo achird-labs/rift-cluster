@@ -986,6 +986,24 @@ binds can fail on some nodes (port taken by an unrelated process). Built (#143):
   core-shaped on purpose — the U-8 decoration seam is deliberately headers-only, so a
   client wanting the detail follows the header rather than a body shape no OSS client can
   parse.
+
+  > **Amended by D-76** (2026-09-09): "no header at all for a healthy port" still holds, but a
+  > *failed* port now carries a second, disjoint marker. Not every engine failure is a bind failure:
+  > a stored record that will not parse, a refused `SetEnabled` or stub patch, and a `flowState` this
+  > build will not honour are none of them bind divergence. The read carries
+  > `rift-cluster-warnings: local-engine=<reason>` for those, leaving `rift-cluster-bind-failures`
+  > its exact meaning. The two can both name one port; that is intended, not an overlap bug.
+  >
+  > The marker is **not** tied to the `200` above, and that is the useful half. Where the imposter
+  > did reach the engine's map — a refused flow store, which is created and bound — the read is a
+  > `200` that would otherwise look healthy. Where it never entered the map — a TLS acceptor this
+  > node could not resolve — it is a `404`, which without the marker is indistinguishable from "no
+  > such imposter" while every other node serves the port. Both statuses mislead alone.
+  >
+  > The flow-store half is **derived from the applied config per read**, not recorded at apply time,
+  > because `apply_failures` is reaped by later drives and by the `SetEnabled`/`Patch` arms — see
+  > D-76 for why recording it let one `disable` erase it permanently.
+
 - **Auto-assigned ports are refused outright under `--cluster`**, not minted per-node: an
   auto-assigned port cannot replicate (every node's local 49152–65535 scan would pick a
   different one), so the admin front rejects a clustered imposter create or whole-set
