@@ -48,6 +48,22 @@
 //! together pin the route in both directions more tightly than a contract entry would:
 //! `tests/console_off.rs` asserts it is *not* served with the feature off (the parity invariant),
 //! and `tests/console.rs` asserts it *is*, with the right headers, when the feature is on.
+//!
+//! **`/__rift/{port}/*` is the other deliberate exclusion**, and unlike `/console` it went unstated
+//! until #575. It is the data plane: `admin_front::handle` short-circuits the prefix to
+//! `ProxyLeg::Gateway` before authentication, RFC-002 §7 makes it an open plane, and it has no
+//! operation, schema or origin to declare. It lives in `deliberately_undeclared` so the
+//! source-derived layer can see that it was excluded on purpose rather than forgotten — which is
+//! the distinction the whole of #575 turned on.
+//!
+//! **The weakest layer, and what replaced it.** `upstream_proxied_routes` is hand-written, so this
+//! module used to have no way to tell "upstream stopped serving that" from "someone deleted it from
+//! both sides". `every_route_upstream_serves_is_declared_on_one_side_or_the_other` closes that by
+//! deriving the served set from the vendored router's own source at the pinned sha, as a *lower
+//! bound*: a scrape that matches too little weakens the guard, but one that matches too much fails
+//! loudly, so it cannot produce a false green about a route that exists. `GET /events` is what it
+//! was written for — served, undocumented, and therefore missing from the generated client's path
+//! union.
 
 use std::sync::OnceLock;
 
@@ -364,9 +380,147 @@ mod parity {
     /// pins every entry by asserting the front really does proxy it, but a genuinely new upstream route
     /// appearing in a submodule bump still needs a human to notice — this is the weakest layer of the
     /// guard and is documented as such rather than dressed up.
+    /// A route's identity for this comparison: its literal segments, with every parameter reduced
+    /// to `{}`.
+    ///
+    /// Upstream and the contract name the same parameters differently — `:index` against
+    /// `{stubIndex}`, `:name` against `{scenarioName}`, `:id` against `{stubId}` — and a name is not
+    /// part of what a route *is*. Comparing shapes asks the question this layer actually has ("is
+    /// this route declared?") instead of a stricter one it does not care about, which would fail on
+    /// a rename that changes nothing.
+    pub(crate) fn route_shape(path: &str) -> String {
+        path.split('/')
+            .map(|seg| {
+                if seg.starts_with('{') || seg.starts_with(':') {
+                    "{}".to_owned()
+                } else {
+                    seg.to_owned()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("/")
+    }
+
+    /// Routes upstream serves that neither side declares **on purpose**, each with the reason.
+    ///
+    /// Kept as an explicit list rather than a filter in the scraper, so that adding one is a
+    /// decision a reviewer sees rather than a regex growing a clause.
+    pub(crate) fn deliberately_undeclared() -> BTreeSet<RouteKey> {
+        [
+            // The data plane, not the admin API. `admin_front::handle` short-circuits this prefix
+            // to `ProxyLeg::Gateway` before authentication, and RFC-002 §7 makes it an open plane.
+            // `openapi-ee.yaml` describes the admin contract; the gateway is described in prose
+            // there and has no operation to declare. Same reasoning as `/console`, which the module
+            // doc above already excludes.
+            ("ANY", "/__rift/{port}/{rest}"),
+        ]
+        .into_iter()
+        .map(|(m, p)| RouteKey {
+            path: (*p).to_owned(),
+            method: (*m).to_owned(),
+        })
+        .collect()
+    }
+
+    /// Every route the **vendored** admin API's source shows it serving, at the pinned sha.
+    ///
+    /// `None` when `vendor/rift` is not checked out.
+    ///
+    /// Line-oriented, because the three shapes upstream uses are each a literal a regex can read
+    /// and none of them needs the syntax tree:
+    ///
+    /// * the system fast path — `(&Method::GET, "/health")` pairs in one `match`;
+    /// * the `/imposters` collection — one `path ==` guard and a method match;
+    /// * `ImposterRoute`'s variants, whose **doc comments** state the methods and the path
+    ///   (`/// GET/DELETE /imposters/:port`) and are the maintained statement of what each serves;
+    /// * `events::stream_target`'s two literals, which is where `/events` lives — dispatched before
+    ///   the router, which is exactly why it escaped every other layer.
+    ///
+    /// A variant whose doc comment does not parse is reported rather than skipped: a silently
+    /// dropped variant is the failure mode this whole layer exists to prevent.
+    pub(crate) fn upstream_routes_from_source() -> Option<BTreeSet<RouteKey>> {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../vendor/rift");
+        let router =
+            std::fs::read_to_string(root.join("crates/rift-http-proxy/src/admin_api/router.rs"))
+                .ok()?;
+        let events = std::fs::read_to_string(
+            root.join("crates/rift-http-proxy/src/admin_api/handlers/events.rs"),
+        )
+        .ok()?;
+
+        let mut routes = BTreeSet::new();
+        let mut add = |method: &str, path: &str| {
+            routes.insert(RouteKey {
+                path: route_shape(path),
+                method: method.to_owned(),
+            });
+        };
+
+        // The system fast path: `(&Method::GET, "/health") => ...`
+        for line in router.lines() {
+            let line = line.trim();
+            if let Some(rest) = line.strip_prefix("(&Method::")
+                && let Some((method, tail)) = rest.split_once(',')
+                && let Some(path) = tail.split('"').nth(1)
+                && path.starts_with('/')
+            {
+                add(method.trim(), path);
+            }
+        }
+
+        // The `/imposters` collection block: one guard, then a method match.
+        if router.contains(r#"if path == "/imposters" {"#) {
+            for method in ["GET", "POST", "PUT", "DELETE"] {
+                add(method, "/imposters");
+            }
+        }
+
+        // `ImposterRoute`'s variants, from their doc comments.
+        let mut variants = 0usize;
+        let enum_start = router.find("pub(crate) enum ImposterRoute {")?;
+        let enum_end = router[enum_start..].find("\n}\n")? + enum_start;
+        for line in router[enum_start..enum_end].lines() {
+            let line = line.trim();
+            let Some(doc) = line.strip_prefix("/// ") else {
+                continue;
+            };
+            let Some((methods, path)) = doc.split_once(" /imposters/") else {
+                continue;
+            };
+            variants += 1;
+            // Upstream's doc comments carry a trailing issue reference on some variants
+            // (`/// POST /imposters/:port/verify (issue #494)`); it is prose, not path.
+            let path = path.split(" (").next().unwrap_or(path).trim();
+            let path = format!("/imposters/{path}");
+            for method in methods.split('/') {
+                add(method.trim(), &path);
+            }
+        }
+        assert!(
+            variants >= 12,
+            "read only {variants} documented ImposterRoute variants; upstream's doc-comment \
+             convention has changed and this scraper no longer sees its routes"
+        );
+
+        // The SSE targets, dispatched before the router — `/events` is the route #575 was filed for.
+        if events.contains(r#"if path == "/events" {"#) {
+            add("GET", "/events");
+        }
+        if events.contains(r#"[port, "savedRequests", "stream"]"#) {
+            add("GET", "/imposters/{port}/savedRequests/stream");
+        }
+
+        Some(routes)
+    }
+
     pub(crate) fn upstream_proxied_routes() -> BTreeSet<RouteKey> {
         [
             ("GET", "/"),
+            // Dispatched before upstream's router (`events::stream_target`), so it is not one of
+            // the paths `classify` can terminate — the front proxies it like any other read. It was
+            // served and declared nowhere until #575; the source-derived layer above is what would
+            // now catch that.
+            ("GET", "/events"),
             ("GET", "/health"),
             ("GET", "/config"),
             ("GET", "/logs"),
@@ -395,7 +549,9 @@ mod parity {
             // `savedProxyResponses` DELETE is gone from this table (issue #226): it terminates
             // as `ControlOp::ProxyRecordedClear` — a proxied clear could never purge the
             // fleet's replicated claim markers. `Terminated::ClearSavedProxyResponses` in
-            // `ee_served_routes` covers it now; the GET listing was never declared here.
+            // `ee_served_routes` covers it now. There is no GET listing to declare either:
+            // upstream dispatches DELETE only on this path (#575's review), so a GET there is a
+            // 404 — the earlier wording implied a proxied listing that does not exist.
             ("GET", "/imposters/{port}/scenarios"),
             ("PUT", "/imposters/{port}/scenarios/{scenarioName}/state"),
             ("POST", "/imposters/{port}/scenarios/reset"),
@@ -557,6 +713,64 @@ mod tests {
     }
 
     /// AC1, the headline criterion: the contract's path set equals the served route set.
+    /// Every route upstream's own source shows it serving must be accounted for — the layer that
+    /// closes #575.
+    ///
+    /// The three layers that existed compared *declarations* against each other:
+    /// `ee_served_routes()` derives from `Terminated` (exhaustive, so a new EE route is a compile
+    /// error) but `upstream_proxied_routes()` is hand-written. So dropping a route from the contract
+    /// **and** from that table left both sides equal and every layer green while the front went on
+    /// serving it — which is how `GET /events` came to be served, undocumented, and absent from the
+    /// generated client's `ApiPath` union. `openapi.rs`'s own module doc called that table "the
+    /// weakest layer of the guard"; this is the layer that stops it being load-bearing.
+    ///
+    /// **A lower bound, deliberately, and that asymmetry is what makes reading upstream's source
+    /// acceptable here.** `upstream_routes_from_source` scrapes the vendored router at the pinned
+    /// sha. If the scrape ever matches less than it should the guard weakens but never lies; if it
+    /// invents a route the assertion fails and a human looks. It cannot produce a false green about
+    /// a route that exists. The alternative — a route table upstream owns and exports — is the
+    /// better long-term shape and is filed as a follow-up; it needs a change in another repo, and
+    /// this closes the hole in this one meanwhile.
+    ///
+    /// The submodule may be absent (a fresh worktree without `git submodule update`), in which case
+    /// this skips rather than fails: an environment gap is not a contract gap. `design-check` makes
+    /// the same distinction for the same reason.
+    #[test]
+    fn every_route_upstream_serves_is_declared_on_one_side_or_the_other() {
+        let Some(derived) = upstream_routes_from_source() else {
+            eprintln!("vendor/rift is not checked out; skipping the upstream-source parity layer");
+            return;
+        };
+
+        // Not a census — a floor. If the scrape stops matching, every assertion below passes
+        // against an empty set, which is the one way this layer could go quietly useless.
+        assert!(
+            derived.len() >= 25,
+            "scraped only {} routes from upstream's router; the scraper is broken, not the \
+             topology: {derived:?}",
+            derived.len()
+        );
+
+        // Shaped, like the derived side: the two sides name path parameters differently.
+        let declared: BTreeSet<RouteKey> = ee_served_routes()
+            .into_iter()
+            .chain(upstream_proxied_routes())
+            .chain(deliberately_undeclared())
+            .map(|r| RouteKey {
+                path: route_shape(&r.path),
+                method: r.method,
+            })
+            .collect();
+
+        let missing: Vec<&RouteKey> = derived.iter().filter(|r| !declared.contains(r)).collect();
+        assert!(
+            missing.is_empty(),
+            "upstream serves these and nothing on either side declares them — the #575 hole. \
+             Add each to docs/api/openapi-ee.yaml (with `x-rift-origin: upstream`) and to \
+             `upstream_proxied_routes`, or to `deliberately_undeclared` with a reason: {missing:?}"
+        );
+    }
+
     #[test]
     fn openapi_paths_match_the_served_route_set() {
         let routes = contract_routes(parsed());
