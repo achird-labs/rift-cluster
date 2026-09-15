@@ -121,6 +121,15 @@ The same string is logged at startup.
 Every open-source flag and subcommand parses here; a test in `tests/cli.rs`
 fails the build if that ever stops being true.
 
+> **Amended by D-77** (2026-09-15, #589): `--rcfile` used to be described here as
+> non-fatal — "a missing or malformed rcfile warns and startup continues, exactly
+> as upstream". Upstream rift#1114 made a refused rcfile abort startup *and* made
+> the refusal whole-file, so continuing would have applied none of the file's
+> keys. Warning and continuing became the behaviour fork, and a fail-open one:
+> a wrong-typed `localOnly` would have dropped the `requireAdminAuth` beside it.
+> The table row below reflects the current behaviour; the sentence about
+> "identical to upstream" is unchanged in intent, which is the point of D-77.
+
 `stop`, `restart`, `save` and `--rcfile` used to be declined with an explanatory
 error, because the open-source binary implemented them in private functions of
 its own `main.rs` rather than behind a library seam — copying them would have
