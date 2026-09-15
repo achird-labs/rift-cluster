@@ -2693,6 +2693,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "rift-ejs"
+version = "0.1.0"
+dependencies = [
+ "regex",
+ "serde_json",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "rift-http-proxy"
 version = "0.1.0"
 dependencies = [
@@ -2718,6 +2727,7 @@ dependencies = [
  "rand 0.8.6",
  "regex",
  "reqwest",
+ "rift-ejs",
  "rift-mock-core",
  "rift-store-redis",
  "rift-types",
