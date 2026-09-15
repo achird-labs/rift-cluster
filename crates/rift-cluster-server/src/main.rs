@@ -60,14 +60,18 @@ fn main() -> anyhow::Result<()> {
     }
 
     // Before tracing, because an rcfile may carry `logLevel` — the open-source
-    // binary applies it here for the same reason. Any complaint is held until
-    // there is a subscriber, so it lands in the log pipeline and not only on a
-    // stderr nobody is collecting.
-    let rcfile_warning = bootstrap::apply_rcfile(&mut cli);
+    // binary applies it here for the same reason. A refused rcfile aborts
+    // startup (D-77): upstream #1114 made the refusal whole-file, so continuing
+    // would run with none of its keys — including a `requireAdminAuth` the
+    // operator asked for. `?` rather than `{e}` keeps the whole chain, so the
+    // file name and serde's line and column survive. Unsupported keys are only
+    // advisory, so they are held until there is a subscriber and land in the log
+    // pipeline, not only on a stderr nobody is collecting.
+    let rcfile_warnings = bootstrap::apply_rcfile(&mut cli)?;
 
     rift_cluster_base::rift_http_proxy::install_default_crypto_provider();
     init_tracing(&cli);
-    if let Some(warning) = rcfile_warning {
+    for warning in rcfile_warnings {
         warn!("{warning}");
     }
     // `save` and `stop` are complete programs; `restart` stops the old process

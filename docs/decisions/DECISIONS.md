@@ -3189,3 +3189,66 @@ and the port can still serve its non-flow stubs.
 **Residual, stated:** `apply_failures` holds one string per port, so a port that is both bind-failed
 and flow-refused reports the drive failure and not the refusal until the bind heals. The recorded
 source wins on that read, deliberately: a live drive failure is the more urgent fact.
+
+### D-77 — A refused `--rcfile` aborts startup; "match the core binary" is a promise about behaviour, not about code
+
+- **Status:** active
+- **Decided:** 2026-09-15 · #589
+- **Amends:** docs/rift-cluster-server.md ("Relationship to the `rift` binary")
+- **Implemented by:** #543
+- **Code:** crates/rift-cluster-server/src/bootstrap.rs, crates/rift-cluster-server/src/main.rs
+
+`apply_rcfile` warned and continued on an rcfile it could not read or apply, and said so in its own
+doc comment: "Changing that to a hard failure here would be a behaviour fork, not a hardening." That
+was true while upstream did the same thing. Upstream #1114 (vendored here as `b64f9d4`) changed two
+things at once, and the pair is what inverts the reasoning:
+
+1. `rift` now **aborts** startup when an rcfile cannot be read or applied.
+2. Every recognised key is **type-checked before any key is applied**, so a single wrong-typed value
+   refuses the *whole* file rather than being ignored or coerced.
+
+Taken together, warning and continuing stopped being the conservative choice and became the forking
+one — and it forks **open**. `{"localOnly": "yes", "requireAdminAuth": true}` is refused whole by
+(2); under the old behaviour this binary would then have started with *none* of those keys, serving
+the admin plane on every interface with no authentication. The operator asked for authentication in
+writing and would have been served the opposite, with a warning on a stderr nobody collects. That is
+exactly the fail-open #1114 closed upstream, reintroduced here by the very code whose stated purpose
+was to stay identical to upstream.
+
+**The invariant is the behaviour, not the call site.** This crate's promise is that `--cluster` off
+behaves identically to the open-source binary. When upstream's behaviour moves, *keeping* our code
+unchanged is the fork. This is the generalisable half: the next upstream bump that changes a
+behaviour we deliberately mirror is to be read the same way, and `rcfile_invalid_is_fatal` /
+`rcfile_missing_is_fatal` exist to make the decision visible at the moment it stops holding.
+
+**A security gate fails closed.** `requireAdminAuth` is a classifier for "may this request touch the
+admin plane"; a bootstrap that cannot parse what it is classifying must take the dangerous reading,
+never the safe one. Refusing to start is the only reading that cannot silently disagree with the
+operator.
+
+**Unsupported keys stay advisory, and are routed through `tracing`.** They are not a refusal —
+upstream applies the rest of the file and reports them — so they must not abort. `apply_rcfile`
+calls `apply_rcfile_defaults_reporting` rather than `apply_rcfile_defaults` precisely to get them
+back as values: the `warn!` inside `apply_rcfile_defaults` fires before any subscriber exists (the
+rcfile may carry `logLevel`, so it must be applied first) and is therefore never seen by anyone.
+They go to stderr immediately *and* are returned to `main`, which re-emits them once `init_tracing`
+has run, so they reach the log pipeline like every other operational signal in this binary.
+
+**The error propagates with `?`, not formatted with `{e}`.** `{e}` renders only the outermost
+message, dropping the `with_context` that names the file (upstream #946) and serde's line and column
+(upstream #1004) — the two things that make a refusal actionable in a fleet carrying several
+rcfiles. `main` already returns `anyhow::Result<()>`, so the whole chain prints.
+
+*Rejected:* keeping the warning and adding a separate check for `requireAdminAuth` specifically —
+that fixes the one key we thought of. `port: 70000` silently binding 4464 and `localOnly: "yes"`
+binding every interface are the same defect wearing different keys, and upstream already decided
+the refusal is whole-file. *Rejected:* aborting only when the refused file mentions a
+security-relevant key — the operator cannot tell by reading their own file which keys are in that
+set, so the behaviour would be unpredictable exactly when it matters. *Rejected:* deferring the
+abort until after `init_tracing`, to log it through the pipeline — the rcfile may set `logLevel`,
+so the subscriber that would carry the message is configured by the file being refused.
+
+**Residual, stated:** an operator who has been running with a quietly-broken rcfile — one this
+binary warned about at every boot and ignored — will find the next restart refused rather than
+degraded. That is the intended outcome, and it is a behaviour change on upgrade: the fleet was not
+running the configuration its rcfile describes, and the abort is the first time anyone is told so.

@@ -130,7 +130,7 @@ implementation** rather than reimplementing or declining it:
 
 | Subcommand / flag | Behaviour |
 |---|---|
-| `--rcfile` | Mountebank-compatible JSON defaults, applied only to fields left at their defaults. A missing or malformed rcfile warns and startup continues, exactly as upstream (the warning goes to stderr immediately and is repeated through `tracing` once the subscriber exists). |
+| `--rcfile` | Mountebank-compatible JSON defaults, applied only to fields left at their defaults. A missing, malformed, or wrong-typed rcfile is **refused whole and aborts startup**, exactly as upstream since rift#1114 — see D-77. Unrecognised keys stay advisory: they go to stderr immediately and are repeated through `tracing` once the subscriber exists. |
 | `--pidfile` | one `global` flag, bindable on either side of the subcommand; written on the serving path only — see below |
 | `stop` | SIGTERM the PID in `--pidfile` (default `rift.pid`), then remove the file |
 | `restart` | `stop`, then start a new server in the same process. A missing PID file is "nothing to stop", not an error |
