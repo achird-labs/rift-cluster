@@ -3272,7 +3272,7 @@ running the configuration its rcfile describes, and the abort is the first time 
 - **Status:** active
 - **Decided:** 2026-09-16 · #596
 - **Refines:** D-67; follows D-42
-- **Implemented by:** #596
+- **Implemented by:** #601
 - **Amends:** docs/architecture/12-testing.md (C5 and C14 rows)
 - **Code:** tests/cluster-chaos/tests/scenarios.rs
 
