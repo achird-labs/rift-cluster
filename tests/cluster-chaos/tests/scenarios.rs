@@ -4295,18 +4295,19 @@ async fn c33_spray(live: &[usize], rounds: usize) -> anyhow::Result<Vec<String>>
 /// How long the ring may take to answer every caller again after the owner
 /// returns.
 ///
-/// **Derived, not borrowed.** The mechanisms that can delay a re-take are
-/// bounded: `TrackedPeerHealth`'s `DEFAULT_COOLDOWN` is 5 s
-/// (`crates/rift-cluster/src/rpc/client.rs`), and a follower has no probe to
-/// clear the mark early — only the leader does, `if !leading()` in
-/// `crates/rift-cluster/src/raft/network.rs` — plus one election, 150-300 ms.
-/// 10 s is that with slack.
+/// **Sized generously, because the mechanism is not yet confirmed.** An earlier
+/// revision derived this from `TrackedPeerHealth`'s 5 s cooldown, on the premise
+/// that followers' stale peer-health marks were what degraded these decisions.
+/// That premise was falsified: C33 degraded the same way with the half-open
+/// peer-health gate (#599) in place — and the three liveness waits before this one take
+/// longer than the cooldown anyway. See [`c33_wait_ring_answers`] for the leading
+/// hypothesis, and the `trail` it records for how the next run confirms or
+/// refutes it. The recorded `took` is what should tighten this number.
 ///
-/// It is deliberately **not** `CONVERGE_TIMEOUT`. 45 s is a harness number for
-/// imposter-config convergence, a different quantity; at 9x the real mechanism
-/// it would hide the whole regression family issue #597 describes. If this
-/// starts failing the question is what got slow, not whether the number should
-/// go up — and if `DEFAULT_COOLDOWN` moves, this must move with it.
+/// It is still deliberately **not** `CONVERGE_TIMEOUT`: 45 s is a harness number
+/// for imposter-config convergence, a different quantity, and a wait that long
+/// would hide any post-restart window that grows. If this starts failing, the
+/// question is what got slow, not whether the number should go up.
 const C33_RING_RETAKE_BOUND: Duration = Duration::from_secs(10);
 
 /// What [`c33_wait_ring_answers`] observed while waiting.
@@ -4320,6 +4321,13 @@ struct RingReady {
     /// Decisions absorbed while still degraded. Recorded, not asserted — see
     /// the caller.
     absorbed: usize,
+    /// Every degraded probe, as `round N: node — why`. The shape of this list is
+    /// what classifies the window: one entry per node, all in round 0, is the
+    /// signature of the owner refusing its own key (see
+    /// [`c33_wait_ring_answers`]); entries for only some callers point at the
+    /// callers' side instead. Kept whole, because a failure that discards the
+    /// value that would classify it cannot be diagnosed from its log.
+    trail: Vec<String>,
 }
 
 /// Wait until every live node's decision is served without the
@@ -4351,15 +4359,28 @@ struct RingReady {
 /// a flaky-but-informative scenario for a quiet one.
 ///
 /// **Every live node is probed each round**, not just one. Ownership is HRW over
-/// committed membership for a single key, so exactly one node holds it and the
-/// other two must each make an RPC — and each caller keeps its **own**
-/// peer-health entry for the owner's address, cleared only by its own success or
-/// its own cooldown. One node answering says nothing about another.
+/// committed membership for a single key, so exactly one node holds it: that
+/// node answers its own decisions in-process, and the other two each make an RPC
+/// to it. Three different paths — one answering says nothing about the others.
+///
+/// **What the window is, as far as is known.** #543's failure degraded **3 of
+/// 9** decisions (`c33_spray` issues `rounds * live.len()` = 9), which is exactly
+/// what one degraded decision per node in the first round would look like. The
+/// leading hypothesis is D-17: an owner refuses its own key while `is_isolated()`,
+/// and `isolated_from` treats `current_leader == None` as isolated — so a
+/// restarted owner that has rebound its imposter but not yet heard from the
+/// leader would degrade *every* node's decision, its own included, while
+/// `wait_converged` already passes. That is a fail-safe working as designed, not
+/// a defect, and a harness wait is the right answer to it. **It is unconfirmed**
+/// (in particular, that the rebind can precede the leader's first probe), and an
+/// earlier, confident attribution to the peer-health gate turned out wrong — so
+/// the `trail` below exists to let the next run settle it.
 async fn c33_wait_ring_answers(live: &[usize], within: Duration) -> anyhow::Result<RingReady> {
     let started = std::time::Instant::now();
     let deadline = started + within;
     let mut absorbed = 0;
-    let mut last = None;
+    let mut trail = Vec::new();
+    let mut round = 0;
     loop {
         let mut bodies = Vec::with_capacity(live.len());
         let mut degraded = 0;
@@ -4367,16 +4388,18 @@ async fn c33_wait_ring_answers(live: &[usize], within: Duration) -> anyhow::Resu
             anyhow::ensure!(
                 std::time::Instant::now() < deadline,
                 "the ring did not answer every caller within {within:?} after the owner \
-                 returned ({absorbed} decision(s) absorbed; last: {}). Ready, formed and \
-                 converged all held, so this is the owner not being reached for its key — \
-                 see issue #597",
-                last.as_deref().unwrap_or("none recorded"),
+                 returned ({absorbed} decision(s) absorbed). Ready, formed and converged \
+                 all held, so the owner is up but not answering for its key. Every \
+                 degraded probe, in order: {trail:?}",
             );
             match c33_cycle(i).await {
                 Ok((200, body, true)) => bodies.push(body),
                 Ok((200, _, false)) => {
                     degraded += 1;
-                    last = Some(format!("{} answered from a local cursor", NODES[i].name));
+                    trail.push(format!(
+                        "round {round}: {} — answered from a local cursor",
+                        NODES[i].name
+                    ));
                 }
                 // D-47 makes every cluster failure on this path a degraded 200,
                 // so a non-200 is its own defect rather than a "not yet" — the
@@ -4394,7 +4417,7 @@ async fn c33_wait_ring_answers(live: &[usize], within: Duration) -> anyhow::Resu
                 // be accepting yet. Carried into the timeout rather than dropped.
                 Err(e) => {
                     degraded += 1;
-                    last = Some(format!("{}: {e}", NODES[i].name));
+                    trail.push(format!("round {round}: {} — {e}", NODES[i].name));
                 }
             }
         }
@@ -4403,9 +4426,11 @@ async fn c33_wait_ring_answers(live: &[usize], within: Duration) -> anyhow::Resu
                 bodies,
                 took: started.elapsed(),
                 absorbed,
+                trail,
             });
         }
         absorbed += degraded;
+        round += 1;
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
 }
@@ -4582,12 +4607,12 @@ async fn c33_owner_mode_sequencing_cycles_fleet_wide_and_degrades_on_owner_kill(
         .await
         .expect("the ring answers every caller once the owner is back");
     chaos_artifact!(
-        "c33 artifact: ring re-take after owner restart = {:?} \
-         ({} decision(s) absorbed while degraded; bound {:?}; \
-         a steady non-zero here is issue #597's signature, not noise)",
+        "c33 artifact: ring answered every caller {:?} after the owner restarted \
+         ({} decision(s) absorbed while degraded; bound {:?}); degraded probes: {:?}",
         ready.took,
         ready.absorbed,
-        C33_RING_RETAKE_BOUND
+        C33_RING_RETAKE_BOUND,
+        ready.trail
     );
 
     let before = c33_fallbacks(&all).await;
