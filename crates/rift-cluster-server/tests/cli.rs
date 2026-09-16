@@ -647,10 +647,12 @@ fn require_admin_auth_refuses_an_exposed_clustered_front_in_the_shipped_binary()
 /// whenever `--require-admin-auth` is set" and the test above would still pass.
 ///
 /// Success is deliberately not asserted. This invocation goes on to be refused
-/// by the solo guard (`--cluster-allow-solo` is not passed), and that is the
-/// point: reaching a *later* refusal proves the exposure judgement let it
-/// through. Asserting a clean start would mean founding a real single-node
-/// cluster in a CLI unit test.
+/// by the solo guard (`--cluster-allow-solo` is not passed) — which runs inside
+/// `join_or_bootstrap`, after the Raft node has started, so this does briefly
+/// start one in a tempdir. Reaching that *later* refusal is what proves the
+/// exposure judgement let it through, so it is asserted: without it, a clap
+/// error, a probe-bind clash or a hang would all pass this test for the wrong
+/// reason.
 #[test]
 fn a_keyed_clustered_front_is_not_refused_by_the_exposure_judgement() {
     let dir = tempfile::TempDir::new().expect("tempdir");
@@ -663,6 +665,8 @@ fn a_keyed_clustered_front_is_not_refused_by_the_exposure_judgement() {
             "not-a-real-secret",
             "--cluster-state-dir",
             &dir.path().join("state").to_string_lossy(),
+            "--cluster-probe-bind",
+            "127.0.0.1:0",
             "--host",
             "0.0.0.0",
             "--port",
@@ -697,5 +701,10 @@ fn a_keyed_clustered_front_is_not_refused_by_the_exposure_judgement() {
     assert!(
         !stderr.contains("reachable from outside this host"),
         "a keyed front must clear the exposure judgement: {stderr}"
+    );
+    assert!(
+        stderr.contains("--cluster-allow-solo"),
+        "the run must reach the later solo guard — that is what shows the judgement \
+         let it through, rather than something else stopping it first: {stderr}"
     );
 }

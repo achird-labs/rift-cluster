@@ -254,16 +254,26 @@ impl EeCli {
     /// through DNS, so a hostname is a startup error there and here.
     ///
     /// Only the admin plane is pinned. Upstream's `--local-only` moves the admin
-    /// API and `/metrics`; imposter ports — and so this crate's front door —
-    /// stay on every interface by design, which is the reason `/config` reports
-    /// the *flag* rather than the bind.
+    /// API and `/metrics`; imposter ports — and so this crate's front door, which
+    /// binds whatever `--front-door` names — are not moved by it, by design. That
+    /// is the reason `/config` reports the *flag* rather than the bind.
     ///
     /// # Errors
     ///
-    /// `--host`/`--port` do not name a literal socket address, or the resolved
-    /// address is reachable off-host with no `--api-key` while
-    /// `--require-admin-auth` is set — upstream's `AdminExposurePolicy::Refuse`.
+    /// `--api-key` is blank; `--host`/`--port` do not name a literal socket
+    /// address; or the resolved address is reachable off-host with no `--api-key`
+    /// while `--require-admin-auth` is set — upstream's
+    /// `AdminExposurePolicy::Refuse`.
     pub fn resolve_front_admin(&self) -> anyhow::Result<SocketAddr> {
+        // The key is validated *first*, and that order is load-bearing:
+        // `check_admin_exposure` takes `Some(_)` to mean a usable key only because
+        // `validate_admin_api_key` has already refused a blank one — upstream's
+        // own doc says reversing the two "would let `Some("")` satisfy the very
+        // gate it defeats". `ServerBuilder::start` does validate, but it runs after
+        // the node has bootstrapped or joined; here a blank key is refused before.
+        rift_cluster_base::rift_http_proxy::admin_api::validate_admin_api_key(
+            self.oss.api_key.as_deref(),
+        )?;
         let addr = rift_cluster_base::rift_http_proxy::server::admin_bind_addr(&self.oss)?;
 
         // Upstream's function, policy enum and `bool` mapping, not a local
@@ -448,6 +458,22 @@ mod tests {
             .expect("a bare IPv6 literal is a valid host");
         assert!(addr.is_ipv6() && addr.ip().is_loopback(), "{addr}");
         assert_eq!(addr.port(), 2525);
+    }
+
+    /// A blank key is refused before the exposure judgement, so it cannot satisfy
+    /// it. Without the ordering, `Some("")` would count as "a key" and an exposed
+    /// front would be let through here — to be refused only later, inside
+    /// `ServerBuilder::start`, after the node had already bootstrapped or joined
+    /// (#603's review).
+    #[test]
+    fn a_blank_api_key_is_refused_before_it_can_satisfy_the_judgement() {
+        let e = front(&["--api-key", "", "--require-admin-auth"])
+            .resolve_front_admin()
+            .expect_err("a blank key is not a key");
+        assert!(
+            format!("{e:#}").contains("blank"),
+            "the refusal must be upstream's blank-key message: {e:#}"
+        );
     }
 
     /// Upstream parses `--host` as a literal and never resolves DNS; a name is a

@@ -3311,6 +3311,13 @@ address is being judged". `FrontConfig::public_addr` is therefore a `SocketAddr`
 that was judged, and `AdminFront::bind` binds exactly that. It used to be a `String` "because the core
 CLI accepts hostnames" — never true of upstream, whose `start()` refuses a name.
 
+**The key is validated first.** `check_admin_exposure` takes `Some(_)` to mean a usable key only
+because upstream's `validate_admin_api_key` has already refused a blank one; `resolve_front_admin`
+calls the validator before the judgement, so `--api-key ""` cannot satisfy it. Review found the
+first version skipped this: the blank key was refused only inside `ServerBuilder::start`, after the
+node had bootstrapped — reproduced with a solo node that became leader and wrote its Raft store
+before exiting.
+
 **Before the node binds or joins.** The judgement sits beside the `--configfile` refusal in
 `start_with_runtimes`, for the same reason: it reads upstream's half of the CLI, which
 `ClusterConfig::validate()` never sees. Upstream judges before binding so a refusal never unwinds a
@@ -3320,7 +3327,8 @@ fleet, then refuse to start. The artifact test caught it. The judgement also now
 `--cluster-allow-solo` guard: a security misconfiguration is reported before a topology preference.
 
 **`--local-only` pins the admin plane only.** Upstream's flag moves the admin API and `/metrics`;
-imposter ports — so this crate's front door — stay on every interface by design. That is also why
+imposter ports — so this crate's front door, which binds whatever `--front-door` names — are not
+moved by it, by design. That is also why
 `/config` reports the **flag** rather than the bind (upstream's `ConfigSnapshot` explains why the
 bind-derived value would overstate). Once the front honours the flag, flag and bind agree, and
 `localOnly` needs no change.
