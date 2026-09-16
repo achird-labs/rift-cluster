@@ -3291,10 +3291,17 @@ every request to a peer that was up and answering.
 **This was never only about sequencing.** Every owner-routed store reaches a peer through
 `bridge.call` → `RaftNode::call_member` → `RpcClient::call`, behind the same gate: the sequencer,
 the flow store and the durable shard, proxyOnce claims. D-10 makes sequencing *degrade* on a refused
-call — which is why the chaos tier saw this first, as C33 counting fallbacks — but CAS and proxyOnce
-**reject**. One peer restarting therefore made each follower refuse every flow-state op homed on
-that peer for five seconds, on an otherwise healthy fleet. That is an availability defect in the
-product; the harness symptom was the messenger.
+call, but CAS and proxyOnce **reject**. One peer restarting therefore made each follower refuse
+every flow-state op homed on that peer for five seconds, on an otherwise healthy fleet. That is an
+availability defect in the product, and it is the whole reason for this decision.
+
+**What this decision is *not* evidence for.** It was found while triaging the chaos scenario C33,
+whose post-restart failure (3 degraded decisions out of 9) was read as this mechanism's signature.
+That attribution was **wrong**: C33 fails the same way with this fix applied (#599's first CI run),
+so whatever produces its partial degradation is a different mechanism, still unidentified, and
+tracked on #595 — whose recorded `absorbed` figure exists to identify it. The mechanism below is
+verified from the code paths named, not from C33, and stands on its own; the scenario was the
+occasion for looking, not the evidence.
 
 **Why it hid.** D-22 (#431) found this mechanism from the other end — the *leader's* stale mark
 suppressing heartbeats to a restarted voter, livelocking the fleet — and fixed it by exempting
