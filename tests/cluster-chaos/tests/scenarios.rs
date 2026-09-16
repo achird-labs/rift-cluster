@@ -52,8 +52,18 @@ const UNBARRIERED_CONVERGE_BOUND: Duration = Duration::from_secs(5);
 /// range must stay clear of the ports other scenarios use.
 const C14_STORM_WRITES: u16 = 100;
 
-/// How long the fleet may take to accept writes again after its leader is
-/// killed — the operator-visible form of the issue's "new leader <= 3s".
+/// How long the fleet is **expected** to take to accept writes again after its
+/// leader is killed — the operator-visible form of the issue's "new leader <= 3s".
+///
+/// **Recorded, not gated (D-80).** C14 used to assert `resumed <= FAILOVER_WRITE_BOUND`
+/// from a single sample on a shared runner, and failed on overshoots that carried
+/// no information about the fleet: 5.176 s (#596's first sighting) and 5.013 s — a
+/// 13 ms miss — on a budget that already includes an election and a barrier
+/// timeout. A regression in failover would not land 0.26% over that. What gates
+/// is liveness — writes resume at all, within `3 ×` this — and durability; the
+/// figure itself is emitted with `chaos_artifact!` so it is trended across runs,
+/// where a regression shows as a moved distribution. This constant still sizes
+/// that liveness wait and still documents what the figure should look like.
 ///
 /// **Why this and not `/_fleet/members`.** The membership view is live and the
 /// harness reads it on the admin port (`fleet_members`), so it *could* time the
@@ -1277,11 +1287,15 @@ async fn c14_leader_kill_keeps_every_acknowledged_write() {
     .unwrap_or_else(|e| {
         panic!("the fleet never accepted a write after the leader was killed: {e}")
     });
-    assert!(
-        resumed <= FAILOVER_WRITE_BOUND,
-        "writes resumed only after {resumed:?} following a leader kill, past the \
-         {FAILOVER_WRITE_BOUND:?} budget (election + barrier timeout) -- this is \
-         the window in which the front door sheds traffic"
+    // Recorded, not gated (D-80): a single sample on a shared runner cannot tell
+    // a slow failover from a slow runner, and the gate failed on a 13 ms miss.
+    // Liveness is what `time_until_writes_resume` already enforced above — it
+    // panics if writes never resume inside `3 × FAILOVER_WRITE_BOUND` — and the
+    // durability claims below are untouched.
+    chaos_artifact!(
+        "c14 artifact: writes resumed {resumed:?} after the leader was killed \
+         (expected ~{FAILOVER_WRITE_BOUND:?}: election <= 3s + barrier timeout 2s; \
+         this is the window in which the front door sheds traffic)"
     );
 
     let acknowledged = storm.await.expect("the storm task ran");

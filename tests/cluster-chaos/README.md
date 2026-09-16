@@ -418,8 +418,10 @@ weaker properties:
 - `empty_state_dirs_cold_start_empty` wipes the state volumes and asserts the
   config is **gone**, which is what makes `test_cold_start`'s restore
   attributable to redb rather than to anything else that outlives a container.
-- C5 and C14 gained the failover bound (`WRITES_RESUME_BOUND`), and C14 the
-  100-write storm and a zero-duplicates check.
+- C14 gained the failover bound (`FAILOVER_WRITE_BOUND`), the 100-write storm
+  and a zero-duplicates check. (C5 asserts zero interruption instead of a bound,
+  for the reason given in its body. Since D-80 the C14 figure is recorded as a
+  run artifact rather than gated — see `docs/architecture/12-testing.md`.)
 
 **Failover is measured as write availability, not off `/_fleet/members`.** The
 membership view is live, so it *could* time the election — but a node named
