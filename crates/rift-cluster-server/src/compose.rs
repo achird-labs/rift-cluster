@@ -460,6 +460,27 @@ pub async fn start_with_runtimes(
         ));
     }
 
+    // The front's public admin address, resolved and judged in one step (D-79).
+    // Under `--cluster` the front *is* the admin plane, so `--local-only` decides
+    // this address and `--require-admin-auth` decides whether it is allowed to be
+    // this address; both used to be read off `cli.oss` *after* `attach_data_plane`
+    // had rewritten it to the core's loopback leg, which is why neither reached
+    // any production code.
+    //
+    // Here, for the same reason the `--configfile` refusal above is here: it
+    // reads upstream's half of the CLI, so `ClusterConfig::validate()` cannot see
+    // it, and a caller entering through `compose::start` directly must still get
+    // the judgement. And here rather than further down for two reasons upstream
+    // states and one this crate adds — the refusal must not have to unwind a
+    // listener, it must not have to unwind a *join*, and a security
+    // misconfiguration should be reported before a topology preference like
+    // `--cluster-allow-solo`.
+    //
+    // The resolved value is threaded down to the front rather than recomputed
+    // there: the address that was judged and the address that is bound are then
+    // the same `SocketAddr`, not two spellings of one that can drift apart.
+    let front_admin = cli.resolve_front_admin()?;
+
     let bind = cluster
         .bind
         .context("--cluster-bind is required with --cluster")?;
@@ -649,6 +670,7 @@ pub async fn start_with_runtimes(
     // the retry too, with an error that hides the real cause.
     match attach_data_plane(
         cli,
+        front_admin,
         &node,
         &readiness,
         Arc::clone(&manager),
@@ -689,6 +711,8 @@ pub async fn start_with_runtimes(
 #[allow(clippy::too_many_arguments)]
 async fn attach_data_plane(
     mut cli: EeCli,
+    // Already resolved and already judged by `EeCli::resolve_front_admin`.
+    front_admin: SocketAddr,
     node: &Arc<RaftNode>,
     readiness: &Arc<Readiness>,
     manager: Arc<ImposterManager>,
@@ -708,7 +732,12 @@ async fn attach_data_plane(
     // retreats to an ephemeral loopback port the front proxies to. `--cluster`
     // off never reaches this function, so that path keeps upstream's binding
     // untouched.
-    let public_admin = format!("{}:{}", cli.oss.host, cli.oss.port);
+    //
+    // `front_admin` arrives already resolved and already judged (D-79), from
+    // before this node bound or joined anything. It is used as given: deriving
+    // it again here is what would let the judged address and the bound address
+    // drift apart.
+    let public_admin = front_admin;
     let api_key = cli.oss.api_key.clone();
     let allow_injection = cli.oss.allow_injection;
     let scripts_dir = cli.oss.scripts_dir.clone();
@@ -766,8 +795,18 @@ async fn attach_data_plane(
     // tenant-aware gate behind the front's own. With one credential (#550, D-73) upstream's own
     // `--api-key` compare — which `cli.oss.api_key` above leaves switched on — is that gate, and
     // a bespoke authorizer would be a second implementation of one comparison.
+    // `GET /config` reports the port clients use, which is the front's (#598,
+    // D-79). Upstream derives `options.port` from the listener that bound — here
+    // the core's ephemeral loopback leg — and a Mountebank-compat client builds
+    // its URLs from that field, so it was handed an unreachable address.
+    //
+    // The *configured* port, because the core starts before the front binds: under
+    // `--port 0` this reports `0`, which upstream documents as a configured value
+    // rather than an absence. `localOnly` beside it needs nothing — it is the
+    // flag, and D-79 makes the front honour the flag, so the two now agree.
     let server = ServerBuilder::from_cli(cli.oss)
         .manager(Arc::clone(&manager))
+        .reported_admin_port(public_admin.port())
         .start()
         .await?;
 
@@ -809,7 +848,7 @@ async fn attach_data_plane(
 
     let front = match admin_front::bind(
         FrontConfig {
-            public_addr: public_admin.clone(),
+            public_addr: public_admin,
             upstream_admin: server.admin_addr(),
             api_key,
             allow_injection,
@@ -1902,6 +1941,99 @@ mod tests {
             &state.path().to_string_lossy(),
         ])
         .expect("parses")
+    }
+
+    /// A loopback port nothing holds right now. Bound and dropped: the window in
+    /// which something else could take it is the only race, and losing it fails
+    /// the bind loudly rather than passing wrongly.
+    fn free_port() -> u16 {
+        std::net::TcpListener::bind("127.0.0.1:0")
+            .expect("bind")
+            .local_addr()
+            .expect("local_addr")
+            .port()
+    }
+
+    /// Pins D-79 for `--local-only` (#591) on the address the front **actually
+    /// bound**, not on the resolver: `cli::tests` covers `resolve_front_admin`,
+    /// and would stay green if `compose` stopped threading its result into the
+    /// front. Also pins #598 — `/config` reports the front's port — and that the
+    /// reported `localOnly` and the real bind now agree.
+    #[tokio::test]
+    async fn local_only_pins_the_bound_front_and_config_reports_its_port() {
+        let state = TempDir::new().expect("tempdir");
+        let port = free_port();
+        let mut args: Vec<String> = [
+            "rift-cluster-server",
+            "--port",
+            &port.to_string(),
+            "--local-only",
+            "--metrics-port",
+            "0",
+            "--cluster",
+            "--cluster-bind",
+            "127.0.0.1:0",
+            "--cluster-probe-bind",
+            "127.0.0.1:0",
+            "--cluster-secret",
+            "issue-591-secret",
+            "--cluster-allow-solo",
+            "--cluster-leave-timeout",
+            "1",
+            "--cluster-state-dir",
+            &state.path().to_string_lossy(),
+        ]
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+        let cli = EeCli::try_parse_from(args.drain(..)).expect("parses");
+
+        let composed = start(cli).await.expect("solo starts");
+        let front = composed.admin_addr();
+        assert!(
+            front.ip().is_loopback(),
+            "--local-only must pin the front the operator reaches: bound {front}"
+        );
+        assert_eq!(front.port(), port, "the front binds the operator's port");
+        assert_ne!(
+            composed.engine_admin_addr().port(),
+            port,
+            "precondition: the core is on its own port, or #598 proves nothing"
+        );
+
+        let config: serde_json::Value = reqwest::get(format!("http://{front}/config"))
+            .await
+            .expect("GET /config")
+            .json()
+            .await
+            .expect("config is JSON");
+        assert_eq!(
+            config["options"]["port"],
+            serde_json::json!(port),
+            "/config must report the front's port, not the core's loopback leg: {config}"
+        );
+        assert_eq!(
+            config["options"]["localOnly"],
+            serde_json::json!(true),
+            "the flag is reported, and the bind above now agrees with it: {config}"
+        );
+
+        composed.shutdown().await;
+    }
+
+    /// The other half: without `--local-only` the front keeps `--host`'s default,
+    /// every interface. Without this, "pin the front" could be implemented as
+    /// "always bind loopback" and the test above would still pass.
+    #[tokio::test]
+    async fn without_local_only_the_front_binds_every_interface() {
+        let state = TempDir::new().expect("tempdir");
+        let composed = start(solo_cli(&state, "1")).await.expect("solo starts");
+        let front = composed.admin_addr();
+        assert!(
+            front.ip().is_unspecified(),
+            "without --local-only the front binds --host's 0.0.0.0: {front}"
+        );
+        composed.shutdown().await;
     }
 
     async fn probe_status(base: &str, path: &str) -> u16 {

@@ -232,6 +232,62 @@ impl EeCli {
         Ok(config)
     }
 
+    /// The address the **clustered admin front** binds, with upstream's own
+    /// exposure judgement already applied to it.
+    ///
+    /// Resolving and judging are one step, and deliberately so. Upstream keeps
+    /// the same coupling — `server::admin_bind_host` exists, in its own words,
+    /// as "one definition so the issue #863 exposure check and the actual bind
+    /// can never disagree about which address is being judged". Under
+    /// `--cluster` the front *is* the admin plane (D-79), so that judgement has
+    /// to be made about the front's address; splitting the two apart here would
+    /// re-create across binaries exactly the drift that comment guards against
+    /// within one.
+    ///
+    /// **`--local-only` pins loopback, otherwise `--host`** — upstream's rule,
+    /// *called* rather than copied: `admin_bind_addr` is the seam upstream
+    /// promoted for exactly this (rift#1131), and `ServerBuilder::start` calls it
+    /// too, so the rule still has one definition across both binaries. That
+    /// matters beyond tidiness: an earlier copy here parsed `"{host}:{port}"`,
+    /// which reads `::1:2525`'s port as one more hextet — the very defect
+    /// upstream fixed for every door in rift#1144. Rift never resolves `--host`
+    /// through DNS, so a hostname is a startup error there and here.
+    ///
+    /// Only the admin plane is pinned. Upstream's `--local-only` moves the admin
+    /// API and `/metrics`; imposter ports — and so this crate's front door, which
+    /// binds whatever `--front-door` names — are not moved by it, by design. That
+    /// is the reason `/config` reports the *flag* rather than the bind.
+    ///
+    /// # Errors
+    ///
+    /// `--api-key` is blank; `--host`/`--port` do not name a literal socket
+    /// address; or the resolved address is reachable off-host with no `--api-key`
+    /// while `--require-admin-auth` is set — upstream's
+    /// `AdminExposurePolicy::Refuse`.
+    pub fn resolve_front_admin(&self) -> anyhow::Result<SocketAddr> {
+        // The key is validated *first*, and that order is load-bearing:
+        // `check_admin_exposure` takes `Some(_)` to mean a usable key only because
+        // `validate_admin_api_key` has already refused a blank one — upstream's
+        // own doc says reversing the two "would let `Some("")` satisfy the very
+        // gate it defeats". `ServerBuilder::start` does validate, but it runs after
+        // the node has bootstrapped or joined; here a blank key is refused before.
+        rift_cluster_base::rift_http_proxy::admin_api::validate_admin_api_key(
+            self.oss.api_key.as_deref(),
+        )?;
+        let addr = rift_cluster_base::rift_http_proxy::server::admin_bind_addr(&self.oss)?;
+
+        // Upstream's function, policy enum and `bool` mapping, not a local
+        // re-reading of them: the flag must mean the same thing in both
+        // binaries, and the operator must get the same message. `Warn` (the
+        // default) logs it; `Refuse` (`--require-admin-auth`) aborts startup.
+        rift_cluster_base::rift_http_proxy::admin_api::check_admin_exposure(
+            addr,
+            self.oss.api_key.as_deref(),
+            self.oss.require_admin_auth.into(),
+        )?;
+        Ok(addr)
+    }
+
     /// How the open-source flags ask the data plane to be scheduled, as the
     /// cluster guards see it. Anything that is not explicitly per-core is
     /// work-stealing — including a value only the open-source resolver
@@ -312,6 +368,124 @@ fn read_secret_file(path: &std::path::Path) -> Result<String, ConfigError> {
 mod tests {
     use super::*;
     use clap::Parser;
+
+    fn front(args: &[&str]) -> EeCli {
+        let mut all = vec!["rift-cluster-server"];
+        all.extend_from_slice(args);
+        EeCli::try_parse_from(all).expect("parses")
+    }
+
+    /// Pins D-79: `--local-only` decides the **front's** bind, because under
+    /// `--cluster` the front is the admin plane. It used to be applied to
+    /// `cli.oss` after `compose` had already rewritten it to loopback, so it
+    /// reached no production code at all.
+    #[test]
+    fn local_only_pins_the_front_to_loopback() {
+        let pinned = front(&["--local-only", "--port", "2525"])
+            .resolve_front_admin()
+            .expect("resolves");
+        assert!(
+            pinned.ip().is_loopback(),
+            "--local-only must pin the front's admin bind: {pinned}"
+        );
+
+        let open = front(&["--port", "2525"])
+            .resolve_front_admin()
+            .expect("resolves");
+        assert!(
+            !open.ip().is_loopback(),
+            "without it the front keeps --host's default 0.0.0.0: {open}"
+        );
+        assert_eq!(open.port(), 2525, "the operator's port is what is bound");
+    }
+
+    /// `--local-only` outranks an explicit `--host`, matching upstream's
+    /// `admin_bind_host` — the flag is the stronger statement.
+    #[test]
+    fn local_only_outranks_an_explicit_host() {
+        let addr = front(&["--host", "10.0.0.5", "--local-only"])
+            .resolve_front_admin()
+            .expect("resolves");
+        assert!(addr.ip().is_loopback(), "{addr}");
+    }
+
+    /// Pins D-79, and the fail-open it closes (#590): an off-host front with no
+    /// `--api-key` is **refused** under `--require-admin-auth`, using upstream's
+    /// own judgement. Before this the check saw the core's rewritten loopback
+    /// leg and could never refuse anything.
+    #[test]
+    fn require_admin_auth_refuses_an_off_host_front_with_no_key() {
+        let refused = front(&["--cluster", "--require-admin-auth"]).resolve_front_admin();
+        let e = refused.expect_err("an off-host admin plane with no key must be refused");
+        let chain = format!("{e:#}");
+        assert!(
+            chain.contains("0.0.0.0:2525"),
+            "the refusal must name the address actually judged — the front's, not \
+             the core's loopback leg: {chain}"
+        );
+    }
+
+    /// The other three corners of the same rule, so "refuse" was not implemented
+    /// as "refuse whenever --require-admin-auth is set".
+    #[test]
+    fn the_exposure_judgement_only_refuses_the_exposed_keyless_case() {
+        assert!(
+            front(&["--require-admin-auth", "--api-key", "s3cr3t"])
+                .resolve_front_admin()
+                .is_ok(),
+            "a key satisfies the requirement"
+        );
+        assert!(
+            front(&["--require-admin-auth", "--local-only"])
+                .resolve_front_admin()
+                .is_ok(),
+            "a loopback front is not exposed, so there is nothing to refuse"
+        );
+        assert!(
+            front(&[]).resolve_front_admin().is_ok(),
+            "without the flag the default policy warns and starts, exactly as upstream"
+        );
+    }
+
+    /// A bare IPv6 literal is a valid `--host`, and resolves to the address it
+    /// names. Pins that this goes through upstream's rule (rift#1144): a
+    /// hand-rolled `"{host}:{port}".parse()` reads `::1:2525`'s port as a hextet
+    /// and refuses a literal the operator got right.
+    #[test]
+    fn a_bare_ipv6_host_resolves_like_upstream() {
+        let addr = front(&["--host", "::1", "--port", "2525"])
+            .resolve_front_admin()
+            .expect("a bare IPv6 literal is a valid host");
+        assert!(addr.is_ipv6() && addr.ip().is_loopback(), "{addr}");
+        assert_eq!(addr.port(), 2525);
+    }
+
+    /// A blank key is refused before the exposure judgement, so it cannot satisfy
+    /// it. Without the ordering, `Some("")` would count as "a key" and an exposed
+    /// front would be let through here — to be refused only later, inside
+    /// `ServerBuilder::start`, after the node had already bootstrapped or joined
+    /// (#603's review).
+    #[test]
+    fn a_blank_api_key_is_refused_before_it_can_satisfy_the_judgement() {
+        let e = front(&["--api-key", "", "--require-admin-auth"])
+            .resolve_front_admin()
+            .expect_err("a blank key is not a key");
+        assert!(
+            format!("{e:#}").contains("blank"),
+            "the refusal must be upstream's blank-key message: {e:#}"
+        );
+    }
+
+    /// Upstream parses `--host` as a literal and never resolves DNS; a name is a
+    /// startup error there, and must be one here rather than becoming an address
+    /// nobody judged.
+    #[test]
+    fn a_hostname_is_refused_rather_than_resolved() {
+        let e = front(&["--host", "rift.internal"])
+            .resolve_front_admin()
+            .expect_err("a hostname is not a literal socket address");
+        assert!(format!("{e:#}").contains("rift.internal"), "{e:#}");
+    }
 
     #[test]
     fn state_dir_follows_the_datadir_by_default() {

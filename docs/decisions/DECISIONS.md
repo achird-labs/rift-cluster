@@ -3387,6 +3387,91 @@ permanently dead, where the old cost was ~3 callers paying ~350 ms of backoff pe
 new cost is ~8 trials per 5 s, each one caller at a time. The alternative — backing the interval
 off as an outage lengthens — would make recovery slowest exactly when a long outage finally ends.
 
+### D-79 — Under `--cluster` the front *is* the admin plane: upstream's listener judgements are made about the front, with upstream's code, before anything binds
+
+- **Status:** active
+- **Decided:** 2026-09-16 · #590, #591, #598
+- **Refines:** D-73, D-77
+- **Amends:** docs/rift-cluster-server.md, docs/architecture/10-operations.md
+- **Implemented by:** #603
+- **Code:** crates/rift-cluster-server/src/cli.rs, crates/rift-cluster-server/src/compose.rs, crates/rift-cluster-server/src/admin_front.rs, crates/rift-cluster-server/tests/cli.rs
+
+Under `--cluster` the public admin address belongs to the front (issue #9): `compose` takes
+`--host`/`--port` for it and rewrites the core's to `127.0.0.1:0`, a loopback leg the front proxies
+to. The front replaced upstream's admin listener — but only a hand-picked subset of upstream's
+**decisions about that listener** moved with it (`api_key`, `allow_injection`, `scripts_dir`).
+Three stayed behind, still made about a listener nobody can reach:
+
+| upstream judgement | was made about | now made about |
+|---|---|---|
+| exposure — warn, or refuse under `--require-admin-auth`, when off-host with no key | the core's `127.0.0.1:0`, so it could never refuse | the front's address (#590) |
+| bind — `--local-only` pins loopback | the core, already loopback, so inert | the front's address (#591) |
+| self-report — `GET /config`'s `options.port` | the core's ephemeral port | the front's port (#598) |
+
+The consequence of the first row is the one that matters: `--cluster --require-admin-auth` with no
+`--api-key` started a node whose admin plane was open on every interface — an invocation upstream
+refuses outright. `require_admin_auth` reached no production code in this crate; `local_only`
+appeared nowhere.
+
+**The rule.** Every judgement upstream makes about its admin listener — where it binds, whether that
+exposure is acceptable, what it reports about itself — is made about the **front's** address, using
+**upstream's own code**, **before the node binds or joins anything**. The core's loopback leg is an
+implementation detail and is judged as one: it always passes, harmlessly.
+
+**Upstream's code, not a copy.** `EeCli::resolve_front_admin` calls `admin_bind_addr` (rift#1131)
+and `check_admin_exposure` with upstream's `From<bool>` policy mapping, so the flag means the same
+thing in both binaries and the operator gets the same message. It started life as a copy, and the
+copy carried a live defect: it parsed `"{host}:{port}"`, which reads `::1:2525`'s port as one more
+hextet — the bug upstream fixed for every door in rift#1144. A copy of a rule inherits its bugs and
+misses its fixes; that is the whole case against copying one.
+
+**Resolved and judged in one call, and the result threaded, not recomputed.** Upstream's own
+`admin_bind_host` exists "so the exposure check and the actual bind can never disagree about which
+address is being judged". `FrontConfig::public_addr` is therefore a `SocketAddr` carrying the value
+that was judged, and `AdminFront::bind` binds exactly that. It used to be a `String` "because the core
+CLI accepts hostnames" — never true of upstream, whose `start()` refuses a name.
+
+**The key is validated first.** `check_admin_exposure` takes `Some(_)` to mean a usable key only
+because upstream's `validate_admin_api_key` has already refused a blank one; `resolve_front_admin`
+calls the validator before the judgement, so `--api-key ""` cannot satisfy it. Review found the
+first version skipped this: the blank key was refused only inside `ServerBuilder::start`, after the
+node had bootstrapped — reproduced with a solo node that became leader and wrote its Raft store
+before exiting.
+
+**Before the node binds or joins.** The judgement sits beside the `--configfile` refusal in
+`start_with_runtimes`, for the same reason: it reads upstream's half of the CLI, which
+`ClusterConfig::validate()` never sees. Upstream judges before binding so a refusal never unwinds a
+listener; here there is a stronger reason. The first placement was at the address's derivation site
+inside `attach_data_plane` — *after* `join_or_bootstrap` — so a misconfigured node would join the
+fleet, then refuse to start. The artifact test caught it. The judgement also now precedes the
+`--cluster-allow-solo` guard: a security misconfiguration is reported before a topology preference.
+
+**`--local-only` pins the admin plane only.** Upstream's flag moves the admin API and `/metrics`;
+imposter ports — so this crate's front door, which binds whatever `--front-door` names — are not
+moved by it, by design. That is also why
+`/config` reports the **flag** rather than the bind (upstream's `ConfigSnapshot` explains why the
+bind-derived value would overstate). Once the front honours the flag, flag and bind agree, and
+`localOnly` needs no change.
+
+**`/config`'s port is the configured one.** The core starts before the front binds, so under
+`--port 0` the reported port is `0` — which upstream's `with_reported_admin_port` documents as a
+configured value, not an absence. Terminating `/config` in the front instead would re-implement
+version, commit, `serveOptions` and the process block to change one integer.
+
+*On "thread the flags into `FrontConfig`"* (the decision as taken, 2026-09-16): honoured in
+upstream's form. `--local-only`'s **effect** is threaded — as the resolved `public_addr`.
+`--require-admin-auth` is **consumed at the judgement**, not carried into `FrontConfig`: judging
+inside `AdminFront::bind` would run after the core, the front door and the probe listener were up,
+and `bind` returns `io::Result`, which a policy refusal is not.
+
+*Rejected:* refusing `--require-admin-auth` / `--local-only` under `--cluster` as inapplicable —
+it makes an operator's explicit hardening flag an error on the one deployment shape that needs it.
+*Rejected:* DNS-resolving `--host` and judging every resolved address — more permissive than
+upstream, and "judge a name" is the ambiguity `is_loopback()` on a literal exists to avoid.
+
+**Residual, stated:** under `--port 0` — tests and embedders, never a production CLI — `/config`
+reports `0` rather than the front's ephemeral port.
+
 ### D-80 — C14 gates durability and liveness; failover latency is a recorded figure, not a gate
 
 - **Status:** active
