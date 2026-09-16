@@ -97,12 +97,23 @@ async fn squat(port: u16) -> tokio::net::TcpListener {
         .expect("squatter bind")
 }
 
-/// Whether the node reports a local engine failure for `port`.
+/// Whether the node reports bind divergence for `port`.
 ///
 /// Read off the node rather than from `/_fleet/members`: this is the exact state the
 /// `bind_failures` field there and the read-side header are both derived from, so asserting
 /// it pins the cause instead of one of its two projections.
 fn reports_bind_failure(server: &ComposedServer, port: u16) -> bool {
+    server
+        .node()
+        .expect("clustered")
+        .bind_failure(port)
+        .is_some()
+}
+
+/// Whether the node's last drive for `port` failed, whatever the kind — the general map the
+/// write path's `local-engine=` warning reads, which is deliberately wider than
+/// [`reports_bind_failure`].
+fn records_engine_failure(server: &ComposedServer, port: u16) -> bool {
     server
         .node()
         .expect("clustered")
@@ -346,7 +357,7 @@ async fn a_non_bind_failure_is_not_reported_as_bind_divergence() {
 
     // The node does record *a* failure for this port...
     assert!(
-        reports_bind_failure(&server, port),
+        records_engine_failure(&server, port),
         "the TLS failure is tracked in the general apply-failure map"
     );
     // ...but it must not be dressed up as bind divergence on either surface.
@@ -391,6 +402,116 @@ async fn a_non_bind_failure_is_not_reported_as_bind_divergence() {
         );
     }
 
+    server.shutdown().await;
+}
+
+/// The `rift-cluster-bind-failures` header on `GET /imposters/{port}`, asserting the read is a `200`.
+async fn bind_marker_on_read(server: &ComposedServer, port: u16) -> Option<String> {
+    let admin = server.admin_addr();
+    let read = Seen::of(
+        reqwest::get(format!("http://{admin}/imposters/{port}"))
+            .await
+            .expect("get imposter"),
+    )
+    .await;
+    assert_eq!(read.status, 200, "{read}");
+    read.header("rift-cluster-bind-failures").map(str::to_owned)
+}
+
+/// Pins D-81 end to end (#586): pausing a bind-diverged imposter, or patching its stubs, leaves the
+/// divergence visible on every surface that reports it.
+///
+/// Both writes succeed and neither touches the socket, and each used to erase the reason. No
+/// `POST /imposters` happens between the squat and the last read: a whole-set write re-attempts
+/// the bind and re-records the reason on its own, so it would make this pass on the defect.
+#[tokio::test]
+async fn a_bind_failed_imposter_stays_marked_after_a_pause_and_a_stub_patch() {
+    let port = reserve_port();
+    let blocker = squat(port).await;
+
+    let state = TempDir::new().expect("tempdir");
+    let server = compose::start(cluster_cli(&state))
+        .await
+        .expect("solo cluster starts");
+    wait_ready(&server).await;
+    let admin = server.admin_addr();
+    let client = reqwest::Client::new();
+
+    let created = Seen::of(
+        client
+            .post(format!("http://{admin}/imposters"))
+            .json(&imposter(port, "served-while-unbound"))
+            .send()
+            .await
+            .expect("post imposter"),
+    )
+    .await;
+    assert_eq!(created.status, 201, "{created}");
+
+    let before = bind_marker_on_read(&server, port)
+        .await
+        .expect("precondition: the read carries the marker");
+    assert!(before.starts_with(&format!("{port}=")), "{before}");
+
+    let paused = Seen::of(
+        client
+            .post(format!("http://{admin}/imposters/{port}/disable"))
+            .send()
+            .await
+            .expect("disable"),
+    )
+    .await;
+    assert_eq!(paused.status, 200, "{paused}");
+    assert_eq!(
+        paused.header("rift-cluster-bind-failures"),
+        Some(before.as_str()),
+        "the write that succeeded fleet-wide must still say this node is serving unbound: {paused}"
+    );
+    assert_eq!(
+        bind_marker_on_read(&server, port).await.as_deref(),
+        Some(before.as_str()),
+        "a pause must not erase the marker"
+    );
+
+    let patched = Seen::of(
+        client
+            .post(format!("http://{admin}/imposters/{port}/stubs"))
+            .json(&json!({
+                "stub": {
+                    "id": "b",
+                    "responses": [{ "is": { "statusCode": 200, "body": "b" } }],
+                },
+            }))
+            .send()
+            .await
+            .expect("add stub"),
+    )
+    .await;
+    assert_eq!(patched.status, 200, "{patched}");
+    assert_eq!(
+        bind_marker_on_read(&server, port).await.as_deref(),
+        Some(before.as_str()),
+        "a stub patch must not erase the marker"
+    );
+
+    let listing = cluster_imposters(&server).await;
+    let entry = listing["imposters"]
+        .as_array()
+        .expect("imposters is an array")
+        .iter()
+        .find(|e| e["port"] == port)
+        .unwrap_or_else(|| panic!("the operator listing names the port: {listing}"));
+    assert!(
+        entry["bind_failure"].is_string(),
+        "the operator listing still calls it a bind failure: {entry}"
+    );
+    let fleet = fleet_members(&server).await;
+    assert!(
+        fleet["bind_failures"][port.to_string()].is_string(),
+        "the fleet projection still names it: {fleet}"
+    );
+
+    drop(blocker);
     server.shutdown().await;
 }
 

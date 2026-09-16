@@ -782,6 +782,11 @@ pub struct RedbStateMachine {
     /// refusal that names no single port). This is node status, not replicated
     /// state — every replica has its own bind outcomes.
     apply_failures: Arc<Mutex<BTreeMap<u16, String>>>,
+    /// Why the engine is serving a port unbound, per port — the bind's own lifetime, not a
+    /// drive's (D-81). Written and cleared only by [`Self::record_report`], i.e. only by drives
+    /// that attempt the bind; a toggle or stub patch leaves it alone. Node status, like
+    /// `apply_failures`.
+    bind_failures: Arc<Mutex<BTreeMap<u16, String>>>,
     /// Serialises engine drives against each other, and — the point of it —
     /// against the *read that computed one* (#574).
     ///
@@ -840,6 +845,7 @@ impl RedbStateMachine {
             flow_net: None,
             routes: None,
             apply_failures: Arc::new(Mutex::new(BTreeMap::new())),
+            bind_failures: Arc::new(Mutex::new(BTreeMap::new())),
             engine_drive: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
@@ -1265,6 +1271,10 @@ impl RedbStateMachine {
     /// Last engine side-effect failure per port (0 = set-level), as recorded by
     /// the most recent drives. Empty when the local engine matches the applied
     /// state.
+    ///
+    /// A drive outcome, not a standing property: a later successful drive for the
+    /// port clears it, whether or not that drive touched what failed. Why a port is
+    /// unbound is [`Self::bind_failure`] (D-81).
     #[must_use]
     pub fn apply_failures(&self) -> BTreeMap<u16, String> {
         self.apply_failures.lock().clone()
@@ -1307,16 +1317,25 @@ impl RedbStateMachine {
     /// operator "this node is still serving it in-process", which for every one of those cases is
     /// false: the imposter is not in the map at all, and the read they are looking at is a 404.
     /// So the engine's own [`Imposter::is_bound`] is the authority here, not the failure string.
+    ///
+    /// The reason is read from its own map, not from `apply_failures` (D-81): that one is reaped by
+    /// a successful toggle or stub patch and overwritten by a failed one, neither of which touches
+    /// the socket — so one `disable` used to leave the port unbound and reported healthy (#586).
     #[must_use]
     pub fn bind_failure(&self, port: u16) -> Option<String> {
-        let engine = self.engine.as_ref()?;
-        if engine
-            .get_imposter(port)
-            .is_ok_and(|imposter| !imposter.is_bound())
-        {
-            return self.apply_failures.lock().get(&port).cloned();
+        if self.serving_unbound(port) {
+            return self.bind_failures.lock().get(&port).cloned();
         }
         None
+    }
+
+    /// The engine holds `port` but has no listener for it — the one state a bind reason describes.
+    fn serving_unbound(&self, port: u16) -> bool {
+        self.engine.as_ref().is_some_and(|engine| {
+            engine
+                .get_imposter(port)
+                .is_ok_and(|imposter| !imposter.is_bound())
+        })
     }
 
     /// Is this node's own engine actually **holding `port`'s socket** right now?
@@ -1395,15 +1414,16 @@ impl RedbStateMachine {
     ///
     /// The same narrowing [`Self::bind_failure`] documents applies per port: a port the engine
     /// holds and has bound goes in `bound_ports`; a port it holds, has not bound, and has a
-    /// recorded failure for goes in the failure map (never the general `apply_failures` failure —
-    /// a parse, cert, or stub-patch failure must not be mislabelled as a bind failure); a port the
-    /// engine does not hold at all — never applied on this node — lands in **neither** collection.
+    /// recorded bind reason for goes in the failure map (read from the bind's own map, D-81 — never
+    /// the general `apply_failures` entry, which a parse, cert, or stub-patch failure can occupy and
+    /// a successful toggle can erase); a port the engine does not hold at all — never applied on
+    /// this node — lands in **neither** collection.
     /// `is_bound()` is tested first, so the two collections stay disjoint by construction, the same
     /// invariant `bind_failure`/`is_locally_bound` rest on.
     #[must_use]
     pub fn local_bind_report(&self) -> Option<(Vec<u16>, BTreeMap<u16, String>)> {
         let engine = self.engine.as_ref()?;
-        let apply_failures = self.apply_failures.lock();
+        let bind_failures = self.bind_failures.lock();
         let mut bound_ports = Vec::new();
         let mut failures = BTreeMap::new();
         for imposter in engine.list_imposters() {
@@ -1412,7 +1432,7 @@ impl RedbStateMachine {
             };
             if imposter.is_bound() {
                 bound_ports.push(port);
-            } else if let Some(reason) = apply_failures.get(&port) {
+            } else if let Some(reason) = bind_failures.get(&port) {
                 failures.insert(port, reason.clone());
             }
         }
@@ -2674,13 +2694,24 @@ impl RedbStateMachine {
             .collect()
     }
 
-    /// Fold a successful sync's report into the failure map, under one lock:
+    /// Fold a successful sync's report into the failure maps, both locks held together:
     /// clear the ports it touched (and the set-level slot), drop entries for
     /// ports with no desired config — without that, a bind-failed port that is
     /// later deleted keeps its stale entry forever (the engine never had it, so
     /// no report bucket names it) — then record the ports that failed.
+    ///
+    /// Also the **only** writer of the bind reasons (D-81), because every drive that attempts a
+    /// bind reports through here and the toggle/patch arms do not. A port leaves that map when a
+    /// bind was attempted and did not fail (`created`, `replaced`) or the port went away
+    /// (`deleted`, or no longer desired); a `failed` port enters it only while it is desired and the
+    /// engine holds it unbound after this drive — the gate [`Self::bind_failure`] reads through — so a failure for a
+    /// port the engine never took, or a failed delete of one no longer wanted, is not called a bind
+    /// failure. The **first** failure per port is
+    /// kept: `apply_config` attempts a held port's bind before its toggle, stub patch and persist,
+    /// so a later entry for the same port is one of those, not the reason it is unbound.
     fn record_report(&self, report: &ApplyReport, desired_ports: &std::collections::BTreeSet<u16>) {
         let mut failures = self.apply_failures.lock();
+        let mut bind_failures = self.bind_failures.lock();
         for port in report
             .created
             .iter()
@@ -2691,9 +2722,25 @@ impl RedbStateMachine {
         {
             failures.remove(port);
         }
+        for port in report
+            .created
+            .iter()
+            .chain(&report.replaced)
+            .chain(&report.deleted)
+        {
+            bind_failures.remove(port);
+        }
         failures.retain(|port, _| desired_ports.contains(port));
+        bind_failures.retain(|port, _| desired_ports.contains(port));
+        let mut bind_recorded = BTreeSet::new();
         for (port, error) in &report.failed {
             failures.insert(*port, error.to_string());
+            if desired_ports.contains(port)
+                && self.serving_unbound(*port)
+                && bind_recorded.insert(*port)
+            {
+                bind_failures.insert(*port, error.to_string());
+            }
         }
     }
 }
@@ -4689,6 +4736,178 @@ mod tests {
              refusing, and this is #576's own defect restored"
         );
 
+        engine.shutdown().await;
+    }
+
+    /// Pins D-81: a bind failure's reason has the bind's lifetime.
+    ///
+    /// Only a drive that attempts the bind records or clears it. A toggle and a stub patch are
+    /// drives that never touch the socket, and each used to `remove` the port's `apply_failures`
+    /// entry on success — which is where the reason lived — so one `disable` left the port unbound,
+    /// still served in-process only, and reported as healthy (#586). No whole-set write happens
+    /// between the toggle and the reads below: that write is the one that heals on its own.
+    #[tokio::test]
+    async fn a_bind_failure_reason_survives_a_toggle_and_a_stub_patch() {
+        // Loopback, matching the address `config` binds: a squat on another address can be
+        // bound over, and the test would then exercise a healthy port.
+        let blocker = std::net::TcpListener::bind("127.0.0.1:0").expect("bind blocker");
+        let port = blocker.local_addr().expect("addr").port();
+        let engine = Arc::new(ImposterManager::new().with_serve_unbound(true));
+        let (_td, mut sm) = fresh_sm(Some(engine.clone())).await;
+
+        sm.apply(vec![entry(1, put(1, port, json!([{ "id": "a" }])))])
+            .await
+            .expect("apply");
+        let reason = sm
+            .bind_failure(port)
+            .expect("the squatted port is served unbound and says why");
+        assert!(
+            !sm.is_locally_bound(port),
+            "precondition: the squat won the bind"
+        );
+
+        sm.apply(vec![entry(
+            2,
+            request(
+                2,
+                ControlOp::SetEnabled {
+                    port,
+                    enabled: false,
+                },
+            ),
+        )])
+        .await
+        .expect("pause");
+        assert_eq!(
+            sm.bind_failure(port).as_deref(),
+            Some(reason.as_str()),
+            "a pause does not touch the socket, so it must not erase why the socket is missing"
+        );
+        assert!(
+            !sm.apply_failures().contains_key(&port),
+            "the pause itself succeeded, and the drive-outcome map says so: {:?}",
+            sm.apply_failures()
+        );
+        assert_eq!(
+            sm.local_bind_report()
+                .expect("engine")
+                .1
+                .get(&port)
+                .map(String::as_str),
+            Some(reason.as_str()),
+            "the fleet projection reads the same reason"
+        );
+
+        sm.apply(vec![entry(
+            3,
+            request(
+                3,
+                ControlOp::PatchStubs {
+                    port,
+                    edit: StubEditScript(vec![StubEdit::Add {
+                        stub: serde_json::from_value(json!({ "id": "b" })).expect("parses"),
+                        index: None,
+                    }]),
+                },
+            ),
+        )])
+        .await
+        .expect("patch");
+        assert_eq!(
+            sm.bind_failure(port).as_deref(),
+            Some(reason.as_str()),
+            "a stub patch does not touch the socket either"
+        );
+
+        // The drive that does attempt the bind is the one that clears it.
+        drop(blocker);
+        sm.apply(vec![entry(4, put(4, port, json!([{ "id": "a" }])))])
+            .await
+            .expect("heal");
+        assert!(sm.is_locally_bound(port), "the freed port was rebound");
+        assert_eq!(sm.bind_failure(port), None, "and the reason went with it");
+
+        engine.shutdown().await;
+    }
+
+    /// Pins D-81's first-failure rule: when one sync reports a port twice, the reason kept is the
+    /// bind attempt's. `apply_config` re-attempts a held-unbound port's bind before it patches that
+    /// port's stubs and persists them, so with a datadir that has gone away the report names the
+    /// port for the bind and again for the persist — and the persist error is not why the port is
+    /// unbound.
+    #[tokio::test]
+    async fn a_later_failure_in_the_same_sync_does_not_replace_the_bind_reason() {
+        let blocker = std::net::TcpListener::bind("127.0.0.1:0").expect("bind blocker");
+        let port = blocker.local_addr().expect("addr").port();
+        let data = TempDir::new().expect("tempdir");
+        let datadir = data.path().join("datadir");
+        std::fs::create_dir(&datadir).expect("mk datadir");
+        let engine =
+            Arc::new(ImposterManager::with_datadir(Some(datadir.clone())).with_serve_unbound(true));
+        let (_td, mut sm) = fresh_sm(Some(engine.clone())).await;
+
+        sm.apply(vec![entry(1, put(1, port, json!([{ "id": "a" }])))])
+            .await
+            .expect("apply");
+        let reason = sm.bind_failure(port).expect("precondition: served unbound");
+        assert!(
+            reason.contains("Address already in use"),
+            "precondition: the reason is the bind's: {reason}"
+        );
+
+        std::fs::remove_dir_all(&datadir).expect("break the datadir");
+        sm.apply(vec![entry(
+            2,
+            put(2, port, json!([{ "id": "a" }, { "id": "b" }])),
+        )])
+        .await
+        .expect("a stub edit, synced whole-set");
+
+        let drive_outcome = sm
+            .apply_failures()
+            .get(&port)
+            .cloned()
+            .expect("the persist failure is this drive's outcome");
+        assert_ne!(
+            drive_outcome, reason,
+            "precondition: the sync failed the port a second time, for another cause"
+        );
+        assert_eq!(
+            sm.bind_failure(port).as_deref(),
+            Some(reason.as_str()),
+            "the bind reason must survive a later failure for the same port in the same sync"
+        );
+
+        drop(blocker);
+        engine.shutdown().await;
+    }
+
+    /// A delete clears the reason: the port is gone, and so is the question.
+    #[tokio::test]
+    async fn deleting_a_bind_failed_imposter_clears_its_reason() {
+        let blocker = std::net::TcpListener::bind("127.0.0.1:0").expect("bind blocker");
+        let port = blocker.local_addr().expect("addr").port();
+        let engine = Arc::new(ImposterManager::new().with_serve_unbound(true));
+        let (_td, mut sm) = fresh_sm(Some(engine.clone())).await;
+
+        sm.apply(vec![entry(1, put(1, port, json!([])))])
+            .await
+            .expect("apply");
+        assert!(sm.bind_failure(port).is_some(), "precondition");
+
+        sm.apply(vec![entry(
+            2,
+            request(2, ControlOp::DeleteImposter { port }),
+        )])
+        .await
+        .expect("delete");
+        assert_eq!(sm.bind_failure(port), None);
+        assert!(
+            sm.local_bind_report().expect("engine").1.is_empty(),
+            "no stale reason survives in the projection"
+        );
+
+        drop(blocker);
         engine.shutdown().await;
     }
 

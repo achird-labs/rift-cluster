@@ -2893,6 +2893,18 @@ async fn run_mutation(
             .join(",");
         warnings.push(format!("unapplied={nodes}"));
     }
+    // The bind marker the read carries, on the write too (D-81). A pause or stub patch of a
+    // bind-diverged imposter succeeds, and its drive clears `local-engine=` — so without this the
+    // response to that write is the one place the operator is looking and it reads healthy.
+    if let Some(port) = mutation.port
+        && let Some(reason) = node.bind_failure(port)
+    {
+        set_header(
+            &mut response,
+            HEADER_BIND_FAILURES,
+            &format!("{port}={reason}"),
+        );
+    }
     // The commit is fleet truth, but THIS node's engine may still have failed
     // to realize it (a bind, a refused toggle): §7.4.6 — success with a named
     // warning, never a silent divergence the client cannot see.

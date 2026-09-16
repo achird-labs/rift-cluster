@@ -3524,3 +3524,48 @@ ones and are not flaky; quarantine would drop them to silence one noisy assertio
 figures across runs, which nothing does automatically. It
 is the honest limit of what one sample on a shared runner can prove, and the reason the figure is
 recorded rather than discarded.
+
+### D-81 — A bind failure's reason has the bind's lifetime: recorded and cleared only by drives that attempt the bind
+
+- **Status:** active
+- **Decided:** 2026-09-16 · #586
+- **Amends:** RFC-001 §7.4.6
+- **Refines:** D-76
+- **Implemented by:** #586
+- **Code:** crates/rift-cluster/src/raft/store.rs, crates/rift-cluster-server/src/admin_front.rs
+
+`bind_failure(port)` answers "why is this node serving `port` in-process only". Its gate — the
+engine holds the port and `!is_bound()` — is live state; its reason string was read from
+`apply_failures`, which records the outcome of the *last drive* for a port and is reaped by later
+drives. The `SetEnabled` and `Patch` arms are drives that never touch the socket, and each removed
+the port's entry on success. So one `POST /imposters/{port}/disable`, or a stub patch, left a port
+unbound and served in-process while every surface — the read header, `GET /_cluster/imposters`,
+`/_fleet/members` — reported it healthy, until an unrelated whole-set write re-attempted the bind or
+the process restarted. A *failed* toggle or patch was the mirror image: it overwrote the bind reason
+with its own error, and the port was then reported as unbound *because* a stub edit was refused.
+
+**Two maps, because there are two lifetimes.** `apply_failures` keeps its meaning — the outcome of
+the last drive per port, which is what the write path's `local-engine=` warning reports. The bind
+reason moves to `bind_failures`, whose **only writer is `record_report`**: every path that attempts a
+bind reports through `ApplyReport` (create, wholesale replace, and the heal branch of `apply_config`,
+which re-attempts the bind of any held-but-unbound port on every whole-set sync), and the toggle and
+patch arms never reach it. Within `record_report` a port is reaped when a bind was attempted and
+succeeded or the port was removed (`created`, `replaced`, `deleted`) or when the desired set stops
+naming it; a `failed` port is recorded **only when the engine holds it and it is still unbound after
+the drive** — the same authority the gate uses, so a failure for a port the engine never took (an
+unresolvable TLS acceptor on create, `PortInUse`) is never called a bind failure. When one sync
+reports several failures for a port, the **first** is kept: upstream attempts the bind before the
+toggle, stub patch and persist steps for that port, so the first is the bind attempt's.
+
+Not keyed on the error type: a rebind whose cert has become unreadable fails with `Tls`, leaves the
+port held and unbound, and that failure *is* why the port is unbound.
+
+The write path now also stamps `rift-cluster-bind-failures` from `bind_failure(port)`, as the read
+does: a pause of a bind-diverged imposter succeeds fleet-wide, and its response is the one place the
+operator is certainly looking.
+
+*Rejected:* gating the two `remove`s on `is_bound()` (the issue's option 1) — it fixes the erase but
+not the overwrite; on a failed toggle one map must either lose the drive error the writer needs or
+mislabel it as the bind reason. *Rejected:* an upstream `Imposter::bind_failure()` accessor — fully
+derived, but three PRs across two repos for a value with exactly this lifetime and this single
+writer; revisit if a second consumer appears upstream.
