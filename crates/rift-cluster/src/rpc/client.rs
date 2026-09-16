@@ -49,26 +49,79 @@ impl PeerHealth for AlwaysHealthy {
 /// marking a peer unhealthy.
 const DEFAULT_FAILURE_THRESHOLD: u32 = 3;
 
-/// How long [`TrackedPeerHealth`] keeps a tripped peer marked unhealthy.
+/// How long [`TrackedPeerHealth`] keeps a tripped peer marked unhealthy *if no
+/// trial ever reaches it* — see [`DEFAULT_HALF_OPEN_INTERVAL`], which is what
+/// governs recovery in the ordinary case.
 const DEFAULT_COOLDOWN: Duration = Duration::from_secs(5);
+
+/// How often a peer marked unhealthy admits one **trial** call (D-78).
+///
+/// The cost of the half-open state is bounded by "one trial in flight", not by
+/// this interval: a second caller is refused while a trial is outstanding
+/// whatever the interval says. So this only paces *resolved* trials — it stops a
+/// peer that fast-fails (`ECONNREFUSED` returns immediately) from admitting a
+/// tight loop of them — which is why it can be short, and short is what makes
+/// recovery fast.
+///
+/// 250ms is five Raft liveness ticks (`raft::network::LIVENESS_TICK`, 50ms) and
+/// five heartbeat intervals, so a peer that is back is found within the window
+/// the Raft layer needs to notice the same thing.
+const DEFAULT_HALF_OPEN_INTERVAL: Duration = Duration::from_millis(250);
 
 #[derive(Default)]
 struct PeerState {
     consecutive_failures: u32,
     unhealthy_until: Option<Instant>,
+    /// When the current pacing window opened — set when the mark is armed, and
+    /// again whenever a trial is admitted or fails. A trial is admitted once
+    /// [`TrackedPeerHealth::half_open_interval`] has passed since then.
+    ///
+    /// Armed at the **trip**, deliberately: the peer has just failed, so trying
+    /// it again in the same breath tells us nothing and costs a caller. It also
+    /// makes an interval longer than the test mean "no trials", which is how a
+    /// test asks for the plain open-circuit behaviour.
+    window_from: Option<Instant>,
+    /// Whether a trial is still outstanding. One at a time: this, not
+    /// [`PeerState::window_from`], is what stops an outage costing more than one
+    /// stalled caller per peer.
+    trial_open: bool,
 }
 
 /// A real, locally observed [`PeerHealth`]: after
 /// [`DEFAULT_FAILURE_THRESHOLD`] consecutive failed calls to a peer, it reports
-/// unhealthy for a bounded cooldown so [`RpcClient::call`] fast-fails instead
-/// of burning the full connect+request timeout on a peer already known to be
-/// down. A success clears the streak immediately; a cooldown that elapses
-/// without one also clears it (the peer gets a fresh run at the threshold
-/// rather than staying flagged forever on stale failures).
+/// unhealthy so [`RpcClient::call`] fast-fails instead of burning the full
+/// connect+request timeout on a peer already known to be down. A success clears
+/// the streak immediately.
+///
+/// **Half-open, not open-then-closed (D-78).** While a peer is marked unhealthy
+/// this admits **one trial call per [`DEFAULT_HALF_OPEN_INTERVAL`]**, one at a
+/// time: a success clears the mark, a liveness failure re-arms the cooldown and
+/// shuts the window until the next interval.
+///
+/// Without it the only early clear was [`RpcClient::probe`], whose sole
+/// production caller is the Raft liveness ticker — and that is gated on
+/// `!leading()`, so on a **follower** nothing ever tested whether a tripped peer
+/// was back and the mark stood for the full cooldown. Every owner-routed store
+/// (the sequencer, the flow store and shard, proxyOnce claims) calls through
+/// this gate, and under D-10 CAS and proxyOnce *reject* rather than degrade — so
+/// one peer restarting made each follower refuse every op homed on it for five
+/// seconds, on an otherwise healthy fleet (issue #597).
+///
+/// The gate exists to stop *many* callers burning full deadlines against a peer
+/// known to be down. It was never meant to stop *anyone* discovering the peer is
+/// back: that is the difference between an open circuit and a half-open one, and
+/// it is the whole of this decision.
+///
+/// A trial that reports back neither way — its future dropped by an outer
+/// deadline — leaves `trial_open` set, and the peer then behaves exactly as it
+/// did before this change: the cooldown expires on its own and clears the entry.
+/// The worst case is the old behaviour, never worse, which is why there is no
+/// separate abandon timer to get wrong.
 pub struct TrackedPeerHealth {
     state: Mutex<HashMap<SocketAddr, PeerState>>,
     threshold: u32,
     cooldown: Duration,
+    half_open_interval: Duration,
 }
 
 impl Default for TrackedPeerHealth {
@@ -78,55 +131,107 @@ impl Default for TrackedPeerHealth {
 }
 
 impl TrackedPeerHealth {
-    /// A tracker using the default threshold (3) and cooldown (5s).
+    /// A tracker using the default threshold (3), cooldown (5s) and half-open
+    /// interval (250ms).
     #[must_use]
     pub fn new() -> Self {
         Self::with_params(DEFAULT_FAILURE_THRESHOLD, DEFAULT_COOLDOWN)
     }
 
     /// A tracker with an explicit threshold and cooldown, for callers (and
-    /// tests) that need to tune the sensitivity.
+    /// tests) that need to tune the sensitivity. The half-open interval keeps
+    /// its default; see [`Self::with_half_open_interval`].
     #[must_use]
     pub fn with_params(threshold: u32, cooldown: Duration) -> Self {
         Self {
             state: Mutex::new(HashMap::new()),
             threshold,
             cooldown,
+            half_open_interval: DEFAULT_HALF_OPEN_INTERVAL,
         }
+    }
+
+    /// Override how often a tripped peer admits a trial call (D-78).
+    ///
+    /// Separate from [`Self::with_params`] so its existing callers — and the
+    /// tests pinning threshold and cooldown behaviour — keep meaning what they
+    /// meant. A test that wants the pre-D-78 open circuit sets this longer than
+    /// the test itself runs.
+    #[must_use]
+    pub fn with_half_open_interval(mut self, interval: Duration) -> Self {
+        self.half_open_interval = interval;
+        self
     }
 }
 
 impl PeerHealth for TrackedPeerHealth {
     fn is_healthy(&self, peer: SocketAddr) -> bool {
+        let now = Instant::now();
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        match state.get(&peer) {
-            Some(entry) => match entry.unhealthy_until {
-                Some(until) if Instant::now() < until => false,
-                Some(_) => {
-                    // Cooldown elapsed on its own: treat it as recovered, same
-                    // as an explicit success, so a later failure needs a fresh
-                    // run at the threshold rather than tripping on the very
-                    // next attempt.
-                    state.remove(&peer);
-                    true
-                }
-                None => true,
-            },
+        let Some(entry) = state.get_mut(&peer) else {
+            return true;
+        };
+        match entry.unhealthy_until {
             None => true,
+            Some(until) if now >= until => {
+                // Cooldown elapsed on its own: treat it as recovered, same as an
+                // explicit success, so a later failure needs a fresh run at the
+                // threshold rather than tripping on the very next attempt. This
+                // arm is also the backstop for a trial that never reported back.
+                state.remove(&peer);
+                true
+            }
+            // Marked unhealthy, and the cooldown has not run out. This is where
+            // the circuit is half-open rather than open (D-78): admit one trial,
+            // so somebody can find out the peer is back.
+            Some(_) => {
+                if entry.trial_open {
+                    return false;
+                }
+                let due = entry
+                    .window_from
+                    .is_none_or(|from| now.duration_since(from) >= self.half_open_interval);
+                if !due {
+                    return false;
+                }
+                entry.window_from = Some(now);
+                entry.trial_open = true;
+                tracing::debug!(%peer, "peer health: admitting a half-open trial call");
+                true
+            }
         }
     }
 
     fn record_success(&self, peer: SocketAddr) {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        // Removing the whole entry clears the streak, the mark and any
+        // outstanding trial in one step: the peer answered, so nothing this
+        // tracker remembered about it is still true.
         state.remove(&peer);
     }
 
     fn record_failure(&self, peer: SocketAddr) {
+        let now = Instant::now();
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         let entry = state.entry(peer).or_default();
+        if entry.trial_open {
+            // A trial that failed: the peer is still down. Close the window and
+            // re-arm, restarting the pacing from *now* rather than from when the
+            // trial was admitted — a trial that took two seconds to fail must
+            // not make the next one due the instant it returns.
+            //
+            // The streak is deliberately *not* incremented. It has already done
+            // its job — it is what tripped the mark — and folding trials into it
+            // would grow it without bound for as long as the peer is down.
+            entry.trial_open = false;
+            entry.window_from = Some(now);
+            entry.unhealthy_until = Some(now + self.cooldown);
+            return;
+        }
         entry.consecutive_failures += 1;
         if entry.consecutive_failures >= self.threshold {
-            entry.unhealthy_until = Some(Instant::now() + self.cooldown);
+            entry.unhealthy_until = Some(now + self.cooldown);
+            entry.window_from = Some(now);
         }
     }
 }
@@ -380,6 +485,14 @@ impl RpcClient {
                     // one node we actually need.
                     if e.is_liveness_failure() {
                         self.health.record_failure(peer);
+                    } else {
+                        // Reachability is what this tracker holds, and a refusal
+                        // settles it in the affirmative — so the answer is
+                        // recorded, not merely declined as a failure. Under D-78
+                        // that also matters mechanically: this call may be the
+                        // half-open trial, and a trial that reports back neither
+                        // way holds the window shut until the cooldown.
+                        self.health.record_success(peer);
                     }
                     return Err(e);
                 }
@@ -902,7 +1015,10 @@ mod tests {
 
     #[test]
     fn tracked_health_trips_after_threshold_consecutive_failures() {
-        let health = TrackedPeerHealth::with_params(3, Duration::from_secs(5));
+        // About the threshold, not the half-open window: an interval longer than
+        // the test asks for the plain open circuit (D-78).
+        let health = TrackedPeerHealth::with_params(3, Duration::from_secs(5))
+            .with_half_open_interval(Duration::from_secs(600));
         let peer: SocketAddr = "127.0.0.1:4001".parse().expect("valid addr");
         assert!(health.is_healthy(peer), "unknown peer starts healthy");
         health.record_failure(peer);
@@ -920,7 +1036,9 @@ mod tests {
 
     #[test]
     fn tracked_health_short_circuits_during_cooldown_and_recovers_after() {
-        let health = TrackedPeerHealth::with_params(3, Duration::from_millis(50));
+        // As above: no trials, so this stays a test of the cooldown alone.
+        let health = TrackedPeerHealth::with_params(3, Duration::from_millis(50))
+            .with_half_open_interval(Duration::from_secs(600));
         let peer: SocketAddr = "127.0.0.1:4002".parse().expect("valid addr");
         for _ in 0..3 {
             health.record_failure(peer);
@@ -940,6 +1058,127 @@ mod tests {
         assert!(
             health.is_healthy(peer),
             "must recover once the cooldown elapses, even without a success"
+        );
+    }
+
+    /// Poll `is_healthy` until it admits a trial, bounded. Returns whether one
+    /// was admitted before the deadline.
+    fn wait_for_trial(health: &TrackedPeerHealth, peer: SocketAddr) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            if health.is_healthy(peer) {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        false
+    }
+
+    /// Pins D-78, and the defect it closes (#597).
+    ///
+    /// Before it, the *only* early clear was `RpcClient::probe`, whose one
+    /// production caller is the Raft liveness ticker — gated on `!leading()`. So
+    /// on a follower nothing ever tested a tripped peer, the mark stood for the
+    /// whole cooldown, and every owner-routed op to a restarted peer failed for
+    /// five seconds on a healthy fleet.
+    ///
+    /// The cooldown is 60s so the assertion cannot pass by waiting it out: the
+    /// only thing that can return `true` here is the half-open trial.
+    #[test]
+    fn a_tripped_peer_admits_a_trial_and_a_successful_one_clears_the_mark() {
+        let health = TrackedPeerHealth::with_params(1, Duration::from_secs(60))
+            .with_half_open_interval(Duration::ZERO);
+        let peer: SocketAddr = "127.0.0.1:4790".parse().expect("valid address");
+
+        health.record_failure(peer);
+        assert!(
+            health.is_healthy(peer),
+            "with a zero interval the next caller is the trial, and must be let through"
+        );
+
+        // The peer is back: the trial succeeds.
+        health.record_success(peer);
+        assert!(
+            health.is_healthy(peer),
+            "a successful trial clears the mark outright"
+        );
+    }
+
+    /// The cost bound: one trial at a time, so an outage still costs one stalled
+    /// caller per peer rather than a stampede. This is the half of D-78 that
+    /// keeps the gate worth having.
+    #[test]
+    fn only_one_trial_is_outstanding_at_a_time() {
+        let health = TrackedPeerHealth::with_params(1, Duration::from_secs(60))
+            .with_half_open_interval(Duration::ZERO);
+        let peer: SocketAddr = "127.0.0.1:4791".parse().expect("valid address");
+        health.record_failure(peer);
+
+        assert!(health.is_healthy(peer), "the first caller is the trial");
+        for i in 0..5 {
+            assert!(
+                !health.is_healthy(peer),
+                "caller {i} must be refused while the trial is outstanding, \
+                 even with a zero pacing interval"
+            );
+        }
+    }
+
+    /// A failed trial re-arms rather than clearing, and the next one waits out
+    /// the interval — otherwise a dead peer would admit a tight loop of trials.
+    #[test]
+    fn a_failed_trial_re_arms_and_the_next_waits_out_the_interval() {
+        let health = TrackedPeerHealth::with_params(1, Duration::from_secs(60))
+            .with_half_open_interval(Duration::from_millis(50));
+        let peer: SocketAddr = "127.0.0.1:4792".parse().expect("valid address");
+        health.record_failure(peer);
+
+        // The window opens one interval after the trip, not immediately.
+        assert!(
+            !health.is_healthy(peer),
+            "a peer that just failed must not be trialled in the same breath"
+        );
+        assert!(
+            wait_for_trial(&health, peer),
+            "a trial must be admitted once the interval elapses"
+        );
+
+        health.record_failure(peer);
+        assert!(
+            !health.is_healthy(peer),
+            "a failed trial must not leave the peer healthy"
+        );
+        assert!(
+            wait_for_trial(&health, peer),
+            "a second trial must follow, one interval after the first one failed"
+        );
+    }
+
+    /// A trial that reports back neither way — its future dropped by an outer
+    /// deadline — must degrade to the pre-D-78 behaviour, with the cooldown
+    /// clearing it, and must never wedge the peer shut for longer than that.
+    #[test]
+    fn an_unresolved_trial_still_clears_on_the_cooldown() {
+        let health = TrackedPeerHealth::with_params(1, Duration::from_millis(80))
+            .with_half_open_interval(Duration::ZERO);
+        let peer: SocketAddr = "127.0.0.1:4793".parse().expect("valid address");
+        health.record_failure(peer);
+
+        assert!(health.is_healthy(peer), "the trial is admitted");
+        // ...and it never reports back: neither `record_success` nor
+        // `record_failure` follows.
+        assert!(
+            !health.is_healthy(peer),
+            "the window stays shut while a trial is outstanding"
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !health.is_healthy(peer) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            Instant::now() < deadline,
+            "an abandoned trial must not outlive the cooldown — the worst case is \
+             the pre-D-78 behaviour, never worse"
         );
     }
 
@@ -1014,7 +1253,12 @@ mod tests {
     #[tokio::test]
     async fn probe_reaches_a_peer_the_tracker_marks_unhealthy_and_clears_the_mark() {
         let (addr, _guard) = spawn_slow_responder(Duration::from_millis(0)).await;
-        let health = Arc::new(TrackedPeerHealth::with_params(1, Duration::from_secs(60)));
+        // No half-open trials: this test is about `probe` bypassing a *closed*
+        // gate, so the gate must stay closed for the gated call below (D-78).
+        let health = Arc::new(
+            TrackedPeerHealth::with_params(1, Duration::from_secs(60))
+                .with_half_open_interval(Duration::from_secs(600)),
+        );
         health.record_failure(addr);
         let client = RpcClient::new(
             None,
