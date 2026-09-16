@@ -4268,6 +4268,44 @@ async fn c33_fallbacks(live: &[usize]) -> f64 {
     total
 }
 
+/// The fleet's total `rift_cluster_sequence_decisions_total` for one answering
+/// `path`, over the nodes in `live` — `op="next"` only, since the serving path
+/// issues exactly one `next` per decision and never peeks (D-63).
+///
+/// `unwrap_or(0.0)` for the same reason as [`c33_fallbacks`]: a labelled child
+/// registers on first use, so a path never taken is absent, which is 0. That
+/// makes a zero reading unfalsifiable on its own, which is why the caller also
+/// asserts a *non-zero* path read through the same helper: if the series name
+/// were wrong, that one would fail loudly instead of this one passing quietly.
+async fn c33_decisions(live: &[usize], path: &str) -> f64 {
+    let series = format!(r#"rift_cluster_sequence_decisions_total{{op="next",path="{path}"}}"#);
+    let mut total = 0.0;
+    for &i in live {
+        total += metric(NODES[i].metrics, &series).await.unwrap_or(0.0);
+    }
+    total
+}
+
+/// One line per live node of what `/_fleet/health` says about it right now:
+/// whether it considers itself isolated (D-17), and the membership epoch its
+/// ring is at. Recorded beside every degraded round, because those are
+/// owner-side refusals a degraded answer cannot otherwise be told apart by.
+async fn c33_health_snapshot(live: &[usize]) -> String {
+    let mut parts = Vec::with_capacity(live.len());
+    for &i in live {
+        let part = match get_json(NODES[i].admin, "/_fleet/health").await {
+            Ok((200, body)) => format!(
+                "{} isolated={} m_idx={}",
+                NODES[i].name, body["isolated"], body["ring"]["m_idx"]
+            ),
+            Ok((status, _)) => format!("{} health={status}", NODES[i].name),
+            Err(e) => format!("{} health unreadable: {e}", NODES[i].name),
+        };
+        parts.push(part);
+    }
+    parts.join("; ")
+}
+
 /// Spray `rounds * 3` serial requests round-robin across `live`, returning the
 /// bodies in order.
 ///
@@ -4290,6 +4328,170 @@ async fn c33_spray(live: &[usize], rounds: usize) -> anyhow::Result<Vec<String>>
         bodies.push(body);
     }
     Ok(bodies)
+}
+
+/// How long the ring may take to answer every caller again after the owner
+/// returns.
+///
+/// **Sized generously, because the mechanism is not yet confirmed.** An earlier
+/// revision derived this from `TrackedPeerHealth`'s 5 s cooldown, on the premise
+/// that followers' stale peer-health marks were what degraded these decisions.
+/// That premise was falsified: C33 degraded the same way with the half-open
+/// peer-health gate (#599) in place. What the window actually is remains open —
+/// see [`c33_wait_ring_answers`] — and the recorded `took` is what should tighten
+/// this number.
+///
+/// It is still deliberately **not** `CONVERGE_TIMEOUT`: 45 s is a harness number
+/// for imposter-config convergence, a different quantity, and a wait that long
+/// would hide any post-restart window that grows. If this starts failing, the
+/// question is what got slow, not whether the number should go up.
+const C33_RING_RETAKE_BOUND: Duration = Duration::from_secs(10);
+
+/// What [`c33_wait_ring_answers`] observed while waiting.
+struct RingReady {
+    /// Bodies of the final, clean round. **These are real decisions**, not
+    /// throwaway probes: they must cycle like any other, so the caller folds
+    /// them into its own sequence assertion rather than discarding them.
+    bodies: Vec<String>,
+    /// How long the ring took to answer every caller again.
+    took: Duration,
+    /// Decisions that were answered, but from a local cursor. Recorded, not
+    /// asserted — see the caller.
+    absorbed: usize,
+    /// Probes that got no answer at all (a transport error). Kept apart from
+    /// `absorbed`: they may never have reached the sequencer, so counting them as
+    /// degraded decisions would describe a window that was not there.
+    unreached: usize,
+    /// Every degraded or unanswered probe, as `round N: node — why`, and for each
+    /// degraded round a `/_fleet/health` snapshot of every node. Kept whole,
+    /// because a failure that discards the value that would classify it cannot
+    /// be diagnosed from its log (C16's lesson).
+    trail: Vec<String>,
+}
+
+/// Wait until every live node's decision is served without the
+/// `rift-cluster-sequence` annotation, returning the clean round's bodies.
+///
+/// `wait_all_ready`, `wait_cluster_formed` and `wait_converged` are all
+/// *liveness*: the process is up, the fleet has re-formed around one leader, the
+/// imposter is rebound. None of them says that a decision about the cursor key
+/// is answered by the ring, which is what Phase 3 goes on to assert. So there is
+/// a window, after all three pass, in which the owner is up and some decisions
+/// still degrade — correctly, per D-47 — and the assertion fails for a reason the
+/// scenario is not about.
+///
+/// This is a **convergence poll against a real surface** — the first house rule
+/// at the top of this file — not a retry of the assertion, which the rule
+/// beneath it forbids.
+///
+/// **What the window is, as far as is known — which is not much.** #543's run
+/// degraded **3 of 9** sprayed decisions (`c33_spray` issues
+/// `rounds * live.len()` = 9). Two explanations have been named and do not hold:
+///
+/// - *Callers' stale peer-health marks* (#597): not supported — C33 degraded the
+///   same way on #599's run, with the half-open gate in place. One sample, so
+///   "not supported", not "ruled out".
+/// - *A restarted owner that has not heard from a leader* (D-17's
+///   `current_leader == None`): excluded by construction — `wait_cluster_formed`
+///   only returns once every node, the owner included, names the same non-null
+///   leader.
+///
+/// Still open. On the owner's side: `is_isolated()` turning true *after* the
+/// fleet formed (a leadership change, or the owner leading without a recent
+/// quorum ack); its ring view still empty; an `m_idx` fence between caller and
+/// owner. On the callers' side: the bridge shedding or refusing a permit, or a
+/// transport failure on `call_member`. The `trail` records, beside every
+/// degraded round, what each node's `/_fleet/health` says about `isolated` and
+/// `m_idx` — which separates the owner-side candidates from each other, though
+/// not the caller-side ones — so the next occurrence narrows its own cause
+/// instead of being guessed at a third time.
+///
+/// **What it does not prove, and why the bodies come back.** Absence of the
+/// annotation means "no node reported a *degraded cluster* decision". It does
+/// **not** mean the ring answered: `ClusteredSequencer::route` takes
+/// `DecisionPath::Local` whenever `SequencingRegistry::mode` is not `Owner`,
+/// and an unapplied port defaults to `Local` — a path that sets no annotation
+/// and does not move `rift_cluster_sequence_fallbacks_total` (it moves
+/// `rift_cluster_sequence_decisions_total{path="local"}` instead). So every
+/// probe's body is returned and folded into the caller's cycling assertion,
+/// and the caller asserts that `path="local"` does not move.
+///
+/// **Every live node is probed each round**, not just one. Ownership is HRW over
+/// committed membership for a single key, so exactly one node holds it: that
+/// node answers its own decisions in-process, and the other two each make an RPC
+/// to it. Three different paths — one answering says nothing about the others.
+async fn c33_wait_ring_answers(
+    live: &[usize],
+    owner: usize,
+    within: Duration,
+) -> anyhow::Result<RingReady> {
+    let started = std::time::Instant::now();
+    let deadline = started + within;
+    let mut absorbed = 0;
+    let mut unreached = 0;
+    let mut trail = vec![format!("owner is {}", NODES[owner].name)];
+    let mut round = 0;
+    loop {
+        let mut bodies = Vec::with_capacity(live.len());
+        let mut degraded = 0;
+        let mut missed = 0;
+        for &i in live {
+            anyhow::ensure!(
+                std::time::Instant::now() < deadline,
+                "the ring did not answer every caller within {within:?} after the owner \
+                 returned ({absorbed} decision(s) answered from a local cursor, \
+                 {unreached} probe(s) unanswered). Ready, formed and converged all held. \
+                 Every degraded or unanswered probe, with health snapshots: {trail:?}",
+            );
+            match c33_cycle(i).await {
+                Ok((200, body, true)) => bodies.push(body),
+                Ok((200, _, false)) => {
+                    degraded += 1;
+                    trail.push(format!(
+                        "round {round}: {} — answered from a local cursor",
+                        NODES[i].name
+                    ));
+                }
+                // D-47 makes every cluster failure on this path a degraded 200,
+                // so a non-200 is its own defect rather than a "not yet" — the
+                // same judgement `c33_spray` makes about the same request, and
+                // the same rule this file's other poll loops follow. Retrying it
+                // would spend the whole budget on a permanently broken request.
+                Ok((status, body, _)) => anyhow::bail!(
+                    "sequencing answered {status} via {} while waiting for the ring — \
+                     D-47 makes every cluster failure on this path a degraded 200, \
+                     never an error: {body}. Probes so far: {trail:?}",
+                    NODES[i].name
+                ),
+                // A transport error *is* a "not yet": `wait_converged` gates the
+                // admin surface, and the data-plane listener can legitimately not
+                // be accepting yet. Carried into the timeout rather than dropped.
+                Err(e) => {
+                    missed += 1;
+                    trail.push(format!("round {round}: {} — no answer: {e}", NODES[i].name));
+                }
+            }
+        }
+        if degraded == 0 && missed == 0 {
+            return Ok(RingReady {
+                bodies,
+                took: started.elapsed(),
+                absorbed,
+                unreached,
+                trail,
+            });
+        }
+        if degraded > 0 {
+            trail.push(format!(
+                "round {round} health: {}",
+                c33_health_snapshot(live).await
+            ));
+        }
+        absorbed += degraded;
+        unreached += missed;
+        round += 1;
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
 }
 
 /// C33 — owner-mode sequencing under an LB-shaped spray, the owner's death, and
@@ -4453,13 +4655,62 @@ async fn c33_owner_mode_sequencing_cycles_fleet_wide_and_degrades_on_owner_kill(
         .await
         .expect("the imposter is rebound on the returned owner");
 
+    // The three waits above are liveness; none of them gates on decisions about
+    // the cursor key being answered by the ring, which is what the assertion
+    // below is about. Poll that surface directly, before the baseline is read —
+    // a fresh baseline afterwards is what keeps the absorbed fallbacks from
+    // being counted against the spray. (Not "the header and the counter are
+    // independent": they are one event on two surfaces, set on adjacent lines of
+    // the same arm of `route`.)
+    let ready = c33_wait_ring_answers(&all, owner, C33_RING_RETAKE_BOUND)
+        .await
+        .expect("the ring answers every caller once the owner is back");
+    chaos_artifact!(
+        "c33 artifact: ring answered every caller {:?} after the owner restarted \
+         ({} decision(s) from a local cursor, {} probe(s) unanswered; bound {:?}); \
+         trail: {:?}",
+        ready.took,
+        ready.absorbed,
+        ready.unreached,
+        C33_RING_RETAKE_BOUND,
+        ready.trail
+    );
+
     let before = c33_fallbacks(&all).await;
-    let bodies = c33_spray(&all, 3).await.expect("spray after recovery");
+    let forward_before = c33_decisions(&all, "forward").await;
+    let local_before = c33_decisions(&all, "local").await;
+    // The wait's clean round is three real decisions immediately preceding this
+    // spray, so they are held to the same cycle. Dropping them would blind the
+    // cycle check to a node silently serving `DecisionPath::Local`, which moves no
+    // fallback counter and sets no header (it is caught separately, below, by
+    // `decisions_total{path="local"}`).
+    let mut bodies = ready.bodies;
+    bodies.extend(c33_spray(&all, 3).await.expect("spray after recovery"));
     let after = c33_fallbacks(&all).await - before;
     assert_eq!(
         after, 0.0,
         "with every node back the ring must answer every decision again; \
          {after} fallback(s) means the returned owner never re-took the key"
+    );
+
+    // Which path answered, not only that nothing degraded. Of the nine sprayed
+    // decisions three land on the owner and six on the two non-owners, each of
+    // which forwards exactly once (D-63). `forward` is asserted first on purpose:
+    // it reads a labelled series through the same helper as `local`, so if that
+    // series name were wrong this fails loudly — and the `local` assertion below
+    // cannot pass by reading nothing.
+    let forwarded = c33_decisions(&all, "forward").await - forward_before;
+    assert_eq!(
+        forwarded, 6.0,
+        "the two non-owners must forward each of their six decisions to the owner \
+         exactly once (D-63); {forwarded} means the decisions took another path"
+    );
+    let local = c33_decisions(&all, "local").await - local_before;
+    assert_eq!(
+        local, 0.0,
+        "{local} decision(s) took the silent `local` path — no annotation, no \
+         fallback count — which an owner-mode imposter takes only while a node's \
+         sequencing registry does not yet know the port"
     );
 
     // Cycling, not continuity. D-8 makes a cursor reset the documented price of
