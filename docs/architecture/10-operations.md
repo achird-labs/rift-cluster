@@ -180,6 +180,11 @@ isolation between teams is two fleets, not a feature (RFC-007 §3.3).
 
 ### The loopback leg carries the key, not the caller's credential
 
+> **Amended by D-79** (2026-09-16): the front is judged as the admin plane it is. Upstream's
+> exposure check (`--require-admin-auth`), its bind rule (`--local-only`) and `/config`'s reported
+> port are all applied to the **front's** address, with upstream's own code, before the node binds or
+> joins. The loopback leg below is an implementation detail and always passes that check.
+
 The public admin listener is this crate's front; the core admin retreats to an ephemeral loopback
 port the front proxies to, and **that listener runs upstream's own key gate**. The front therefore
 authenticates first and then presents the *configured* key on both internal legs — the proxied

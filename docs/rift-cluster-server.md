@@ -142,6 +142,8 @@ implementation** rather than reimplementing or declining it:
 | Subcommand / flag | Behaviour |
 |---|---|
 | `--rcfile` | Mountebank-compatible JSON defaults, applied only to fields left at their defaults. A missing, malformed, or wrong-typed rcfile is **refused whole and aborts startup**, exactly as upstream since rift#1114 — see D-77. Unrecognised keys stay advisory: they go to stderr immediately and are repeated through `tracing` once the subscriber exists. `apiKey` is a recognised key since rift#1132, applied only when `--api-key`/`MB_APIKEY` is unset. The rcfile is applied **before** `healthcheck` computes its target (rift#1133), so a `healthcheck --rcfile <file>` probe follows the file's port, and a refused rcfile is an unhealthy verdict. `--rcfile` has no environment variable, so the image's built-in health check — a bare `healthcheck` — never sees a file given on the server's command line and still probes the flag/default port; pass `--rcfile` to the probe too, or set the port by flag or `MB_PORT`. |
+| `--local-only` | Under `--cluster`, pins the **admin front** to loopback — the front is the admin plane (D-79). Imposter ports and the front door stay on every interface, exactly as upstream's flag leaves them. |
+| `--require-admin-auth` | Under `--cluster`, judged against the **front's** address with upstream's own `check_admin_exposure`, before the node binds or joins: an off-host front with no `--api-key` refuses startup with upstream's message. |
 | `--pidfile` | one `global` flag, bindable on either side of the subcommand; written on the serving path only — see below |
 | `stop` | SIGTERM the PID in `--pidfile` (default `rift.pid`), then remove the file |
 | `restart` | `stop`, then start a new server in the same process. A missing PID file is "nothing to stop", not an error |
@@ -646,6 +648,13 @@ table exists so an operator reading here does not conclude they are absent.
 | `DELETE /imposters/{port}/savedProxyResponses` | terminated, not proxied: one Raft op deleting the fleet's exactly-once recording markers, so every signature records afresh on every node (#226) |
 
 ## The clustered admin write path
+
+> **Amended by D-79** (2026-09-16, #590, #591, #598): the front is the admin plane, so upstream's
+> judgements about an admin listener are made about **the front's** address. `--local-only` pins
+> the front to loopback; `--require-admin-auth` refuses an off-host front with no `--api-key`, before
+> the node binds or joins; and `GET /config` reports the front's port. All three used to be applied
+> to the core's loopback leg, where `--require-admin-auth` could never refuse and `--local-only` had
+> no effect.
 
 Under `--cluster`, the public admin address is served by a thin front: the
 config-mutating routes (`POST/PUT/DELETE /imposters`, `DELETE

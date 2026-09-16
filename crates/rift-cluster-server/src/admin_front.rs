@@ -126,9 +126,17 @@ type FrontBody = BoxBody<Bytes, hyper::Error>;
 
 /// Everything the front needs besides the node itself.
 pub struct FrontConfig {
-    /// The public admin address to bind (what the operator pointed clients at);
-    /// a `host:port` string because the core CLI accepts hostnames.
-    pub public_addr: String,
+    /// The public admin address to bind — what the operator pointed clients at,
+    /// already resolved and already judged by `EeCli::resolve_front_admin`
+    /// (D-79), which is where `--local-only` and `--require-admin-auth` are
+    /// applied.
+    ///
+    /// A `SocketAddr`, not a string: it used to be one "because the core CLI
+    /// accepts hostnames", which was never true of upstream — `start()` parses
+    /// `--host` as a literal and errors on a name. Carrying it resolved is what
+    /// makes the address that was judged and the address that is bound the same
+    /// value rather than two spellings of one.
+    pub public_addr: SocketAddr,
     /// The loopback address the core admin actually bound.
     pub upstream_admin: SocketAddr,
     /// The fleet's one admin credential (`--api-key` / `MB_APIKEY`), or `None` for an open
@@ -279,7 +287,7 @@ struct FrontState {
 
 /// Bind the public admin address and start serving.
 pub async fn bind(config: FrontConfig, node: &Arc<RaftNode>) -> std::io::Result<AdminFront> {
-    let listener = TcpListener::bind(config.public_addr.as_str()).await?;
+    let listener = TcpListener::bind(config.public_addr).await?;
     let local_addr = listener.local_addr()?;
     tracing::info!(
         %local_addr,
@@ -5243,7 +5251,7 @@ mod tests {
         .expect("bind flow net");
         let front = bind(
             FrontConfig {
-                public_addr: "127.0.0.1:0".to_owned(),
+                public_addr: "127.0.0.1:0".parse().expect("valid address"),
                 upstream_admin: "127.0.0.1:1".parse().expect("addr"),
                 api_key: None,
                 allow_injection: false,
@@ -5626,7 +5634,7 @@ mod tests {
         let (node, dir) = test_node().await;
         let front = bind(
             FrontConfig {
-                public_addr: "127.0.0.1:0".to_owned(),
+                public_addr: "127.0.0.1:0".parse().expect("valid address"),
                 upstream_admin: "127.0.0.1:1".parse().expect("addr"),
                 api_key: None,
                 allow_injection: false,

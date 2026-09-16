@@ -588,3 +588,114 @@ fn an_unknown_log_level_refuses_startup_and_a_real_one_does_not() {
         "`trace` must pass tracing initialisation and reach the subcommand: {stderr}"
     );
 }
+
+/// Pins D-79 against the **real artifact** — the only thing that can catch the
+/// regression that matters.
+///
+/// `EeCli::resolve_front_admin` is a library function, so a unit test on it stays
+/// green if `compose` stops calling it, which is precisely how
+/// `--require-admin-auth` came to reach no production code in the first place:
+/// the judgement existed upstream and nothing on this path invoked it against
+/// the front's address. Same argument `tests/cli.rs` already makes for issue
+/// #43's declines and for D-77's rcfile refusal.
+///
+/// `--cluster-bind` and a secret are supplied so the refusal cannot be the
+/// cluster guards refusing something else; the assertion on the message is what
+/// makes it the *exposure* refusal.
+#[test]
+fn require_admin_auth_refuses_an_exposed_clustered_front_in_the_shipped_binary() {
+    // A state dir of its own, so that if the refusal ever moves back behind
+    // `create_dir_all(state_dir)` the test litters a tempdir and not the crate
+    // (an earlier revision of this change did exactly that).
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_rift-cluster-server"))
+        .args([
+            "--cluster",
+            "--cluster-bind",
+            "127.0.0.1:0",
+            "--cluster-secret",
+            "not-a-real-secret",
+            "--cluster-state-dir",
+            &dir.path().join("state").to_string_lossy(),
+            "--host",
+            "0.0.0.0",
+            "--port",
+            "2525",
+            "--require-admin-auth",
+        ])
+        .output()
+        .expect("run the binary");
+
+    assert!(
+        !out.status.success(),
+        "an off-host admin front with no --api-key must refuse startup: {:?}",
+        out.status
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("0.0.0.0:2525"),
+        "the refusal must name the front's address, not the core's loopback leg: {stderr}"
+    );
+    assert!(
+        stderr.contains("api-key") || stderr.contains("API key"),
+        "the refusal must say what would fix it, in upstream's own words: {stderr}"
+    );
+}
+
+/// The other half: the same invocation **with** a key must get *past* the
+/// exposure judgement. Without this, "refuse" could be implemented as "refuse
+/// whenever `--require-admin-auth` is set" and the test above would still pass.
+///
+/// Success is deliberately not asserted. This invocation goes on to be refused
+/// by the solo guard (`--cluster-allow-solo` is not passed), and that is the
+/// point: reaching a *later* refusal proves the exposure judgement let it
+/// through. Asserting a clean start would mean founding a real single-node
+/// cluster in a CLI unit test.
+#[test]
+fn a_keyed_clustered_front_is_not_refused_by_the_exposure_judgement() {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_rift-cluster-server"))
+        .args([
+            "--cluster",
+            "--cluster-bind",
+            "127.0.0.1:0",
+            "--cluster-secret",
+            "not-a-real-secret",
+            "--cluster-state-dir",
+            &dir.path().join("state").to_string_lossy(),
+            "--host",
+            "0.0.0.0",
+            "--port",
+            "0",
+            "--require-admin-auth",
+            "--api-key",
+            "s3cr3t",
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn the binary");
+
+    // Spawned and polled rather than `output()`ed: with the key accepted this
+    // process goes on to serve, so waiting for its pipes to close would hang.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let exited = loop {
+        match child.try_wait().expect("poll the child") {
+            Some(status) => break Some(status),
+            None if std::time::Instant::now() >= deadline => break None,
+            None => std::thread::sleep(std::time::Duration::from_millis(50)),
+        }
+    };
+    if exited.is_none() {
+        let _ = child.kill();
+    }
+    let out = child
+        .wait_with_output()
+        .expect("collect the child's output");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    assert!(
+        !stderr.contains("reachable from outside this host"),
+        "a keyed front must clear the exposure judgement: {stderr}"
+    );
+}
