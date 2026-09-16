@@ -542,6 +542,14 @@ separate question; this entry does not settle them.
 > presents as a joiner — a departing voter is never a learner in committed membership.
 
 ### D-22 — Liveness probes bypass the peer-health gate
+> **Amended by D-78** (2026-09-16, #597): the exemption below is unchanged — `probe` still ignores
+> the mark entirely, and every liveness mechanism still uses it. What changed is the gate it
+> bypasses: the gate (`PeerHealth::admit`) is now **half-open**, admitting one trial call per 250ms to a
+> tripped peer.
+> The rule below fixed the *leader's* stale mark suppressing heartbeats; on a **follower** nothing
+> cleared the mark at all, because `probe`'s only caller is gated on `!leading()`, so every
+> owner-routed data-plane op to a restarted peer failed (CAS, proxyOnce) or degraded (sequencing) for
+> the full cooldown (#597).
 - **Status:** active
 - **Decided:** 2026-08-24 · #431
 - **Implemented by:** #431, #442, #449
@@ -3267,6 +3275,118 @@ binary warned about at every boot and ignored — will find the next restart ref
 degraded. That is the intended outcome, and it is a behaviour change on upgrade: the fleet was not
 running the configuration its rcfile describes, and the abort is the first time anyone is told so.
 
+### D-78 — The peer-health gate is half-open: a tripped peer admits one trial call per interval
+
+- **Status:** active
+- **Decided:** 2026-09-16 · #597
+- **Refines:** D-22
+- **Implemented by:** #599
+- **Code:** crates/rift-cluster/src/rpc/client.rs
+
+`TrackedPeerHealth` was a circuit breaker with two states — **open**, then **closed** when the
+cooldown ran out — and no half-open state. Once tripped, the only thing that could clear the mark
+early was `RpcClient::probe`, and `probe`'s sole production caller is the Raft liveness ticker,
+gated on `if !leading()`. So on a **follower** nothing ever tested whether a tripped peer had come
+back: the mark stood for the full `DEFAULT_COOLDOWN` (5 s) while `RpcClient::call` fast-failed
+every request to a peer that was up and answering.
+
+**This was never only about sequencing.** Every owner-routed store reaches a peer through
+`bridge.call` → `RaftNode::call_member` → `RpcClient::call`, behind the same gate: the sequencer,
+the flow store, proxyOnce claims. (The sequencer's reset fan-out is spawned rather than run under
+`bridge.call`, but reaches the same `call`.) D-10 makes sequencing *degrade* on a refused
+call, but CAS and proxyOnce **reject**. One peer restarting therefore made each follower refuse
+every flow-state op homed on that peer for five seconds, on an otherwise healthy fleet. That is an
+availability defect in the product, and it is the whole reason for this decision.
+
+**What this decision is *not* evidence for.** It was found while triaging the chaos scenario C33,
+whose post-restart failure (3 degraded decisions out of 9) was read as this mechanism's signature.
+That attribution was **wrong**: C33 fails the same way with this fix applied (#599's first CI run),
+so whatever produces its partial degradation is a different mechanism, still unidentified, and
+tracked on #595 — whose recorded `absorbed` figure exists to identify it. The mechanism below is
+verified from the code paths named, not from C33, and stands on its own; the scenario was the
+occasion for looking, not the evidence.
+
+**Why it hid.** D-22 (#431) found this mechanism from the other end — the *leader's* stale mark
+suppressing heartbeats to a restarted voter, livelocking the fleet — and fixed it by exempting
+liveness probes. The data path was never in that fix's frame, and its symptom is a degraded-but-200
+response that looks exactly like D-47 working as designed.
+
+**The rule.** While a peer is marked unhealthy, the gate admits **one trial call per
+`DEFAULT_HALF_OPEN_INTERVAL` (250 ms), one at a time**. A success clears the mark outright; a
+liveness failure closes the window, re-arms the cooldown and restarts the pacing.
+
+**"One at a time" needs a token, so `PeerHealth` hands one out.** `admit` returns an `Admission`
+— `Healthy`, `Trial` or `Refused` — and the caller hands it back to `record_success`,
+`record_failure` or `release`. A first revision returned a `bool` and let *any* failure close an
+outstanding trial; review found that a call admitted while the peer still looked healthy, failing
+after the peer tripped and a trial went out, closed that trial's window. Against a peer that never
+answers, each such misattribution let another trial out beside the first — up to one per interval,
+~9 stalled callers per peer for a 2.35 s blackholed call, enough to exhaust the bridge's
+data-plane permits. With the token, only `Admission::Trial` closes a trial.
+
+**And the token names *which* trial.** A second review found the flag still had no identity: a
+trial can outlive its own episode — the entry cleared by a success or by the cooldown, the peer
+tripped again, a newer trial sent — and when the first finally reported, `trial_open` was the newer
+trial's flag, so the stale outcome closed it. Reachable only for a call that runs across a clear and
+a re-trip (a plain `call` against a hung peer takes up to ~8 s; `call_once` with a long snapshot
+deadline), so narrow — but it made the stated invariant false. `Admission::Trial` now carries a
+`TrialId` from one tracker-wide counter (per-entry would restart when entries are recreated), and
+both `record_failure` and `release` resolve a trial only when the id matches. Liveness probes
+still bypass the gate entirely — **D-22 is unchanged**, and `probe` remains the only thing that may
+ignore the mark rather than be metered by it.
+
+*The distinction this turns on:* the gate exists to stop **many** callers burning full deadlines
+against a peer known to be down. It was never meant to stop **anyone** discovering that the peer is
+back. An open circuit conflates the two; a half-open one does not.
+
+**Two bounds, both stated.** *Cost during a real outage:* at most one trial caller per peer is in
+flight **per tripped episode**, because the entry refuses a second trial while one is outstanding and
+only that trial's own outcome — matched by `TrialId` — can clear it. A success or a cooldown expiry
+ends the episode by design, so a trial orphaned that way can still be running beside the next
+episode's trial; it can no longer close it — the pacing interval is not what bounds the cost, and that is why it can
+be short. *Recovery after a restart:*
+one interval plus one call, instead of five seconds.
+
+**The window opens at the trip, not on the next call.** A peer that has just failed tells us
+nothing if we retry it in the same breath, and it costs a caller to find that out. It also gives
+tests a way to ask for the old open-circuit behaviour — an interval longer than the test — which is
+how `probe_reaches_a_peer_the_tracker_marks_unhealthy_and_clears_the_mark` keeps pinning D-22
+against a genuinely closed gate.
+
+**A deadline the caller chose releases the trial.** `call_once` — the path Raft replication and
+snapshot transfers take — used to record nothing on its own deadline expiring (#442: that expiry
+says nothing about the peer). Under a half-open gate "nothing" leaves the trial outstanding, so the
+expiry now calls `release`: the window reopens, and the mark is neither cleared nor re-armed.
+
+**A trial that reports back neither way degrades to the old behaviour, deliberately.** If an outer
+deadline drops the caller's future — `bridge.call`'s 2 s deadline does this to every trial against a
+blackholed peer, which needs ~2.35 s to fail — `trial_open` stays set and the entry then behaves
+exactly as it did before this decision: the cooldown expires and clears it. The worst case is the status quo,
+never worse — which is why there is no abandon timer, a second timeout to derive, tune and get
+wrong.
+
+**`call` now records a non-liveness error as a success.** It previously recorded nothing, on the
+reasoning — still correct, and still in the code — that a `Handler` refusal proves the peer
+answered and must not count against it. Reachability is what this tracker holds, so *proving it
+in the affirmative* is the completion of that thought, not a change of direction. Mechanically it
+also matters: such a call may be the trial, and a trial that resolves neither way holds the window
+shut until the cooldown.
+
+*Rejected:* a shorter cooldown — still a blind window, and D-22 is explicit that these timers are
+unmeasured; this changes the semantics rather than a number. *Rejected:* letting followers probe —
+a non-leader must not send `AppendEntries`, and a separate probe endpoint is new surface for a
+problem the standard circuit-breaker pattern already solves. *Rejected:* gossiping peer health from
+the leader — new surface, and the leader's view of a peer is not the follower's. *Rejected:* routing
+owner-bound ops via the leader — that is D-47's design, not a bug in it.
+
+**Residual, stated:** the interval is a fixed constant rather than adaptive, so a peer that is down
+for hours keeps being trialled. For one that refuses connections quickly, that is one trial every
+~600 ms per node (the interval plus ~350 ms of retry backoff, pacing restarting at each failure);
+the steady case that matters most is D-28's name resolving to several addresses with one
+permanently dead, where the old cost was ~3 callers paying ~350 ms of backoff per 5 s cycle and the
+new cost is ~8 trials per 5 s, each one caller at a time. The alternative — backing the interval
+off as an outage lengthens — would make recovery slowest exactly when a long outage finally ends.
+
 ### D-79 — Under `--cluster` the front *is* the admin plane: upstream's listener judgements are made about the front, with upstream's code, before anything binds
 
 - **Status:** active
@@ -3351,3 +3471,56 @@ upstream, and "judge a name" is the ambiguity `is_loopback()` on a literal exist
 
 **Residual, stated:** under `--port 0` — tests and embedders, never a production CLI — `/config`
 reports `0` rather than the front's ephemeral port.
+
+### D-80 — C14 gates durability and liveness; failover latency is a recorded figure, not a gate
+
+- **Status:** active
+- **Decided:** 2026-09-16 · #596
+- **Refines:** D-67; follows D-42
+- **Implemented by:** #601
+- **Amends:** docs/architecture/12-testing.md (C5 and C14 rows)
+- **Code:** tests/cluster-chaos/tests/scenarios.rs
+
+C14 kills the Raft leader during a 100-write admin storm. Its claims are **durability** — every
+acknowledged write is present, none duplicated — and **liveness** — writes resume. It also asserted a
+third claim, failover **latency**, as `resumed <= FAILOVER_WRITE_BOUND` (5 s): one sample, one hard
+threshold, on a shared GitHub runner whose contention the scenario does not control.
+
+That gate failed on numbers that carry no information about the fleet: **5.176 s** (#596's first
+sighting) and **5.013 s** — a 13 ms, 0.26 % miss — against a budget that already contains an election
+(≤ 3 s) and the default write barrier's timeout (2 s). A regression in failover does not land a
+quarter of a percent over that. The shard went red, the PR in front of it waited on a re-run, and the
+re-run proved nothing.
+
+**The rule.** C14 keeps both of its real claims as gates. Liveness was already enforced separately:
+`time_until_writes_resume` returns an error if writes do not resume within `3 × FAILOVER_WRITE_BOUND`,
+and C14 turns that error into a panic. That stays. The latency figure is emitted with `chaos_artifact!` (D-67), so it lands in the per-shard
+artifact log, uploaded per shard per run — a regression shows as a moved distribution, which is what
+"failover got slower" actually means. Nothing aggregates those logs today, so comparing runs is a
+manual read of the artifacts; that is a gap in tooling, not in what is recorded. `FAILOVER_WRITE_BOUND` keeps its derivation and still sizes the
+liveness wait; it now documents the expected figure rather than failing on it.
+
+**Same shape as D-42.** C6 had a single-sample timing gate on the same infrastructure, and D-42
+resolved it by bounding a *rate* — and explicitly **rejected** widening the underlying timer so a
+count bound would hold. Widening C14's 5 s to 6 s is that rejected move, and would have to be made
+again at the next overshoot.
+
+**Also corrected — the docs described a bound that does not exist.** The C5 and C14 rows of
+`12-testing.md`, and `tests/cluster-chaos/README.md`, named `WRITES_RESUME_BOUND`; the code has
+`FAILOVER_WRITE_BOUND`, and **only C14 ever used it**. C5 deliberately asserts *zero interruption* —
+the very first write after a graceful roll is accepted with no retry — because a graceful leave hands
+leadership over inside the synchronous `stop`, so any "recovered within N seconds" bound would be met
+by one round trip however bad the handover was. The docs now credit C5 with the stronger claim it
+actually makes.
+
+*Rejected:* widening the bound — D-42's rejected analogue, and there is no derivation for a runner
+contention allowance; the number would be picked to make today's failure pass. *Rejected:* bounding a
+percentile over N kill/resume cycles — faithful, but the tier already costs ~19 minutes and this claim
+is not worth multiplying C14. *Rejected:* quarantining C14 — its durability claims are the valuable
+ones and are not flaky; quarantine would drop them to silence one noisy assertion.
+
+**Residual, stated:** nothing now fails the build if failover genuinely slows from 5 s to, say,
+12 s — that is inside the liveness bound. Such a regression is visible only by reading the recorded
+figures across runs, which nothing does automatically. It
+is the honest limit of what one sample on a shared runner can prove, and the reason the figure is
+recorded rather than discarded.
