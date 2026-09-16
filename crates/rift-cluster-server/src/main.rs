@@ -6,6 +6,7 @@
 //! and serve.
 
 use clap::Parser as _;
+use rift_cluster_base::rift_http_proxy::bootstrap::log_filter;
 use rift_cluster_base::rift_http_proxy::{healthcheck, runtime, script_cli};
 use rift_cluster_base::seams::Commands;
 use rift_cluster_server::bootstrap;
@@ -13,37 +14,59 @@ use rift_cluster_server::cli::EeCli;
 use rift_cluster_server::compose;
 use rift_cluster_server::probes;
 use tracing::{info, warn};
-use tracing_subscriber::{EnvFilter, Layer, fmt, prelude::*};
+use tracing_subscriber::{Layer, fmt, prelude::*};
 
 fn main() -> anyhow::Result<()> {
     let mut cli = EeCli::parse();
 
-    // Both of these must run before any bootstrap: they are self-contained
-    // programs that want only their own exit code, and neither should pay for
-    // (or perturb) a server bootstrap — `healthcheck` runs on every container
-    // health check. Since upstream #827 the PID file is written on the serving
-    // path only, so a transient subcommand can no longer clobber a running
-    // server's file; skipping the bootstrap is now the whole reason.
-    match cli.oss.command.clone() {
-        Some(Commands::Script { action }) => return script_cli::dispatch(action),
-        Some(Commands::Healthcheck { url, timeout }) => {
-            // With no --url, the target follows the mode (#297): this parse
-            // read the same RIFT_* environment the server's own did, and
-            // healthcheck_url double-checks a "no" against the node itself,
-            // because cluster flags given as command-line arguments never
-            // reach a healthcheck exec's environment. Passing Some makes
-            // dispatch's own host/port fallback unreachable by construction.
-            let url = url.unwrap_or_else(|| {
-                probes::healthcheck_url(
-                    cli.cluster.cluster,
-                    cli.cluster.cluster_probe_bind,
-                    &cli.oss.host,
-                    cli.oss.port,
-                )
-            });
-            return healthcheck::dispatch(Some(url), &cli.oss.host, cli.oss.port, timeout);
-        }
-        _ => {}
+    // `script` is a self-contained program that wants only its own exit code,
+    // and reads no host or port, so it runs ahead of everything — including the
+    // rcfile. (Upstream's order, step for step.)
+    if let Some(Commands::Script { action }) = cli.oss.command.clone() {
+        return script_cli::dispatch(action);
+    }
+
+    // The rcfile comes next: before `healthcheck`, and before tracing.
+    //
+    // Before tracing, because an rcfile may carry `logLevel`. A refused rcfile
+    // aborts startup (D-77): upstream #1114 made the refusal whole-file, so
+    // continuing would run with none of its keys — including a
+    // `requireAdminAuth` the operator asked for. `?` rather than `{e}` keeps the
+    // whole chain: `{e}` names the file but stops at that one layer and drops
+    // serde's line and column beneath it. `tests/cli.rs` pins this `?` against
+    // the real binary. Unsupported keys are only advisory, so they are also
+    // re-emitted below, once there is a subscriber, for a pipeline that is not
+    // collecting stderr.
+    //
+    // Before `healthcheck` (#593, upstream #1133), which computes its target from
+    // `--host`/`--port`: a deployment that sets the admin port in an rcfile ran a
+    // server on that port and a probe that knocked on 2525 forever. This is not
+    // the server bootstrap the probe skips — that is the crypto provider and the
+    // subscriber. Reading one small file is the one step whose *output* the probe
+    // depends on, and a refused rcfile refuses the probe too: a server started
+    // with that file would not have started either, so "unhealthy" is the true
+    // answer.
+    let rcfile_warnings = bootstrap::apply_rcfile(&mut cli)?;
+
+    // `healthcheck` runs on every container health check, so it must not pay for
+    // (or perturb) a server bootstrap. Since upstream #827 the PID file is written
+    // on the serving path only, so skipping the bootstrap is now the whole reason.
+    if let Some(Commands::Healthcheck { url, timeout }) = cli.oss.command.clone() {
+        // With no --url, the target follows the mode (#297): this parse read the
+        // same RIFT_* environment the server's own did, and healthcheck_url
+        // double-checks a "no" against the node itself, because cluster flags
+        // given as command-line arguments never reach a healthcheck exec's
+        // environment. Passing Some makes dispatch's own host/port fallback
+        // unreachable by construction.
+        let url = url.unwrap_or_else(|| {
+            probes::healthcheck_url(
+                cli.cluster.cluster,
+                cli.cluster.cluster_probe_bind,
+                &cli.oss.host,
+                cli.oss.port,
+            )
+        });
+        return healthcheck::dispatch(Some(url), &cli.oss.host, cli.oss.port, timeout);
     }
 
     // `--debug` is the server-flag spelling of debug mode; `RIFT_DEBUG` is the
@@ -54,25 +77,14 @@ fn main() -> anyhow::Result<()> {
     // SAFETY: single-threaded — `main` is not `#[tokio::main]`, no runtime is
     // built until `run`, and no thread has been spawned. Placed before anything
     // calls `rift_debug_env()`, which caches its first read, so the flag cannot
-    // be observed inconsistently afterwards.
+    // be observed inconsistently afterwards. (Neither the rcfile nor the probe
+    // above reads it.)
     if cli.oss.debug {
         unsafe { std::env::set_var("RIFT_DEBUG", "1") };
     }
 
-    // Before tracing, because an rcfile may carry `logLevel` — the open-source
-    // binary applies it here for the same reason. A refused rcfile aborts
-    // startup (D-77): upstream #1114 made the refusal whole-file, so continuing
-    // would run with none of its keys — including a `requireAdminAuth` the
-    // operator asked for. `?` rather than `{e}` keeps the whole chain: `{e}` does
-    // name the file, but stops at that one layer and drops serde's line and
-    // column beneath it. `tests/cli.rs` pins this `?` against the real binary —
-    // the bootstrap unit tests call the library directly and stay green without
-    // it. Unsupported keys are only advisory, so they are also re-emitted here,
-    // once there is a subscriber, for a pipeline that is not collecting stderr.
-    let rcfile_warnings = bootstrap::apply_rcfile(&mut cli)?;
-
     rift_cluster_base::rift_http_proxy::install_default_crypto_provider();
-    init_tracing(&cli);
+    init_tracing(&cli)?;
     for warning in rcfile_warnings {
         warn!("{warning}");
     }
@@ -205,15 +217,14 @@ async fn termination_signal() {
     }
 }
 
-fn init_tracing(cli: &EeCli) {
-    let level = match cli.oss.loglevel.to_lowercase().as_str() {
-        "debug" => "debug",
-        "warn" | "warning" => "warn",
-        "error" => "error",
-        _ => "info",
-    };
-    let filter = if cli.oss.debug { "debug" } else { level };
-    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(filter));
+fn init_tracing(cli: &EeCli) -> anyhow::Result<()> {
+    // Upstream's rules, called rather than copied (#594, upstream #1134). This
+    // used to be a copy of upstream's `main.rs`, and both copies fell through to
+    // `info` for a level that does not exist — `trace` included — and mistook an
+    // unparseable `RUST_LOG` for an unset one. The seam refuses both, so the two
+    // binaries now agree by construction rather than by keeping two copies in
+    // step. `--debug` is handled inside it.
+    let env_filter = log_filter(&cli.oss)?;
 
     // `--nologfile` wins over `--log`, matching upstream. A path with no file
     // name yields no layer rather than a logfile named after a directory.
@@ -244,4 +255,5 @@ fn init_tracing(cli: &EeCli) {
         .with(env_filter)
         .with(file_layer)
         .init();
+    Ok(())
 }
