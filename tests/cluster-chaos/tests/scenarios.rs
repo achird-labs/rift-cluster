@@ -4386,21 +4386,25 @@ struct RingReady {
 ///
 /// **What the window is, as far as is known — which is not much.** #543's run
 /// degraded **3 of 9** sprayed decisions (`c33_spray` issues
-/// `rounds * live.len()` = 9). Two explanations have already been ruled out:
+/// `rounds * live.len()` = 9). Two explanations have been named and do not hold:
 ///
-/// - *Callers' stale peer-health marks* (#597): C33 degraded the same way with
-///   the half-open gate (#599) in place.
+/// - *Callers' stale peer-health marks* (#597): not supported — C33 degraded the
+///   same way on #599's run, with the half-open gate in place. One sample, so
+///   "not supported", not "ruled out".
 /// - *A restarted owner that has not heard from a leader* (D-17's
-///   `current_leader == None`): `wait_cluster_formed` only returns once every
-///   node, the owner included, names the same non-null leader.
+///   `current_leader == None`): excluded by construction — `wait_cluster_formed`
+///   only returns once every node, the owner included, names the same non-null
+///   leader.
 ///
-/// Still open, from `ClusteredSequencer`'s own refusal paths: the owner's
-/// `is_isolated()` turning true *after* the fleet formed (a leadership change,
-/// or the owner leading without a recent quorum ack); the owner's ring view
-/// still empty; and an `m_idx` fence between caller and owner. The `trail`
-/// therefore records, beside every degraded round, what each node's
-/// `/_fleet/health` says about `isolated` and `m_idx`, so the next occurrence
-/// names its own cause instead of being guessed at a third time.
+/// Still open. On the owner's side: `is_isolated()` turning true *after* the
+/// fleet formed (a leadership change, or the owner leading without a recent
+/// quorum ack); its ring view still empty; an `m_idx` fence between caller and
+/// owner. On the callers' side: the bridge shedding or refusing a permit, or a
+/// transport failure on `call_member`. The `trail` records, beside every
+/// degraded round, what each node's `/_fleet/health` says about `isolated` and
+/// `m_idx` — which separates the owner-side candidates from each other, though
+/// not the caller-side ones — so the next occurrence narrows its own cause
+/// instead of being guessed at a third time.
 ///
 /// **What it does not prove, and why the bodies come back.** Absence of the
 /// annotation means "no node reported a *degraded cluster* decision". It does
@@ -4677,8 +4681,9 @@ async fn c33_owner_mode_sequencing_cycles_fleet_wide_and_degrades_on_owner_kill(
     let local_before = c33_decisions(&all, "local").await;
     // The wait's clean round is three real decisions immediately preceding this
     // spray, so they are held to the same cycle. Dropping them would blind the
-    // assertion to a node silently serving `DecisionPath::Local`, which moves no
-    // counter and sets no header.
+    // cycle check to a node silently serving `DecisionPath::Local`, which moves no
+    // fallback counter and sets no header (it is caught separately, below, by
+    // `decisions_total{path="local"}`).
     let mut bodies = ready.bodies;
     bodies.extend(c33_spray(&all, 3).await.expect("spray after recovery"));
     let after = c33_fallbacks(&all).await - before;
