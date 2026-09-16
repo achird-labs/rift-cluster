@@ -3273,7 +3273,7 @@ running the configuration its rcfile describes, and the abort is the first time 
 - **Decided:** 2026-09-16 · #590, #591, #598
 - **Refines:** D-73, D-77
 - **Amends:** docs/rift-cluster-server.md, docs/architecture/10-operations.md
-- **Implemented by:** #602
+- **Implemented by:** #603
 - **Code:** crates/rift-cluster-server/src/cli.rs, crates/rift-cluster-server/src/compose.rs, crates/rift-cluster-server/src/admin_front.rs, crates/rift-cluster-server/tests/cli.rs
 
 Under `--cluster` the public admin address belongs to the front (issue #9): `compose` takes
