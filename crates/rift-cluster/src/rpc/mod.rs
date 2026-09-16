@@ -12,8 +12,8 @@ pub mod server;
 
 pub use auth::{AuthError, SignedRequest, Signer, Verifier};
 pub use client::{
-    AlwaysHealthy, Authority, AuthorityError, DnsResolver, PeerHealth, PeerResolver, RpcClient,
-    RpcClientConfig, TrackedPeerHealth,
+    Admission, AlwaysHealthy, Authority, AuthorityError, DnsResolver, PeerHealth, PeerResolver,
+    RpcClient, RpcClientConfig, TrackedPeerHealth,
 };
 pub use routes::{Handler, HandlerFuture, PROTO_VERSION, PrefixHandler, ProtocolVersion, Router};
 pub use server::{DEFAULT_MAX_BODY_BYTES, RpcServer, RpcServerConfig};
