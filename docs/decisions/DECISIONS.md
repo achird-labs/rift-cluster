@@ -3322,7 +3322,16 @@ outstanding trial; review found that a call admitted while the peer still looked
 after the peer tripped and a trial went out, closed that trial's window. Against a peer that never
 answers, each such misattribution let another trial out beside the first — up to one per interval,
 ~9 stalled callers per peer for a 2.35 s blackholed call, enough to exhaust the bridge's
-data-plane permits. With the token, only `Admission::Trial` closes a trial. Liveness probes
+data-plane permits. With the token, only `Admission::Trial` closes a trial.
+
+**And the token names *which* trial.** A second review found the flag still had no identity: a
+trial can outlive its own episode — the entry cleared by a success or by the cooldown, the peer
+tripped again, a newer trial sent — and when the first finally reported, `trial_open` was the newer
+trial's flag, so the stale outcome closed it. Reachable only for a call that runs across a clear and
+a re-trip (a plain `call` against a hung peer takes up to ~8 s; `call_once` with a long snapshot
+deadline), so narrow — but it made the stated invariant false. `Admission::Trial` now carries a
+`TrialId` from one tracker-wide counter (per-entry would restart when entries are recreated), and
+both `record_failure` and `release` resolve a trial only when the id matches. Liveness probes
 still bypass the gate entirely — **D-22 is unchanged**, and `probe` remains the only thing that may
 ignore the mark rather than be metered by it.
 
@@ -3331,8 +3340,10 @@ against a peer known to be down. It was never meant to stop **anyone** discoveri
 back. An open circuit conflates the two; a half-open one does not.
 
 **Two bounds, both stated.** *Cost during a real outage:* at most one trial caller per peer is in
-flight, because `trial_open` refuses a second trial while one is outstanding and only that trial's
-own outcome can clear it — the pacing interval is not what bounds the cost, and that is why it can
+flight **per tripped episode**, because the entry refuses a second trial while one is outstanding and
+only that trial's own outcome — matched by `TrialId` — can clear it. A success or a cooldown expiry
+ends the episode by design, so a trial orphaned that way can still be running beside the next
+episode's trial; it can no longer close it — the pacing interval is not what bounds the cost, and that is why it can
 be short. *Recovery after a restart:*
 one interval plus one call, instead of five seconds.
 

@@ -57,11 +57,24 @@ pub trait PeerHealth: Send + Sync {
 pub enum Admission {
     /// The peer is believed reachable; the call proceeds normally.
     Healthy,
-    /// The peer is marked down, and this call is the one half-open trial.
-    Trial,
+    /// The peer is marked down, and this call is the one half-open trial —
+    /// *this* trial, which is what the id is for.
+    Trial(TrialId),
     /// The peer is marked down and no trial is due; the call must not be made.
     Refused,
 }
+
+/// Identifies one half-open trial, so that its outcome can resolve only itself.
+///
+/// A flag alone cannot tell "my trial is open" from "a later trial is open". A
+/// trial can outlive its own episode — the entry is cleared by a success or by
+/// the cooldown, the peer trips again, and a new trial goes out — and when the
+/// first one finally reports, a bare flag would let it close the second's window,
+/// putting two trials in flight at once (#599's second review). Ids come from one
+/// tracker-wide counter rather than a per-entry one, because entries are removed
+/// and recreated and a per-entry counter would restart and collide.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TrialId(u64);
 
 /// Health source for single-node and test use: never fast-fails.
 pub struct AlwaysHealthy;
@@ -108,11 +121,11 @@ struct PeerState {
     /// makes an interval longer than the test mean "no trials", which is how a
     /// test asks for the plain open-circuit behaviour.
     window_from: Option<Instant>,
-    /// Whether a trial is still outstanding. One at a time: this, not
+    /// The trial currently outstanding, if any. One at a time: this, not
     /// [`PeerState::window_from`], is what stops an outage costing more than one
-    /// stalled trial caller per peer — and it holds only because a failure closes
-    /// it **only when the failure is the trial's own** ([`Admission::Trial`]).
-    trial_open: bool,
+    /// stalled trial caller per peer — and it holds only because a trial is
+    /// closed **only by its own outcome**, matched by [`TrialId`].
+    trial: Option<TrialId>,
 }
 
 /// A real, locally observed [`PeerHealth`]: after
@@ -141,7 +154,7 @@ struct PeerState {
 /// it is the whole of this decision.
 ///
 /// A trial that reports back neither way — its future dropped by an outer
-/// deadline — leaves `trial_open` set, and the peer then behaves exactly as it
+/// deadline — leaves its trial set, and the peer then behaves exactly as it
 /// did before this change: the cooldown expires on its own and clears the entry.
 /// The worst case is the old behaviour, never worse, which is why there is no
 /// separate abandon timer to get wrong.
@@ -150,6 +163,8 @@ pub struct TrackedPeerHealth {
     threshold: u32,
     cooldown: Duration,
     half_open_interval: Duration,
+    /// Source of [`TrialId`]s. Tracker-wide — see [`TrialId`] for why not per peer.
+    next_trial: std::sync::atomic::AtomicU64,
 }
 
 impl Default for TrackedPeerHealth {
@@ -176,6 +191,7 @@ impl TrackedPeerHealth {
             threshold,
             cooldown,
             half_open_interval: DEFAULT_HALF_OPEN_INTERVAL,
+            next_trial: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -213,7 +229,7 @@ impl PeerHealth for TrackedPeerHealth {
             // the circuit is half-open rather than open (D-78): admit one trial,
             // so somebody can find out the peer is back.
             Some(_) => {
-                if entry.trial_open {
+                if entry.trial.is_some() {
                     return Admission::Refused;
                 }
                 let due = entry
@@ -222,10 +238,14 @@ impl PeerHealth for TrackedPeerHealth {
                 if !due {
                     return Admission::Refused;
                 }
+                let id = TrialId(
+                    self.next_trial
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+                );
                 entry.window_from = Some(now);
-                entry.trial_open = true;
-                tracing::debug!(%peer, "peer health: admitting a half-open trial call");
-                Admission::Trial
+                entry.trial = Some(id);
+                tracing::debug!(%peer, trial = id.0, "peer health: admitting a half-open trial call");
+                Admission::Trial(id)
             }
         }
     }
@@ -252,18 +272,20 @@ impl PeerHealth for TrackedPeerHealth {
             // its job — it is what tripped the mark — and folding trials into it
             // would grow it without bound for as long as the peer is down.
             //
-            // `trial_open` is checked, not assumed: if the entry was cleared while
-            // this trial ran (a success elsewhere, or the cooldown expiring), this
-            // failure is a fresh observation and counts like any other.
-            Admission::Trial if entry.trial_open => {
-                entry.trial_open = false;
+            // Matched by id, not assumed: if the entry was cleared while this trial
+            // ran (a success elsewhere, or the cooldown expiring) — and perhaps
+            // re-tripped with a newer trial out — this failure is a fresh
+            // observation and counts like any other, and the newer trial stays
+            // outstanding.
+            Admission::Trial(id) if entry.trial == Some(id) => {
+                entry.trial = None;
                 entry.window_from = Some(now);
                 entry.unhealthy_until = Some(now + self.cooldown);
             }
             // An ordinary failure. It must never close an outstanding trial: a call
             // admitted before the peer tripped can fail after a trial was admitted,
             // and nothing about *its* failure says the trial is over.
-            Admission::Healthy | Admission::Trial => {
+            Admission::Healthy | Admission::Trial(_) => {
                 entry.consecutive_failures = entry.consecutive_failures.saturating_add(1);
                 if entry.consecutive_failures >= self.threshold {
                     entry.unhealthy_until = Some(now + self.cooldown);
@@ -276,15 +298,18 @@ impl PeerHealth for TrackedPeerHealth {
     }
 
     fn release(&self, peer: SocketAddr, admission: Admission) {
-        if admission != Admission::Trial {
+        let Admission::Trial(id) = admission else {
             return;
-        }
+        };
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         // No re-arm and no clear: the trial learned nothing about the peer. The
         // window reopens at `window_from`'s pacing, so the next trial follows one
-        // interval after this one was admitted.
-        if let Some(entry) = state.get_mut(&peer) {
-            entry.trial_open = false;
+        // interval after this one was admitted. Only this trial is released — a
+        // newer one, from a later episode, is left alone.
+        if let Some(entry) = state.get_mut(&peer)
+            && entry.trial == Some(id)
+        {
+            entry.trial = None;
         }
     }
 }
@@ -1146,17 +1171,22 @@ mod tests {
         );
     }
 
-    /// Poll `admit` until it hands out a trial, bounded. Returns whether one was
-    /// admitted before the deadline.
-    fn wait_for_trial(health: &TrackedPeerHealth, peer: SocketAddr) -> bool {
+    fn is_trial(admission: Admission) -> bool {
+        matches!(admission, Admission::Trial(_))
+    }
+
+    /// Poll `admit` until it hands out a trial, bounded, returning the trial's
+    /// admission so the caller can resolve that very trial.
+    fn wait_for_trial(health: &TrackedPeerHealth, peer: SocketAddr) -> Option<Admission> {
         let deadline = Instant::now() + Duration::from_secs(5);
         while Instant::now() < deadline {
-            if health.admit(peer) == Admission::Trial {
-                return true;
+            let admission = health.admit(peer);
+            if is_trial(admission) {
+                return Some(admission);
             }
             std::thread::sleep(Duration::from_millis(5));
         }
-        false
+        None
     }
 
     /// Pins D-78, and the defect it closes (#597).
@@ -1176,9 +1206,8 @@ mod tests {
 
         health.record_failure(peer, Admission::Healthy);
         let trial = health.admit(peer);
-        assert_eq!(
-            trial,
-            Admission::Trial,
+        assert!(
+            is_trial(trial),
             "with a zero interval the next caller is the trial, and must be let through"
         );
 
@@ -1202,9 +1231,8 @@ mod tests {
         let peer: SocketAddr = "127.0.0.1:4791".parse().expect("valid address");
         health.record_failure(peer, Admission::Healthy);
 
-        assert_eq!(
-            health.admit(peer),
-            Admission::Trial,
+        assert!(
+            is_trial(health.admit(peer)),
             "the first caller is the trial"
         );
         for i in 0..5 {
@@ -1236,7 +1264,7 @@ mod tests {
             "admitted while the peer looked fine"
         );
         health.record_failure(peer, Admission::Healthy); // another call trips it
-        assert_eq!(health.admit(peer), Admission::Trial, "the trial goes out");
+        assert!(is_trial(health.admit(peer)), "the trial goes out");
 
         health.record_failure(peer, early); // the early call fails *now*
         assert_eq!(
@@ -1244,6 +1272,49 @@ mod tests {
             Admission::Refused,
             "the trial is still outstanding; an earlier call's failure must not \
              open a second one"
+        );
+    }
+
+    /// A trial can outlive its own episode: the entry is cleared (here by a
+    /// success, as a probe getting through would), the peer trips again, and a
+    /// newer trial goes out. When the first trial finally reports — as a failure
+    /// or as a released deadline — it must resolve only itself, or two trials
+    /// would be in flight at once (#599's second review).
+    #[test]
+    fn a_trial_from_an_earlier_episode_cannot_close_a_later_one() {
+        let health = TrackedPeerHealth::with_params(1, Duration::from_secs(60))
+            .with_half_open_interval(Duration::ZERO);
+        let peer: SocketAddr = "127.0.0.1:4797".parse().expect("valid address");
+
+        health.record_failure(peer, Admission::Healthy);
+        let stale = health.admit(peer);
+        assert!(is_trial(stale), "{stale:?}");
+
+        // The episode ends without that trial reporting, and a new one begins.
+        health.record_success(peer, Admission::Healthy);
+        health.record_failure(peer, Admission::Healthy);
+        let current = health.admit(peer);
+        assert!(is_trial(current), "{current:?}");
+        assert_ne!(stale, current, "two trials must be told apart");
+
+        health.release(peer, stale);
+        assert_eq!(
+            health.admit(peer),
+            Admission::Refused,
+            "a stale trial's release must not free the current trial's window"
+        );
+        health.record_failure(peer, stale);
+        assert_eq!(
+            health.admit(peer),
+            Admission::Refused,
+            "a stale trial's failure must not close the current trial either"
+        );
+
+        // The current trial resolving itself is what reopens the window.
+        health.record_failure(peer, current);
+        assert!(
+            is_trial(health.admit(peer)),
+            "the next trial may now go out"
         );
     }
 
@@ -1261,15 +1332,14 @@ mod tests {
         health.record_failure(peer, Admission::Healthy); // trip at t0; mark until t0 + 1s
 
         let trial = health.admit(peer);
-        assert_eq!(trial, Admission::Trial);
+        assert!(is_trial(trial), "{trial:?}");
         std::thread::sleep(Duration::from_millis(600));
         health.record_failure(peer, trial); // at f >= t0 + 600ms; re-armed until f + 1s
 
         // Now >= f + 500ms >= t0 + 1.1s: the original mark has expired.
         std::thread::sleep(Duration::from_millis(500));
-        assert_eq!(
-            health.admit(peer),
-            Admission::Trial,
+        assert!(
+            is_trial(health.admit(peer)),
             "the failed trial must have re-armed the mark; `Healthy` here means the \
              original cooldown lapsed with nothing extending it"
         );
@@ -1291,19 +1361,17 @@ mod tests {
             Admission::Refused,
             "a peer that just failed must not be trialled in the same breath"
         );
-        assert!(
-            wait_for_trial(&health, peer),
-            "a trial must be admitted once the interval elapses"
-        );
+        let first = wait_for_trial(&health, peer)
+            .expect("a trial must be admitted once the interval elapses");
 
-        health.record_failure(peer, Admission::Trial);
+        health.record_failure(peer, first);
         assert_eq!(
             health.admit(peer),
             Admission::Refused,
             "a failed trial must not be followed by another in the same breath"
         );
         assert!(
-            wait_for_trial(&health, peer),
+            wait_for_trial(&health, peer).is_some(),
             "a second trial must follow, one interval after the first one failed"
         );
     }
@@ -1318,11 +1386,7 @@ mod tests {
         let peer: SocketAddr = "127.0.0.1:4793".parse().expect("valid address");
         health.record_failure(peer, Admission::Healthy);
 
-        assert_eq!(
-            health.admit(peer),
-            Admission::Trial,
-            "the trial is admitted"
-        );
+        assert!(is_trial(health.admit(peer)), "the trial is admitted");
         // ...and it never reports back: no `record_*`, no `release`.
         assert_eq!(
             health.admit(peer),
@@ -1350,11 +1414,10 @@ mod tests {
         health.record_failure(peer, Admission::Healthy);
 
         let first = health.admit(peer);
-        assert_eq!(first, Admission::Trial);
+        assert!(is_trial(first), "{first:?}");
         health.release(peer, first);
-        assert_eq!(
-            health.admit(peer),
-            Admission::Trial,
+        assert!(
+            is_trial(health.admit(peer)),
             "a released trial frees the window, and the mark is still there — \
              `Healthy` would mean release cleared it"
         );
@@ -1687,9 +1750,8 @@ mod tests {
             .expect_err("the deadline expires");
         assert_eq!(err, RpcError::Timeout);
 
-        assert_eq!(
-            health.admit(addr),
-            Admission::Trial,
+        assert!(
+            is_trial(health.admit(addr)),
             "the timed-out trial must have released the window: `Refused` means it \
              is still outstanding, `Healthy` would mean the expiry was credited"
         );
