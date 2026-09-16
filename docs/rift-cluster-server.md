@@ -141,7 +141,7 @@ implementation** rather than reimplementing or declining it:
 
 | Subcommand / flag | Behaviour |
 |---|---|
-| `--rcfile` | Mountebank-compatible JSON defaults, applied only to fields left at their defaults. A missing, malformed, or wrong-typed rcfile is **refused whole and aborts startup**, exactly as upstream since rift#1114 — see D-77. Unrecognised keys stay advisory: they go to stderr immediately and are repeated through `tracing` once the subscriber exists. `apiKey` is a recognised key since rift#1132, applied only when `--api-key`/`MB_APIKEY` is unset. The rcfile is applied **before** `healthcheck` computes its target (rift#1133), so a probe follows an rcfile-set port, and a refused rcfile is an unhealthy verdict. |
+| `--rcfile` | Mountebank-compatible JSON defaults, applied only to fields left at their defaults. A missing, malformed, or wrong-typed rcfile is **refused whole and aborts startup**, exactly as upstream since rift#1114 — see D-77. Unrecognised keys stay advisory: they go to stderr immediately and are repeated through `tracing` once the subscriber exists. `apiKey` is a recognised key since rift#1132, applied only when `--api-key`/`MB_APIKEY` is unset. The rcfile is applied **before** `healthcheck` computes its target (rift#1133), so a `healthcheck --rcfile <file>` probe follows the file's port, and a refused rcfile is an unhealthy verdict. `--rcfile` has no environment variable, so the image's built-in health check — a bare `healthcheck` — never sees a file given on the server's command line and still probes the flag/default port; pass `--rcfile` to the probe too, or set the port by flag or `MB_PORT`. |
 | `--pidfile` | one `global` flag, bindable on either side of the subcommand; written on the serving path only — see below |
 | `stop` | SIGTERM the PID in `--pidfile` (default `rift.pid`), then remove the file |
 | `restart` | `stop`, then start a new server in the same process. A missing PID file is "nothing to stop", not an error |
@@ -164,6 +164,15 @@ fixes them:
 - `--log <path>` adds a file layer (via `tracing-appender`, non-blocking,
   never-rotated) alongside the console output. `--nologfile` overrides `--log`
   and suppresses the file even when one is named.
+- The log level comes from upstream's own `bootstrap::log_filter` (rift#1140),
+  not from a copy of it. **This refuses startup where the copy did not:** a
+  `--loglevel` (or `MB_LOGLEVEL`, or rcfile `logLevel`) outside `trace`, `debug`,
+  `info`, `warn`/`warning`, `error` used to become `info` silently and now aborts
+  with the value named; the level is checked even when `--debug` or `RUST_LOG`
+  would supersede it; and a `RUST_LOG` that is set but does not parse (or is not
+  UTF-8) is refused instead of being treated as unset. An empty `MB_LOGLEVEL`
+  still means `info`. Precedence is unchanged: `RUST_LOG`, then `--debug`, then
+  the level.
 
 `script`, `healthcheck`, `start` and `replay` all work exactly as upstream.
 `replay` is worth spelling out because it does less than the name suggests: it is

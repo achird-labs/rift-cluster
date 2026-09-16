@@ -466,9 +466,11 @@ fn healthy_listener() -> u16 {
 
 /// A loopback address nothing is listening on, so `healthcheck_url`'s
 /// clustered-mode detection answers "not clustered" regardless of what else runs
-/// on this machine. Bound and dropped; the window in which something else could
-/// take the port is the only race, and it is harmless — it could only make the
-/// probe pick the probe listener, which the assertions below would report.
+/// on this machine. Bound and dropped, so another process could take the port in
+/// between. In this test binary nothing else binds a listener that answers, so the
+/// race is theoretical here — but it is not self-reporting: a port reused by
+/// something answering `200` on `/healthz` would make the probe test pass without
+/// testing the rcfile.
 fn closed_addr() -> String {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
     listener.local_addr().expect("local_addr").to_string()
@@ -576,7 +578,9 @@ fn an_unknown_log_level_refuses_startup_and_a_real_one_does_not() {
         "a bad level must be refused before the subcommand runs: {stderr}"
     );
 
-    // `trace` is a real tracing level, and used to be silently downgraded too.
+    // `trace` is a real level and must not be refused. This half guards against
+    // refusing too much; it does not prove `trace` is *honoured* — the old code
+    // turned it into `info` and `stop` still ran, so it passed then too.
     let accepted = run("trace");
     let stderr = String::from_utf8_lossy(&accepted.stderr);
     assert!(
