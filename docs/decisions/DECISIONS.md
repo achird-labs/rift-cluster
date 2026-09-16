@@ -3196,7 +3196,7 @@ source wins on that read, deliberately: a live drive failure is the more urgent 
 - **Decided:** 2026-09-15 · #589
 - **Amends:** docs/rift-cluster-server.md ("Relationship to the `rift` binary")
 - **Implemented by:** #543
-- **Code:** crates/rift-cluster-server/src/bootstrap.rs, crates/rift-cluster-server/src/main.rs
+- **Code:** crates/rift-cluster-server/src/bootstrap.rs, crates/rift-cluster-server/src/main.rs, crates/rift-cluster-server/tests/cli.rs
 
 `apply_rcfile` warned and continued on an rcfile it could not read or apply, and said so in its own
 doc comment: "Changing that to a hard failure here would be a behaviour fork, not a hardening." That
@@ -3221,23 +3221,37 @@ unchanged is the fork. This is the generalisable half: the next upstream bump th
 behaviour we deliberately mirror is to be read the same way, and `rcfile_invalid_is_fatal` /
 `rcfile_missing_is_fatal` exist to make the decision visible at the moment it stops holding.
 
+**The refusal is pinned against the real binary, not only the library function.** Every unit test
+here drives `apply_rcfile` directly, so `let _ = bootstrap::apply_rcfile(&mut cli);` in `main.rs`
+would restore the exact fail-open this decision closes and leave all of them green. `tests/cli.rs`
+already makes this argument for issue #43's declines, for the mirror-image reason — a guard
+reintroduced *in front of* the bootstrap would be invisible to the unit tests — and a security gate
+that stops being fatal deserves the same treatment as a flag that stops being accepted.
+
 **A security gate fails closed.** `requireAdminAuth` is a classifier for "may this request touch the
 admin plane"; a bootstrap that cannot parse what it is classifying must take the dangerous reading,
 never the safe one. Refusing to start is the only reading that cannot silently disagree with the
 operator.
 
-**Unsupported keys stay advisory, and are routed through `tracing`.** They are not a refusal —
-upstream applies the rest of the file and reports them — so they must not abort. `apply_rcfile`
-calls `apply_rcfile_defaults_reporting` rather than `apply_rcfile_defaults` precisely to get them
-back as values: the `warn!` inside `apply_rcfile_defaults` fires before any subscriber exists (the
-rcfile may carry `logLevel`, so it must be applied first) and is therefore never seen by anyone.
-They go to stderr immediately *and* are returned to `main`, which re-emits them once `init_tracing`
-has run, so they reach the log pipeline like every other operational signal in this binary.
+**Unsupported keys stay advisory, and go to both channels.** They are not a refusal — upstream
+applies the rest of the file and reports them — so they must not abort. `apply_rcfile` calls
+`apply_rcfile_defaults_reporting` rather than `apply_rcfile_defaults` precisely to get them back as
+values: the `warn!` inside `apply_rcfile_defaults` fires before any subscriber exists (the rcfile
+may carry `logLevel`, so it must be applied first) and is therefore never seen by anyone. They go to
+stderr immediately *and* are returned to `main`, which re-emits them once `init_tracing` has run.
+
+*Both channels, and neither is redundant* — this is the part that looks like duplication and is not.
+An rcfile carrying `logLevel: "error"` configures away the very `warn!` that would report its own
+unsupported key, and `init_tracing` can panic before the re-emission is reached at all; stderr
+covers both. Equally, a deployment collecting only the log pipeline never sees stderr. The duplicate
+line in an interactive terminal is the price of an advisory that survives either gap.
 
 **The error propagates with `?`, not formatted with `{e}`.** `{e}` renders only the outermost
-message, dropping the `with_context` that names the file (upstream #946) and serde's line and column
-(upstream #1004) — the two things that make a refusal actionable in a fleet carrying several
-rcfiles. `main` already returns `anyhow::Result<()>`, so the whole chain prints.
+context. That context *does* name the file — upstream #946 put it there precisely so an embedder
+calling the seam directly would not get a bare "No such file or directory" — but it stops at that
+one layer, dropping the source beneath it, which is serde's line and column (upstream #1004). In a
+fleet carrying several rcfiles the file name alone still leaves an operator hunting the character
+that broke it. `main` already returns `anyhow::Result<()>`, so `?` prints the whole chain.
 
 *Rejected:* keeping the warning and adding a separate check for `requireAdminAuth` specifically —
 that fixes the one key we thought of. `port: 70000` silently binding 4464 and `localOnly: "yes"`

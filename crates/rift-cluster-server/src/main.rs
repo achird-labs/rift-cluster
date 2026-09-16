@@ -63,10 +63,12 @@ fn main() -> anyhow::Result<()> {
     // binary applies it here for the same reason. A refused rcfile aborts
     // startup (D-77): upstream #1114 made the refusal whole-file, so continuing
     // would run with none of its keys — including a `requireAdminAuth` the
-    // operator asked for. `?` rather than `{e}` keeps the whole chain, so the
-    // file name and serde's line and column survive. Unsupported keys are only
-    // advisory, so they are held until there is a subscriber and land in the log
-    // pipeline, not only on a stderr nobody is collecting.
+    // operator asked for. `?` rather than `{e}` keeps the whole chain: `{e}` does
+    // name the file, but stops at that one layer and drops serde's line and
+    // column beneath it. `tests/cli.rs` pins this `?` against the real binary —
+    // the bootstrap unit tests call the library directly and stay green without
+    // it. Unsupported keys are only advisory, so they are also re-emitted here,
+    // once there is a subscriber, for a pipeline that is not collecting stderr.
     let rcfile_warnings = bootstrap::apply_rcfile(&mut cli)?;
 
     rift_cluster_base::rift_http_proxy::install_default_crypto_provider();

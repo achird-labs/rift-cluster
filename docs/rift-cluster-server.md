@@ -127,8 +127,10 @@ fails the build if that ever stops being true.
 > the refusal whole-file, so continuing would have applied none of the file's
 > keys. Warning and continuing became the behaviour fork, and a fail-open one:
 > a wrong-typed `localOnly` would have dropped the `requireAdminAuth` beside it.
-> The table row below reflects the current behaviour; the sentence about
-> "identical to upstream" is unchanged in intent, which is the point of D-77.
+> The table row below reflects the current behaviour. The claim in this section
+> that the two binaries "stay shared" and "call the same implementation" is
+> unchanged — honouring it is *why* the behaviour moved, which is the point of
+> D-77.
 
 `stop`, `restart`, `save` and `--rcfile` used to be declined with an explanatory
 error, because the open-source binary implemented them in private functions of

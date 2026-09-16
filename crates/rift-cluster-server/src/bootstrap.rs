@@ -51,16 +51,19 @@ pub enum AfterBootstrap {
 /// Returns the unsupported keys rather than logging them, because this has to
 /// run before tracing is initialised — an rcfile may carry `logLevel`, so the
 /// `warn!` that [`apply_rcfile_defaults`] would emit fires before any subscriber
-/// exists and is never seen. `eprintln!` alone would leave them the one piece of
-/// operational signal in this binary that never reaches the log pipeline, so
-/// they go to stderr now *and* back to the caller, which re-emits them through
-/// `tracing` as soon as there is a subscriber to receive it.
+/// exists and is never seen. They go to stderr here *and* back to the caller,
+/// which re-emits them through `tracing` once there is a subscriber. Both, not
+/// either: stderr is what survives a `logLevel` that filters `warn` away (and an
+/// `init_tracing` that panics), and `tracing` is what reaches a log pipeline
+/// that is not collecting stderr. Neither channel alone covers the other's gap.
 ///
 /// # Errors
 ///
 /// The rcfile the operator named cannot be read, parsed, or applied. The error
-/// chain is returned intact — formatting it with `{e}` would drop the file name
-/// and the serde line and column that upstream #946/#1004 put there.
+/// is returned whole rather than rendered here: `{e}` prints only the outermost
+/// context, which does name the file (upstream #946) but drops the source under
+/// it — and that source is serde's line and column (upstream #1004). The caller
+/// propagates with `?`, so the full chain reaches the operator.
 ///
 /// [`apply_rcfile_defaults`]: rift_cluster_base::rift_http_proxy::bootstrap::apply_rcfile_defaults
 pub fn apply_rcfile(cli: &mut EeCli) -> anyhow::Result<Vec<String>> {
@@ -69,7 +72,15 @@ pub fn apply_rcfile(cli: &mut EeCli) -> anyhow::Result<Vec<String>> {
     };
     let warnings = apply_rcfile_defaults_reporting(&mut cli.oss, &rcfile)?
         .into_iter()
-        .map(|key| format!("--rcfile {rcfile:?}: unsupported key '{key}' (ignored)"))
+        .map(|key| {
+            // Upstream's own wording and formatting (`main.rs`), unquoted path
+            // included: this crate's promise is behaviour identity, and an
+            // operator grepping their logs should not have to match two spellings.
+            format!(
+                "--rcfile {}: unsupported key '{key}' (ignored)",
+                rcfile.display()
+            )
+        })
         .collect::<Vec<_>>();
     for warning in &warnings {
         eprintln!("Warning: {warning}");
