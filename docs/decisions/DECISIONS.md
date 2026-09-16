@@ -3386,3 +3386,56 @@ the steady case that matters most is D-28's name resolving to several addresses 
 permanently dead, where the old cost was ~3 callers paying ~350 ms of backoff per 5 s cycle and the
 new cost is ~8 trials per 5 s, each one caller at a time. The alternative — backing the interval
 off as an outage lengthens — would make recovery slowest exactly when a long outage finally ends.
+
+### D-80 — C14 gates durability and liveness; failover latency is a recorded figure, not a gate
+
+- **Status:** active
+- **Decided:** 2026-09-16 · #596
+- **Refines:** D-67; follows D-42
+- **Implemented by:** #601
+- **Amends:** docs/architecture/12-testing.md (C5 and C14 rows)
+- **Code:** tests/cluster-chaos/tests/scenarios.rs
+
+C14 kills the Raft leader during a 100-write admin storm. Its claims are **durability** — every
+acknowledged write is present, none duplicated — and **liveness** — writes resume. It also asserted a
+third claim, failover **latency**, as `resumed <= FAILOVER_WRITE_BOUND` (5 s): one sample, one hard
+threshold, on a shared GitHub runner whose contention the scenario does not control.
+
+That gate failed on numbers that carry no information about the fleet: **5.176 s** (#596's first
+sighting) and **5.013 s** — a 13 ms, 0.26 % miss — against a budget that already contains an election
+(≤ 3 s) and the default write barrier's timeout (2 s). A regression in failover does not land a
+quarter of a percent over that. The shard went red, the PR in front of it waited on a re-run, and the
+re-run proved nothing.
+
+**The rule.** C14 keeps both of its real claims as gates. Liveness was already enforced separately:
+`time_until_writes_resume` returns an error if writes do not resume within `3 × FAILOVER_WRITE_BOUND`,
+and C14 turns that error into a panic. That stays. The latency figure is emitted with `chaos_artifact!` (D-67), so it lands in the per-shard
+artifact log, uploaded per shard per run — a regression shows as a moved distribution, which is what
+"failover got slower" actually means. Nothing aggregates those logs today, so comparing runs is a
+manual read of the artifacts; that is a gap in tooling, not in what is recorded. `FAILOVER_WRITE_BOUND` keeps its derivation and still sizes the
+liveness wait; it now documents the expected figure rather than failing on it.
+
+**Same shape as D-42.** C6 had a single-sample timing gate on the same infrastructure, and D-42
+resolved it by bounding a *rate* — and explicitly **rejected** widening the underlying timer so a
+count bound would hold. Widening C14's 5 s to 6 s is that rejected move, and would have to be made
+again at the next overshoot.
+
+**Also corrected — the docs described a bound that does not exist.** The C5 and C14 rows of
+`12-testing.md`, and `tests/cluster-chaos/README.md`, named `WRITES_RESUME_BOUND`; the code has
+`FAILOVER_WRITE_BOUND`, and **only C14 ever used it**. C5 deliberately asserts *zero interruption* —
+the very first write after a graceful roll is accepted with no retry — because a graceful leave hands
+leadership over inside the synchronous `stop`, so any "recovered within N seconds" bound would be met
+by one round trip however bad the handover was. The docs now credit C5 with the stronger claim it
+actually makes.
+
+*Rejected:* widening the bound — D-42's rejected analogue, and there is no derivation for a runner
+contention allowance; the number would be picked to make today's failure pass. *Rejected:* bounding a
+percentile over N kill/resume cycles — faithful, but the tier already costs ~19 minutes and this claim
+is not worth multiplying C14. *Rejected:* quarantining C14 — its durability claims are the valuable
+ones and are not flaky; quarantine would drop them to silence one noisy assertion.
+
+**Residual, stated:** nothing now fails the build if failover genuinely slows from 5 s to, say,
+12 s — that is inside the liveness bound. Such a regression is visible only by reading the recorded
+figures across runs, which nothing does automatically. It
+is the honest limit of what one sample on a shared runner can prove, and the reason the figure is
+recorded rather than discarded.
