@@ -340,3 +340,108 @@ fn cluster_advertise_rejects_a_value_without_a_port() {
         "peers dial a port, so an authority without one must be refused at parse time"
     );
 }
+
+/// Pins D-77 against the **real artifact**, which is the only thing that can
+/// catch the regression that matters.
+///
+/// The unit tests around `bootstrap` drive `apply_rcfile` directly, so replacing
+/// the `?` in `main.rs` with `let _ = bootstrap::apply_rcfile(&mut cli);` would
+/// restore the exact fail-open D-77 closes — a refused rcfile applying none of
+/// its keys, `requireAdminAuth` among them — and leave every one of them green.
+/// This is the mirror image of the argument
+/// `the_binary_no_longer_declines_rcfile_or_the_pidfile_subcommands` makes for
+/// issue #43: a guard reintroduced in `main.rs` is invisible from the library.
+///
+/// The wrong-typed key is the case worth spawning a process for. It is the one
+/// upstream #1114 added, the one that refuses the file *whole*, and the one
+/// where continuing is silently insecure rather than merely wrong.
+#[test]
+fn a_refused_rcfile_refuses_startup_in_the_shipped_binary() {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let rcfile = dir.path().join("rc.json");
+    // Exactly the pairing from issue #589: a wrong-typed flag beside the
+    // security flag it would have taken down with it.
+    std::fs::write(&rcfile, r#"{"localOnly": "yes", "requireAdminAuth": true}"#)
+        .expect("write rcfile");
+
+    // Spawned and polled rather than `output()`ed, because the regression this
+    // guards is not "exits with the wrong code" — it is "does not exit at all".
+    // Swallow the refusal and the binary goes on to *serve*, so `output()` would
+    // block on a pipe that never closes and hang the suite instead of failing
+    // it. Still running past the deadline is therefore the assertion, not an
+    // accident of it.
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_rift-cluster-server"))
+        .args(["--rcfile", &rcfile.to_string_lossy()])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn the binary");
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let exited = loop {
+        match child.try_wait().expect("poll the child") {
+            Some(status) => break Some(status),
+            None if std::time::Instant::now() >= deadline => break None,
+            None => std::thread::sleep(std::time::Duration::from_millis(50)),
+        }
+    };
+    if exited.is_none() {
+        let _ = child.kill();
+    }
+    let out = child
+        .wait_with_output()
+        .expect("collect the child's output");
+
+    let status = exited.expect(
+        "the binary was still running 30s after a refused rcfile: it started a server instead \
+         of refusing, which is the fail-open D-77 closes",
+    );
+    assert!(
+        !status.success(),
+        "a refused rcfile must refuse startup, not warn and serve: {status:?}"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("rc.json"),
+        "the refusal must name the file: {stderr}"
+    );
+    assert!(
+        stderr.contains("localOnly"),
+        "the refusal must name the offending key: {stderr}"
+    );
+}
+
+/// The other half of D-77: an rcfile the binary *can* apply must not be turned
+/// into a refusal by the change above. Without this, "refuse on error" could be
+/// implemented as "refuse whenever --rcfile is given" and the test above would
+/// still pass.
+///
+/// `stop` against an absent PID file is the cheapest complete program that
+/// reaches the rcfile: it exits after the bootstrap without binding a port.
+#[test]
+fn a_good_rcfile_still_starts_and_reports_its_unsupported_keys() {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let rcfile = dir.path().join("rc.json");
+    std::fs::write(&rcfile, r#"{"port": 4321, "mountebankOnly": 1}"#).expect("write rcfile");
+
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_rift-cluster-server"))
+        .args([
+            "--rcfile",
+            &rcfile.to_string_lossy(),
+            "stop",
+            "--pidfile",
+            &dir.path().join("absent.pid").to_string_lossy(),
+        ])
+        .output()
+        .expect("run the binary");
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("must be"),
+        "a well-formed rcfile must not be refused: {stderr}"
+    );
+    assert!(
+        stderr.contains("mountebankOnly"),
+        "an unsupported key must still be reported, on stderr, before any subscriber exists: {stderr}"
+    );
+}

@@ -14,7 +14,7 @@
 use std::path::{Path, PathBuf};
 
 use rift_cluster_base::rift_http_proxy::bootstrap::{
-    DEFAULT_PIDFILE, apply_rcfile_defaults, save_imposters, stop_server,
+    DEFAULT_PIDFILE, apply_rcfile_defaults_reporting, save_imposters, stop_server,
 };
 use rift_cluster_base::seams::Commands;
 use tracing::{info, warn};
@@ -37,22 +37,55 @@ pub enum AfterBootstrap {
 
 /// Apply `--rcfile` defaults to the flattened open-source CLI.
 ///
-/// Non-fatal by design, matching the open-source binary: a bad rcfile warns and
-/// startup continues with the flags as given. Changing that to a hard failure
-/// here would be a behaviour fork, not a hardening.
+/// **Fatal by design**, matching the open-source binary since upstream #1114: an
+/// rcfile that cannot be read, is not a JSON object, or gives a recognised key a
+/// wrong-typed value is refused *whole*, and startup is refused with it.
 ///
-/// Returns the warning text rather than logging it, because this has to run
-/// before tracing is initialised — an rcfile may carry `logLevel`. `eprintln!`
-/// alone would be the one piece of operational signal in this binary that never
-/// reaches the log pipeline, so the caller re-emits it through `tracing` as soon
-/// as there is a subscriber to receive it.
-#[must_use]
-pub fn apply_rcfile(cli: &mut EeCli) -> Option<String> {
-    let rcfile = cli.oss.rcfile.clone()?;
-    let e = apply_rcfile_defaults(&mut cli.oss, &rcfile).err()?;
-    let warning = format!("failed to load --rcfile {rcfile:?}: {e}");
-    eprintln!("Warning: {warning}");
-    Some(warning)
+/// This used to warn and continue, on the reasoning that a hard failure would be
+/// a behaviour fork. Upstream #1114 inverted that: because a refused rcfile now
+/// applies *none* of its keys, warning and continuing is what forks — and it
+/// forks open. `{"localOnly": "yes", "requireAdminAuth": true}` would start a
+/// server with the admin plane on every interface and no authentication, which
+/// is precisely the fail-open #1114 closed (issue #589, D-77).
+///
+/// Returns the unsupported keys rather than logging them, because this has to
+/// run before tracing is initialised — an rcfile may carry `logLevel`, so the
+/// `warn!` that [`apply_rcfile_defaults`] would emit fires before any subscriber
+/// exists and is never seen. They go to stderr here *and* back to the caller,
+/// which re-emits them through `tracing` once there is a subscriber. Both, not
+/// either: stderr is what survives a `logLevel` that filters `warn` away (and an
+/// `init_tracing` that panics), and `tracing` is what reaches a log pipeline
+/// that is not collecting stderr. Neither channel alone covers the other's gap.
+///
+/// # Errors
+///
+/// The rcfile the operator named cannot be read, parsed, or applied. The error
+/// is returned whole rather than rendered here: `{e}` prints only the outermost
+/// context, which does name the file (upstream #946) but drops the source under
+/// it — and that source is serde's line and column (upstream #1004). The caller
+/// propagates with `?`, so the full chain reaches the operator.
+///
+/// [`apply_rcfile_defaults`]: rift_cluster_base::rift_http_proxy::bootstrap::apply_rcfile_defaults
+pub fn apply_rcfile(cli: &mut EeCli) -> anyhow::Result<Vec<String>> {
+    let Some(rcfile) = cli.oss.rcfile.clone() else {
+        return Ok(Vec::new());
+    };
+    let warnings = apply_rcfile_defaults_reporting(&mut cli.oss, &rcfile)?
+        .into_iter()
+        .map(|key| {
+            // Upstream's own wording and formatting (`main.rs`), unquoted path
+            // included: this crate's promise is behaviour identity, and an
+            // operator grepping their logs should not have to match two spellings.
+            format!(
+                "--rcfile {}: unsupported key '{key}' (ignored)",
+                rcfile.display()
+            )
+        })
+        .collect::<Vec<_>>();
+    for warning in &warnings {
+        eprintln!("Warning: {warning}");
+    }
+    Ok(warnings)
 }
 
 /// Write this process's PID to `--pidfile`, if one was given.
@@ -264,8 +297,9 @@ mod tests {
         let rc = write(&dir, "rc.json", r#"{"port": 4321, "logLevel": "warn"}"#);
         let mut c = cli(&["--rcfile", &rc.to_string_lossy()]);
 
-        assert!(
-            apply_rcfile(&mut c).is_none(),
+        assert_eq!(
+            apply_rcfile(&mut c).expect("a good rcfile applies"),
+            Vec::<String>::new(),
             "a good rcfile warns about nothing"
         );
 
@@ -281,40 +315,99 @@ mod tests {
         let rc = write(&dir, "rc.json", r#"{"port": 4321}"#);
         let mut c = cli(&["--port", "9999", "--rcfile", &rc.to_string_lossy()]);
 
-        assert!(apply_rcfile(&mut c).is_none());
+        assert!(
+            apply_rcfile(&mut c)
+                .expect("a good rcfile applies")
+                .is_empty()
+        );
 
         assert_eq!(c.oss.port, 9999);
     }
 
-    /// AC2: a broken rcfile warns and startup continues, matching the core binary.
+    /// Pins D-77: a malformed rcfile refuses startup rather than warning, and
+    /// the whole error chain survives, so the file and serde's line and column
+    /// reach the operator (upstream #946/#1004).
     #[test]
-    fn rcfile_invalid_is_not_fatal() {
+    fn rcfile_invalid_is_fatal() {
         let dir = TempDir::new().expect("tempdir");
         let rc = write(&dir, "rc.json", "not json at all");
         let mut c = cli(&["--port", "8080", "--rcfile", &rc.to_string_lossy()]);
 
-        let warning = apply_rcfile(&mut c).expect("a malformed rcfile must be reported");
+        let e = apply_rcfile(&mut c).expect_err("a malformed rcfile must refuse startup");
+        let chain = format!("{e:#}");
         assert!(
-            warning.contains("rc.json"),
-            "the warning must name the file: {warning}"
+            chain.contains("rc.json"),
+            "the error must name the file: {chain}"
+        );
+        assert!(
+            chain.contains("line") || chain.contains("column"),
+            "the serde position must survive the chain: {chain}"
         );
 
         assert_eq!(c.oss.port, 8080, "a bad rcfile must not disturb the flags");
     }
 
-    /// AC2: a missing rcfile is likewise non-fatal.
+    /// Pins D-77: an rcfile the operator named but that does not exist refuses
+    /// startup. Starting anyway ran with defaults the operator never chose.
     #[test]
-    fn rcfile_missing_is_not_fatal() {
+    fn rcfile_missing_is_fatal() {
         let dir = TempDir::new().expect("tempdir");
-        let mut c = cli(&[
-            "--rcfile",
-            &dir.path().join("absent.json").to_string_lossy(),
-        ]);
+        let absent = dir.path().join("absent.json");
+        let mut c = cli(&["--rcfile", &absent.to_string_lossy()]);
 
+        let e = apply_rcfile(&mut c).expect_err("a missing rcfile must refuse startup");
         assert!(
-            apply_rcfile(&mut c).is_some(),
-            "an rcfile the operator named but that does not exist must be reported, not ignored"
+            format!("{e:#}").contains("absent.json"),
+            "the error must name the file: {e:#}"
         );
+    }
+
+    /// Pins D-77, and the reason it is not merely cosmetic. Upstream #1114 made a
+    /// wrong-typed key refuse the *whole* rcfile, so the old warn-and-continue
+    /// would have started this server with `requireAdminAuth` off — the admin
+    /// plane on every interface with no authentication, which is the exact
+    /// fail-open #1114 closed (issue #589).
+    #[test]
+    fn a_type_error_refuses_rather_than_dropping_require_admin_auth() {
+        let dir = TempDir::new().expect("tempdir");
+        let rc = write(
+            &dir,
+            "rc.json",
+            r#"{"localOnly": "yes", "requireAdminAuth": true}"#,
+        );
+        let mut c = cli(&["--rcfile", &rc.to_string_lossy()]);
+
+        let e = apply_rcfile(&mut c).expect_err("a wrong-typed key must refuse the rcfile");
+        assert!(
+            format!("{e:#}").contains("localOnly"),
+            "the error must name the offending key: {e:#}"
+        );
+        assert!(
+            !c.oss.require_admin_auth,
+            "the refusal must apply nothing — this is what makes continuing unsafe"
+        );
+    }
+
+    /// An unrecognised key is advisory, not fatal: it is reported for the caller
+    /// to re-emit through `tracing`, and the recognised keys still apply.
+    #[test]
+    fn an_unsupported_key_is_reported_and_does_not_refuse() {
+        let dir = TempDir::new().expect("tempdir");
+        let rc = write(&dir, "rc.json", r#"{"port": 4321, "mountebankOnly": 1}"#);
+        let mut c = cli(&["--rcfile", &rc.to_string_lossy()]);
+
+        let warnings = apply_rcfile(&mut c).expect("an unsupported key is not fatal");
+        assert_eq!(
+            warnings.len(),
+            1,
+            "one unsupported key, one warning: {warnings:?}"
+        );
+        assert!(
+            warnings[0].contains("mountebankOnly") && warnings[0].contains("rc.json"),
+            "the warning must name the key and the file: {warnings:?}"
+        );
+
+        assert_eq!(c.oss.port, 4321, "the recognised keys still apply");
     }
 
     /// AC6: the PID file is what makes `stop`/`restart` mean anything.
@@ -577,7 +670,9 @@ mod tests {
 
         let mut c = cli(&["--rcfile", &rc.to_string_lossy()]);
         assert!(
-            apply_rcfile(&mut c).is_none(),
+            apply_rcfile(&mut c)
+                .expect("a well-formed rcfile applies")
+                .is_empty(),
             "a well-formed rcfile must apply without complaint"
         );
         assert_eq!(
