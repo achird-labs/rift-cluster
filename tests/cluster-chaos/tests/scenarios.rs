@@ -61,8 +61,8 @@ const C14_STORM_WRITES: u16 = 100;
 /// 13 ms miss — on a budget that already includes an election and a barrier
 /// timeout. A regression in failover would not land 0.26% over that. What gates
 /// is liveness — writes resume at all, within `3 ×` this — and durability; the
-/// figure itself is emitted with `chaos_artifact!` so it is trended across runs,
-/// where a regression shows as a moved distribution. This constant still sizes
+/// figure itself is emitted with `chaos_artifact!` and uploaded with each run,
+/// where a regression shows as a moved distribution across runs. This constant still sizes
 /// that liveness wait and still documents what the figure should look like.
 ///
 /// **Why this and not `/_fleet/members`.** The membership view is live and the
@@ -1290,8 +1290,9 @@ async fn c14_leader_kill_keeps_every_acknowledged_write() {
     // Recorded, not gated (D-80): a single sample on a shared runner cannot tell
     // a slow failover from a slow runner, and the gate failed on a 13 ms miss.
     // Liveness is what `time_until_writes_resume` already enforced above — it
-    // panics if writes never resume inside `3 × FAILOVER_WRITE_BOUND` — and the
-    // durability claims below are untouched.
+    // returns an error if writes never resume inside `3 × FAILOVER_WRITE_BOUND`,
+    // which the `unwrap_or_else` turns into a panic — and the durability claims
+    // below are untouched.
     chaos_artifact!(
         "c14 artifact: writes resumed {resumed:?} after the leader was killed \
          (expected ~{FAILOVER_WRITE_BOUND:?}: election <= 3s + barrier timeout 2s; \

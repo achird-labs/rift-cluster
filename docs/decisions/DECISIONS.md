@@ -3288,10 +3288,11 @@ quarter of a percent over that. The shard went red, the PR in front of it waited
 re-run proved nothing.
 
 **The rule.** C14 keeps both of its real claims as gates. Liveness was already enforced separately:
-`time_until_writes_resume` panics if writes do not resume within `3 × FAILOVER_WRITE_BOUND`, and that
-stays. The latency figure is emitted with `chaos_artifact!` (D-67), so it lands in the per-shard
-artifact log and is trended across runs — a regression shows as a moved distribution, which is what
-"failover got slower" actually means. `FAILOVER_WRITE_BOUND` keeps its derivation and still sizes the
+`time_until_writes_resume` returns an error if writes do not resume within `3 × FAILOVER_WRITE_BOUND`,
+and C14 turns that error into a panic. That stays. The latency figure is emitted with `chaos_artifact!` (D-67), so it lands in the per-shard
+artifact log, uploaded per shard per run — a regression shows as a moved distribution, which is what
+"failover got slower" actually means. Nothing aggregates those logs today, so comparing runs is a
+manual read of the artifacts; that is a gap in tooling, not in what is recorded. `FAILOVER_WRITE_BOUND` keeps its derivation and still sizes the
 liveness wait; it now documents the expected figure rather than failing on it.
 
 **Same shape as D-42.** C6 had a single-sample timing gate on the same infrastructure, and D-42
@@ -3314,6 +3315,7 @@ is not worth multiplying C14. *Rejected:* quarantining C14 — its durability cl
 ones and are not flaky; quarantine would drop them to silence one noisy assertion.
 
 **Residual, stated:** nothing now fails the build if failover genuinely slows from 5 s to, say,
-12 s — that is inside the liveness bound. Such a regression is visible only in the artifact trend. It
+12 s — that is inside the liveness bound. Such a regression is visible only by reading the recorded
+figures across runs, which nothing does automatically. It
 is the honest limit of what one sample on a shared runner can prove, and the reason the figure is
 recorded rather than discarded.
