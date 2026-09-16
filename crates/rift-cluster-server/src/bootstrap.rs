@@ -410,6 +410,35 @@ mod tests {
         assert_eq!(c.oss.port, 4321, "the recognised keys still apply");
     }
 
+    /// Pins #592 (upstream #1132): `apiKey` is now a recognised rcfile key. It used
+    /// to fall into the unsupported arm, so a credential written into an rcfile was
+    /// answered with one advisory line and the server started with no key at all.
+    #[test]
+    fn an_rcfile_api_key_is_applied_rather_than_reported() {
+        let dir = TempDir::new().expect("tempdir");
+        let rc = write(&dir, "rc.json", r#"{"apiKey": "s3cr3t"}"#);
+        let mut c = cli(&["--rcfile", &rc.to_string_lossy()]);
+
+        let warnings = apply_rcfile(&mut c).expect("an rcfile api key applies");
+        assert!(
+            warnings.is_empty(),
+            "a recognised key must not be reported as unsupported: {warnings:?}"
+        );
+        assert_eq!(c.oss.api_key.as_deref(), Some("s3cr3t"));
+    }
+
+    /// The same "flags win" rule every other rcfile key follows: an operator who
+    /// typed `--api-key` must not have it silently replaced by a file.
+    #[test]
+    fn an_api_key_flag_outranks_the_rcfile() {
+        let dir = TempDir::new().expect("tempdir");
+        let rc = write(&dir, "rc.json", r#"{"apiKey": "from-rcfile"}"#);
+        let mut c = cli(&["--api-key", "from-flag", "--rcfile", &rc.to_string_lossy()]);
+
+        apply_rcfile(&mut c).expect("applies");
+        assert_eq!(c.oss.api_key.as_deref(), Some("from-flag"));
+    }
+
     /// AC6: the PID file is what makes `stop`/`restart` mean anything.
     #[test]
     fn pidfile_is_written() {
