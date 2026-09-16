@@ -445,3 +445,146 @@ fn a_good_rcfile_still_starts_and_reports_its_unsupported_keys() {
         "an unsupported key must still be reported, on stderr, before any subscriber exists: {stderr}"
     );
 }
+
+/// A stand-in admin plane: answers `200` to every request on an ephemeral
+/// loopback port, for as long as the test runs.
+fn healthy_listener() -> u16 {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().expect("local_addr").port();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { break };
+            let mut buf = [0u8; 1024];
+            let _ = stream.read(&mut buf);
+            let _ = stream
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n");
+        }
+    });
+    port
+}
+
+/// A loopback address nothing is listening on, so `healthcheck_url`'s
+/// clustered-mode detection answers "not clustered" regardless of what else runs
+/// on this machine. Bound and dropped, so another process could take the port in
+/// between. In this test binary nothing else binds a listener that answers, so the
+/// race is theoretical here — but it is not self-reporting: a port reused by
+/// something answering `200` on `/healthz` would make the probe test pass without
+/// testing the rcfile.
+fn closed_addr() -> String {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    listener.local_addr().expect("local_addr").to_string()
+}
+
+/// Pins #593 (upstream #1133) against the real binary: `healthcheck` probes the
+/// port an rcfile sets. It used to compute its target before the rcfile was
+/// applied, so a deployment configured through an rcfile ran a server on one port
+/// and a container probe that knocked on 2525 forever.
+///
+/// The power of this test assumes nothing answers `200` on 2525 — true in CI.
+/// Under the regression the probe targets 2525 and is refused.
+#[test]
+fn healthcheck_probes_the_port_an_rcfile_sets() {
+    let port = healthy_listener();
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let rcfile = dir.path().join("rc.json");
+    std::fs::write(&rcfile, format!(r#"{{"port": {port}}}"#)).expect("write rcfile");
+
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_rift-cluster-server"))
+        .args([
+            "--rcfile",
+            &rcfile.to_string_lossy(),
+            "--cluster-probe-bind",
+            &closed_addr(),
+            "healthcheck",
+        ])
+        .output()
+        .expect("run the binary");
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "the probe must reach the rcfile's port {port}, not the default: {stderr}"
+    );
+}
+
+/// The other half of #593: a refused rcfile refuses the probe. A server started
+/// with that file would not have started either, so "unhealthy" is the true
+/// answer — and the operator is told which file, not handed a connection error
+/// against a port nobody configured.
+#[test]
+fn a_refused_rcfile_refuses_the_healthcheck_and_names_the_file() {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let rcfile = dir.path().join("broken.json");
+    std::fs::write(&rcfile, "not json at all").expect("write rcfile");
+
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_rift-cluster-server"))
+        .args([
+            "--rcfile",
+            &rcfile.to_string_lossy(),
+            "--cluster-probe-bind",
+            &closed_addr(),
+            "healthcheck",
+        ])
+        .output()
+        .expect("run the binary");
+
+    assert!(
+        !out.status.success(),
+        "a refused rcfile is an unhealthy verdict"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("broken.json"),
+        "the verdict must name the rcfile, not a port nobody configured: {stderr}"
+    );
+}
+
+/// Pins #594 (upstream #1134) against the real binary: an unrecognised
+/// `--loglevel` refuses startup with the value named. It used to become `info`
+/// silently, in both binaries, because this one carried a copy of upstream's
+/// filter logic rather than calling it.
+///
+/// `stop` against an absent PID file is the cheapest program that passes through
+/// tracing initialisation: it reaches `init_tracing`, then fails for its own,
+/// distinguishable reason.
+#[test]
+fn an_unknown_log_level_refuses_startup_and_a_real_one_does_not() {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let pidfile = dir.path().join("absent.pid");
+    let run = |level: &str| {
+        std::process::Command::new(env!("CARGO_BIN_EXE_rift-cluster-server"))
+            .args([
+                "--loglevel",
+                level,
+                "stop",
+                "--pidfile",
+                &pidfile.to_string_lossy(),
+            ])
+            .env_remove("RUST_LOG")
+            .output()
+            .expect("run the binary")
+    };
+
+    let refused = run("warnn");
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(!refused.status.success());
+    assert!(
+        stderr.contains("warnn"),
+        "the refusal must echo the level the operator typed: {stderr}"
+    );
+    assert!(
+        !stderr.contains("PID file not found"),
+        "a bad level must be refused before the subcommand runs: {stderr}"
+    );
+
+    // `trace` is a real level and must not be refused. This half guards against
+    // refusing too much; it does not prove `trace` is *honoured* — the old code
+    // turned it into `info` and `stop` still ran, so it passed then too.
+    let accepted = run("trace");
+    let stderr = String::from_utf8_lossy(&accepted.stderr);
+    assert!(
+        stderr.contains("PID file not found"),
+        "`trace` must pass tracing initialisation and reach the subcommand: {stderr}"
+    );
+}
