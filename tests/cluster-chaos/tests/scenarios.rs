@@ -4292,6 +4292,77 @@ async fn c33_spray(live: &[usize], rounds: usize) -> anyhow::Result<Vec<String>>
     Ok(bodies)
 }
 
+/// Wait for the ring to answer every live node's decisions again.
+///
+/// `wait_all_ready`, `wait_cluster_formed` and `wait_converged` are all
+/// *liveness*: the process is up, the fleet has re-formed, the imposter is
+/// rebound. None of them says the returned owner has **re-taken the cursor
+/// key**, which is what Phase 3 goes on to assert. Between the last of those
+/// waits and the first sprayed decision there is a window in which every node is
+/// healthy and the key is still homed on a node that has not claimed it yet — so
+/// the decision degrades *correctly*, and the assertion fails for a reason the
+/// scenario is not about. Observed on PR #543: 3 fallbacks out of 3 sprayed,
+/// green on a re-run of the same commit, with the bump provably unreachable from
+/// this path.
+///
+/// This is a **convergence poll against a real surface** — the house rule at the
+/// top of this file — and deliberately *not* a retry of the assertion, which the
+/// rule beneath it forbids. Nothing is weakened: the caller still demands zero
+/// fallbacks across a full spray, and a ring that never re-takes the key still
+/// fails. It now says so, instead of reporting a bare count mismatch.
+///
+/// **Every live node is probed each round**, not just one. The key is homed on
+/// exactly one of them, and one node answering from the ring is not evidence
+/// that the node the next sprayed request lands on will.
+///
+/// The probes are decisions like any other: they advance the cursor, and while
+/// degraded they move the fallback counter. Both are why this must run *before*
+/// the caller reads its baseline — D-8 already permits the post-recovery
+/// sequence to start anywhere, and the fallbacks absorbed here are exactly the
+/// ones the wait exists to outlast.
+async fn c33_wait_ring_answers(live: &[usize], timeout: Duration) -> anyhow::Result<()> {
+    let deadline = std::time::Instant::now() + timeout;
+    let mut last = None;
+    loop {
+        let mut degraded = 0;
+        for &i in live {
+            // An error or a non-200 is "not yet", the same rule `wait_converged_on`
+            // follows — a node that is still settling legitimately refuses. It is
+            // carried into the timeout message rather than discarded, because a
+            // read failure presenting as a bare count is what leaves nothing to act
+            // on. D-47 means a non-200 here is its own defect, so it is named too.
+            match c33_cycle(i).await {
+                Ok((200, _, true)) => {}
+                Ok((200, _, false)) => {
+                    degraded += 1;
+                    last = Some(format!("{} answered from a local cursor", NODES[i].name));
+                }
+                Ok((status, body, _)) => {
+                    degraded += 1;
+                    last = Some(format!("{} answered {status}: {body}", NODES[i].name));
+                }
+                Err(e) => {
+                    degraded += 1;
+                    last = Some(format!("{}: {e}", NODES[i].name));
+                }
+            }
+        }
+        if degraded == 0 {
+            return Ok(());
+        }
+        anyhow::ensure!(
+            std::time::Instant::now() < deadline,
+            "the ring did not answer again within {timeout:?} after the owner returned \
+             ({degraded}/{} probes still degraded; last: {}). Ready, formed and converged \
+             all held, so this is the owner never re-taking the cursor key — a stall, not \
+             a slow start",
+            live.len(),
+            last.as_deref().unwrap_or("none recorded"),
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
 /// C33 — owner-mode sequencing under an LB-shaped spray, the owner's death, and
 /// its return.
 ///
@@ -4452,6 +4523,14 @@ async fn c33_owner_mode_sequencing_cycles_fleet_wide_and_degrades_on_owner_kill(
     wait_converged(u64::from(port), CONVERGE_TIMEOUT)
         .await
         .expect("the imposter is rebound on the returned owner");
+
+    // The three waits above are liveness; none of them gates on the returned
+    // owner re-taking the cursor key, which is precisely what the assertion
+    // below is about. Poll that surface directly, before the baseline is read,
+    // so the fallbacks the wait absorbs cannot be counted against the spray.
+    c33_wait_ring_answers(&all, CONVERGE_TIMEOUT)
+        .await
+        .expect("the ring answers again once the owner is back");
 
     let before = c33_fallbacks(&all).await;
     let bodies = c33_spray(&all, 3).await.expect("spray after recovery");
