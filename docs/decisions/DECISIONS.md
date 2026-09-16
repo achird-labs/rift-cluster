@@ -544,10 +544,12 @@ separate question; this entry does not settle them.
 ### D-22 — Liveness probes bypass the peer-health gate
 > **Amended by D-78** (2026-09-16, #597): the exemption below is unchanged — `probe` still ignores
 > the mark entirely, and every liveness mechanism still uses it. What changed is the gate it
-> bypasses: `is_healthy` is now **half-open**, admitting one trial call per 250ms to a tripped peer.
+> bypasses: the gate (`PeerHealth::admit`) is now **half-open**, admitting one trial call per 250ms to a
+> tripped peer.
 > The rule below fixed the *leader's* stale mark suppressing heartbeats; on a **follower** nothing
 > cleared the mark at all, because `probe`'s only caller is gated on `!leading()`, so every
-> owner-routed data-plane op to a restarted peer failed for the full cooldown (#597).
+> owner-routed data-plane op to a restarted peer failed (CAS, proxyOnce) or degraded (sequencing) for
+> the full cooldown (#597).
 - **Status:** active
 - **Decided:** 2026-08-24 · #431
 - **Implemented by:** #431, #442, #449
@@ -3290,7 +3292,8 @@ every request to a peer that was up and answering.
 
 **This was never only about sequencing.** Every owner-routed store reaches a peer through
 `bridge.call` → `RaftNode::call_member` → `RpcClient::call`, behind the same gate: the sequencer,
-the flow store and the durable shard, proxyOnce claims. D-10 makes sequencing *degrade* on a refused
+the flow store, proxyOnce claims. (The sequencer's reset fan-out is spawned rather than run under
+`bridge.call`, but reaches the same `call`.) D-10 makes sequencing *degrade* on a refused
 call, but CAS and proxyOnce **reject**. One peer restarting therefore made each follower refuse
 every flow-state op homed on that peer for five seconds, on an otherwise healthy fleet. That is an
 availability defect in the product, and it is the whole reason for this decision.
@@ -3308,9 +3311,18 @@ suppressing heartbeats to a restarted voter, livelocking the fleet — and fixed
 liveness probes. The data path was never in that fix's frame, and its symptom is a degraded-but-200
 response that looks exactly like D-47 working as designed.
 
-**The rule.** While a peer is marked unhealthy, `is_healthy` admits **one trial call per
+**The rule.** While a peer is marked unhealthy, the gate admits **one trial call per
 `DEFAULT_HALF_OPEN_INTERVAL` (250 ms), one at a time**. A success clears the mark outright; a
-liveness failure closes the window, re-arms the cooldown and restarts the pacing. Liveness probes
+liveness failure closes the window, re-arms the cooldown and restarts the pacing.
+
+**"One at a time" needs a token, so `PeerHealth` hands one out.** `admit` returns an `Admission`
+— `Healthy`, `Trial` or `Refused` — and the caller hands it back to `record_success`,
+`record_failure` or `release`. A first revision returned a `bool` and let *any* failure close an
+outstanding trial; review found that a call admitted while the peer still looked healthy, failing
+after the peer tripped and a trial went out, closed that trial's window. Against a peer that never
+answers, each such misattribution let another trial out beside the first — up to one per interval,
+~9 stalled callers per peer for a 2.35 s blackholed call, enough to exhaust the bridge's
+data-plane permits. With the token, only `Admission::Trial` closes a trial. Liveness probes
 still bypass the gate entirely — **D-22 is unchanged**, and `probe` remains the only thing that may
 ignore the mark rather than be metered by it.
 
@@ -3318,9 +3330,10 @@ ignore the mark rather than be metered by it.
 against a peer known to be down. It was never meant to stop **anyone** discovering that the peer is
 back. An open circuit conflates the two; a half-open one does not.
 
-**Two bounds, both stated.** *Cost during a real outage:* at most one caller per peer per interval
-pays a deadline, because `trial_open` refuses a second trial while one is outstanding — the pacing
-interval is not what bounds the cost, and that is why it can be short. *Recovery after a restart:*
+**Two bounds, both stated.** *Cost during a real outage:* at most one trial caller per peer is in
+flight, because `trial_open` refuses a second trial while one is outstanding and only that trial's
+own outcome can clear it — the pacing interval is not what bounds the cost, and that is why it can
+be short. *Recovery after a restart:*
 one interval plus one call, instead of five seconds.
 
 **The window opens at the trip, not on the next call.** A peer that has just failed tells us
@@ -3329,9 +3342,15 @@ tests a way to ask for the old open-circuit behaviour — an interval longer tha
 how `probe_reaches_a_peer_the_tracker_marks_unhealthy_and_clears_the_mark` keeps pinning D-22
 against a genuinely closed gate.
 
+**A deadline the caller chose releases the trial.** `call_once` — the path Raft replication and
+snapshot transfers take — used to record nothing on its own deadline expiring (#442: that expiry
+says nothing about the peer). Under a half-open gate "nothing" leaves the trial outstanding, so the
+expiry now calls `release`: the window reopens, and the mark is neither cleared nor re-armed.
+
 **A trial that reports back neither way degrades to the old behaviour, deliberately.** If an outer
-deadline drops the caller's future, `trial_open` stays set and the entry then behaves exactly as it
-did before this decision: the cooldown expires and clears it. The worst case is the status quo,
+deadline drops the caller's future — `bridge.call`'s 2 s deadline does this to every trial against a
+blackholed peer, which needs ~2.35 s to fail — `trial_open` stays set and the entry then behaves
+exactly as it did before this decision: the cooldown expires and clears it. The worst case is the status quo,
 never worse — which is why there is no abandon timer, a second timeout to derive, tune and get
 wrong.
 
@@ -3350,6 +3369,9 @@ the leader — new surface, and the leader's view of a peer is not the follower'
 owner-bound ops via the leader — that is D-47's design, not a bug in it.
 
 **Residual, stated:** the interval is a fixed constant rather than adaptive, so a peer that is down
-for hours is trialled roughly four times a second per node. Each trial costs one caller one
-deadline and no more, and the alternative — backing the interval off as the outage lengthens —
-would make recovery slowest exactly when a long outage finally ends.
+for hours keeps being trialled. For one that refuses connections quickly, that is one trial every
+~600 ms per node (the interval plus ~350 ms of retry backoff, pacing restarting at each failure);
+the steady case that matters most is D-28's name resolving to several addresses with one
+permanently dead, where the old cost was ~3 callers paying ~350 ms of backoff per 5 s cycle and the
+new cost is ~8 trials per 5 s, each one caller at a time. The alternative — backing the interval
+off as an outage lengthens — would make recovery slowest exactly when a long outage finally ends.

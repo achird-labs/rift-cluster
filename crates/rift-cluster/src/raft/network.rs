@@ -342,10 +342,11 @@ impl PeerClient {
         // The steady-state cost of a permanently-dead address is bounded, not
         // zero: `RpcClient` tracks health per `SocketAddr`, so after
         // `DEFAULT_FAILURE_THRESHOLD` consecutive failures that address is
-        // fast-failed for the cooldown instead of burning a connect timeout,
-        // and the live one is reached without any pinning state of our own.
-        // Each cooldown expiry lets it be tried once more — which is the point,
-        // since an address that comes back must be usable again.
+        // fast-failed instead of burning a connect timeout, and the live one is
+        // reached without any pinning state of our own. Since D-78 the tracker
+        // is half-open, so the dead address is re-tried by one trial call per
+        // `DEFAULT_HALF_OPEN_INTERVAL` (250ms), one at a time — which is the
+        // point, since an address that comes back must be usable again.
         // A bulk transfer's deadline is a budget for this whole send, not for each address in
         // turn. openraft wraps the entire `install_snapshot` call in its own
         // `install_snapshot_timeout` and abandons the transfer when that fires, so a per-address
@@ -1924,7 +1925,12 @@ mod tests {
         let dead: SocketAddr = "127.0.0.1:1".parse().expect("addr");
         // Threshold 1 so a single failure is enough; the production default is
         // 3, and this test is about the composition, not the tuning.
-        let health = Arc::new(TrackedPeerHealth::with_params(1, Duration::from_secs(60)));
+        // No half-open trials (D-78): this pins the composition of fan-out with a
+        // *closed* gate, and a trial admitted within the test would re-dial.
+        let health = Arc::new(
+            TrackedPeerHealth::with_params(1, Duration::from_secs(60))
+                .with_half_open_interval(Duration::from_secs(600)),
+        );
         let client = RpcClient::new(
             None,
             health.clone(),
