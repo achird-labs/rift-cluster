@@ -43,10 +43,13 @@ fifth, **Record**, is on the imposter detail, because it acts on one imposter:
 
 - **Export** — a dialog, because what lands in the file (replay-ready vs as-configured, proxies
   kept or folded) needs more than a button label. A whole-set export is byte-preserving so the
-  same fleet exports to the same file (`features/imposters/portable.ts`). The dialog also carries
-  an *include TLS material* toggle, off by default, that the export route does not yet honour
-  (`EXPORT_TLS_IS_INERT`); whether an export should carry an https imposter's private key unless
-  asked is an open decision, #367, and this line changes with it.
+  same fleet exports to the same file (`features/imposters/portable.ts`). **TLS material is
+  opt-in in the file, not in the route (D-84).** The route returns each imposter's config verbatim,
+  an https imposter's own `cert` and `key` included, as Mountebank does; the dialog's *include TLS
+  material* option, off by default, decides whether the downloaded file keeps that pair. With it
+  off, `cert` and `key` are removed before download and `ca`, `mutualAuth` and
+  `rejectUnauthorized` stay. The detail screen's single-imposter export always removes the pair
+  and says so; *Duplicate* keeps it, because the copy stays in a fleet that already holds the key.
 - **Import** — this console's own export format back in: a single imposter, an
   `{"imposters": [...]}` document or a bare list, with a pre-flight (which ports, which already
   exist, which repeat) and a choice between *Add* (N calls, reported per item) and *Replace all*
