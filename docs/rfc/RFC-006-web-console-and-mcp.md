@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | v1 — **partly retired**: §8 (MCP) by D-71; tenancy and principals throughout by D-73; the fleet request-log merge by D-74 (RFC-007 §3.2). The console design (§3–§7, §9) stands as amended at each section |
+| **Status** | v1 — **partly retired**: §8 (MCP) by D-71; tenancy and principals throughout by D-73; the fleet request-log merge by D-74 (RFC-007 §3.2). The console design (§3–§7, §9.1–§9.3, §9.5) stands as amended at each section |
 | **Tracking issue** | [achird-labs/rift-cluster#150](https://github.com/achird-labs/rift-cluster/issues/150) (console, M6a) · [#151](https://github.com/achird-labs/rift-cluster/issues/151) (MCP, M6b) |
 | **Canonical location** | `rift-cluster:docs/rfc/RFC-006-web-console-and-mcp.md` |
 | **Depends on** | **RFC-002** (principals, roles, API keys — the console's auth substrate); **ADR-001 / #14** (the control plane every write lands in). References, without depending on for v1: RFC-004 (spec-driven mocking), RFC-005 (data sources & state), `docs/architecture/07-verification-plane.md`, `docs/architecture/13-router.md` |
@@ -297,9 +297,12 @@ minted once and stored as a control-plane record (`ControlOp::SessionKeyPut`) �
 every node verifies without coordination, and a login is not a Raft write.
 Revocation is honest about its bounds: the cookie proves authentication and
 there is no identity behind it to disable, so the 8-hour `Max-Age` bounds the
-window in which a *stolen cookie* outlives its theft, and rotating the signing
-key (a new `SessionKeyPut`; `kr` is its revision) invalidates every session on
-every node at once. What v1 does not have is per-session server-side revocation — stated in
+window in which a *stolen cookie* outlives its theft, and a new signing key (a
+new `SessionKeyPut`; `kr` is its revision) would invalidate every session on
+every node at once. **Nothing issues one today (#619):** the front mints only the first
+key (`ensure_session_key`), and no route or flag rotates it — so the 8-hour
+`Max-Age` is, in practice, the only bound. Changing `--api-key` does not end
+sessions minted under the old key. What v1 does not have is per-session server-side revocation — stated in
 §10, not hidden.
 
 **CSRF.** `SameSite=Strict` plus a double-submit custom header: the SPA sends
@@ -606,8 +609,8 @@ RFC-002. The cluster *secret* and the write/RPC surface stay where they are.
 
 ## 11. Phasing
 
-> **Amended by D-71** (RFC-007 §3.2, #547): milestones M1–M3 shipped and were then removed with
-> the MCP server; the console milestones stand.
+> **Amended by D-71** (RFC-007 §3.2, #547): milestones M1 (#417) and M2 (#423) shipped and were
+> removed with the MCP server (#560); M3 was never built. The console milestones stand.
 
 Console slices `feat(console): …`, MCP slices `feat(mcp): …`, ~1 PR each.
 C1–C3 are strictly ordered; C4+ and M1+ parallelize.

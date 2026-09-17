@@ -315,8 +315,6 @@ paths:
           headers:
             Rift-Cluster-Revision:
               $ref: '#/components/headers/RiftClusterRevision'
-            Rift-Cluster-Bind-Failures:
-              $ref: '#/components/headers/RiftClusterBindFailures'
             Rift-Cluster-Op-Id:
               $ref: '#/components/headers/RiftClusterOpId'
           content:
@@ -368,10 +366,10 @@ paths:
         '200':
           description: The imposter.
           headers:
-            Rift-Cluster-Revision:
-              $ref: '#/components/headers/RiftClusterRevision'
             Rift-Cluster-Bind-Failures:
               $ref: '#/components/headers/RiftClusterBindFailures'
+            Rift-Cluster-Revision:
+              $ref: '#/components/headers/RiftClusterRevision'
             Rift-Cluster-Warnings:
               $ref: '#/components/headers/RiftClusterWarnings'
           content:
@@ -416,10 +414,10 @@ paths:
         '200':
           description: Upstream's own canned message body, byte-identical.
           headers:
-            Rift-Cluster-Revision:
-              $ref: '#/components/headers/RiftClusterRevision'
             Rift-Cluster-Bind-Failures:
               $ref: '#/components/headers/RiftClusterBindFailures'
+            Rift-Cluster-Revision:
+              $ref: '#/components/headers/RiftClusterRevision'
             Rift-Cluster-Op-Id:
               $ref: '#/components/headers/RiftClusterOpId'
           content:
@@ -471,10 +469,10 @@ paths:
         '200':
           description: Upstream's own canned message body, byte-identical.
           headers:
-            Rift-Cluster-Revision:
-              $ref: '#/components/headers/RiftClusterRevision'
             Rift-Cluster-Bind-Failures:
               $ref: '#/components/headers/RiftClusterBindFailures'
+            Rift-Cluster-Revision:
+              $ref: '#/components/headers/RiftClusterRevision'
             Rift-Cluster-Op-Id:
               $ref: '#/components/headers/RiftClusterOpId'
           content:
@@ -546,10 +544,10 @@ paths:
         '200':
           description: The imposter, re-read with the new stub applied.
           headers:
-            Rift-Cluster-Revision:
-              $ref: '#/components/headers/RiftClusterRevision'
             Rift-Cluster-Bind-Failures:
               $ref: '#/components/headers/RiftClusterBindFailures'
+            Rift-Cluster-Revision:
+              $ref: '#/components/headers/RiftClusterRevision'
             Rift-Cluster-Op-Id:
               $ref: '#/components/headers/RiftClusterOpId'
           content:
@@ -609,10 +607,10 @@ paths:
         '200':
           description: The imposter, re-read with the new stub list.
           headers:
-            Rift-Cluster-Revision:
-              $ref: '#/components/headers/RiftClusterRevision'
             Rift-Cluster-Bind-Failures:
               $ref: '#/components/headers/RiftClusterBindFailures'
+            Rift-Cluster-Revision:
+              $ref: '#/components/headers/RiftClusterRevision'
             Rift-Cluster-Op-Id:
               $ref: '#/components/headers/RiftClusterOpId'
           content:
@@ -650,6 +648,9 @@ paths:
       x-rift-origin: upstream
       responses:
         '200':
+          headers:
+            Rift-Cluster-Bind-Failures:
+              $ref: '#/components/headers/RiftClusterBindFailures'
           description: The stub list.
           content:
             application/json:
@@ -704,10 +705,10 @@ paths:
         '200':
           description: The imposter, re-read with the stub replaced.
           headers:
-            Rift-Cluster-Revision:
-              $ref: '#/components/headers/RiftClusterRevision'
             Rift-Cluster-Bind-Failures:
               $ref: '#/components/headers/RiftClusterBindFailures'
+            Rift-Cluster-Revision:
+              $ref: '#/components/headers/RiftClusterRevision'
             Rift-Cluster-Op-Id:
               $ref: '#/components/headers/RiftClusterOpId'
           content:
@@ -754,10 +755,10 @@ paths:
         '200':
           description: The imposter, re-read with the stub removed.
           headers:
-            Rift-Cluster-Revision:
-              $ref: '#/components/headers/RiftClusterRevision'
             Rift-Cluster-Bind-Failures:
               $ref: '#/components/headers/RiftClusterBindFailures'
+            Rift-Cluster-Revision:
+              $ref: '#/components/headers/RiftClusterRevision'
             Rift-Cluster-Op-Id:
               $ref: '#/components/headers/RiftClusterOpId'
           content:
@@ -791,6 +792,9 @@ paths:
       x-rift-origin: upstream
       responses:
         '200':
+          headers:
+            Rift-Cluster-Bind-Failures:
+              $ref: '#/components/headers/RiftClusterBindFailures'
           description: The stub.
           content:
             application/json:
@@ -840,10 +844,10 @@ paths:
         '200':
           description: The imposter, re-read with the stub replaced.
           headers:
-            Rift-Cluster-Revision:
-              $ref: '#/components/headers/RiftClusterRevision'
             Rift-Cluster-Bind-Failures:
               $ref: '#/components/headers/RiftClusterBindFailures'
+            Rift-Cluster-Revision:
+              $ref: '#/components/headers/RiftClusterRevision'
             Rift-Cluster-Op-Id:
               $ref: '#/components/headers/RiftClusterOpId'
           content:
@@ -893,10 +897,10 @@ paths:
         '200':
           description: The imposter, re-read with the stub removed.
           headers:
-            Rift-Cluster-Revision:
-              $ref: '#/components/headers/RiftClusterRevision'
             Rift-Cluster-Bind-Failures:
               $ref: '#/components/headers/RiftClusterBindFailures'
+            Rift-Cluster-Revision:
+              $ref: '#/components/headers/RiftClusterRevision'
             Rift-Cluster-Op-Id:
               $ref: '#/components/headers/RiftClusterOpId'
           content:
@@ -930,6 +934,9 @@ paths:
       x-rift-origin: upstream
       responses:
         '200':
+          headers:
+            Rift-Cluster-Bind-Failures:
+              $ref: '#/components/headers/RiftClusterBindFailures'
           description: The stub.
           content:
             application/json:
@@ -989,6 +996,8 @@ paths:
         '200':
           description: Recorded requests, oldest first (bare array, not an envelope).
           headers:
+            Rift-Cluster-Bind-Failures:
+              $ref: '#/components/headers/RiftClusterBindFailures'
             x-rift-next-index:
               $ref: '#/components/headers/XRiftNextIndex'
             x-rift-truncated:
@@ -1034,6 +1043,9 @@ paths:
         - $ref: '#/components/parameters/JournalMatch'
       responses:
         '200':
+          headers:
+            Rift-Cluster-Bind-Failures:
+              $ref: '#/components/headers/RiftClusterBindFailures'
           description: Requests cleared; answers the imposter as it now stands.
           content:
             application/json:
@@ -1075,6 +1087,8 @@ paths:
         '200':
           description: Matched requests, oldest first (bare array, not an envelope).
           headers:
+            Rift-Cluster-Bind-Failures:
+              $ref: '#/components/headers/RiftClusterBindFailures'
             x-rift-next-index:
               $ref: '#/components/headers/XRiftNextIndex'
             x-rift-truncated:
@@ -1109,6 +1123,9 @@ paths:
         - $ref: '#/components/parameters/JournalMatch'
       responses:
         '200':
+          headers:
+            Rift-Cluster-Bind-Failures:
+              $ref: '#/components/headers/RiftClusterBindFailures'
           description: Requests cleared; answers the imposter as it now stands.
           content:
             application/json:
@@ -1204,6 +1221,9 @@ paths:
         - $ref: '#/components/parameters/JournalMatch'
       responses:
         '200':
+          headers:
+            Rift-Cluster-Bind-Failures:
+              $ref: '#/components/headers/RiftClusterBindFailures'
           description: >
             An open SSE stream. Ends only when the client disconnects or the node stops.
           content:
@@ -1250,6 +1270,9 @@ paths:
               $ref: '#/components/schemas/VerifyOptions'
       responses:
         '200':
+          headers:
+            Rift-Cluster-Bind-Failures:
+              $ref: '#/components/headers/RiftClusterBindFailures'
           description: Verification result.
           content:
             application/json:
@@ -1297,6 +1320,9 @@ paths:
       x-rift-origin: ee
       responses:
         '200':
+          headers:
+            Rift-Cluster-Bind-Failures:
+              $ref: '#/components/headers/RiftClusterBindFailures'
           description: Cleared; answers the imposter as it now stands.
           content:
             application/json:
@@ -1330,6 +1356,9 @@ paths:
         - $ref: '#/components/parameters/FlowIdQuery'
       responses:
         '200':
+          headers:
+            Rift-Cluster-Bind-Failures:
+              $ref: '#/components/headers/RiftClusterBindFailures'
           description: Scenario states, for the flow named in the body.
           content:
             application/json:
@@ -1391,6 +1420,9 @@ paths:
                   description: Which space's slice of the scenario to write. Absent means the imposter's default flow.
       responses:
         '200':
+          headers:
+            Rift-Cluster-Bind-Failures:
+              $ref: '#/components/headers/RiftClusterBindFailures'
           description: State set; the write echoed back as it was applied.
           content:
             application/json:
@@ -1447,6 +1479,9 @@ paths:
                   description: Which space to reset. Absent means the imposter's default flow.
       responses:
         '200':
+          headers:
+            Rift-Cluster-Bind-Failures:
+              $ref: '#/components/headers/RiftClusterBindFailures'
           description: Reset, for the flow named in the body.
           content:
             application/json:
@@ -1507,6 +1542,9 @@ paths:
       x-rift-origin: ee
       responses:
         '200':
+          headers:
+            Rift-Cluster-Bind-Failures:
+              $ref: '#/components/headers/RiftClusterBindFailures'
           description: >
             The imposter's spaces. `spaces: []` with `partial: false` means the imposter
             genuinely holds none right now; `spaces: []` with `partial: true` means the fleet
@@ -1606,6 +1644,9 @@ paths:
       x-rift-origin: upstream
       responses:
         '200':
+          headers:
+            Rift-Cluster-Bind-Failures:
+              $ref: '#/components/headers/RiftClusterBindFailures'
           description: The space.
           content:
             application/json:
@@ -1687,6 +1728,9 @@ paths:
       x-rift-origin: ee
       responses:
         '200':
+          headers:
+            Rift-Cluster-Bind-Failures:
+              $ref: '#/components/headers/RiftClusterBindFailures'
           description: Torn down.
           content:
             application/json:
@@ -1732,6 +1776,9 @@ paths:
       x-rift-origin: upstream
       responses:
         '200':
+          headers:
+            Rift-Cluster-Bind-Failures:
+              $ref: '#/components/headers/RiftClusterBindFailures'
           description: The space's stubs.
           content:
             application/json:
@@ -1780,6 +1827,8 @@ paths:
         '201':
           description: The space and its stubs, including the one just added.
           headers:
+            Rift-Cluster-Bind-Failures:
+              $ref: '#/components/headers/RiftClusterBindFailures'
             Rift-Cluster-Op-Id:
               $ref: '#/components/headers/RiftClusterOpId'
           content:
@@ -1954,6 +2003,9 @@ paths:
       x-rift-origin: upstream
       responses:
         '200':
+          headers:
+            Rift-Cluster-Bind-Failures:
+              $ref: '#/components/headers/RiftClusterBindFailures'
           description: Cleared.
           content:
             application/json:
@@ -2000,6 +2052,9 @@ paths:
       x-rift-origin: upstream
       responses:
         '200':
+          headers:
+            Rift-Cluster-Bind-Failures:
+              $ref: '#/components/headers/RiftClusterBindFailures'
           description: The entry's value.
           content:
             application/json:
@@ -2037,6 +2092,9 @@ paths:
                     beyond `value` are ignored.
       responses:
         '200':
+          headers:
+            Rift-Cluster-Bind-Failures:
+              $ref: '#/components/headers/RiftClusterBindFailures'
           description: Written; the stored entry echoed back.
           content:
             application/json:
@@ -2061,6 +2119,9 @@ paths:
       x-rift-origin: upstream
       responses:
         '200':
+          headers:
+            Rift-Cluster-Bind-Failures:
+              $ref: '#/components/headers/RiftClusterBindFailures'
           description: Deleted.
           content:
             application/json:
@@ -2554,8 +2615,9 @@ paths:
         is no identity for it to resolve to. There is no server-side
         session table and, deliberately, **no per-session revocation**:
         the documented bounds are the 8-hour `Max-Age` and
-        session-signing-key rotation, which invalidates every outstanding
-        session at once. This is a stated limit, not a gap.
+        session-signing-key rotation, which would invalidate every outstanding
+        session at once. No route issues a rotation yet (#619), so `Max-Age`
+        is the bound that holds today.
 
         A fleet running with **no** `--api-key` has an open admin plane
         and nothing to exchange; this answers `400` rather than handing
@@ -3019,9 +3081,10 @@ components:
       description: >
         Present when the answering node holds the addressed imposter but could not bind its
         port, as `<port>=<reason>` (D-81). The imposter is committed fleet-wide and this
-        node serves it in-process only; other nodes may be bound normally. Carried on reads
-        of the imposter and on writes to it — a pause or stub patch that succeeds does not
-        clear it, because neither attempts the bind. Distinct from `Rift-Cluster-Warnings:
+        node serves it in-process only; other nodes may be bound normally. Carried on every
+        port-scoped read and on every write that names a port — a pause or stub patch that
+        succeeds does not clear it, because neither attempts the bind; deleting the imposter
+        does, so a delete never carries it. Distinct from `Rift-Cluster-Warnings:
         local-engine=…`, which covers every way this node failed to realize the config.
       schema:
         type: string

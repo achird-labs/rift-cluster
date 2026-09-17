@@ -2896,6 +2896,8 @@ authorization data would be a second source of truth for a decision the key alre
 **this supersedes D-46**, which refused the legacy `--api-key` a session because the synthetic
 identity it named had no principal row behind it: with one credential there is no other key, so
 the key *is* what the exchange accepts. Rotating `SessionKeyPut` remains the only revocation.
+(As of 2026-09-17 nothing can issue that rotation — the front mints only the first key — so the
+8-hour `Max-Age` is the bound that holds in practice; the trigger is open in #619.)
 
 **Keys lose their tenant component — a true removal, not a `default` shim.** `sm_configs` is keyed
 by `u16`, `sm_routes` by route id, `sm_routes_revision` is a one-row table beside

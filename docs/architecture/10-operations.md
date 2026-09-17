@@ -29,8 +29,9 @@ rift-cluster-server \
                                       # address under --cluster (D-79, below)
 ```
 
-Every flag has an `RIFT_CLUSTER_*` environment form (`crates/rift-cluster-server/src/cli.rs`
-is the source of truth; `docs/rift-cluster-server.md` the full reference).
+Every `--cluster-*` flag has a `RIFT_CLUSTER_*` environment form (`crates/rift-cluster-server/src/cli.rs`
+is the source of truth; `docs/rift-cluster-server.md` the full reference). The last two are
+upstream's own, with upstream's names: `RIFT_REQUIRE_ADMIN_AUTH` and `MB_LOCAL_ONLY`.
 
 There is no `--cluster-degraded-mode` flag: what a node does when a flow's owner is unreachable
 is a per-imposter `readConsistency` setting (D-10, Chapter 9's degradation table), not a
@@ -232,11 +233,13 @@ already holds all committed config. Deriving it from the cluster secret instead 
 rejected: that secret is optional (`--cluster-insecure`), so an unauthenticated fleet would have
 nothing to derive from.
 
-**Rotation is the containment, and it is structural.** Every token carries the key record's
-`revision`; verification refuses a token whose revision is not the current one, so writing a new
-key invalidates every outstanding session at once without sweeping a table. It is also the **only**
-revocation: with one credential there is no principal to disable, so the documented bounds are the
-8-hour `Max-Age` and signing-key rotation, and nothing else. A fleet running with no `--api-key`
+**Rotation would be the containment, and it is structural — but nothing triggers it.** Every
+token carries the key record's `revision`; verification refuses a token whose revision is not the
+current one, so writing a new key would invalidate every outstanding session at once without
+sweeping a table. The front only ever mints the first key, though, and no route or flag writes a
+second: the one bound that actually holds today is the 8-hour `Max-Age` (#619). With one credential there
+is no principal to disable, and changing `--api-key` does not end sessions minted under the old
+key. A fleet running with no `--api-key`
 has nothing to exchange and answers `400` rather than handing out a cookie that proves nothing.
 
 **What the cookie proves.** Authentication, and nothing more — its subject is the constant

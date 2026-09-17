@@ -799,7 +799,7 @@ export interface paths {
          * Exchange an API key for a session cookie
          * @description Terminates. Not a Raft write: the server compares the submitted key against the fleet's `--api-key` in constant time, then mints an HMAC-signed `{subject, issued_at, expiry, key_revision}` token under the fleet's session-signing key (a control-plane record every node verifies from its own applied state) and returns it as an `HttpOnly` cookie — this is the one moment the long-lived API key transits the page (RFC-006 §9.3), so it belongs in component state only, never `localStorage` and never a URL, and should be dropped as soon as this call returns.
          *     The cookie is accepted by **every node**, because the signing key is replicated: a session minted on one node verifies on the next with no second login.
-         *     The cookie proves authentication only — with one credential there is no identity for it to resolve to. There is no server-side session table and, deliberately, **no per-session revocation**: the documented bounds are the 8-hour `Max-Age` and session-signing-key rotation, which invalidates every outstanding session at once. This is a stated limit, not a gap.
+         *     The cookie proves authentication only — with one credential there is no identity for it to resolve to. There is no server-side session table and, deliberately, **no per-session revocation**: the documented bounds are the 8-hour `Max-Age` and session-signing-key rotation, which would invalidate every outstanding session at once. No route issues a rotation yet (#619), so `Max-Age` is the bound that holds today.
          *     A fleet running with **no** `--api-key` has an open admin plane and nothing to exchange; this answers `400` rather than handing out a cookie that proves nothing.
          */
         post: operations["createSession"];
@@ -1611,7 +1611,7 @@ export interface components {
     };
     requestBodies: never;
     headers: {
-        /** @description Present when the answering node holds the addressed imposter but could not bind its port, as `<port>=<reason>` (D-81). The imposter is committed fleet-wide and this node serves it in-process only; other nodes may be bound normally. Carried on reads of the imposter and on writes to it — a pause or stub patch that succeeds does not clear it, because neither attempts the bind. Distinct from `Rift-Cluster-Warnings: local-engine=…`, which covers every way this node failed to realize the config. */
+        /** @description Present when the answering node holds the addressed imposter but could not bind its port, as `<port>=<reason>` (D-81). The imposter is committed fleet-wide and this node serves it in-process only; other nodes may be bound normally. Carried on every port-scoped read and on every write that names a port — a pause or stub patch that succeeds does not clear it, because neither attempts the bind; deleting the imposter does, so a delete never carries it. Distinct from `Rift-Cluster-Warnings: local-engine=…`, which covers every way this node failed to realize the config. */
         RiftClusterBindFailures: string;
         /**
          * @description Present when the answering node has something to say that did not change the outcome. A comma-separated list of `key=value` items. `local-engine=<reason>` means THIS node failed to realize the addressed imposter's committed config — a stored record that will not parse, a refused enable/disable or stub patch, an unreadable TLS cert, or a `flowState` this build will not honour (D-76). The record is committed fleet-wide either way, and other nodes may be serving it normally; this is a per-node observation.
@@ -1801,8 +1801,8 @@ export interface operations {
             /** @description The imposter. */
             200: {
                 headers: {
-                    "Rift-Cluster-Revision": components["headers"]["RiftClusterRevision"];
                     "Rift-Cluster-Bind-Failures": components["headers"]["RiftClusterBindFailures"];
+                    "Rift-Cluster-Revision": components["headers"]["RiftClusterRevision"];
                     "Rift-Cluster-Warnings": components["headers"]["RiftClusterWarnings"];
                     [name: string]: unknown;
                 };
@@ -1847,7 +1847,6 @@ export interface operations {
             200: {
                 headers: {
                     "Rift-Cluster-Revision": components["headers"]["RiftClusterRevision"];
-                    "Rift-Cluster-Bind-Failures": components["headers"]["RiftClusterBindFailures"];
                     "Rift-Cluster-Op-Id": components["headers"]["RiftClusterOpId"];
                     [name: string]: unknown;
                 };
@@ -1895,8 +1894,8 @@ export interface operations {
             /** @description Upstream's own canned message body, byte-identical. */
             200: {
                 headers: {
-                    "Rift-Cluster-Revision": components["headers"]["RiftClusterRevision"];
                     "Rift-Cluster-Bind-Failures": components["headers"]["RiftClusterBindFailures"];
+                    "Rift-Cluster-Revision": components["headers"]["RiftClusterRevision"];
                     "Rift-Cluster-Op-Id": components["headers"]["RiftClusterOpId"];
                     [name: string]: unknown;
                 };
@@ -1947,8 +1946,8 @@ export interface operations {
             /** @description Upstream's own canned message body, byte-identical. */
             200: {
                 headers: {
-                    "Rift-Cluster-Revision": components["headers"]["RiftClusterRevision"];
                     "Rift-Cluster-Bind-Failures": components["headers"]["RiftClusterBindFailures"];
+                    "Rift-Cluster-Revision": components["headers"]["RiftClusterRevision"];
                     "Rift-Cluster-Op-Id": components["headers"]["RiftClusterOpId"];
                     [name: string]: unknown;
                 };
@@ -1992,6 +1991,7 @@ export interface operations {
             /** @description The stub list. */
             200: {
                 headers: {
+                    "Rift-Cluster-Bind-Failures": components["headers"]["RiftClusterBindFailures"];
                     [name: string]: unknown;
                 };
                 content: {
@@ -2041,8 +2041,8 @@ export interface operations {
             /** @description The imposter, re-read with the new stub list. */
             200: {
                 headers: {
-                    "Rift-Cluster-Revision": components["headers"]["RiftClusterRevision"];
                     "Rift-Cluster-Bind-Failures": components["headers"]["RiftClusterBindFailures"];
+                    "Rift-Cluster-Revision": components["headers"]["RiftClusterRevision"];
                     "Rift-Cluster-Op-Id": components["headers"]["RiftClusterOpId"];
                     [name: string]: unknown;
                 };
@@ -2100,8 +2100,8 @@ export interface operations {
             /** @description The imposter, re-read with the new stub applied. */
             200: {
                 headers: {
-                    "Rift-Cluster-Revision": components["headers"]["RiftClusterRevision"];
                     "Rift-Cluster-Bind-Failures": components["headers"]["RiftClusterBindFailures"];
+                    "Rift-Cluster-Revision": components["headers"]["RiftClusterRevision"];
                     "Rift-Cluster-Op-Id": components["headers"]["RiftClusterOpId"];
                     [name: string]: unknown;
                 };
@@ -2146,6 +2146,7 @@ export interface operations {
             /** @description The stub. */
             200: {
                 headers: {
+                    "Rift-Cluster-Bind-Failures": components["headers"]["RiftClusterBindFailures"];
                     [name: string]: unknown;
                 };
                 content: {
@@ -2193,8 +2194,8 @@ export interface operations {
             /** @description The imposter, re-read with the stub replaced. */
             200: {
                 headers: {
-                    "Rift-Cluster-Revision": components["headers"]["RiftClusterRevision"];
                     "Rift-Cluster-Bind-Failures": components["headers"]["RiftClusterBindFailures"];
+                    "Rift-Cluster-Revision": components["headers"]["RiftClusterRevision"];
                     "Rift-Cluster-Op-Id": components["headers"]["RiftClusterOpId"];
                     [name: string]: unknown;
                 };
@@ -2246,8 +2247,8 @@ export interface operations {
             /** @description The imposter, re-read with the stub removed. */
             200: {
                 headers: {
-                    "Rift-Cluster-Revision": components["headers"]["RiftClusterRevision"];
                     "Rift-Cluster-Bind-Failures": components["headers"]["RiftClusterBindFailures"];
+                    "Rift-Cluster-Revision": components["headers"]["RiftClusterRevision"];
                     "Rift-Cluster-Op-Id": components["headers"]["RiftClusterOpId"];
                     [name: string]: unknown;
                 };
@@ -2290,6 +2291,7 @@ export interface operations {
             /** @description The stub. */
             200: {
                 headers: {
+                    "Rift-Cluster-Bind-Failures": components["headers"]["RiftClusterBindFailures"];
                     [name: string]: unknown;
                 };
                 content: {
@@ -2337,8 +2339,8 @@ export interface operations {
             /** @description The imposter, re-read with the stub replaced. */
             200: {
                 headers: {
-                    "Rift-Cluster-Revision": components["headers"]["RiftClusterRevision"];
                     "Rift-Cluster-Bind-Failures": components["headers"]["RiftClusterBindFailures"];
+                    "Rift-Cluster-Revision": components["headers"]["RiftClusterRevision"];
                     "Rift-Cluster-Op-Id": components["headers"]["RiftClusterOpId"];
                     [name: string]: unknown;
                 };
@@ -2390,8 +2392,8 @@ export interface operations {
             /** @description The imposter, re-read with the stub removed. */
             200: {
                 headers: {
-                    "Rift-Cluster-Revision": components["headers"]["RiftClusterRevision"];
                     "Rift-Cluster-Bind-Failures": components["headers"]["RiftClusterBindFailures"];
+                    "Rift-Cluster-Revision": components["headers"]["RiftClusterRevision"];
                     "Rift-Cluster-Op-Id": components["headers"]["RiftClusterOpId"];
                     [name: string]: unknown;
                 };
@@ -2447,6 +2449,7 @@ export interface operations {
             /** @description Recorded requests, oldest first (bare array, not an envelope). */
             200: {
                 headers: {
+                    "Rift-Cluster-Bind-Failures": components["headers"]["RiftClusterBindFailures"];
                     "x-rift-next-index": components["headers"]["XRiftNextIndex"];
                     "x-rift-truncated": components["headers"]["XRiftTruncated"];
                     [name: string]: unknown;
@@ -2493,6 +2496,7 @@ export interface operations {
             /** @description Requests cleared; answers the imposter as it now stands. */
             200: {
                 headers: {
+                    "Rift-Cluster-Bind-Failures": components["headers"]["RiftClusterBindFailures"];
                     [name: string]: unknown;
                 };
                 content: {
@@ -2543,6 +2547,7 @@ export interface operations {
             /** @description Matched requests, oldest first (bare array, not an envelope). */
             200: {
                 headers: {
+                    "Rift-Cluster-Bind-Failures": components["headers"]["RiftClusterBindFailures"];
                     "x-rift-next-index": components["headers"]["XRiftNextIndex"];
                     "x-rift-truncated": components["headers"]["XRiftTruncated"];
                     [name: string]: unknown;
@@ -2589,6 +2594,7 @@ export interface operations {
             /** @description Requests cleared; answers the imposter as it now stands. */
             200: {
                 headers: {
+                    "Rift-Cluster-Bind-Failures": components["headers"]["RiftClusterBindFailures"];
                     [name: string]: unknown;
                 };
                 content: {
@@ -2655,6 +2661,7 @@ export interface operations {
             /** @description An open SSE stream. Ends only when the client disconnects or the node stops. */
             200: {
                 headers: {
+                    "Rift-Cluster-Bind-Failures": components["headers"]["RiftClusterBindFailures"];
                     [name: string]: unknown;
                 };
                 content: {
@@ -2694,6 +2701,7 @@ export interface operations {
             /** @description Verification result. */
             200: {
                 headers: {
+                    "Rift-Cluster-Bind-Failures": components["headers"]["RiftClusterBindFailures"];
                     [name: string]: unknown;
                 };
                 content: {
@@ -2737,6 +2745,7 @@ export interface operations {
             /** @description Cleared; answers the imposter as it now stands. */
             200: {
                 headers: {
+                    "Rift-Cluster-Bind-Failures": components["headers"]["RiftClusterBindFailures"];
                     [name: string]: unknown;
                 };
                 content: {
@@ -2774,6 +2783,7 @@ export interface operations {
             /** @description Scenario states, for the flow named in the body. */
             200: {
                 headers: {
+                    "Rift-Cluster-Bind-Failures": components["headers"]["RiftClusterBindFailures"];
                     [name: string]: unknown;
                 };
                 content: {
@@ -2822,6 +2832,7 @@ export interface operations {
             /** @description State set; the write echoed back as it was applied. */
             200: {
                 headers: {
+                    "Rift-Cluster-Bind-Failures": components["headers"]["RiftClusterBindFailures"];
                     [name: string]: unknown;
                 };
                 content: {
@@ -2871,6 +2882,7 @@ export interface operations {
             /** @description Reset, for the flow named in the body. */
             200: {
                 headers: {
+                    "Rift-Cluster-Bind-Failures": components["headers"]["RiftClusterBindFailures"];
                     [name: string]: unknown;
                 };
                 content: {
@@ -2913,6 +2925,7 @@ export interface operations {
             /** @description The imposter's spaces. `spaces: []` with `partial: false` means the imposter genuinely holds none right now; `spaces: []` with `partial: true` means the fleet could not be asked in time (or its view was not yet available) and nothing should be inferred from the empty list — the same "cannot tell you" distinction `Rift-Cluster-Partial` marks elsewhere in this API, folded into the body here since this route has no header convention of its own to reuse. When `unavailable` is present the listing was never attempted at all — always `spaces: []` and `partial: true` — and `unavailable` says why. */
             200: {
                 headers: {
+                    "Rift-Cluster-Bind-Failures": components["headers"]["RiftClusterBindFailures"];
                     [name: string]: unknown;
                 };
                 content: {
@@ -2973,6 +2986,7 @@ export interface operations {
             /** @description The space. */
             200: {
                 headers: {
+                    "Rift-Cluster-Bind-Failures": components["headers"]["RiftClusterBindFailures"];
                     [name: string]: unknown;
                 };
                 content: {
@@ -3025,6 +3039,7 @@ export interface operations {
             /** @description Torn down. */
             200: {
                 headers: {
+                    "Rift-Cluster-Bind-Failures": components["headers"]["RiftClusterBindFailures"];
                     [name: string]: unknown;
                 };
                 content: {
@@ -3069,6 +3084,7 @@ export interface operations {
             /** @description The space's stubs. */
             200: {
                 headers: {
+                    "Rift-Cluster-Bind-Failures": components["headers"]["RiftClusterBindFailures"];
                     [name: string]: unknown;
                 };
                 content: {
@@ -3109,6 +3125,7 @@ export interface operations {
             /** @description The space and its stubs, including the one just added. */
             201: {
                 headers: {
+                    "Rift-Cluster-Bind-Failures": components["headers"]["RiftClusterBindFailures"];
                     "Rift-Cluster-Op-Id": components["headers"]["RiftClusterOpId"];
                     [name: string]: unknown;
                 };
@@ -3226,6 +3243,7 @@ export interface operations {
             /** @description Cleared. */
             200: {
                 headers: {
+                    "Rift-Cluster-Bind-Failures": components["headers"]["RiftClusterBindFailures"];
                     [name: string]: unknown;
                 };
                 content: {
@@ -3272,6 +3290,7 @@ export interface operations {
             /** @description The entry's value. */
             200: {
                 headers: {
+                    "Rift-Cluster-Bind-Failures": components["headers"]["RiftClusterBindFailures"];
                     [name: string]: unknown;
                 };
                 content: {
@@ -3317,6 +3336,7 @@ export interface operations {
             /** @description Written; the stored entry echoed back. */
             200: {
                 headers: {
+                    "Rift-Cluster-Bind-Failures": components["headers"]["RiftClusterBindFailures"];
                     [name: string]: unknown;
                 };
                 content: {
@@ -3356,6 +3376,7 @@ export interface operations {
             /** @description Deleted. */
             200: {
                 headers: {
+                    "Rift-Cluster-Bind-Failures": components["headers"]["RiftClusterBindFailures"];
                     [name: string]: unknown;
                 };
                 content: {
