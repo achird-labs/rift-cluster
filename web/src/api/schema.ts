@@ -799,7 +799,7 @@ export interface paths {
          * Exchange an API key for a session cookie
          * @description Terminates. Not a Raft write: the server compares the submitted key against the fleet's `--api-key` in constant time, then mints an HMAC-signed `{subject, issued_at, expiry, key_revision}` token under the fleet's session-signing key (a control-plane record every node verifies from its own applied state) and returns it as an `HttpOnly` cookie — this is the one moment the long-lived API key transits the page (RFC-006 §9.3), so it belongs in component state only, never `localStorage` and never a URL, and should be dropped as soon as this call returns.
          *     The cookie is accepted by **every node**, because the signing key is replicated: a session minted on one node verifies on the next with no second login.
-         *     The cookie proves authentication only — with one credential there is no identity for it to resolve to. There is no server-side session table and, deliberately, **no per-session revocation**: the documented bounds are the 8-hour `Max-Age` and session-signing-key rotation, which would invalidate every outstanding session at once. No route issues a rotation yet (#619), so `Max-Age` is the bound that holds today.
+         *     The cookie proves authentication only — with one credential there is no identity for it to resolve to. There is no server-side session table and, deliberately, **no per-session revocation**: the documented bounds are the 8-hour `Max-Age`, session-signing-key rotation (`POST /session/rotate`), which invalidates every outstanding session at once, and changing the fleet's `--api-key`, which ends the sessions that key minted as each node restarts under the new one.
          *     A fleet running with **no** `--api-key` has an open admin plane and nothing to exchange; this answers `400` rather than handing out a cookie that proves nothing.
          */
         post: operations["createSession"];
@@ -808,6 +808,29 @@ export interface paths {
          * @description Terminates. Acts on the cookie the caller already holds, so it is exempt from `apiKeyAuth` the same way `createSession` is — there is no credential to check before clearing a cookie. It is not exempt from the CSRF header: a logout is a state-changing request the browser attaches the cookie to, so without `X-Rift-CSRF` it is refused with `403` rather than letting a cross-site page force an operator out. Not a Raft write: the server only ever mints this cookie at `POST /session`, never adopts a client-presented one, so there is no session-fixation case to guard against here.
          */
         delete: operations["deleteSession"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/session/rotate": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * End every console session on every node
+         * @description Terminates. **Is** a Raft write, unlike its two siblings: it commits a fresh session-signing key, and because every token carries the revision it was minted under, every node refuses every outstanding cookie the moment it applies the new record — with no session table to sweep and nothing to coordinate.
+         *     Unlike `createSession` and `deleteSession` this is authenticated: `apiKeyAuth` as a bearer, or a session cookie plus `X-Rift-CSRF`. A cookie holder may call it because in a one-credential fleet a cookie already carries full admin power, and it is what lets an operator evict a thief from the console session they are in.
+         *     **The caller's own session ends too** and the response clears their cookie, so after a rotation every live session was minted by someone who presented the API key since. Works from any node; a follower forwards the write to the leader.
+         *     A fleet running with **no** `--api-key` has an open admin plane and no sessions to end; this answers `400` rather than committing a signing key.
+         */
+        post: operations["rotateSessionKey"];
+        delete?: never;
         options?: never;
         head?: never;
         patch?: never;
@@ -3758,6 +3781,35 @@ export interface operations {
             };
             403: components["responses"]["Forbidden"];
             503: components["responses"]["Unavailable"];
+        };
+    };
+    rotateSessionKey: {
+        parameters: {
+            query?: never;
+            header?: {
+                /** @description RFC-006 §5.3/§9.2 CSRF defense: a cookie-authenticated state-changing request (anything that would mutate state, sent with the `rift_session` cookie rather than an `Authorization` bearer) that omits this header is refused with `403`, checked before authorization runs. Send any non-empty value — `SameSite=Strict` already stops the cookie riding cross-site, so this header exists only to defeat the narrower case (a same-site-adjacent or misconfigured-CORS request) by requiring a custom header cross-origin HTML cannot attach without a preflight. Bearer-authenticated requests are exempt: a bearer cannot be attached to a request by a victim's browser in the first place, which is the entire attack this header defends against — so requiring it there would add friction without closing a real hole. */
+                "X-Rift-CSRF"?: components["parameters"]["CsrfHeader"];
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Every session on every node is ended; no body. The caller's own cookie is cleared by the `Set-Cookie` below. */
+            204: {
+                headers: {
+                    /** @description `rift_session=; Max-Age=0; Path=/` — the caller's session ended with the rest, so the browser is told to drop it. */
+                    "Set-Cookie"?: string;
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            400: components["responses"]["BadData"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            500: components["responses"]["InternalError"];
+            503: components["responses"]["Unavailable"];
+            504: components["responses"]["WriteTimeout"];
         };
     };
     getRoot: {

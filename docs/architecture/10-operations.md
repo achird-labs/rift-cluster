@@ -233,14 +233,30 @@ already holds all committed config. Deriving it from the cluster secret instead 
 rejected: that secret is optional (`--cluster-insecure`), so an unauthenticated fleet would have
 nothing to derive from.
 
-**Rotation would be the containment, and it is structural — but nothing triggers it.** Every
-token carries the key record's `revision`; verification refuses a token whose revision is not the
-current one, so writing a new key would invalidate every outstanding session at once without
-sweeping a table. The front only ever mints the first key, though, and no route or flag writes a
-second: the one bound that actually holds today is the 8-hour `Max-Age` (#619). With one credential there
-is no principal to disable, and changing `--api-key` does not end sessions minted under the old
-key. A fleet running with no `--api-key`
-has nothing to exchange and answers `400` rather than handing out a cookie that proves nothing.
+**Rotation is the containment, and it is structural.** Every token carries the key record's
+`revision`; verification refuses a token whose revision is not the current one, so writing a new
+key invalidates every outstanding session at once without sweeping a table. An operator writes one
+(D-85):
+
+```sh
+curl -X POST -H "Authorization: $RIFT_API_KEY" http://<any-node>:<admin-port>/session/rotate
+```
+
+`204` means every console session on **every** node is over, including the caller's own — the
+response clears their cookie — so afterwards every live session belongs to someone who has
+presented the API key since. Any node serves it; a follower forwards the write to the leader. A
+node that is partitioned away honours the old cookies until it applies the rotation, or until they
+expire: revocation is a replicated write like any other, and such a node can still serve *reads*
+to that cookie, never writes. A rotation that answers `504` is parked for replay like every write
+on this front, so it may still land later and end sessions minted in between; it fails closed, and
+the operator logs in again.
+
+**Changing `--api-key` is the second bound, and it needs no second step.** The token is signed with
+the session key bound to the node's `--api-key`, so a node restarted under a different key refuses
+every cookie minted under the old one — node by node as a rolling restart proceeds, exactly as the
+*bearer* changes over, and for no longer. With one credential there is no principal to disable. A
+fleet running with no `--api-key` has nothing to exchange and answers `400` to both a login and a
+rotation, rather than handing out a cookie that proves nothing or committing a key nothing needs.
 
 **What the cookie proves.** Authentication, and nothing more — its subject is the constant
 `"admin"` and `session::verify` answers `Result<(), _>`, because there is no identity for it to

@@ -298,12 +298,19 @@ every node verifies without coordination, and a login is not a Raft write.
 Revocation is honest about its bounds: the cookie proves authentication and
 there is no identity behind it to disable, so the 8-hour `Max-Age` bounds the
 window in which a *stolen cookie* outlives its theft, and a new signing key (a
-new `SessionKeyPut`; `kr` is its revision) would invalidate every session on
-every node at once. **Nothing issues one today (#619):** the front mints only the first
-key (`ensure_session_key`), and no route or flag rotates it — so the 8-hour
-`Max-Age` is, in practice, the only bound. Changing `--api-key` does not end
-sessions minted under the old key. What v1 does not have is per-session server-side revocation — stated in
-§10, not hidden.
+new `SessionKeyPut`; `kr` is its revision) invalidates every session on
+every node at once. **`POST /session/rotate` issues one** (D-85, #619) —
+behind the ordinary admin gate, from any node, ending the caller's own session
+with the rest. And because the token is signed with that key *bound to the
+node's `--api-key`*, changing the key ends the sessions it minted as each node
+restarts under the new one, with no second step to forget. What v1 does not have
+is per-session server-side revocation — stated in §10, not hidden.
+
+> **Amended by D-85** (#619): this section described the signing-key rotation as
+> the revocation while nothing could issue one, and described `POST /session` as
+> the only write on this surface. Both are now false: `POST /session/rotate`
+> commits the rotation, and the signing key is the replicated record bound to the
+> node's `--api-key`, which makes a changed key a second, automatic bound.
 
 **CSRF.** `SameSite=Strict` plus a double-submit custom header: the SPA sends
 `X-Rift-CSRF: 1` on every state-changing call, and the front rejects
@@ -547,7 +554,8 @@ cookie-authenticated mutations; no permissive CORS; `Secure` cookie so the
 session never crosses plaintext HTTP. Session fixation is not applicable —
 the server only ever mints the cookie itself at `POST /session`, never adopts
 a client-presented one. Residual risk: no per-session revocation in v1
-(§10); the bound is `Max-Age` + signing-key rotation + principal disable.
+(§10); the bounds are `Max-Age`, signing-key rotation (`POST /session/rotate`,
+D-85) and changing `--api-key`. There is no principal to disable (D-73).
 
 ### 9.3 The login form holds the real key, briefly
 
@@ -596,7 +604,8 @@ RFC-002. The cluster *secret* and the write/RPC surface stay where they are.
   OIDC arrives with RFC-002 v2's `AuthSource::Oidc` and slots in as a second
   way to mint the same session cookie.
 - **No per-session server-side revocation in v1** (§5.3). Bounds: TTL,
-  signing-key rotation, principal disable.
+  signing-key rotation (`POST /session/rotate`, D-85) and changing `--api-key`.
+  Not "disable the principal" — D-73 left no principal to disable.
 - **No collaborative editing** — no presence, no locks beyond `If-Match`.
   Two humans editing one imposter get the same 409-and-rebase a lagging
   agent gets.
@@ -758,6 +767,13 @@ screen rather than replacing it.
 4. **Session-signing-key rotation cadence** — operator-triggered only, or
    scheduled? Scheduled rotation logs everyone out on a timer; v1 leans
    operator-triggered with a documented runbook.
+
+   ***Resolved by D-85 (#619): operator-triggered.*** The lean was taken and given a caller —
+   `POST /session/rotate`, with the runbook in `docs/architecture/10-operations.md`. Scheduled
+   rotation is rejected outright: it logs everyone out on a timer and bounds nothing the 8-hour
+   `Max-Age` does not already bound. A second, automatic trigger arrived with it that this
+   question did not anticipate — changing `--api-key` ends the sessions that key minted, because
+   the signing key is bound to it.
 5. **rmcp maturity.** If the official SDK's stdio server support is not
    release-grade at M1 time, the fallback is implementing the (small) stdio
    framing directly; the tool layer above it is transport-agnostic either way.

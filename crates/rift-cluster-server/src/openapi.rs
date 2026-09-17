@@ -121,7 +121,7 @@ pub(crate) fn contract_json() -> Result<Vec<u8>, &'static str> {
 ///
 /// Public so that integration test can reach it; a duplicated list is exactly how the two halves
 /// would drift.
-pub const HANDLE_DIRECT_ROUTES: [(&str, &str); 7] = [
+pub const HANDLE_DIRECT_ROUTES: [(&str, &str); 8] = [
     ("GET", "/front-door/routes"),
     ("GET", "/openapi.json"),
     // C2 (#185): the read-only fleet projection and the session exchange.
@@ -130,6 +130,8 @@ pub const HANDLE_DIRECT_ROUTES: [(&str, &str); 7] = [
     ("GET", "/_fleet/ops/{opId}"),
     ("POST", "/session"),
     ("DELETE", "/session"),
+    // D-85 (#619): the operator-triggered revocation, beside the exchange it revokes.
+    ("POST", "/session/rotate"),
 ];
 
 /// The route-parity gate (issue #184's acceptance criteria).

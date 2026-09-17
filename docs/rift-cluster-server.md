@@ -304,11 +304,14 @@ The console should not keep the key after login, so it exchanges it:
 curl -sX POST http://$ADMIN/session -H 'content-type: application/json' \
   -d "{\"apiKey\":\"$RIFT_ADMIN_KEY\"}" -i
 # 200
-# set-cookie: rift_session=v1.…; HttpOnly; Secure; SameSite=Strict; Max-Age=28800; Path=/
+# set-cookie: rift_session=v2.…; HttpOnly; Secure; SameSite=Strict; Max-Age=28800; Path=/
 
-curl -s http://$ADMIN/imposters -H "cookie: rift_session=v1.…"
+curl -s http://$ADMIN/imposters -H "cookie: rift_session=v2.…"
 
-curl -sX DELETE http://$ADMIN/session -i    # 204, cookie cleared
+curl -sX DELETE http://$ADMIN/session -i    # 204, this browser's cookie cleared
+
+# end every session on every node — including this caller's own (D-85)
+curl -sX POST http://$ADMIN/session/rotate -H "authorization: $RIFT_ADMIN_KEY" -i   # 204
 ```
 
 - **The cookie works on every node.** The signing key is a fleet-wide
@@ -316,11 +319,14 @@ curl -sX DELETE http://$ADMIN/session -i    # 204, cookie cleared
   login is not a Raft write — only the first mint and any rotation are.
 - **It proves authentication and nothing else.** Its subject is the constant
   `"admin"`; there is no identity for it to resolve to.
-- **Rotation is the only revocation.** Committing a new `SessionKeyPut`
-  invalidates every outstanding session at once (each token carries the key
-  record's revision), with no session table to sweep. The other bound is the
-  8-hour `Max-Age`. There is no per-session revocation, and no principal to
-  disable.
+- **Two revocations, both fleet-wide.** `POST /session/rotate` commits a new
+  `SessionKeyPut`, which invalidates every outstanding session at once (each
+  token carries the key record's revision), with no session table to sweep —
+  the caller's own session included, which is why the response clears their
+  cookie. And because the token is signed with that key *bound to the node's
+  `--api-key`*, changing that key ends the sessions it minted, node by node as
+  a rolling restart proceeds. The remaining bound is the 8-hour `Max-Age`.
+  There is no per-session revocation, and no principal to disable.
 - **CSRF.** A cookie-authenticated *mutation* must carry `X-Rift-CSRF` (any
   value) or it is refused `403`. A key-authenticated request is exempt — a
   bearer cannot be attached by a victim's browser, which is the whole attack.
@@ -646,6 +652,7 @@ table exists so an operator reading here does not conclude they are absent.
 | `GET /_fleet/ops/{opId}` | the state of one submitted write — pending, applied or failed; what a `202` under `--cluster-admin-async` is polled with |
 | `PUT /admin/fleet/name` | set or rename the fleet's operator-facing name; a replicated write, not a projection |
 | `POST /session`, `DELETE /session` | exchange the admin key for the console's `HttpOnly` cookie, and clear it |
+| `POST /session/rotate` | commit a new session-signing key: every session on every node ends at once, the caller's included (D-85) |
 | `GET /openapi.json` | this contract, served by the binary that implements it |
 | `POST /admin/imposters/{port}/try` | send a sample request to the imposter from the admin origin and answer what it answered — the console's Send button |
 | `GET /imposters/{port}/spaces`, `DELETE /imposters/{port}/spaces/{flowId}`, `POST …/spaces/{flowId}/stubs` | list, tear down and add stubs to a correlated-isolation space — a flow's own state slice and its own stubs, replicated (#374, #537, D-69) |
