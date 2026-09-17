@@ -3,11 +3,11 @@ import type { ReactNode } from "react";
 
 import { ApiError } from "../api/client.ts";
 import { FLEET_HEALTH_FIELDS, FLEET_MEMBER_FIELDS } from "../app/contract.ts";
-import type { FleetView } from "../app/fleetView.ts";
+import { WRITE_PATH_FIELDS, writePathByVoter, writePathDisagreements } from "../app/fleetView.ts";
+import type { FleetView, WritePath } from "../app/fleetView.ts";
 import { useFleetView } from "../app/queries.ts";
 import { Card, ErrorNote, Ident, Status, Tile, UNKNOWN } from "../components/primitives.tsx";
 import { ControlPlane, HashRing } from "../components/fleetRail.tsx";
-import { PendingPanel } from "../components/pending.tsx";
 
 export function Fleet(): ReactNode {
   const fleet = useFleetView();
@@ -190,7 +190,7 @@ function View({ view }: { view: FleetView }): ReactNode {
        */}
       <div className="fleet-ops">
         <Card title="Durability &amp; write path">
-          <PendingPanel issue={394} reason="The write barrier, its timeout, the flow fsync policy and the admin-write mode are configured on the node's command line and are not read back by any endpoint." />
+          <WritePathTable view={view} />
         </Card>
       </div>
 
@@ -201,6 +201,76 @@ function View({ view }: { view: FleetView }): ReactNode {
       ) : null}
     </>
   );
+}
+
+/**
+ * Each voter's write-path flags, read back (#394, D-82). Read-only on purpose: these are node
+ * startup flags, and the console has no business setting them.
+ */
+function WritePathTable({ view }: { view: FleetView }): ReactNode {
+  const rows = writePathByVoter(view);
+  const disagreements = writePathDisagreements(rows);
+  return (
+    <>
+      <table className="dense" data-testid="write-path">
+        <thead>
+          <tr>
+            <th>Node</th>
+            {WRITE_PATH_FIELDS.map((field) => (
+              <th key={field.key}>{field.label}</th>
+            ))}
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map(({ id, writePath }) => (
+            <tr key={id} data-testid={`write-path-${id}`}>
+              <td className="nid nobreak">{id}</td>
+              {writePath === null ? (
+                <td
+                  colSpan={WRITE_PATH_FIELDS.length}
+                  className="muted"
+                  title="This node did not answer, or runs a build that does not report its write path."
+                >
+                  unknown
+                </td>
+              ) : (
+                WRITE_PATH_FIELDS.map((field) => (
+                  <td
+                    key={field.key}
+                    className={disagreements.includes(field.key) ? "mono is-warn" : "mono"}
+                  >
+                    {formatWritePath(field.key, writePath)}
+                  </td>
+                ))
+              )}
+            </tr>
+          ))}
+        </tbody>
+      </table>
+      {disagreements.length > 0 ? (
+        <p className="hint" data-testid="write-path-disagreement">
+          The nodes were started with different{" "}
+          {disagreements
+            .map((key) => WRITE_PATH_FIELDS.find((field) => field.key === key)?.label.toLowerCase())
+            .join(", ")}{" "}
+          settings. A write&rsquo;s guarantees depend on which node answers it.
+        </p>
+      ) : null}
+    </>
+  );
+}
+
+function formatWritePath(key: (typeof WRITE_PATH_FIELDS)[number]["key"], settings: WritePath): string {
+  switch (key) {
+    case "write_barrier":
+      return settings.write_barrier;
+    case "write_barrier_timeout_seconds":
+      return `${settings.write_barrier_timeout_seconds} s`;
+    case "admin_async":
+      return settings.admin_async ? "async (202 + op id)" : "sync";
+    case "flow_fsync_interval_ms":
+      return `${settings.flow_fsync_interval_ms} ms`;
+  }
 }
 
 /**

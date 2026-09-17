@@ -1260,6 +1260,8 @@ export interface components {
              *     `false` once a node has an engine and has checked its ports, whether or not anything is bound. `null` (or the key absent) only for a peer this node could not reach or that predates this field — the same "unknown, not unhealthy" rule `bound_ports` documents. A reachable voter reporting `true` here is enough on its own to mark `/_fleet/members`'s response `Rift-Cluster-Partial`, the same as an unreachable one.
              */
             bind_status_unavailable?: boolean | null;
+            /** @description The answering node's own write-path flags (issue #394, D-82). Deliberately **not** in `required`, for the same rolling-upgrade reason as `bound_ports`: a pre-#394 node omits it, and absent means unknown — never the defaults. */
+            write_path?: components["schemas"]["WritePath"];
             /**
              * @description One row per voter, in `voters` order (issue #361). Present on `/_fleet/members` only — `/_cluster/members` is node-local.
              *     The console is served under `default-src 'self'`, so the page can only ever dial the node that served it: a peer's applied index is unreachable from the browser by construction, and can only arrive through an aggregate the serving node assembles. This is it.
@@ -1286,7 +1288,29 @@ export interface components {
                 } | null;
                 /** @description That voter's own `bind_status_unavailable`, echoed verbatim. `true` here — on an otherwise `reachable: true` row — is on its own enough to mark this response `Rift-Cluster-Partial`: the row is reachable but the body is missing a fact it claims to carry. See `FleetMembers.bind_status_unavailable`. */
                 bind_status_unavailable?: boolean | null;
+                /** @description That voter's own `write_path` (issue #394), echoed verbatim from its reply — never this node's settings standing in for a peer's, since a rolling deploy where the nodes disagree is when this row is worth reading. `null` when the voter is unreachable or predates the field. Unlike the bind fields, a reachable row with `null` here does **not** mark the response `Rift-Cluster-Partial` (D-82): the fan-out got its answer, and the row says which setting is unknown. */
+                write_path?: components["schemas"]["WritePath"] | null;
             }[];
+        };
+        /** @description The write-path settings the answering node was started with (issue #394, D-82) — its `--cluster-*` flags, read back. Read-only: nothing on either port can change them; they are node startup configuration. Values and units are the flags' own, so a value can be pasted back onto a command line. */
+        WritePath: {
+            /**
+             * @description `--cluster-write-barrier`. `ready-nodes`: a committed admin write waits until every Ready node has applied it. `none`: it waits only for this node's own apply.
+             * @enum {string}
+             */
+            write_barrier: "ready-nodes" | "none";
+            /**
+             * Format: int64
+             * @description `--cluster-write-barrier-timeout`. How long the barrier waits before answering anyway with a `Rift-Cluster-Warnings` header naming the nodes that had not applied.
+             */
+            write_barrier_timeout_seconds: number;
+            /** @description `--cluster-admin-async`. `true`: an admin write is answered `202` with an op id as soon as it is durably parked, and its outcome is polled at `/_fleet/ops/{opId}`. */
+            admin_async: boolean;
+            /**
+             * Format: int64
+             * @description `--cluster-flow-fsync-interval-ms`. The group-fsync period for `durability: "async"` flow-state writes — the bound on what a whole-fleet crash can lose for imposters that did not choose `"sync"`.
+             */
+            flow_fsync_interval_ms: number;
         };
         /** @description This node's readiness plus its ring view — the `/_fleet/health` read-only admin-port projection (RFC-006 §5.2) of `cluster_api.rs`'s `health_body`. */
         FleetHealth: {

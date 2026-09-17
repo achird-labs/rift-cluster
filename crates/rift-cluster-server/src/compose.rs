@@ -35,6 +35,7 @@ use crate::cli::EeCli;
 use crate::cluster_api::{self, NodeSlot};
 use crate::probes::{self, ProbeListener};
 use crate::readiness::{GATE_JOINED, GATE_RECONCILED, Readiness};
+use crate::write_path::WritePathSettings;
 
 /// How long a starting node keeps trying its seeds before giving up.
 ///
@@ -496,6 +497,10 @@ pub async fn start_with_runtimes(
 
     let readiness = Arc::new(Readiness::awaiting([GATE_JOINED, GATE_RECONCILED]));
 
+    // Built once (D-82): the admin front acts on it and the cluster port's members builder reports
+    // it, and one value is what keeps the report describing the node that answers.
+    let write_path = WritePathSettings::from_cli(&cli.cluster);
+
     // Probes come up first, before the node exists. `/healthz` has to answer
     // *during* the join — a liveness probe that gets connection-refused while
     // the node is converging restarts the pod mid-convergence, which is the one
@@ -526,7 +531,7 @@ pub async fn start_with_runtimes(
     let flow_shard = match FlowShard::open(
         &state_dir,
         ShardConfig {
-            fsync_interval: Duration::from_millis(cli.cluster.cluster_flow_fsync_interval_ms),
+            fsync_interval: Duration::from_millis(write_path.flow_fsync_interval_ms),
             ..ShardConfig::default()
         },
     ) {
@@ -608,6 +613,7 @@ pub async fn start_with_runtimes(
                 flow_routes(Arc::clone(&flow_net)),
                 slot.clone(),
                 Arc::clone(&readiness),
+                write_path,
             )
             .merge(proxy_routes(Arc::clone(&proxy_net)))
             .merge(seq_routes(Arc::clone(&sequencer))),
@@ -677,6 +683,7 @@ pub async fn start_with_runtimes(
         front_door_routes,
         source_registry,
         Arc::clone(&flow_net),
+        write_path,
     )
     .await
     {
@@ -719,6 +726,7 @@ async fn attach_data_plane(
     front_door_routes: Arc<ArcSwap<CompiledRoutes>>,
     source_registry: SourceRegistry,
     flow_net: Arc<FlowNet>,
+    write_path: WritePathSettings,
 ) -> anyhow::Result<(
     RunningServer,
     AdminFront,
@@ -786,9 +794,6 @@ async fn attach_data_plane(
     // nodes do not have — and a `--imposters file:` URI has the same property, which is why the
     // bootstrap replicates what it read rather than asking each node to read it.
     let bootstrap_sources = cli.oss.imposters.take().as_deref().map(parse_uri_list);
-    let barrier = cli.cluster.cluster_write_barrier;
-    let barrier_timeout = Duration::from_secs(cli.cluster.cluster_write_barrier_timeout);
-    let admin_async = cli.cluster.cluster_admin_async;
     let seeds = cli.cluster.cluster_seeds.clone();
 
     // No `.admin_authorizer(...)`: the U-9 seam existed to give the loopback a second,
@@ -853,9 +858,7 @@ async fn attach_data_plane(
             api_key,
             allow_injection,
             scripts_dir,
-            barrier,
-            barrier_timeout,
-            admin_async,
+            write_path,
             readiness: Arc::clone(readiness),
             flow_net: Arc::clone(&flow_net),
         },

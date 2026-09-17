@@ -13,6 +13,7 @@ use rift_cluster::rpc::{HandlerFuture, RpcError};
 use rift_cluster::{RaftNode, Router};
 
 use crate::readiness::Readiness;
+use crate::write_path::WritePathSettings;
 
 /// Binding an already-bound [`NodeSlot`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -59,8 +60,16 @@ impl NodeSlot {
 }
 
 /// Register the operator endpoints onto `base`.
+///
+/// `write_path` is what this node's admin front was started with; `/_cluster/members` reports it
+/// (D-82).
 #[must_use]
-pub fn routes(base: Router, slot: NodeSlot, readiness: Arc<Readiness>) -> Router {
+pub fn routes(
+    base: Router,
+    slot: NodeSlot,
+    readiness: Arc<Readiness>,
+    write_path: WritePathSettings,
+) -> Router {
     let members = slot.clone();
     let config = slot.clone();
     let imposters = slot.clone();
@@ -99,7 +108,7 @@ pub fn routes(base: Router, slot: NodeSlot, readiness: Arc<Readiness>) -> Router
     .route(
         "GET",
         "/_cluster/members",
-        json_handler(move || Ok(members_body(members.node()?.as_ref()))),
+        json_handler(move || Ok(members_body(members.node()?.as_ref(), write_path))),
     )
     .route(
         "GET",
@@ -195,7 +204,7 @@ fn node_id(id: impl std::fmt::Display) -> serde_json::Value {
     serde_json::Value::String(id.to_string())
 }
 
-pub(crate) fn members_body(node: &RaftNode) -> serde_json::Value {
+pub(crate) fn members_body(node: &RaftNode, write_path: WritePathSettings) -> serde_json::Value {
     let status = node.status();
     // `fleet_name()` is the one read here that can fail, and it is `Result<Option<String>, _>` —
     // which is why it cannot use `.ok()` the way `parked_intents` does a few lines below. That
@@ -232,6 +241,9 @@ pub(crate) fn members_body(node: &RaftNode) -> serde_json::Value {
         "bound_ports": bind_fields.bound_ports,
         "bind_failures": bind_fields.bind_failures,
         "bind_status_unavailable": bind_fields.bind_status_unavailable,
+        // Issue #394 (D-82): the startup settings this node's writes ride. Read-only by
+        // construction — they are flags, and nothing on either port can change them.
+        "write_path": write_path.to_json(),
     })
 }
 

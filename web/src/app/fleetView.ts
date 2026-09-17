@@ -2,6 +2,7 @@ import type { components } from "../api/schema.ts";
 
 type FleetMembers = components["schemas"]["FleetMembers"];
 type FleetHealth = components["schemas"]["FleetHealth"];
+export type WritePath = components["schemas"]["WritePath"];
 
 /**
  * A named reason this node's answers may not describe the whole fleet. Each maps to a schema'd
@@ -78,6 +79,11 @@ export type FleetView = {
    * operator, so they are different fields.
    */
   parkedIntentsPartial: boolean;
+  /**
+   * The write-path flags the answering node was started with (#394, D-82). `null` when that node
+   * predates the field — unknown, never "the defaults".
+   */
+  writePath: WritePath | null;
 };
 
 /**
@@ -106,6 +112,8 @@ export type MemberRow = {
   reachable: boolean;
   /** That voter's own bind report (#369). See `BindReport` for why it is a union, not three fields. */
   bind: BindReport;
+  /** That voter's own write-path flags (#394), or `null` when it did not answer or predates them. */
+  writePath: WritePath | null;
 };
 
 /**
@@ -204,6 +212,7 @@ export function fleetView(
      */
     parkedIntents: health.parked_intents_fleet ?? null,
     parkedIntentsPartial: healthPartial,
+    writePath: writePathOf(members.write_path),
     members: new Map(
       (members.members ?? []).map((row) => [
         row.node_id,
@@ -212,10 +221,68 @@ export function fleetView(
           isLeader: row.is_leader ?? null,
           reachable: row.reachable,
           bind: bindReportOf(row),
+          writePath: writePathOf(row.write_path),
         },
       ]),
     ),
   };
+}
+
+/**
+ * A reported write path, or `null` when there is none to trust.
+ *
+ * Absent is a pre-#394 node and is "unknown", the same as `null`. A *malformed* object is unknown
+ * too, and that half is why this checks every field rather than the object's presence: a peer on a
+ * build whose shape drifted would otherwise reach the table with, say, `admin_async` missing — and
+ * render it as "sync", a specific and reassuring answer nobody gave.
+ */
+function writePathOf(value: unknown): WritePath | null {
+  if (typeof value !== "object" || value === null) return null;
+  const v = value as Record<string, unknown>;
+  const barrier = v.write_barrier;
+  if (barrier !== "ready-nodes" && barrier !== "none") return null;
+  if (typeof v.write_barrier_timeout_seconds !== "number") return null;
+  if (typeof v.admin_async !== "boolean") return null;
+  if (typeof v.flow_fsync_interval_ms !== "number") return null;
+  return {
+    write_barrier: barrier,
+    write_barrier_timeout_seconds: v.write_barrier_timeout_seconds,
+    admin_async: v.admin_async,
+    flow_fsync_interval_ms: v.flow_fsync_interval_ms,
+  };
+}
+
+/** The write-path settings, in the order the durability panel shows them. */
+export const WRITE_PATH_FIELDS = [
+  { key: "write_barrier", label: "Write barrier" },
+  { key: "write_barrier_timeout_seconds", label: "Barrier timeout" },
+  { key: "admin_async", label: "Admin writes" },
+  { key: "flow_fsync_interval_ms", label: "Flow fsync" },
+] as const satisfies readonly { key: keyof WritePath; label: string }[];
+
+/**
+ * Each voter's write-path flags, in `voters` order (#394). The answering node's come from the
+ * top-level read, so they are known even when the fan-out reached nobody.
+ */
+export function writePathByVoter(view: FleetView): { id: string; writePath: WritePath | null }[] {
+  return view.voters.map((id) => ({
+    id,
+    writePath: id === view.nodeId ? view.writePath : (view.members.get(id)?.writePath ?? null),
+  }));
+}
+
+/**
+ * The settings on which the voters that reported disagree — the reason the panel reads every node
+ * rather than the one that served the page. Voters that reported nothing are left out: an unknown
+ * is not a disagreement, and the table already says which rows are unknown.
+ */
+export function writePathDisagreements(
+  rows: readonly { writePath: WritePath | null }[],
+): (typeof WRITE_PATH_FIELDS)[number]["key"][] {
+  const known = rows.flatMap((row) => (row.writePath === null ? [] : [row.writePath]));
+  return WRITE_PATH_FIELDS.map((field) => field.key).filter(
+    (key) => new Set(known.map((settings) => settings[key])).size > 1,
+  );
 }
 
 const WORDING: Record<Degradation, string> = {

@@ -829,6 +829,12 @@ table.dense tbody tr:last-child td,
   border-bottom: 0;
 }
 
+/* A write-path setting the voters disagree on (#394). */
+table.dense td.is-warn {
+  color: var(--warn);
+  background: var(--warn-soft);
+}
+
 /*
  * `--surface-3`, not `--surface-2`. The header row is `--surface-2` and sticks to the top of a
  * scrolling table, so a hover tint of the same value made the hovered row read as a second header

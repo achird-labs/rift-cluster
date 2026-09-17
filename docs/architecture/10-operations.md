@@ -87,7 +87,7 @@ flowchart TB
 
 | Endpoint | Answers |
 |---|---|
-| `GET /_cluster/members` | roster: id, address, voter/learner, Ready, applied index; plus this node's own `bound_ports` / `bind_failures` (Chapter 2 divergence) |
+| `GET /_cluster/members` | roster: id, address, voter/learner, Ready, applied index; plus this node's own `bound_ports` / `bind_failures` (Chapter 2 divergence) and `write_path` — the write-barrier, admin-write and flow-fsync flags it was started with (D-82) |
 | `GET /_cluster/config` | per port: revision @ every node, `converged: bool` — the CI wait target |
 | `GET /_cluster/imposters` | per-(port, node) bind status (Chapter 2 divergence) |
 | `GET /_cluster/ops/:op_id` | intent state: pending / applied / failed (Chapter 4) |
