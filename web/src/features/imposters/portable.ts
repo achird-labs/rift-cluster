@@ -8,9 +8,10 @@
  * whole point is to commit the result beside the tests it supports, so a document that changes when
  * the mock has not is one a developer learns to distrust.
  *
- * Byte-preservation is how that is achieved for the whole-SET export, which is why `apiGetText`
- * exists: `GET /imposters?replayable=true` already emits clean `ImposterConfig`s, so re-indenting
- * them would only add churn.
+ * Byte-preservation is how that is achieved for a whole-SET export that keeps TLS material, which is
+ * why `apiGetText` exists: `GET /imposters?replayable=true` already emits clean `ImposterConfig`s, so
+ * re-indenting them would only add churn. Leaving TLS material out means taking fields out, which
+ * means a deterministic re-serialization instead (`renderSetExport`, D-84).
  *
  * It is emphatically NOT how it is achieved for a single imposter, and this is the trap.
  * `GET /imposters/:port?replayable=true` looks like the obvious call and is wrong: `handle_get`
@@ -30,37 +31,135 @@
 export type ExportProjection = "replay-ready" | "as-configured";
 
 /**
- * The two flags the export route actually takes.
+ * What an export contains.
  *
- * `replayable=true` renders the imposter in the form `PUT /imposters` accepts back.
- * `removeProxies=true` additionally turns recorded proxy responses into static stubs and drops the
- * proxy stubs themselves — the difference between "a mock of what the upstream said" and "a mock
- * that will go on recording at whoever imports it".
+ * `replayable` and `removeProxies` are the route's own flags. `replayable=true` renders the imposter
+ * in the form `PUT /imposters` accepts back. `removeProxies=true` additionally turns recorded proxy
+ * responses into static stubs and drops the proxy stubs themselves — the difference between "a mock
+ * of what the upstream said" and "a mock that will go on recording at whoever imports it".
  *
- * `tls` is the design's third option and it is NOT yet a server flag: the export route never
- * carries `key` or `cert` for an https imposter today, with or without a parameter asking it to —
- * verified against a live fleet. It is carried here so the dialog matches the design, and it is
- * sent on the wire so that the moment the route learns the parameter this begins working with no
- * further change. Until then the server ignores it and the exported file has no TLS material in it,
- * which is what `EXPORT_TLS_IS_INERT` exists to say out loud to anyone reading this code.
+ * `tls` is not a route flag, and is never sent (D-84). The replayable projection is the imposter's
+ * config verbatim, so an https imposter created with its own `cert` and `key` always comes back with
+ * both; `tls` decides whether the console keeps that pair in the downloaded file.
  */
 export type ExportOptions = { replayable: boolean; removeProxies: boolean; tls: boolean };
 
-/**
- * Whether `tls=true` actually changes the exported document.
- *
- * `false` today. Flip it when the export route implements the parameter — and when it is flipped,
- * the dialog's private-key warning stops being a statement about a file that cannot contain keys
- * and starts being a statement about one that can.
- */
-export const EXPORT_TLS_IS_INERT = true;
+/** What the export covers. The imposter list offers only the whole set; a detail screen offers both. */
+export type ExportScope = { kind: "all" } | { kind: "one"; port: number };
 
 export function exportOptionsQuery(options: ExportOptions): string {
-  return (
-    `?replayable=${String(options.replayable)}` +
-    `&removeProxies=${String(options.removeProxies)}` +
-    `&tls=${String(options.tls)}`
-  );
+  return `?replayable=${String(options.replayable)}&removeProxies=${String(options.removeProxies)}`;
+}
+
+/**
+ * The fields that are an https imposter's own certificate (D-84).
+ *
+ * Both, always: the engine refuses an imposter carrying one without the other, so half a pair in a
+ * file is no fixture, and a lone `key` is still a private key. `ca`, `mutualAuth` and
+ * `rejectUnauthorized` are not here — they are public, and they change what the imposter does.
+ */
+const TLS_MATERIAL_FIELDS = ["cert", "key"] as const;
+
+function carriesTlsMaterial(imposter: Record<string, unknown>): boolean {
+  return TLS_MATERIAL_FIELDS.some((field) => field in imposter);
+}
+
+function withoutTlsMaterial(imposter: Record<string, unknown>): Record<string, unknown> {
+  const stripped: Record<string, unknown> = { ...imposter };
+  for (const field of TLS_MATERIAL_FIELDS) delete stripped[field];
+  return stripped;
+}
+
+/**
+ * A file ready to download.
+ *
+ * `tlsPorts` names the imposters that carried their own `cert`/`key` — kept in `text` when the
+ * operator asked for TLS material, removed from it when not — so the screen can say which, rather
+ * than warning about keys in general.
+ */
+export type ExportDocument =
+  | {
+      kind: "ok";
+      text: string;
+      tlsPorts: number[];
+      /** Imposters with material of their own but no usable port to name them by. */
+      tlsWithoutPort: number;
+    }
+  | { kind: "error"; message: string };
+
+/**
+ * Why an export that has to be rewritten is refused in a browser that would round its numbers.
+ *
+ * The file would look right and hold different numbers than the fleet serves. The curl the dialog
+ * shows does the same removal in `jq`, which keeps digits.
+ */
+const CANNOT_KEEP_DIGITS =
+  "This browser cannot take the key and cert out of the file without risking changes to numbers in it. " +
+  "Use the curl command the export dialog shows, or a current browser.";
+
+/**
+ * The whole-set file, from the route's `GET /imposters?replayable=…` text.
+ *
+ * Kept TLS material, or none to remove, means the route's bytes, untouched. Removed means a
+ * deterministic re-serialization — the only way to take fields out of a JSON document — that keeps
+ * every number's digits, so two exports of an unchanged fleet are still identical and neither
+ * differs from the fleet in anything but the pair. A document that does not parse is refused in
+ * both modes: passing unreadable bytes through would pass through whatever key they hold.
+ */
+export function renderSetExport(setText: string, tls: boolean): ExportDocument {
+  const parsed = parseImportDocument(setText);
+  if (parsed.kind === "error") {
+    return { kind: "error", message: `The fleet's export could not be read: ${parsed.message}` };
+  }
+  const carriers = parsed.entries.filter((entry) => carriesTlsMaterial(entry.imposter));
+  const tlsPorts = carriers.flatMap((entry) => (entry.port === null ? [] : [entry.port]));
+  const reported = { tlsPorts, tlsWithoutPort: carriers.length - tlsPorts.length };
+  // Nothing kept or nothing to remove: the route's own bytes are already the file.
+  if (tls || carriers.length === 0) return { kind: "ok", text: setText, ...reported };
+  if (!keepsDigits()) return { kind: "error", message: CANNOT_KEEP_DIGITS };
+  const imposters = parsed.entries.map((entry) => withoutTlsMaterial(entry.imposter));
+  return {
+    kind: "ok",
+    text: `${JSON.stringify({ imposters }, null, EXPORT_INDENT)}\n`,
+    ...reported,
+  };
+}
+
+/** One imposter's file, selected out of the set text the same way `selectImposter` does. */
+export function renderImposterExport(setText: string, port: number, tls: boolean): ExportDocument {
+  // Always a rewrite — one imposter is cut out of the set — so digits must survive either way.
+  if (!keepsDigits()) return { kind: "error", message: CANNOT_KEEP_DIGITS };
+  const found = findImposter(setText, port);
+  if (found.kind === "error") return found;
+  const tlsPorts = carriesTlsMaterial(found.imposter) ? [port] : [];
+  const imposter = tls ? found.imposter : withoutTlsMaterial(found.imposter);
+  return {
+    kind: "ok",
+    text: `${JSON.stringify(imposter, null, EXPORT_INDENT)}\n`,
+    tlsPorts,
+    tlsWithoutPort: 0,
+  };
+}
+
+/**
+ * The command the export dialog shows: one that produces the same file the console downloads.
+ *
+ * Both scopes read the set route, as the console does. The jq filter does what `renderSetExport` and
+ * `renderImposterExport` do — select the one imposter, and drop `cert`/`key` unless kept — so a
+ * command copied out of the dialog cannot write a private key the dialog said it would leave out.
+ * It does not repeat `stripPerNode`, which removes fields the set route never sends.
+ */
+export function exportCurl(scope: ExportScope, options: ExportOptions): string {
+  const read = `curl -s '/imposters${exportOptionsQuery(options)}'`;
+  const strip = `del(${TLS_MATERIAL_FIELDS.map((field) => `.${field}`).join(", ")})`;
+  if (scope.kind === "all") {
+    return options.tls
+      ? `${read} > ${EXPORT_SET_FILENAME}`
+      : `${read} | jq '.imposters[] |= ${strip}' > ${EXPORT_SET_FILENAME}`;
+  }
+  const select = `.imposters[] | select(.port == ${String(scope.port)})`;
+  const filter = options.tls ? select : `${select} | ${strip}`;
+  return `${read} | jq '${filter}' > ${exportFilename(scope.port, undefined)}`;
 }
 
 /**
@@ -94,13 +193,22 @@ export function selectImposter(
   setText: string,
   port: number,
 ): { kind: "ok"; text: string } | { kind: "error"; message: string } {
+  const found = findImposter(setText, port);
+  if (found.kind === "error") return found;
+  return { kind: "ok", text: `${JSON.stringify(found.imposter, null, EXPORT_INDENT)}\n` };
+}
+
+function findImposter(
+  setText: string,
+  port: number,
+): { kind: "ok"; imposter: Record<string, unknown> } | { kind: "error"; message: string } {
   const parsed = parseImportDocument(setText);
-  if (parsed.kind === "error") return { kind: "error", message: parsed.message };
+  if (parsed.kind === "error") return parsed;
   const entry = parsed.entries.find((candidate) => candidate.port === port);
   if (entry === undefined) {
     return { kind: "error", message: `The fleet returned no imposter on port ${port}.` };
   }
-  return { kind: "ok", text: `${JSON.stringify(stripPerNode(entry.imposter), null, EXPORT_INDENT)}\n` };
+  return { kind: "ok", imposter: stripPerNode(entry.imposter) };
 }
 
 /**
@@ -171,7 +279,50 @@ export type ImportDocument =
   | { kind: "error"; message: string };
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
+  return (
+    typeof value === "object" && value !== null && !Array.isArray(value) && !isRawNumber(value)
+  );
+}
+
+/**
+ * `JSON.rawJSON` and `JSON.isRawJSON`, which ES2022's lib does not declare. They shipped with the
+ * reviver's `context.source` (Chrome 114, Firefox 135, Safari 18.4), so one presence check covers
+ * all three.
+ */
+type RawJsonApi = {
+  rawJSON?: (text: string) => unknown;
+  isRawJSON?: (value: unknown) => boolean;
+};
+const RAW_JSON: RawJsonApi = JSON as RawJsonApi;
+
+function isRawNumber(value: unknown): boolean {
+  return RAW_JSON.isRawJSON?.(value) ?? false;
+}
+
+/**
+ * Parse JSON without changing any number, where the browser can.
+ *
+ * A stub body is free-form JSON, so an imposter can hold `1234567890123456789` or `1.0`, and plain
+ * `JSON.parse` turns those into `1234567890123456800` and `1` without a word. Every number whose
+ * text a JavaScript number would not reproduce is kept as its original digits instead, and
+ * `JSON.stringify` writes those digits back. Without the API this is plain `JSON.parse` — what the
+ * console always did — and `keepsDigits` says so, for the callers that must refuse rather than
+ * round (D-84).
+ */
+export function parseJson(text: string): unknown {
+  const rawJSON = RAW_JSON.rawJSON;
+  if (rawJSON === undefined) return JSON.parse(text);
+  return JSON.parse(text, (_key, value: unknown, context?: { source?: string }) =>
+    typeof value === "number" &&
+    context?.source !== undefined &&
+    String(value) !== context.source
+      ? rawJSON(context.source)
+      : value,
+  );
+}
+
+function keepsDigits(): boolean {
+  return RAW_JSON.rawJSON !== undefined;
 }
 
 function entryOf(imposter: Record<string, unknown>): ImportEntry {
@@ -202,7 +353,7 @@ export function parseImportDocument(text: string): ImportDocument {
 
   let parsed: unknown;
   try {
-    parsed = JSON.parse(text) as unknown;
+    parsed = parseJson(text);
   } catch (error) {
     // Surfaced, never swallowed: a malformed paste is the single most likely thing to go wrong
     // here, and the parser's own message names the offset.
