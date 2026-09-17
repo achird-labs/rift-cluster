@@ -1443,21 +1443,70 @@ async fn a_joiner_is_caught_up_by_a_multi_mebibyte_snapshot() {
     // one would let the joiner arrive before the purge — at which point it catches up by log
     // replication, the install this test measures never happens, and the failure looks like a
     // margin problem instead of a route problem (#492).
-    let deadline = Instant::now() + CONVERGE_BY;
+    //
+    // **Polling alone can wait forever (#610).** openraft evaluates the snapshot policy only when
+    // the commit index advances — and `LogsSinceLast(2)` wants two entries past the snapshot — and
+    // skips the evaluation while a build is running; nothing re-evaluates when that build lands.
+    // So a snapshot one entry short of the tip is stable by the threshold alone, and one two or
+    // more short is stranded when a build was still running at the last commit. CI saw both,
+    // `snapshot=8` and `snapshot=7` against `applied=9`, for the full minute. So the loop commits
+    // one more entry, which clears the threshold either way, but only at a moment when no build
+    // can be running:
+    //
+    // - **right after it sees a build land behind the tip.** That build has finished, every
+    //   trigger during it was skipped, and this test is the only writer, so the nudge's commit
+    //   starts a build that captures the tip and nothing commits while it runs. Nudging on a
+    //   timer instead does not converge: each nudge lands mid-build, its trigger is skipped, and
+    //   the tip moves one further away (measured: 49 nudges in 60 s with 3 s builds).
+    // - **once, after `ENTRY_FALLBACK`,** for the one case a landing cannot signal: the last build
+    //   landed before this loop began. If it fires while a build is in fact running, it costs
+    //   one entry and the landing rule takes over. It must stay single-shot — repeated, it is the
+    //   timer again.
+    //
+    // The nudge is a `FleetNamePut`: replicated like any config, but it touches no imposter, so
+    // `ENTRIES`, `last_port` and the 32 MiB the install is measured against are unchanged. It is
+    // not `trigger().snapshot()`, which nothing in this codebase calls (D-24).
+    const ENTRY_FALLBACK: Duration = Duration::from_secs(10);
+    let poll_started = Instant::now();
+    let deadline = poll_started + CONVERGE_BY;
+    let mut seen = leader.snapshot_index();
+    let mut fallback_spent = false;
+    let mut nudges = 0u32;
     loop {
         let applied = leader.status().last_applied;
-        if applied.is_some()
-            && leader.snapshot_index() == applied
-            && leader.purged_index() == applied
-        {
+        let snapshot = leader.snapshot_index();
+        if applied.is_some() && snapshot == applied && leader.purged_index() == applied {
             break;
+        }
+        let landed_behind = snapshot != seen && snapshot != applied;
+        let final_at_entry = !fallback_spent
+            && snapshot == seen
+            && snapshot != applied
+            && poll_started.elapsed() >= ENTRY_FALLBACK;
+        seen = snapshot;
+        if landed_behind || final_at_entry {
+            fallback_spent |= final_at_entry;
+            nudges += 1;
+            leader
+                .submit(ControlRequest {
+                    op_id: uuid::Uuid::new_v4(),
+                    principal: None,
+                    issued_at_secs: 0,
+                    expected_revision: None,
+                    op: rift_cluster::ControlOp::FleetNamePut {
+                        name: format!("snapshot-nudge-{nudges}"),
+                    },
+                })
+                .await
+                .unwrap_or_else(|e| panic!("snapshot nudge {nudges} commits: {e}"));
         }
         assert!(
             Instant::now() < deadline,
             "the leader never snapshotted and purged within {CONVERGE_BY:?}, so the joiner would \
              be caught up by log replication rather than an install: applied={applied:?} \
-             snapshot={:?} purged={:?}",
-            leader.snapshot_index(),
+             snapshot={snapshot:?} purged={:?}, after {nudges} nudge(s) (#610: a count above zero \
+             means a nudge after a landing did not bring the snapshot to the tip, which this loop \
+             assumes it does)",
             leader.purged_index()
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
