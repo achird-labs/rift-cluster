@@ -3138,6 +3138,7 @@ impl RaftStateMachine<TypeConfig> for RedbStateMachine {
             .into());
         }
         let received = snapshot.into_std().await;
+        let t602_started = std::time::Instant::now();
 
         // Two steps: parse the payload off the runtime (redb-free, but a JSON parse of a bounded
         // buffer), then write the durable state off the runtime. The engine drive stays the
@@ -3167,6 +3168,13 @@ impl RaftStateMachine<TypeConfig> for RedbStateMachine {
         })??;
 
         self.drive_engine(actions).await;
+        if std::env::var_os("T602_INSTALL_TIMING").is_some() {
+            eprintln!(
+                "T602-INSTALL last_log={:?} took={}ms",
+                meta.last_log_id.map(|l| l.index),
+                t602_started.elapsed().as_millis()
+            );
+        }
 
         Ok(())
     }

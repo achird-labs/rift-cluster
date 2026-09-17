@@ -542,6 +542,11 @@ separate question; this entry does not settle them.
 > presents as a joiner — a departing voter is never a learner in committed membership.
 
 ### D-22 — Liveness probes bypass the peer-health gate
+> **Amended by D-83** (2026-09-17, #602): a probe also waits on its reply for at most
+> `LIVENESS_PROBE_DEADLINE` (150 ms). The bypass below is unchanged; what changed is that a
+> follower holding replies — as openraft does behind a snapshot install — no longer silences the
+> ticker for the length of the ordinary 2 s request timeout.
+
 > **Amended by D-78** (2026-09-16, #597): the exemption below is unchanged — `probe` still ignores
 > the mark entirely, and every liveness mechanism still uses it. What changed is the gate it
 > bypasses: the gate (`PeerHealth::admit`) is now **half-open**, admitting one trial call per 250ms to a
@@ -3605,3 +3610,45 @@ of every rolling upgrade.
 four values that fit the one already running. *Rejected:* reporting only the answering node — the
 disagreement across nodes is the case the issue names as worth looking at.
 
+### D-83 — A liveness probe has done its job when it arrives: the ticker waits on a reply for at most 150 ms
+
+- **Status:** active
+- **Decided:** 2026-09-17 · #602
+- **Refines:** D-22
+- **Implemented by:** #602
+- **Code:** crates/rift-cluster/src/raft/network.rs, crates/rift-cluster/src/raft/node.rs
+
+D-22's ticker allowed one probe in flight per peer and gave it the ordinary request timeout (2 s).
+That was harmless while replies were prompt. They are not during a snapshot install: openraft
+0.9.25 queues the state-machine install and then a `Respond` guarded by
+`Condition::StateMachineCommand`, and `run_engine_commands` stops at the first postponed command,
+so the reply to every AppendEntries that arrives during the install waits for it to finish. The
+engine *did* process each probe on arrival — the vote check refreshed the follower's election
+timer — but the leader, waiting on the reply, sent nothing more. A follower campaigns after
+`leader_lease + election_timeout` of silence, which openraft sets to `election_timeout_max` plus a
+draw from `[election_timeout_min, election_timeout_max)`: 450–600 ms. Since D-72 put every config
+inline on the log, a restarted voter's snapshot install passes that on a CI runner, and
+`a_restarted_voter_behind_a_purged_log_catches_up_by_snapshot` — D-22's pin — failed in 10 of 104
+runs after #564 and in none of the 96 before it.
+
+**The rule.** The ticker waits on a probe's reply for at most `LIVENESS_PROBE_DEADLINE` (150 ms),
+then paces the next probe by one `LIVENESS_TICK` (50 ms). Probes therefore *arrive* at most 200 ms
+apart whatever the follower does with the replies — under half of the 450 ms minimum a follower
+tolerates, so one lost probe is survivable. A test pins that inequality against the Raft timers,
+so a timer change fails there rather than reopening this. A timed-out probe is neither charged nor
+credited to the peer's health (D-22, #442); `RpcClient` is unchanged.
+
+**The one-in-flight gate stays**, and its job changed: it bounds how many handlers a long install
+parks on the follower — one per deadline per ticker (openraft builds two clients per target), all
+released when the install ends — instead of one per tick.
+
+**Measured.** Locally (M-series, instrumented): a slowed install that failed the pin 4/4 on the 2 s
+deadline passed 4/4 on 150 ms; the unit test that pins this lets 2 probes through in 1.2 s of held
+replies on the old deadline and at least 5 on the new one. On CI: <CI_FIGURE>.
+
+*Rejected:* **no gate** (fire-and-forget) — unbounded parked handlers on a follower that is slow
+for a real reason. **Answering probes outside the Raft core** — the probe must reach the engine to
+refresh the timer, and the queue that holds its reply is openraft's. **Longer election timeouts** —
+moves D-17's isolation window and the #411 timer coupling for a defect in our ticker. **A smaller
+test fixture** — the test is right; the fixture change exposed a production defect, since a real
+fleet's snapshot is tens of MiB and a voter caught up by one would campaign mid-install.

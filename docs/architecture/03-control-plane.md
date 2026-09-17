@@ -180,7 +180,11 @@ per-peer *liveness ticker* — an empty AppendEntries on its current vote whenev
 openraft has sent that peer nothing for a heartbeat interval, which is the whole
 of a snapshot install and the whole of a large entry's transfer — sent through a
 probe that bypasses the peer-health tracker (D-22), because the tracker would otherwise
-refuse to talk to a just-restarted peer for its cooldown. The ticker speaks only
+refuse to talk to a just-restarted peer for its cooldown. Each probe waits at most
+150 ms for its reply (D-83): a follower installing a snapshot processes a probe the
+moment it arrives — that is what refreshes its election timer — but openraft answers
+it only when the install ends, and a ticker that waited on the answer fell silent for
+the whole install (#602). The ticker speaks only
 while its node actually leads: a probe asserts "your leader is alive", and a
 leader that has gracefully left (or been deposed) must fall *silent* — its
 silence is what lets the survivors' leader leases lapse so a successor can win

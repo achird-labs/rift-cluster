@@ -1245,6 +1245,11 @@ async fn a_leadership_change_under_load_never_panics_a_replication_worker() {
 ///
 /// Pins D-22: the leader's liveness probes reach a restarted voter *through* the health gate,
 /// so its term never runs ahead while it is caught up by snapshot.
+///
+/// Pins D-83: those probes keep *arriving* while the voter holds their replies behind the
+/// install. Since D-72 the nine 512 KiB entries ride the log inline, so the install is long
+/// enough on a CI runner to outlast a follower's election timeout; a ticker that waited on the
+/// held reply made this fail ~10% of the time (#602).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_restarted_voter_behind_a_purged_log_catches_up_by_snapshot() {
     let _serial = TEST_LOCK.lock().await;
