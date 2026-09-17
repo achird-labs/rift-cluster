@@ -50,6 +50,7 @@ table is where a `U-n` is defined (`scripts/design-check.py` resolves citations 
 | U-16 | rift#910/#911 | `ProxyRecordingStore` claim semantics revised for fleet-wide exactly-once (`StubPublication`, `publishes_stubs()`) | clustered `proxyOnce` (#226, Chapter 6) | merged |
 | U-17 | rift#990 | `ProxyStoreError::Refused(BackendUnavailable)` (+ `#[non_exhaustive]`) and the proxy-leg 503 door — a store that *arbitrates* exactly-once can refuse a claim instead of being degraded around | clustered `proxyOnce` fails closed at the client (#529, D-66; Chapter 6) | merged |
 | U-18 | rift#1012 | `admin_api::not_a_stub_reason` — the space-stub shape guard's *decision* (#336), separated from its rendering | the clustered front terminates `POST .../spaces/{flowId}/stubs` as a replicated write and applies the same rule, rather than keeping a second copy of `STUB_FIELD_NAMES` that would go stale (#537, D-69) | merged |
+| U-19 | rift#1146 | `admin_api::{ADMIN_ROUTES, AdminRoute, RouteFamily}` — every `(method, path)` the admin listener dispatches, pinned upstream against its router | the OpenAPI parity oracle (`openapi.rs`) reads the served set from it and requires `upstream_proxied_routes` to equal it minus what the front terminates, replacing a scrape of the vendored router's source (#588) | merged |
 
 The pattern in U-8 deserves a sentence: cluster backends *annotate* the
 request task-locally ("degraded: kv-adopt", "revision: 421"), and a
