@@ -542,6 +542,11 @@ separate question; this entry does not settle them.
 > presents as a joiner — a departing voter is never a learner in committed membership.
 
 ### D-22 — Liveness probes bypass the peer-health gate
+> **Amended by D-83** (2026-09-17, #602): a probe also waits on its reply for at most
+> `LIVENESS_PROBE_DEADLINE` (150 ms). The bypass below is unchanged; what changed is that a
+> follower holding replies — as openraft does behind a snapshot install — no longer silences the
+> ticker for the length of the ordinary 2 s request timeout.
+
 > **Amended by D-78** (2026-09-16, #597): the exemption below is unchanged — `probe` still ignores
 > the mark entirely, and every liveness mechanism still uses it. What changed is the gate it
 > bypasses: the gate (`PeerHealth::admit`) is now **half-open**, admitting one trial call per 250ms to a
@@ -3605,3 +3610,62 @@ of every rolling upgrade.
 four values that fit the one already running. *Rejected:* reporting only the answering node — the
 disagreement across nodes is the case the issue names as worth looking at.
 
+### D-83 — A liveness probe has done its job when it arrives: the ticker waits on a reply for at most 150 ms
+
+- **Status:** active
+- **Decided:** 2026-09-17 · #602
+- **Refines:** D-22
+- **Implemented by:** #602
+- **Code:** crates/rift-cluster/src/raft/network.rs, crates/rift-cluster/src/raft/node.rs
+
+D-22's ticker allowed one probe in flight per peer and gave it the ordinary request timeout (2 s).
+That was harmless while replies were prompt. They are not during a snapshot install: openraft
+0.9.25 queues the state-machine install and then a `Respond` guarded by
+`Condition::StateMachineCommand`, and `run_engine_commands` stops at the first postponed command,
+so the reply to every AppendEntries that arrives during the install waits for it to finish. The
+engine *did* process each probe on arrival — the vote check refreshed the follower's election
+timer — but the leader, waiting on the reply, sent nothing more. A follower campaigns after
+`leader_lease + election_timeout` of silence, which openraft sets to `election_timeout_max` plus a
+draw from `[election_timeout_min, election_timeout_max)`: 450–600 ms. Since D-72 put every config
+inline on the log, a restarted voter's snapshot install passes that on a CI runner, and
+`a_restarted_voter_behind_a_purged_log_catches_up_by_snapshot` — D-22's pin — failed in 10 of 104
+runs after #564 and in none of the 96 before it.
+
+**The rule.** The ticker waits on a probe's reply for at most `LIVENESS_PROBE_DEADLINE` (150 ms)
+per address, then paces the next round by one `LIVENESS_TICK` (50 ms). For a peer with one address
+— every literal `host:port` — probes therefore *arrive* at most 200 ms apart whatever the follower
+does with the replies: under half of the 450 ms minimum silence after which a follower holding a
+committed vote campaigns, so one lost probe is survivable. A dual-stack hostname whose first
+address does not answer is heard every 350 ms, still inside it. Each address keeps its own
+deadline rather than sharing one, because a shared budget spent on a dead first address would never
+reach the live second one (D-28); a peer with three or more addresses of which the leading ones are
+dead is the case this does not cover. A test pins both inequalities against the Raft timers, so a
+timer change fails there rather than reopening this. `RpcClient` is unchanged.
+
+**What a short deadline costs.** A timed-out probe is neither charged nor credited to the peer's
+health (D-22, #442), so a follower that holds replies is not credited by probes while it does —
+under the 2 s deadline it sometimes was. Nothing depends on that credit: D-78's half-open trial
+readmits the peer on the replication path. Each timed-out probe also drops its connection, so
+during an install every probe opens a new one and the follower keeps each parked request's socket
+until the install ends — about ten per second across openraft's two clients per target. Bounded,
+and released together.
+
+**The one-in-flight gate is gone.** `probe_inflight` dated from #429, when keepalives were spawned
+from the transfer path. Since #449 the ticker is a single task that awaits each probe inline, so
+the gate could never refuse anything; the loop itself is what keeps one probe outstanding per
+round.
+
+**Measured.** Locally (M-series, instrumented): a slowed install that failed the pin 4/4 on the 2 s
+deadline passed 4/4 on 150 ms; the unit test that pins this lets 1 probe through in 2 s of held
+replies on the old deadline and 10 on the new one (3/3 runs each). On a GitHub runner (throwaway
+draft #611, one binary, the deadline switched by environment): the victim's multi-MiB snapshot
+installs took **296–818 ms (median 587, n = 100)**, straddling the 450–600 ms a follower tolerates,
+and the pin failed **7 of 30** runs on the 2 s deadline and **0 of 30** on 150 ms.
+
+*Rejected:* **fire-and-forget probes** (spawning each probe instead of awaiting it) — unbounded
+parked handlers on a follower that is slow for a real reason. **Answering probes outside the Raft
+core** — the probe must reach the engine to refresh the timer, and the queue that holds its reply
+is openraft's. **Longer election timeouts** —
+moves D-17's isolation window and the #411 timer coupling for a defect in our ticker. **A smaller
+test fixture** — the test is right; the fixture change exposed a production defect, since a real
+fleet's snapshot is tens of MiB and a voter caught up by one would campaign mid-install.

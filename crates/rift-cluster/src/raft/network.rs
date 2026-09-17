@@ -168,7 +168,6 @@ impl RaftNetworkFactory<TypeConfig> for RpcNetwork {
             addr: node.addr.clone(),
             resolver: Arc::clone(&self.resolver),
             inflight: None,
-            probe_inflight: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             liveness: Arc::new(std::sync::Mutex::new(PeerLiveness::default())),
             leading: Arc::clone(&self.leading),
             ticker: None,
@@ -190,17 +189,6 @@ pub(crate) struct PeerClient {
     /// one `PeerClient` per replication stream sequentially, so this needs no
     /// lock.
     inflight: Option<InflightAppend>,
-    /// Whether a keepalive probe is already in flight to this peer.
-    ///
-    /// openraft re-drives the attach path about every 50 ms, so without this the
-    /// adapter would spawn ~20 probes a second. That is not merely wasteful:
-    /// each one runs through `call_once`, which feeds `TrackedPeerHealth`, and
-    /// three consecutive failures mark the peer unhealthy for a cooldown — after
-    /// which the *transfer's* own `call_once` fast-fails with "peer is not
-    /// healthy". A slow-but-alive follower could therefore have the keepalive
-    /// kill the very transfer it exists to protect. One probe at a time keeps
-    /// failures accruing at the probe's timeout rate, like any other call.
-    probe_inflight: Arc<std::sync::atomic::AtomicBool>,
     /// Shared with the liveness ticker: the leader's last-seen vote and when
     /// openraft last sent this peer anything. See [`PeerClient::spawn_liveness_ticker`].
     liveness: Arc<std::sync::Mutex<PeerLiveness>>,
@@ -237,6 +225,20 @@ impl Drop for PeerClient {
 /// ticker speaks for openraft — the same cadence as `heartbeat_interval`, so a
 /// follower sees no difference between openraft's heartbeat and the ticker's.
 const LIVENESS_TICK: Duration = Duration::from_millis(50);
+
+/// How long the liveness ticker waits for a probe's reply before it may send the next one
+/// (D-83).
+///
+/// A probe has done its job when it *arrives*: the follower's engine checks the vote and
+/// refreshes its election timer then. The reply can be held for much longer — openraft answers
+/// an AppendEntries only after any snapshot install queued ahead of it — and a ticker that
+/// waited out the ordinary 2 s request timeout went silent for the whole install, which is how a
+/// voter caught up by snapshot came to campaign mid-install (#602). With this bound, a peer
+/// resolving to `n` addresses hears a probe at least every `n × LIVENESS_PROBE_DEADLINE +
+/// LIVENESS_TICK` (the ticker tries each address in turn); a test pins that against the Raft timers
+/// for one and two addresses. A timed-out probe is neither charged nor credited to the peer's
+/// health (D-22).
+const LIVENESS_PROBE_DEADLINE: Duration = Duration::from_millis(150);
 
 /// What an in-flight AppendEntries transfer resolves to.
 type AppendOutcome =
@@ -436,18 +438,21 @@ impl PeerClient {
     /// and can truncate nothing. It goes through [`RpcClient::probe`], not
     /// `call_once`, because the health tracker would otherwise refuse it for
     /// the whole cooldown after the peer's restart — the exact window it exists
-    /// to cover (decision D-22). It dies with the `PeerClient`.
+    /// to cover (decision D-22). Each probe waits at most [`LIVENESS_PROBE_DEADLINE`] for its
+    /// reply, so a follower that holds replies still hears the leader (D-83). It dies with the
+    /// `PeerClient`.
     fn spawn_liveness_ticker(&self) -> tokio::task::JoinHandle<()> {
         let client = self.client.clone();
         let resolver = Arc::clone(&self.resolver);
         let target = self.target;
         let addr = self.addr.clone();
-        let gate = Arc::clone(&self.probe_inflight);
         let liveness = Arc::clone(&self.liveness);
         let leading = Arc::clone(&self.leading);
-        let deadline = self.client.request_timeout();
         tokio::spawn(async move {
-            use std::sync::atomic::Ordering;
+            // Whether the last round could not even be attempted. Logged on the transition only:
+            // this loop runs every tick, and a peer whose name never resolves would otherwise
+            // flood the log — or, unlogged, silently never be probed at all.
+            let mut unprobeable = false;
             loop {
                 tokio::time::sleep(LIVENESS_TICK).await;
                 // A node that stopped leading must fall silent: its silence is
@@ -460,26 +465,50 @@ impl PeerClient {
                     if quiet { l.vote } else { None }
                 });
                 let Some(vote) = due else { continue };
-                // One probe in flight per peer, shared with the transfer path's
-                // gate: without it the ticker would pile up probes behind a slow
-                // link instead of pacing them.
-                if gate
-                    .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-                    .is_err()
-                {
-                    continue;
-                }
+                // Probes are sent one at a time from this loop, each bounded by the deadline,
+                // so a follower holding replies has at most one of them parked per deadline.
                 let probe = AppendEntriesRequest::<TypeConfig> {
                     vote,
                     prev_log_id: None,
                     entries: Vec::new(),
                     leader_commit: None,
                 };
-                let resolved = resolve_peer(&resolver, target, &addr).await;
-                if let (Ok(body), Ok(addrs)) = (serde_json::to_vec(&probe), resolved) {
+                let round = match (
+                    serde_json::to_vec(&probe),
+                    resolve_peer(&resolver, target, &addr).await,
+                ) {
+                    (Ok(body), Ok(addrs)) => Ok((body, addrs)),
+                    (Err(e), _) => Err(format!("encoding the probe failed: {e}")),
+                    (_, Err(e)) => Err(format!("resolving the peer failed: {e}")),
+                };
+                match &round {
+                    Err(reason) if !unprobeable => tracing::warn!(
+                        peer = target,
+                        addr = %addr,
+                        %reason,
+                        "liveness probe skipped; the peer will not hear this leader through the \
+                         ticker until this clears"
+                    ),
+                    Ok(_) if unprobeable => {
+                        tracing::info!(peer = target, addr = %addr, "liveness probes resumed");
+                    }
+                    _ => {}
+                }
+                unprobeable = round.is_err();
+                if let Ok((body, addrs)) = round {
+                    // Each address gets its own deadline rather than sharing one: a shared
+                    // budget spent on a dead first address would never reach the live second
+                    // one (D-28 dials every address). The price is a wider gap between rounds
+                    // for a peer whose earlier addresses do not answer — see D-83.
                     for peer in &addrs {
                         if client
-                            .probe(*peer, "POST", RAFT_APPEND_PATH, body.clone(), deadline)
+                            .probe(
+                                *peer,
+                                "POST",
+                                RAFT_APPEND_PATH,
+                                body.clone(),
+                                LIVENESS_PROBE_DEADLINE,
+                            )
                             .await
                             .is_ok()
                         {
@@ -487,7 +516,6 @@ impl PeerClient {
                         }
                     }
                 }
-                gate.store(false, Ordering::Release);
             }
         })
     }
@@ -2294,6 +2322,16 @@ mod tests {
         addr: SocketAddr,
         leading: Arc<std::sync::atomic::AtomicBool>,
     ) -> PeerClient {
+        peer_client_with_timeout(addr, leading, Duration::from_millis(500)).await
+    }
+
+    /// [`peer_client_with_leading`], with the client's ordinary request timeout chosen by the
+    /// caller — for a test whose claim must not depend on the helpers' shortened 500 ms.
+    async fn peer_client_with_timeout(
+        addr: SocketAddr,
+        leading: Arc<std::sync::atomic::AtomicBool>,
+        request_timeout: Duration,
+    ) -> PeerClient {
         let leading: LeadingProbe =
             Arc::new(move || leading.load(std::sync::atomic::Ordering::Acquire));
         use crate::rpc::{AlwaysHealthy, RpcClientConfig};
@@ -2309,7 +2347,7 @@ mod tests {
             Arc::new(AlwaysHealthy),
             RpcClientConfig {
                 connect_timeout: Duration::from_millis(200),
-                request_timeout: Duration::from_millis(500),
+                request_timeout,
                 max_retries: 0,
             },
         );
@@ -2722,6 +2760,88 @@ mod tests {
         assert!(
             probes.load(Ordering::SeqCst) >= 1,
             "250 ms of silence from openraft must produce at least one probe"
+        );
+    }
+
+    /// A follower that holds its replies must still *hear* the leader (#602).
+    ///
+    /// openraft processes an AppendEntries on arrival — the vote check refreshes the follower's
+    /// election timer — but answers it only after any snapshot install queued ahead of it. A
+    /// ticker that waits on that answer goes silent for the whole install, and a voter caught up
+    /// by snapshot campaigns mid-install. The responder here does the same: it counts a probe
+    /// the moment it arrives and answers 2.5 s later.
+    ///
+    /// Built on the production request timeout (2 s), not the helpers' 500 ms: waiting on the
+    /// reply for that long lets exactly one probe through in the 2 s window, where the bounded
+    /// wait lets through about ten — so the threshold of six sits well clear of both, and the
+    /// claim does not rest on a margin the test's own client configuration sets.
+    ///
+    /// Pins D-83: a liveness probe has done its job when it arrives; the ticker waits on a reply
+    /// for at most `LIVENESS_PROBE_DEADLINE`.
+    #[tokio::test]
+    async fn the_liveness_ticker_keeps_speaking_while_replies_are_held() {
+        use openraft::network::{RPCOption, RaftNetwork};
+        use std::sync::atomic::Ordering;
+
+        let (addr, _bodies, probes, _guard) =
+            spawn_append_responder(Duration::from_millis(2500), AppendReply::Success).await;
+        let leading = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let mut peer =
+            peer_client_with_timeout(addr, leading, crate::rpc::DEFAULT_REQUEST_TIMEOUT).await;
+
+        // Arm the ticker with a vote. The adapter ignores `RPCOption` and this heartbeat's reply
+        // is held too, so bound the call here, as openraft's own RPC deadline would; otherwise it
+        // blocks for the whole hold and the window below is not the one being measured. The
+        // heartbeat carries a `prev_log_id`, so the responder does not count it as a probe.
+        let mut hb = append_req(1, Some(3), 3);
+        hb.entries.clear();
+        let _ = tokio::time::timeout(
+            Duration::from_millis(50),
+            peer.append_entries(hb, RPCOption::new(Duration::from_millis(50))),
+        )
+        .await;
+        tokio::time::sleep(Duration::from_millis(2000)).await;
+        let arrived = probes.load(Ordering::SeqCst);
+        assert!(
+            arrived >= 6,
+            "only {arrived} probe(s) reached a follower in 2 s of held replies; a follower \
+             campaigns after 450 ms of silence, so the ticker must not wait on an answer"
+        );
+    }
+
+    /// Consecutive probes arrive well inside the silence a follower tolerates.
+    ///
+    /// A follower whose vote is committed — one that has accepted this leader, which is the only
+    /// follower a probe is keeping quiet — campaigns once it has heard nothing for
+    /// `leader_lease + election_timeout`. openraft sets the lease to `election_timeout_max` and
+    /// draws the timeout from `[election_timeout_min, election_timeout_max)`, so the shortest
+    /// silence that can trigger that campaign is `max + min`.
+    ///
+    /// A round tries each resolved address for at most `LIVENESS_PROBE_DEADLINE` and the next
+    /// round starts one `LIVENESS_TICK` later. For a peer with one address — every literal
+    /// `host:port` — the gap is `deadline + tick`, and keeping it under half the tolerated silence
+    /// means one lost probe is survivable. A dual-stack hostname (two addresses, the first not
+    /// answering) must still be heard before the follower campaigns. Changing the Raft timers or
+    /// either ticker constant re-checks this here instead of reopening #602.
+    ///
+    /// Pins D-83: probe arrivals are spaced by at most half of the silence that makes a follower
+    /// campaign, and a two-address peer is still heard inside it.
+    #[test]
+    fn a_liveness_probe_arrives_well_inside_a_followers_election_timeout() {
+        use crate::raft::node::{ELECTION_TIMEOUT_MAX_MS, ELECTION_TIMEOUT_MIN_MS};
+
+        let tolerated = Duration::from_millis(ELECTION_TIMEOUT_MAX_MS + ELECTION_TIMEOUT_MIN_MS);
+        let one_address_gap = LIVENESS_PROBE_DEADLINE + LIVENESS_TICK;
+        assert!(
+            one_address_gap * 2 <= tolerated,
+            "probes may arrive {one_address_gap:?} apart, but a follower campaigns after {tolerated:?} \
+             of silence; the gap must stay under half of that"
+        );
+        let two_address_gap = LIVENESS_PROBE_DEADLINE * 2 + LIVENESS_TICK;
+        assert!(
+            two_address_gap < tolerated,
+            "a dual-stack peer may hear a probe only every {two_address_gap:?}, but it campaigns after \
+             {tolerated:?} of silence"
         );
     }
 
