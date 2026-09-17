@@ -2932,6 +2932,7 @@ mod tests {
         }
 
         let term_after = n2.raft_term().max(n3.raft_term());
+        eprintln!("T606-CI longest={longest:?} term={term_before}->{term_after} widest_gap={widest_gap:?}");
         for (i, (id, _)) in survivors.iter().enumerate() {
             assert!(
                 longest[i] < Duration::from_millis(400),
