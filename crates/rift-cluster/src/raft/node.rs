@@ -73,9 +73,14 @@ const NODE_HELD_DB_REFS: usize = 1;
 /// startup.
 const INIT_LEADER_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// The lower election timeout the Raft config uses. Read by the liveness ticker's spacing pin
+/// (D-83), which is why it is a named constant rather than a literal in `raft_config`.
+pub(super) const ELECTION_TIMEOUT_MIN_MS: u64 = 150;
+
 /// The upper election timeout the Raft config uses; also the basis for the
-/// isolated-owner window below.
-const ELECTION_TIMEOUT_MAX_MS: u64 = 300;
+/// isolated-owner window below, and — as openraft's `leader_lease` — for the liveness ticker's
+/// spacing pin (D-83).
+pub(super) const ELECTION_TIMEOUT_MAX_MS: u64 = 300;
 
 /// A leader that a quorum has not acknowledged within this window is treated as
 /// isolated (the isolated-owner rule, RFC-001 §7.2): 3× the election timeout.
@@ -473,7 +478,7 @@ impl RaftNode {
             // Fixed here, not a `NodeConfig` knob (D-42): C6's leadership-transition bound is
             // derived from these numbers, and widening them so a count bound could hold was
             // the rejected alternative. #411 pins them below.
-            election_timeout_min: 150,
+            election_timeout_min: ELECTION_TIMEOUT_MIN_MS,
             election_timeout_max: ELECTION_TIMEOUT_MAX_MS,
             heartbeat_interval: 50,
             // Snapshot transport (#428). openraft bounds each *chunk* by `install_snapshot_timeout`
