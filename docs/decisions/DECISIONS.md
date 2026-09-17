@@ -414,15 +414,16 @@ at ~1 ms, 10 rounds / 20 observations):
 - a routine election isolates each node for **tens of milliseconds** — the election round trip
   plus the new leader's first quorum-ack, because `current_leader` is `None` exactly while the
   node's vote is uncommitted.
-- **an extra election round costs the candidate 225–375 ms** (measured 204–341 ms, #606). Split
-  votes do not cause one: openraft is built without `single-term-leader`, so votes are ordered by
-  `(term, node_id)` and two survivors campaigning at once resolve in one round (40/40 forced).
-  What causes one is a survivor whose lease on the dead leader is still live when the campaign
-  arrives — it was *behind* at the moment of failure, still processing AppendEntries the leader
-  sent before dying — so it refuses, and the candidate waits out its election timeout, which
-  openraft draws once per process and checks on a 75 ms tick. A leader dying under write load
-  with a follower backlogged can therefore cost one or two such rounds; D-17's pin starts from a
-  quiesced fleet so that it measures the routine case.
+- **an extra election round costs the candidate 150–375 ms** (measured 204–341 ms, #606): its
+  election timeout — drawn from `[150, 300)` once per Raft instance — reached on openraft's next
+  75 ms election tick. Split votes do not cause one: openraft is built without
+  `single-term-leader`, so votes are ordered by `(term, node_id)` and two survivors campaigning at
+  once resolve in one round (40/40 forced). A *refused* vote does: a survivor whose lease on the
+  dead leader is still live when the campaign arrives — it was behind at the moment of failure,
+  still processing AppendEntries the leader sent before dying — refuses it. A survivor holding a
+  longer log also refuses, and then the candidate additionally waits `smaller_log_timeout`
+  (600 ms). A leader dying under write load with a follower backlogged can therefore cost one or
+  more such rounds; D-17's pin starts from a quiesced fleet so that it measures the routine case.
   The #472 probe measured **13–31 ms**; re-measuring while writing this entry's guard test, on
   different hardware and with a coarser ~8 ms sampler, gave **32–40 ms**. Both are the same
   quantity and both are two orders of magnitude below the figure this entry used to state; take
