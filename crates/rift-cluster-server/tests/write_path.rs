@@ -4931,3 +4931,104 @@ fn only_a_leaderless_503_is_retried() {
         );
     }
 }
+
+/// Pins D-82 end to end (#394), across a real fan-out: each node's `/_fleet/members` row for its
+/// peer carries the flags **that peer** was started with.
+///
+/// Two nodes, deliberately started with different flags. A peer's row is filled from that peer's
+/// own `/_cluster/members` — the cluster-port routes `compose` built — so this is what proves those
+/// routes got the node's real settings, and that a row is never filled from the answering node's.
+/// A solo node cannot show either: its only row is itself, answered from the admin front's copy.
+#[tokio::test]
+async fn each_voters_row_carries_the_write_path_that_voter_was_started_with() {
+    let _serial = TEST_LOCK.lock().await;
+    let leader_state = TempDir::new().expect("tempdir");
+    let leader = compose::start(cluster_cli(
+        &leader_state,
+        &[
+            "--cluster-allow-solo",
+            "--cluster-write-barrier",
+            "none",
+            "--cluster-write-barrier-timeout",
+            "6",
+            "--cluster-flow-fsync-interval-ms",
+            "80",
+        ],
+    ))
+    .await
+    .expect("leader starts");
+    wait_ready(&leader).await;
+    let seed = leader.cluster_addr().expect("cluster addr").to_string();
+
+    let follower_state = TempDir::new().expect("tempdir");
+    let follower = compose::start(cluster_cli(
+        &follower_state,
+        &[
+            "--cluster-seeds",
+            &seed,
+            "--cluster-write-barrier-timeout",
+            "9",
+            "--cluster-admin-async",
+        ],
+    ))
+    .await
+    .expect("follower joins");
+    wait_ready(&follower).await;
+
+    let leader_settings = json!({
+        "write_barrier": "none",
+        "write_barrier_timeout_seconds": 6,
+        "admin_async": false,
+        "flow_fsync_interval_ms": 80,
+    });
+    let follower_settings = json!({
+        "write_barrier": "ready-nodes",
+        "write_barrier_timeout_seconds": 9,
+        "admin_async": true,
+        "flow_fsync_interval_ms": 50,
+    });
+
+    for (reader, own, peer) in [
+        (&leader, &leader_settings, &follower_settings),
+        (&follower, &follower_settings, &leader_settings),
+    ] {
+        let admin = reader.admin_addr();
+        let me = reader.node().expect("clustered").id().to_string();
+        // Polled: a joiner is a learner until promoted, and the members rows are per voter.
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        let body = loop {
+            let seen = Seen::of(
+                reqwest::get(format!("http://{admin}/_fleet/members"))
+                    .await
+                    .expect("GET /_fleet/members"),
+            )
+            .await;
+            let body = seen.json();
+            let rows = body["members"].as_array().cloned().unwrap_or_default();
+            if rows.len() == 2 && rows.iter().all(|row| !row["write_path"].is_null()) {
+                break body;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{admin}: both voters never reported a write path: {body}"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        };
+
+        assert_eq!(
+            &body["write_path"], own,
+            "{admin}: its own settings: {body}"
+        );
+        for row in body["members"].as_array().expect("rows") {
+            let expected = if row["node_id"] == me.as_str() {
+                own
+            } else {
+                peer
+            };
+            assert_eq!(&row["write_path"], expected, "{admin}: row {row}");
+        }
+    }
+
+    follower.shutdown().await;
+    leader.shutdown().await;
+}

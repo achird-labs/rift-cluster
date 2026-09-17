@@ -1,7 +1,15 @@
 import { describe, expect, it } from "vitest";
 
 import type { components } from "../api/schema.ts";
-import { bindStatus, bindVerdict, fleetView, viewConfidence } from "./fleetView.ts";
+import {
+  bindStatus,
+  bindVerdict,
+  fleetView,
+  viewConfidence,
+  writePathByVoter,
+  writePathDisagreements,
+} from "./fleetView.ts";
+import type { WritePath } from "./fleetView.ts";
 
 type FleetMembers = components["schemas"]["FleetMembers"];
 type FleetHealth = components["schemas"]["FleetHealth"];
@@ -414,5 +422,90 @@ describe("bindStatus", () => {
   it("says nothing about a port when no voter published a row", () => {
     const view = fleetView(THREE_NODE, HEALTHY);
     expect(bindVerdict(view, 8080)).toBe("unknown");
+  });
+});
+
+/*
+ * The durability panel (#394, D-82): each voter's startup write-path flags, read back. Every case is
+ * about whose settings a row shows — the answering node's must never stand in for a peer's.
+ */
+describe("write path read-back", () => {
+  const DEFAULTS: WritePath = {
+    write_barrier: "ready-nodes",
+    write_barrier_timeout_seconds: 2,
+    admin_async: false,
+    flow_fsync_interval_ms: 50,
+  };
+  const LOOSER: WritePath = {
+    write_barrier: "none",
+    write_barrier_timeout_seconds: 2,
+    admin_async: true,
+    flow_fsync_interval_ms: 50,
+  };
+  const row = (node_id: string, write_path: WritePath | null | undefined, reachable = true) => ({
+    node_id,
+    reachable,
+    last_applied: reachable ? 412 : null,
+    is_leader: node_id === A,
+    bound_ports: [],
+    bind_failures: {},
+    bind_status_unavailable: false,
+    ...(write_path === undefined ? {} : { write_path }),
+  });
+
+  it("reads each voter's own settings, the answering node's from the top level", () => {
+    const view = fleetView(
+      {
+        ...THREE_NODE,
+        write_path: DEFAULTS,
+        // The answering node's own row is deliberately absent: its settings are still known.
+        members: [row(B, LOOSER), row(C, DEFAULTS)],
+      },
+      HEALTHY,
+    );
+    expect(writePathByVoter(view)).toEqual([
+      { id: A, writePath: DEFAULTS },
+      { id: B, writePath: LOOSER },
+      { id: C, writePath: DEFAULTS },
+    ]);
+  });
+
+  it("is unknown for a peer that did not answer, predates the field, or is missing a row", () => {
+    const view = fleetView(
+      { ...THREE_NODE, write_path: DEFAULTS, members: [row(B, null, false), row(C, undefined)] },
+      HEALTHY,
+    );
+    expect(writePathByVoter(view).map((r) => r.writePath)).toEqual([DEFAULTS, null, null]);
+
+    const noRows = fleetView({ ...THREE_NODE, write_path: DEFAULTS }, HEALTHY);
+    expect(writePathByVoter(noRows).map((r) => r.writePath)).toEqual([DEFAULTS, null, null]);
+  });
+
+  it("treats a malformed report as unknown rather than filling the gaps", () => {
+    const partial = { write_barrier: "none", write_barrier_timeout_seconds: 2, flow_fsync_interval_ms: 50 };
+    const view = fleetView(
+      {
+        ...THREE_NODE,
+        write_path: { ...DEFAULTS, write_barrier: "eventually" } as unknown as WritePath,
+        members: [row(B, partial as unknown as WritePath), row(C, "fast" as unknown as WritePath)],
+      },
+      HEALTHY,
+    );
+    expect(writePathByVoter(view).map((r) => r.writePath)).toEqual([null, null, null]);
+  });
+
+  it("is unknown for an answering node that predates the field", () => {
+    expect(fleetView(THREE_NODE, HEALTHY).writePath).toBeNull();
+  });
+
+  it("names exactly the settings the reporting voters disagree on", () => {
+    expect(
+      writePathDisagreements([{ writePath: DEFAULTS }, { writePath: LOOSER }, { writePath: DEFAULTS }]),
+    ).toEqual(["write_barrier", "admin_async"]);
+  });
+
+  it("does not count an unknown voter as a disagreement", () => {
+    expect(writePathDisagreements([{ writePath: DEFAULTS }, { writePath: null }])).toEqual([]);
+    expect(writePathDisagreements([{ writePath: null }, { writePath: null }])).toEqual([]);
   });
 });

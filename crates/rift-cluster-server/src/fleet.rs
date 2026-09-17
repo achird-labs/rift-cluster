@@ -38,6 +38,7 @@ use serde::Deserialize;
 
 use crate::cluster_api::{BindFields, health_body, members_body, op_body};
 use crate::readiness::Readiness;
+use crate::write_path::WritePathSettings;
 
 /// `PUT /admin/fleet/name` (issue #373): the fleet's operator-facing name.
 ///
@@ -137,9 +138,10 @@ pub(crate) async fn body(
     route: &FleetRoute,
     node: &Arc<RaftNode>,
     readiness: &Readiness,
+    write_path: WritePathSettings,
 ) -> Result<Option<FleetBody>, String> {
     match route {
-        FleetRoute::Members => Ok(Some(merged_members(node).await)),
+        FleetRoute::Members => Ok(Some(merged_members(node, write_path).await)),
         FleetRoute::Health => Ok(Some(fleet_health(node, readiness).await)),
         FleetRoute::Op(op_id) => op_body(node, op_id)
             .map(|found| found.map(FleetBody::local))
@@ -284,8 +286,8 @@ fn add_peer_depth(total: u64, reply: Option<&serde_json::Value>) -> (u64, bool) 
 ///
 /// Every field `members_body` produced is still there and still means what it did; `members` is
 /// added beside them. An existing reader of `last_applied` (this node's) is unaffected.
-async fn merged_members(node: &Arc<RaftNode>) -> FleetBody {
-    let mut value = members_body(node);
+async fn merged_members(node: &Arc<RaftNode>, write_path: WritePathSettings) -> FleetBody {
+    let mut value = members_body(node, write_path);
     let status = node.status();
     let me = status.node_id;
 
@@ -361,6 +363,7 @@ async fn merged_members(node: &Arc<RaftNode>) -> FleetBody {
                 status.is_leader,
                 answered.get(&id),
                 &local_bind,
+                write_path,
             )
         })
         .collect();
@@ -380,6 +383,11 @@ async fn merged_members(node: &Arc<RaftNode>) -> FleetBody {
 ///
 /// `local_bind` is this node's own bind fields, computed once by the caller before the fan-out
 /// starts (blocker B1) — passed in rather than recomputed here for the same reason.
+///
+/// `write_path` is this node's own settings (#394). A peer's row carries the peer's, echoed from
+/// its reply: a rolling deploy where the nodes disagree is exactly when the row is worth reading,
+/// so this node must never substitute its own. A peer that did not answer, or predates the field,
+/// has `null` — unknown, not "the defaults".
 fn member_row(
     id: NodeId,
     is_me: bool,
@@ -387,6 +395,7 @@ fn member_row(
     status_is_leader: bool,
     answered: Option<&serde_json::Value>,
     local_bind: &BindFields,
+    write_path: WritePathSettings,
 ) -> serde_json::Value {
     if is_me {
         // This node observing itself: `status_last_applied`/`status_is_leader` come from the same
@@ -401,6 +410,7 @@ fn member_row(
             "bound_ports": local_bind.bound_ports.clone(),
             "bind_failures": local_bind.bind_failures.clone(),
             "bind_status_unavailable": local_bind.bind_status_unavailable.clone(),
+            "write_path": write_path.to_json(),
         });
     }
     match answered {
@@ -418,6 +428,7 @@ fn member_row(
                 "bound_ports": bind.bound_ports,
                 "bind_failures": bind.bind_failures,
                 "bind_status_unavailable": bind.bind_status_unavailable,
+                "write_path": reply.get("write_path").cloned().unwrap_or(serde_json::Value::Null),
             })
         }
         // `null`, never `0`. A voter that did not answer has an *unknown* applied index, and a
@@ -434,6 +445,7 @@ fn member_row(
                 "bound_ports": bind.bound_ports,
                 "bind_failures": bind.bind_failures,
                 "bind_status_unavailable": bind.bind_status_unavailable,
+                "write_path": serde_json::Value::Null,
             })
         }
     }
@@ -627,7 +639,15 @@ mod tests {
             bind_status_unavailable: serde_json::json!(false),
         };
 
-        let row = member_row(7, true, Some(412), true, None, &local_bind);
+        let row = member_row(
+            7,
+            true,
+            Some(412),
+            true,
+            None,
+            &local_bind,
+            LOCAL_WRITE_PATH,
+        );
 
         assert_eq!(row["reachable"], serde_json::json!(true));
         assert_eq!(row["bound_ports"], local_bind.bound_ports);
@@ -650,9 +670,23 @@ mod tests {
             "bound_ports": [8080],
             "bind_failures": { "9090": "Address already in use" },
             "bind_status_unavailable": false,
+            "write_path": {
+                "write_barrier": "none",
+                "write_barrier_timeout_seconds": 9,
+                "admin_async": true,
+                "flow_fsync_interval_ms": 10,
+            },
         });
 
-        let row = member_row(9, false, Some(999), true, Some(&answered), &local_bind);
+        let row = member_row(
+            9,
+            false,
+            Some(999),
+            true,
+            Some(&answered),
+            &local_bind,
+            LOCAL_WRITE_PATH,
+        );
 
         assert_eq!(
             row,
@@ -664,8 +698,85 @@ mod tests {
                 "bound_ports": [8080],
                 "bind_failures": { "9090": "Address already in use" },
                 "bind_status_unavailable": false,
+                "write_path": {
+                    "write_barrier": "none",
+                    "write_barrier_timeout_seconds": 9,
+                    "admin_async": true,
+                    "flow_fsync_interval_ms": 10,
+                },
             })
         );
+    }
+
+    /// Settings this node's rows are built with in these tests — deliberately not the defaults, so
+    /// a peer row that leaked them would be visible.
+    const LOCAL_WRITE_PATH: WritePathSettings = WritePathSettings {
+        barrier: crate::cli::WriteBarrier::ReadyNodes,
+        barrier_timeout: std::time::Duration::from_secs(4),
+        admin_async: false,
+        flow_fsync_interval_ms: 75,
+    };
+
+    /// Pins D-82 for the local row: this node reports its own settings.
+    #[test]
+    fn the_local_row_carries_this_nodes_own_write_path() {
+        let row = member_row(
+            7,
+            true,
+            Some(412),
+            true,
+            None,
+            &BindFields::unknown(),
+            LOCAL_WRITE_PATH,
+        );
+        assert_eq!(
+            row["write_path"],
+            serde_json::json!({
+                "write_barrier": "ready-nodes",
+                "write_barrier_timeout_seconds": 4,
+                "admin_async": false,
+                "flow_fsync_interval_ms": 75,
+            })
+        );
+    }
+
+    /// Pins D-82 for a peer: a reply without the field (a pre-#394 build) is unknown, and a silent
+    /// peer is unknown — never this node's settings standing in for the peer's.
+    #[test]
+    fn a_peer_row_never_borrows_this_nodes_write_path() {
+        let old_build = serde_json::json!({
+            "last_applied": 12,
+            "is_leader": false,
+            "bound_ports": [],
+            "bind_failures": {},
+            "bind_status_unavailable": false,
+        });
+        for answered in [Some(&old_build), None] {
+            let row = member_row(
+                9,
+                false,
+                Some(999),
+                true,
+                answered,
+                &BindFields::unknown(),
+                LOCAL_WRITE_PATH,
+            );
+            assert_eq!(row["write_path"], serde_json::Value::Null, "{row}");
+        }
+    }
+
+    /// An unknown `write_path` does not stamp `Rift-Cluster-Partial` (D-82): the fan-out got its
+    /// answer, and what an older peer cannot report is shown as unknown on its row instead.
+    #[test]
+    fn a_reachable_row_without_write_path_is_not_partial() {
+        let rows = [serde_json::json!({
+            "reachable": true,
+            "bound_ports": [],
+            "bind_failures": {},
+            "bind_status_unavailable": false,
+            "write_path": null,
+        })];
+        assert!(!members_partial(false, &rows));
     }
 
     /// A peer that never answered is unknown in every bind field, and `reachable: false`.
@@ -673,7 +784,15 @@ mod tests {
     fn a_silent_peer_row_is_unknown_in_every_bind_field() {
         let local_bind = BindFields::unknown();
 
-        let row = member_row(9, false, Some(999), true, None, &local_bind);
+        let row = member_row(
+            9,
+            false,
+            Some(999),
+            true,
+            None,
+            &local_bind,
+            LOCAL_WRITE_PATH,
+        );
 
         assert_eq!(row["reachable"], serde_json::json!(false));
         assert_eq!(row["bound_ports"], serde_json::Value::Null);

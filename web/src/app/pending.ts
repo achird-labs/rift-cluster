@@ -87,19 +87,3 @@ export type RequestOutcome = { node: string; status: number; latencyMs: number }
 export function requestOutcome(_index: number): Pending<RequestOutcome> {
   return pending(364);
 }
-
-/**
- * The durability settings a write actually rode.
- *
- * The write barrier, its timeout, the flow fsync policy and the admin-write mode are all command
- * line flags on the node and none is read back by any endpoint.
- *
- * Split out of the snapshot issue (#365) when that was closed as rejected-by-design (D-24): triggering
- * a snapshot or a compaction from here is not something the console should be able to do at all,
- * whereas *reading back* what a node is configured to do changes nothing and is a real gap.
- *
- * @see https://github.com/achird-labs/rift-cluster/issues/394
- */
-export function durability(): Pending<{ barrier: string; timeoutMs: number; fsync: string }> {
-  return pending(394);
-}

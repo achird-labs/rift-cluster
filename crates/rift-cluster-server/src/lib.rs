@@ -33,6 +33,7 @@ pub mod openapi;
 pub mod probes;
 pub mod readiness;
 pub mod session;
+pub mod write_path;
 
 pub use cli::EeCli;
 pub use compose::ComposedServer;

@@ -7,8 +7,10 @@ use std::time::Duration;
 
 use rift_cluster::rpc::{AlwaysHealthy, RpcClient, RpcClientConfig, Signer};
 use rift_cluster::{NodeConfig, RaftNode};
+use rift_cluster_server::cli::WriteBarrier;
 use rift_cluster_server::cluster_api;
 use rift_cluster_server::readiness::{GATE_JOINED, Readiness};
+use rift_cluster_server::write_path::WritePathSettings;
 use tempfile::TempDir;
 
 const SECRET: &str = "cluster-api-test-secret";
@@ -29,7 +31,17 @@ async fn start() -> Fixture {
         advertise: None,
         data_dir: dir.path().to_path_buf(),
         secret: Some(SECRET.to_owned()),
-        routes: cluster_api::routes(rift_cluster::Router::new(), slot.clone(), readiness.clone()),
+        routes: cluster_api::routes(
+            rift_cluster::Router::new(),
+            slot.clone(),
+            readiness.clone(),
+            WritePathSettings {
+                barrier: WriteBarrier::None,
+                barrier_timeout: Duration::from_secs(11),
+                admin_async: true,
+                flow_fsync_interval_ms: 250,
+            },
+        ),
         engine: None,
         snapshot_log_entries: None,
     };
@@ -78,6 +90,16 @@ async fn members_reports_this_nodes_view_of_the_cluster() {
     assert_eq!(members["voters"], serde_json::json!(["1"]));
     assert_eq!(members["current_leader"], "1");
     assert_eq!(members["is_leader"], true);
+    // The settings the routes were built with, as the flags spell them (#394, D-82).
+    assert_eq!(
+        members["write_path"],
+        serde_json::json!({
+            "write_barrier": "none",
+            "write_barrier_timeout_seconds": 11,
+            "admin_async": true,
+            "flow_fsync_interval_ms": 250,
+        })
+    );
 }
 
 #[tokio::test]

@@ -3569,3 +3569,39 @@ not the overwrite; on a failed toggle one map must either lose the drive error t
 mislabel it as the bind reason. *Rejected:* an upstream `Imposter::bind_failure()` accessor — fully
 derived, but three PRs across two repos for a value with exactly this lifetime and this single
 writer; revisit if a second consumer appears upstream.
+
+### D-82 — A node's write-path flags are read back per node on the members builder; the console reads them and never sets them
+
+- **Status:** active
+- **Decided:** 2026-09-17 · #394
+- **Refines:** D-24, D-74
+- **Implemented by:** #394
+- **Code:** crates/rift-cluster-server/src/write_path.rs, crates/rift-cluster-server/src/cluster_api.rs, crates/rift-cluster-server/src/fleet.rs, web/src/screens/Fleet.tsx
+
+The write barrier, its timeout, `--cluster-admin-async` and `--cluster-flow-fsync-interval-ms`
+decide what a `2xx` promises and what a whole-fleet crash can lose, and none of them was reported
+anywhere. D-24 settled that the console must not *act* on the cluster's own maintenance; reading
+startup configuration back is not acting, so the console's *Durability & write path* panel reads
+them — and has no control to change them, because they are flags.
+
+**Where it lives: a `write_path` object on `members_body`, not a new route.** `/_cluster/members`
+is already the node-local answer to "what is this node", and `/_fleet/members` already folds it
+across every voter. A rolling deploy where nodes disagree is exactly when the panel is worth
+reading, so each row carries the *voter's own* settings, echoed from its reply — never the
+answering node's standing in for a peer's. A voter that did not answer, or predates the field, is
+`null`: unknown, not "the defaults".
+
+**One value, built once.** `compose` builds `WritePathSettings` from the flags and hands the same
+value to the admin front, which acts on it, and to the cluster-port routes, which report it. The
+front's three separate fields became that value, so the report cannot describe a configuration
+other than the one the answering node runs.
+
+**An unknown `write_path` does not stamp `Rift-Cluster-Partial`.** D-74 narrowed the header to
+reads that genuinely fan out and got less than an answer; a peer on an older build did answer, and
+its row says which fact is unknown. Stamping it would mark every response partial for the length
+of every rolling upgrade.
+
+*Rejected:* a separate `GET /_fleet/write-path` route — a second fan-out over the same voters for
+four values that fit the one already running. *Rejected:* reporting only the answering node — the
+disagreement across nodes is the case the issue names as worth looking at.
+

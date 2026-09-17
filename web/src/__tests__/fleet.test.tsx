@@ -206,3 +206,70 @@ describe("degraded and unknown states", () => {
     expect(error.textContent).toMatch(/serves no fleet projection|--cluster/i);
   });
 });
+
+/*
+ * The durability panel (#394, D-82). It was a pending panel; it now reads each voter's startup
+ * write-path flags back, and it is read-only — there is nothing on it to press.
+ */
+describe("durability and write path", () => {
+  const settings = (overrides: Record<string, unknown> = {}) => ({
+    write_barrier: "ready-nodes",
+    write_barrier_timeout_seconds: 2,
+    admin_async: false,
+    flow_fsync_interval_ms: 50,
+    ...overrides,
+  });
+  const member = (node_id: number, write_path: unknown) => ({
+    node_id,
+    reachable: write_path !== null,
+    last_applied: 412,
+    is_leader: node_id === 1,
+    bound_ports: [],
+    bind_failures: {},
+    bind_status_unavailable: false,
+    write_path,
+  });
+  const fleet = (members: unknown[]) => ({
+    ...THREE_NODE,
+    "/_fleet/members": {
+      json: { ...THREE_NODE["/_fleet/members"].json, write_path: settings(), members },
+    },
+  });
+
+  it("shows each voter's settings in the flags' own words, and nothing to act on", async () => {
+    stubFetch(fleet([member(1, settings({ flow_fsync_interval_ms: 80 })), member(3, settings())]));
+    renderInApp(<Fleet />);
+
+    const table = await screen.findByTestId("write-path");
+    expect(screen.getByTestId("write-path-2").textContent).toBe("2ready-nodes2 ssync50 ms");
+    expect(screen.getByTestId("write-path-1").textContent).toBe("1ready-nodes2 ssync80 ms");
+    expect(table.querySelectorAll("button, input, select")).toHaveLength(0);
+    expect(screen.queryByText(/#394/)).toBeNull();
+  });
+
+  it("says unknown for a voter that did not answer, rather than showing defaults", async () => {
+    stubFetch(fleet([member(1, settings()), member(3, null)]));
+    renderInApp(<Fleet />);
+
+    expect((await screen.findByTestId("write-path-3")).textContent).toBe("3unknown");
+  });
+
+  it("calls out settings the voters disagree on", async () => {
+    stubFetch(
+      fleet([member(1, settings({ write_barrier: "none", admin_async: true })), member(3, settings())]),
+    );
+    renderInApp(<Fleet />);
+
+    const note = await screen.findByTestId("write-path-disagreement");
+    expect(note.textContent).toContain("write barrier, admin writes");
+    expect(screen.getByTestId("write-path-1").textContent).toBe("1none2 sasync (202 + op id)50 ms");
+  });
+
+  it("says nothing about disagreement when the voters agree", async () => {
+    stubFetch(fleet([member(1, settings()), member(3, settings())]));
+    renderInApp(<Fleet />);
+
+    await screen.findByTestId("write-path");
+    expect(screen.queryByTestId("write-path-disagreement")).toBeNull();
+  });
+});

@@ -321,7 +321,11 @@ manual posture. Both paths are pinned by tests named in the register entry.
 
 openraft *does* expose both operations (`trigger().snapshot()` and `trigger().purge_log(upto)`). The
 panel was buildable. It is declined anyway. The panel's third, **`Durability & write path`**,
-survives as a read and is tracked in [#394](https://github.com/achird-labs/rift-cluster/issues/394).
+survives as a read and is built ([#394](https://github.com/achird-labs/rift-cluster/issues/394), D-82): one row
+per voter with the barrier, its timeout, the admin-write mode and the flow fsync interval each
+node was started with, and a note naming any setting the voters disagree on. The rescope comment
+on #394 dropped the fsync interval on the belief that #551 removed it; #551 was withdrawn, the
+flag is live, so the panel reports it.
 
 ## The pattern across all three corrections
 

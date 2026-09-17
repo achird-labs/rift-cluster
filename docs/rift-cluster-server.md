@@ -253,6 +253,10 @@ it, so a stray flag on a single node is not an error.
 | `--cluster-admin-async` | Answer admin writes with an immediate `202` + op id after durably parking them; poll `GET /_cluster/ops/:id` for the outcome |
 | `--cluster-flow-fsync-interval-ms <MILLIS>` | Group-fsync cadence for `durability: "async"` flow-state writes (default `50`) — the bound on what a whole-fleet crash can lose for imposters that did not choose `"sync"` or `"none"` |
 
+The last four are read back, per node, as `write_path` on `GET /_cluster/members`, and for every
+voter on `GET /_fleet/members` — the console's *Durability & write path* panel, which flags
+settings the nodes disagree on (D-82). Read-only: they stay startup flags.
+
 Each flag also has an environment-variable spelling (`RIFT_CLUSTER_BIND`,
 `RIFT_CLUSTER_SECRET_FILE`, …), which is the intended vehicle for the secret.
 

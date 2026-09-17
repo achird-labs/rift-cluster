@@ -105,6 +105,7 @@ use crate::fleet;
 use crate::openapi;
 use crate::readiness::Readiness;
 use crate::session;
+use crate::write_path::WritePathSettings;
 
 /// Largest admin request body the front accepts on a terminated route. The
 /// proxied path streams and is not subject to this.
@@ -148,11 +149,9 @@ pub struct FrontConfig {
     /// Resolution base for `_rift.script` `file:` refs on terminated writes
     /// (upstream #356); absent ⇒ any `file:` ref is refused.
     pub scripts_dir: Option<PathBuf>,
-    pub barrier: WriteBarrier,
-    pub barrier_timeout: Duration,
-    /// `--cluster-admin-async`: answer 202 + op id right after parking, and
-    /// let the submit run in the background.
-    pub admin_async: bool,
+    /// The barrier, its timeout and `--cluster-admin-async`, acted on here and reported by
+    /// `/_fleet/members` from this same value (D-82).
+    pub write_path: WritePathSettings,
     /// This node's startup-readiness latch, threaded through so `/_fleet/health` (RFC-006 §5.2,
     /// issue #185) can report the same state `/readyz` does without a second latch to keep in
     /// sync.
@@ -273,9 +272,7 @@ struct FrontState {
     api_key: Option<String>,
     allow_injection: bool,
     scripts_dir: Option<PathBuf>,
-    barrier: WriteBarrier,
-    barrier_timeout: Duration,
-    admin_async: bool,
+    write_path: WritePathSettings,
     readiness: Arc<Readiness>,
     /// See [`FrontConfig::flow_net`].
     flow_net: Arc<FlowNet>,
@@ -301,9 +298,7 @@ pub async fn bind(config: FrontConfig, node: &Arc<RaftNode>) -> std::io::Result<
         api_key: config.api_key,
         allow_injection: config.allow_injection,
         scripts_dir: config.scripts_dir,
-        barrier: config.barrier,
-        barrier_timeout: config.barrier_timeout,
-        admin_async: config.admin_async,
+        write_path: config.write_path,
         readiness: config.readiness,
         flow_net: config.flow_net,
         proxy: Client::builder(TokioExecutor::new()).build_http(),
@@ -772,7 +767,7 @@ async fn handle(state: Arc<FrontState>, req: Request<Incoming>) -> Response<Fron
                         "cluster node is shutting down",
                     );
                 };
-                match fleet::body(&route, &node, &state.readiness).await {
+                match fleet::body(&route, &node, &state.readiness, state.write_path).await {
                     Ok(Some(body)) => match serde_json::to_vec(&body.value) {
                         Ok(bytes) => {
                             let mut response = buffered_response(
@@ -1341,7 +1336,7 @@ async fn ensure_session_key(
     // This node must see its own write before the re-read below can be trusted: `submit`
     // guarantees the op committed on a quorum, not that *this* node's local state machine has
     // caught up to it — a follower forwards to the leader and gets the leader's answer back.
-    node.await_local_applied(committed.revision, state.barrier_timeout)
+    node.await_local_applied(committed.revision, state.write_path.barrier_timeout)
         .await;
 
     // Re-read rather than trust the bytes generated above: two concurrent first logins can both
@@ -2710,7 +2705,7 @@ async fn run_mutation(
         }
     }
 
-    if state.admin_async {
+    if state.write_path.admin_async {
         let node = Arc::clone(node);
         let op_ids: Vec<Uuid> = requests.iter().map(|request| request.op_id).collect();
         let background = requests;
@@ -2820,7 +2815,7 @@ async fn run_mutation(
         ));
     };
 
-    let unapplied = match state.barrier {
+    let unapplied = match state.write_path.barrier {
         WriteBarrier::None => {
             // `none` skips the *fleet* barrier, not local coherence. The render
             // below re-reads the resource just committed, so a node that has
@@ -2828,7 +2823,7 @@ async fn run_mutation(
             // (#99). No peer is consulted here, so the level keeps its promise:
             // this waits for one apply, never for the fleet.
             if node
-                .await_local_applied(committed.revision, state.barrier_timeout)
+                .await_local_applied(committed.revision, state.write_path.barrier_timeout)
                 .await
             {
                 Vec::new()
@@ -2846,7 +2841,7 @@ async fn run_mutation(
             }
         }
         WriteBarrier::ReadyNodes => {
-            node.await_applied(committed.revision, state.barrier_timeout)
+            node.await_applied(committed.revision, state.write_path.barrier_timeout)
                 .await
         }
     };
@@ -5268,9 +5263,12 @@ mod tests {
                 api_key: None,
                 allow_injection: false,
                 scripts_dir: None,
-                barrier: crate::cli::WriteBarrier::None,
-                barrier_timeout: Duration::from_secs(1),
-                admin_async: false,
+                write_path: WritePathSettings {
+                    barrier: crate::cli::WriteBarrier::None,
+                    barrier_timeout: Duration::from_secs(1),
+                    admin_async: false,
+                    flow_fsync_interval_ms: 50,
+                },
                 readiness: Arc::new(crate::readiness::Readiness::awaiting([])),
                 flow_net: Arc::clone(&net),
             },
@@ -5651,9 +5649,12 @@ mod tests {
                 api_key: None,
                 allow_injection: false,
                 scripts_dir: None,
-                barrier: crate::cli::WriteBarrier::None,
-                barrier_timeout: Duration::from_secs(1),
-                admin_async: false,
+                write_path: WritePathSettings {
+                    barrier: crate::cli::WriteBarrier::None,
+                    barrier_timeout: Duration::from_secs(1),
+                    admin_async: false,
+                    flow_fsync_interval_ms: 50,
+                },
                 readiness: Arc::new(crate::readiness::Readiness::awaiting([])),
                 // In-memory and never bound to `node`'s ring: this only needs to satisfy
                 // `FrontConfig`'s required field.
