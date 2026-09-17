@@ -15,12 +15,14 @@
 > **Retired by D-71** (RFC-007 §3.2, #549): this RFC is superseded **in full**. Data sources,
 > datasets and the content-addressed blob store that carried their bytes no longer exist — no
 > source records, no providers, no poll scheduler, no drift policy, no `DatasetPut`, no quota
-> governance for any of it. Nothing below is served or built. The document stays as the record
-> of what was designed and shipped, and of why it was withdrawn (RFC-007 §2.4, §3.2).
+> governance for any of it. Nothing in §3.1–§3.4 or §4–§6 is served or built. The document
+> stays as the record of what was designed and shipped, and of why it was withdrawn (RFC-007
+> §2.4, §3.2).
 >
 > What survives from this RFC's scope lives elsewhere and is unaffected: the flow-state store
-> (RFC-007 §3.1, `docs/architecture/06-flow-state.md`) and upstream's own `_rift.stateOps`
-> (U-15).
+> and §3.5's scoped flow ids (RFC-007 §3.1, `docs/architecture/06-flow-state.md`;
+> `contextScope` is `imposter` or `fleet` since D-73 removed `tenant`), and §3.7's declarative
+> state operations, which are upstream's own `_rift.stateOps` (U-15).
 
 ## 1. Summary
 

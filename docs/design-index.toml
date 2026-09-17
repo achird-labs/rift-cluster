@@ -22,14 +22,14 @@ note = "The register itself; verified by design-check's structural checks rather
 
 ["docs/adr/ADR-001-raft-control-plane.md"]
 status = "amended"
-verified_sha = "9e0433dd0"
-verified_on = "2026-08-25"
+verified_sha = "7f6a3bbbd"
+verified_on = "2026-09-17"
 code = ["crates/rift-cluster/src/raft/**"]
 
 ["docs/rfc/RFC-001-self-clustering-rift.md"]
 status = "amended"
-verified_sha = "e0df0c376"
-verified_on = "2026-08-29"
+verified_sha = "7f6a3bbbd"
+verified_on = "2026-09-17"
 code = ["crates/rift-cluster/src/**"]
 note = "v3.2. §7.1/§7.2/§7.4 superseded by D-15 (gossip → Raft); Appendix C is now a pointer to the register. #554 retired §7.5 (bar §7.5.3), §8.1's monetization paragraph, §9, §10 and §11.1; review of that pass then fixed §8.1's trait table, which still named RedisSequencer and RedisProxyStore as implementations — neither exists anywhere in crates/ — and struck §7.x's --cluster-features bullet, whose 'not accepted yet' had outlived the phased plan it belonged to."
 
@@ -63,8 +63,8 @@ note = "§4, §5.3, §8.3, §8.4, §9.2 and §9.3 amended by D-73 (#550) and car
 
 ["docs/rfc/RFC-007-distributed-core.md"]
 status = "current"
-verified_sha = "d755d2c9f"
-verified_on = "2026-09-09"
+verified_sha = "7f6a3bbbd"
+verified_on = "2026-09-17"
 code = []
 note = "Scope decision D-71: the distributed core, now active. §9 carries the issue-to-PR mapping and D-71 carries the same one; when they disagree the register wins. §2 is a measurement taken on 2026-09-06 and is deliberately not re-measured. Review of #554 reconciled the two: Appendix A had listed D-69 in both the untouched-active list and the amended table, while the register read `active` over a body that already carried an amendment; §9 said the epic 'closes with #554' while a child was still open; §9's five out-of-child PRs were three in the register; and the retired-document list omitted RFC-001 §8.1, §9, §10 and Appendix B."
 
@@ -77,8 +77,8 @@ note = "#554 corrected the seam count (eighteen rows, five reading withdrawn —
 
 ["docs/architecture/02-topology.md"]
 status = "current"
-verified_sha = "1ce94fc75"
-verified_on = "2026-08-28"
+verified_sha = "7f6a3bbbd"
+verified_on = "2026-09-17"
 code = ["crates/rift-cluster-server/src/compose.rs"]
 
 ["docs/architecture/03-control-plane.md"]
@@ -90,21 +90,21 @@ note = "Gained chapter 8's cluster-internal security section in #550 (D-73), hen
 
 ["docs/architecture/04-write-path.md"]
 status = "current"
-verified_sha = "9e0433dd0"
-verified_on = "2026-08-25"
+verified_sha = "7f6a3bbbd"
+verified_on = "2026-09-17"
 code = ["crates/rift-cluster/src/control.rs", "crates/rift-cluster/src/raft/node.rs", "crates/rift-cluster-server/src/admin_front.rs"]
 
 ["docs/architecture/05-read-path.md"]
 status = "amended"
-verified_sha = "98bcbfc09"
-verified_on = "2026-08-28"
+verified_sha = "7f6a3bbbd"
+verified_on = "2026-09-17"
 code = ["crates/rift-cluster/src/stores/flow.rs", "crates/rift-cluster/src/stores/shard.rs"]
 note = "The Admin reads section is amended by D-74 (#552) and carries the callout: verification reads are per node, numberOfRequests is the answering node's count."
 
 ["docs/architecture/06-flow-state.md"]
 status = "amended"
-verified_sha = "0135ae018"
-verified_on = "2026-09-07"
+verified_sha = "7f6a3bbbd"
+verified_on = "2026-09-17"
 code = ["crates/rift-cluster/src/stores/flow.rs", "crates/rift-cluster/src/stores/flow_config.rs", "crates/rift-cluster/src/stores/shard.rs", "crates/rift-cluster/src/raft/ring.rs", "crates/rift-cluster/src/stores/proxy.rs"]
 note = "Gained chapter 7's proxyOnce owner-claim section in #552 (D-74), hence the added proxy.rs anchor: a proxy claim is owned on this chapter's ring (KeyClass::Proxy), and the journal it used to sit beside is gone."
 
@@ -124,8 +124,8 @@ note = "Retired by D-71/D-73 (#550). Its two non-tenancy sections were moved out
 
 ["docs/architecture/09-durability-failure.md"]
 status = "amended"
-verified_sha = "e0df0c376"
-verified_on = "2026-08-29"
+verified_sha = "7f6a3bbbd"
+verified_on = "2026-09-17"
 code = ["crates/rift-cluster/src/raft/store.rs", "crates/rift-cluster/src/stores/flow.rs"]
 note = "Amended in place by D-74 (#552): the journal row, the failure-matrix row and the Rift-Cluster-Partial paragraph now describe a per-node journal. `status` is prose for a reader — check_index reads only verified_sha and code — and the standing doc-stale warning is NOT about that edit, which moved doc and code together: it is raft/store.rs and stores/flow.rs changing in #565/#567 and #563 since e0df0c376. #554 removed tenancy and bindings from the write row, the cold-start list and the snapshot description, and pointed the isolation condition at /_cluster/health rather than a /_cluster/status that is not served. That is a targeted correction, not a whole-chapter reading: re-verify the rest, then --mark-verified."
 
@@ -145,34 +145,34 @@ note = "#554 re-checked every U-n row against the code: U-9's authorizer half an
 
 ["docs/architecture/12-testing.md"]
 status = "current"
-verified_sha = "e0df0c376"
-verified_on = "2026-08-29"
+verified_sha = "7f6a3bbbd"
+verified_on = "2026-09-17"
 code = ["tests/cluster-chaos/**", "crates/rift-cluster/tests/**", "crates/rift-cluster-server/tests/**"]
 note = "#554 replaced the overlay list with the nine that exist in tests/cluster-chaos/compose/. The tenancy overlay was the stale half and is gone; Envoy is not — it has no overlay of its own but is brought up by chaos.overlay.yml alongside toxiproxy, and scenarios assert on its admin API. An earlier draft of this note claimed there is no Envoy overlay, which is why the enumeration dropped it."
 
 ["docs/architecture/13-router.md"]
 status = "current"
-verified_sha = "d755d2c9f"
-verified_on = "2026-09-09"
+verified_sha = "7f6a3bbbd"
+verified_on = "2026-09-17"
 code = ["crates/rift-cluster/src/control.rs", "crates/rift-cluster/src/raft/store.rs", "crates/rift-cluster-server/src/compose.rs", "crates/rift-cluster-server/src/admin_front.rs"]
 note = "Renamed from 13-front-door-and-sources.md in #554, per RFC-007 §6: the feature is the router in prose, and the wire contract (/front-door/routes, --front-door, RIFT_FRONT_DOOR, x-rift-front-door, upstream's front_door module) keeps its name. The sources half was retired by D-71 (#549) and the tenancy half by D-73 (#550). #554 moved chapter 8's routes_installed_for definition here, rewritten against desired_routes, which filters nothing."
 
 ["docs/architecture/14-cloud-deployment.md"]
 status = "current"
-verified_sha = "9e0433dd0"
-verified_on = "2026-08-25"
+verified_sha = "7f6a3bbbd"
+verified_on = "2026-09-17"
 code = ["deploy/**"]
 
 ["docs/architecture/15-azure-deployment.md"]
 status = "current"
-verified_sha = "9e0433dd0"
-verified_on = "2026-08-25"
+verified_sha = "7f6a3bbbd"
+verified_on = "2026-09-17"
 code = ["deploy/**"]
 
 ["docs/design/console/README.md"]
 status = "amended"
-verified_sha = "5c6876acf"
-verified_on = "2026-09-08"
+verified_sha = "749eb1073"
+verified_on = "2026-09-17"
 code = ["web/src/**"]
 note = "Rewritten for the five screens by #553 (D-71): Imposters with Import from OpenAPI spec and Record, Requests per node, Scenarios, Router, Cluster, and the single-key login. The prototype HTML is a design artifact that predates the trim and still renders retired screens; the D-70 callout stays on the Router section."
 
@@ -185,8 +185,8 @@ note = "The repository's front door. Added to the index in #554, which rewrote i
 
 ["web/README.md"]
 status = "current"
-verified_sha = "d755d2c9f"
-verified_on = "2026-09-09"
+verified_sha = "749eb1073"
+verified_on = "2026-09-17"
 code = ["web/src/**", "web/vite.config.ts", "web/package.json"]
 note = "Rewritten in #554 for the five-screen, one-credential console: no tenant switcher, no RBAC table, no merged journal, and the real CSP (which carries wasm-unsafe-eval and style-src unsafe-inline). The route screen is the Router, as #569 landed RFC-007 §6's rename. Review of that pass moved scripts/e2e-console.sh out of the pnpm block: the pnpm commands run from web/, the script from the repository root."
 

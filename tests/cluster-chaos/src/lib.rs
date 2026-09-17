@@ -946,7 +946,7 @@ pub async fn probe(port: u16, path: &str) -> anyhow::Result<u16> {
 /// GET a JSON document from any published HTTP port.
 ///
 /// No credential: every scenario in this tier runs against an open admin plane.
-/// The fleet is started without `MB_APIKEY`, which is what leaves it open (D-46).
+/// The fleet is started without `MB_APIKEY`, which is what leaves it open (D-73).
 pub async fn get_json(port: u16, path: &str) -> anyhow::Result<(u16, serde_json::Value)> {
     let response = reqwest::Client::new()
         .get(format!("http://127.0.0.1:{port}{path}"))
@@ -1413,7 +1413,7 @@ pub async fn metric(port: u16, family: &str) -> anyhow::Result<f64> {
 /// behind the HMAC credential the harness does not hold (see
 /// `FAILOVER_WRITE_BOUND` in the scenarios). Read without a credential, like
 /// every other admin read in this tier — the fleet boots with no `MB_APIKEY`,
-/// so the admin plane is open (D-46).
+/// so the admin plane is open (D-73).
 ///
 /// Live, not sampled: the body is read off the node's Raft state at request
 /// time, so unlike the retired `rift_cluster_members` gauges (D-71, #548) there

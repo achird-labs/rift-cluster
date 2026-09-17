@@ -193,7 +193,7 @@ surface this RFC removes. It also built a flow-state tier stronger than upstream
 
 | Surface | Replaced by | Decisions retired | Issue |
 |---|---|---|---|
-| Route hits | The request log | D-70 superseded; D-68 amended | #545 |
+| Route hits | The request log | D-70 superseded (by D-71); D-68 superseded (by D-73) | #545 |
 | Audit log, export loop, sink, retention flag | The Raft log; a `tracing` line at apply | none defined it; RFC-002 §9 retired | #546 |
 | MCP server | Nothing, for now | RFC-006 §8 retired | #547 |
 | Cluster metric families, observability overlay, dashboards, rule tests | Upstream's metrics server, untouched; `/_fleet/members` for tests | RFC-001 metrics section retired | #548 |
@@ -328,7 +328,7 @@ what confused people, and the prose is what changed.
    reason to keep the exchange. Default: keep it, simplified (#550).
    **Resolved by #550 (D-73):** kept, simplified. The default was taken, and a second reason
    emerged for it — rotating the signing key is the *only* revocation a one-credential fleet has,
-   so dropping the cookie would have left none. The payload's subject is now the constant
+   so dropping the cookie would have left none. (Nothing can trigger that rotation yet: #619.) The payload's subject is now the constant
    `"admin"` and `verify` answers `Result<(), _>`; a session proves authentication and resolves
    to no identity.
 2. **Does the Requests screen offer a node picker or only show the node it reached?** Default:

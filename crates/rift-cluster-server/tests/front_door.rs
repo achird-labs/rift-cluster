@@ -662,7 +662,7 @@ async fn a_route_table_body_put_back_verbatim_round_trips() {
         .expect("json");
     assert!(
         first.get("installed").is_none(),
-        "D-68's `installed` decoration left with tenancy (#550): {first}"
+        "D-68's `installed` decoration left with tenancy (D-73, #550): {first}"
     );
 
     // The whole body back — exactly what a client that read then wrote would send.

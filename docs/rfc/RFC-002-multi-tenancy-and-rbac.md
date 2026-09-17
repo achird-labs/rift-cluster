@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | v1 — **superseded by D-73** (RFC-007 §3.2, #550) |
+| **Status** | v1 — **retired by D-73** (RFC-007 §3.2, #550); kept as the record of what was built and withdrawn |
 | **Tracking issue** | [achird-labs/rift-cluster#17](https://github.com/achird-labs/rift-cluster/issues/17) |
 | **Canonical location** | `rift-cluster:docs/rfc/RFC-002-multi-tenancy-and-rbac.md` |
 | **Depends on** | **ADR-001** (Raft control plane) and **#14** — the state machine this RFC's records live in. Nothing here works on an eventually-consistent store; see §3.1 |
@@ -219,7 +219,8 @@ A closed enum, one per route class:
 
 > **As shipped.** RFC-004 (`SpecRead` · `SpecWrite` · `SpecDelete`) and RFC-005 (`DatasetRead` ·
 > `DatasetWrite` · `DatasetDelete`) have since added six actions; `authz::Action` in
-> `crates/rift-cluster-server/src/authz.rs` is the authoritative list.
+> `crates/rift-cluster-server/src/authz.rs` was the authoritative list until D-72 and D-73
+> removed the action set and the file.
 
 `ImposterTry` (issue #335) authorizes `POST /admin/imposters/{port}/try` — the
 console's "send a sample request to this stub" affordance. As first shipped it
@@ -639,16 +640,16 @@ Listed rather than papered over:
    can execute stub scripts; an argument exists for Operator. Decide with a user,
    not in the abstract.
 
-**All three are settled**, in `docs/architecture/08-tenancy-security.md`, "RFC-002
-§11 open questions, settled here" — read that section, not this list, for the
-current answer. Building T2–T4 also forced two questions this RFC did not think
+**All three were settled**, in `docs/architecture/08-tenancy-security.md`, "RFC-002
+§11 open questions, settled here" — that chapter is now retired too, and D-73 is
+the current answer: there are no roles to place them in. Building T2–T4 also forced two questions this RFC did not think
 to ask, settled in the same place:
 
 4. **What a stale minority node does with an authorization read** — it serves
    from its own applied state rather than refusing, and what is pinned instead is
    that the first request after a heal is refused (`c25_key_revocation_survives_a_partition`).
-5. **Tenanted resource state was stored but not served — resolved (issue #182).**
-   The read/sync paths now bind the union of every tenant's resources into the
+5. **Tenanted resource state was stored but not served — resolved (issue #182),
+   then moot (D-73).** The read/sync paths bound the union of every tenant's resources into the
    local engine, sound because ports are fleet-unique across tenants (§3.2); a
    single ownership gate at the authorization choke point refuses a request
    whose addressed port belongs to a different tenant, with the *same*

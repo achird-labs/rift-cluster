@@ -173,6 +173,18 @@ class Resolution(unittest.TestCase):
         code, out = f.run("--strict")
         self.assertEqual(code, 0, out)
 
+    def test_superseded_cited_beside_its_successor_is_history_not_a_warning(self):
+        f = Fixture()
+        f.write("crates/x/src/hist.rs", "// D-2 supersedes D-1: the old rule is gone\n")
+        f.write("crates/x/src/wrapped.rs", "// the shape D-1 used,\n// which D-2 replaced\n")
+        f.write("crates/x/src/before.rs", "// D-2 replaced\n// the shape D-1 used\n")
+        # The window is one line either side: two lines away is not "beside".
+        f.write("crates/x/src/stale.rs", "// still does D-1\n\n// unrelated D-2\n")
+        code, out = f.run("--strict")
+        self.assertEqual(code, 0, out)
+        self.assertEqual(out.count("superseded-cited"), 1, out)
+        self.assertIn("crates/x/src/stale.rs", out)
+
     def test_docpath_may_resolve_under_vendor(self):
         f = Fixture()
         f.write("vendor/rift/docs/upstream.md", "x")

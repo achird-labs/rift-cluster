@@ -79,7 +79,7 @@ feature: the un-clustered binary is the open-source server and the open-source s
 |---|---|
 | [`docs/rift-cluster-server.md`](docs/rift-cluster-server.md) | The binary: flags, startup guards, probes, the `/_cluster/*` operator surface |
 | [`deploy/README.md`](deploy/README.md) | Containers, Compose, Kubernetes, Helm |
-| [`docs/architecture/`](docs/architecture/README.md) | How it works, in 13 live chapters — topology, control plane, read/write paths, flow state, durability, operations, the upstream boundary, testing, the router, two cloud deployments (7 and 8 are retired stubs) |
+| [`docs/architecture/`](docs/architecture/README.md) | How it works, in 13 live chapters — topology, control plane, read/write paths, flow state, durability, operations, the upstream boundary, testing, the router, two cloud deployments (7 is a retired stub; 8 is retired and kept as the record of the withdrawn tenancy design) |
 | [`docs/decisions/DECISIONS.md`](docs/decisions/DECISIONS.md) | **The decision register** — the only place a `D-n` is defined, and what everything else is checked against |
 | [`docs/adr/`](docs/adr) · [`docs/rfc/`](docs/rfc) | Why it works that way: the argument behind a large decision, and the design proposals behind each milestone |
 | [`docs/process/design-code-sync.md`](docs/process/design-code-sync.md) | How the docs are kept true to the code, and what `scripts/design-check.py` enforces |

@@ -172,7 +172,7 @@ revision-guarded, and `Idempotency-Key` where it is retryable.
 
 ## Testing
 
-`pnpm test` runs vitest over 48 test files. Node is the default environment;
+`pnpm test` runs vitest over every `*.test.ts(x)` under `src/`. Node is the default environment;
 component tests opt into jsdom with a `/** @vitest-environment jsdom */`
 docblock — not the other way round, because under jsdom `import.meta.url` is an
 `http:` URL and the two tests that read repository files could not resolve them.

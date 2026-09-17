@@ -135,9 +135,9 @@ export function ImposterFilters({
         >
           Paused
         </button>
-        {/* The design's bind pill (#369). Real once this session holds `fleet.read` — without it
-            there is no bind reading to filter on, and the pill says so rather than filtering
-            nothing. */}
+        {/* The design's bind pill (#369). Real once this node has served its fleet reading —
+            without one there is no bind reading to filter on, and the pill says so rather than
+            filtering nothing. */}
         {bindFilterAvailable ? (
           <button
             type="button"

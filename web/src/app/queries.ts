@@ -1064,7 +1064,7 @@ export function useClearFlowState(): UseMutationResult<
  *
  * Just the rows. `GET`/`PUT /front-door/routes` used to answer a `RouteTableView` — the rows plus
  * an `installed` boolean saying whether *this tenant's* table was compiled into the shared front
- * door (D-68). #550 left one fleet-wide table, so every stored route is installed and the flag,
+ * door (D-68, superseded by D-73). #550 left one fleet-wide table, so every stored route is installed and the flag,
  * the view schema and the console's whole not-installed treatment went with it.
  */
 export function useRouteTable(): UseQueryResult<Route[]> {

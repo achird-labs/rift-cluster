@@ -154,7 +154,7 @@ function matchesRecording(imposter: Imposter, filter: RecordingFilter): boolean 
 }
 
 /**
- * `fleet` is `null` when the reading is refused (`fleet.read` withheld), not yet loaded, or the
+ * `fleet` is `null` when the reading could not be obtained, is not yet loaded, or the
  * caller does not have one to offer. A port with no fleet reading to check is
  * `unknown`, never `failed`: an operator asking for failures must never see "none" stand in for
  * "could not check", nor "everything" stand in for it either.

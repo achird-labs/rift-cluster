@@ -21,7 +21,7 @@ The open-source engine knows nothing about clusters. It exposes **generic
 extension seams** — traits with `Local` default implementations that preserve
 single-node behavior byte-for-byte — and the cluster crates supply
 cluster-aware implementations. The first eight (`achird-labs/rift#311–#318`) landed together and
-completed Phase 0 of the program; the table below has grown to eighteen since, and five of those
+completed Phase 0 of the program; the table below has grown to nineteen since, and five of those
 rows now read **withdrawn** — merged upstream, still upstream's, no longer consumed here (U-9 in
 part: its authorizer half is withdrawn, its `classify` half is not). A withdrawn
 row is kept, never deleted: `U-n` is a stable citation, and "the cluster stopped using this" is a

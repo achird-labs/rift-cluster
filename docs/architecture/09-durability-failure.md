@@ -124,6 +124,8 @@ read it are asserting.
 | Journal append / count | — (always local) | unaffected | Recording never leaves the node |
 | Journal / count read | — (this node's own journal) | unaffected, and scoped to this node by contract | A per-node answer cannot be partial: there is nothing it failed to reach (D-74) |
 | Admin config read | — (local applied state) | served, possibly behind; revision comparable | Staleness is measurable, not hidden |
+| Imposter bind on one node | — (that node's socket) | the imposter stays configured fleet-wide; the node keeps the bind's reason and reports it on its own `GET /_cluster/imposters` and members row (folded into `/_fleet/members`) and as `Rift-Cluster-Bind-Failures` on that port's reads and writes, until a drive that attempts the bind succeeds or the imposter is deleted (D-81) | A pause or stub patch does not attempt the bind, so it must not erase the reason |
+| Flow store for a config this build will not honour | — (derived from the applied config) | the imposter serves; each read and write of the port carries `Rift-Cluster-Warnings: local-engine=<reason>` (D-76) | Derived per read, not recorded: a recorded marker was erased by the next `disable` |
 
 ## The replication ceiling
 

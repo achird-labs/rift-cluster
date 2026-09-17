@@ -15,7 +15,7 @@ between nodes *and* an Envoy front round-robining the three admin APIs behind an
 active health check (both in `chaos.overlay.yml`), a router listener, flow
 state, config catch-up on a miss, a squatted bind, a disabled write barrier,
 sequencing, a forced snapshot install, a proxy origin — driven by a Rust
-integration binary (`tests/scenarios.rs`) with a scenario DSL:
+integration binary (`tests/cluster-chaos/tests/scenarios.rs`) with a scenario DSL:
 
 ```rust
 let c = cluster.start(3).await;
@@ -38,8 +38,8 @@ an issue rather than deleted. CI budget: at PR time every scenario runs
 **once**, across four `cluster-smoke-shard` jobs that share one prebuilt image
 (D-58); `cluster-smoke` itself is the required status check (#104 — a merge may
 not outrun it) and does no testing, it judges whether the shards ran. The
-nightly soak (`nightly-chaos.yml`) iterates each scenario 60–100× under a 2 h
-cap. Both cadences are deliberate deviations from RFC-001 §12's 3×/100× bars,
+nightly soak (`nightly-chaos.yml`) iterates each scenario 20–100× under a 2 h
+cap, each count sized from that scenario's measured cost (D-41). Both cadences are deliberate deviations from RFC-001 §12's 3×/100× bars,
 recorded with their reasoning in the harness README.
 
 Beside the tier, on the same path filter and the same prebuilt image, the
@@ -154,8 +154,11 @@ LB-independence; C4+C5 together are R1 under adversity.
 
 - **Single-node fidelity**: the entire upstream test suite runs against
   `rift-cluster-server` with `--cluster` off — byte-identical behavior required.
-- **Hot-path performance**: `matcher_bench` within 2% of the pre-seam
-  baseline; clustering compiled in but disabled must be free.
+- **Hot-path performance**: upstream's `imposter_matcher_bench`
+  (`vendor/rift/crates/rift-mock-core`) within 2% of the pre-seam baseline;
+  clustering compiled in but disabled must be free. **Not automated:** no CI job
+  runs a benchmark, so this gate holds only when a change touching the match path
+  is benched by hand.
 - **SDK conformance**: the four language SDKs' conformance suites pass against
   a clustered fleet — the admin API contract (envelopes, cursors, SSE,
   `Rift-Cluster-*` headers as additive-only) holds from a client that didn't
