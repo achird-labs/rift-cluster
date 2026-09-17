@@ -1,7 +1,7 @@
 //! The clustered `proxyOnce` recording store (#226, Ch.6 §proxyOnce, D-40): exactly-once
 //! recording fleet-wide, through upstream's `ProxyRecordingStore` seam (U-16, rift#911).
-//! Cluster-native, not Redis-first: D-12's Redis-backed-first ordering was amended once this
-//! shipped on consensus (see D-12's amendment); no Redis proxyOnce backend exists.
+//! Cluster-native, not Redis-first: D-47 superseded D-12's Redis-backed-first ordering once
+//! this shipped on consensus; no Redis proxyOnce backend exists.
 //!
 //! Shape, mirroring the flow store's discipline:
 //!

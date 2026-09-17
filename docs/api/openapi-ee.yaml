@@ -136,6 +136,8 @@ paths:
           headers:
             Rift-Cluster-Revision:
               $ref: '#/components/headers/RiftClusterRevision'
+            Rift-Cluster-Bind-Failures:
+              $ref: '#/components/headers/RiftClusterBindFailures'
             Rift-Cluster-Op-Id:
               $ref: '#/components/headers/RiftClusterOpId'
           content:
@@ -313,6 +315,8 @@ paths:
           headers:
             Rift-Cluster-Revision:
               $ref: '#/components/headers/RiftClusterRevision'
+            Rift-Cluster-Bind-Failures:
+              $ref: '#/components/headers/RiftClusterBindFailures'
             Rift-Cluster-Op-Id:
               $ref: '#/components/headers/RiftClusterOpId'
           content:
@@ -366,6 +370,8 @@ paths:
           headers:
             Rift-Cluster-Revision:
               $ref: '#/components/headers/RiftClusterRevision'
+            Rift-Cluster-Bind-Failures:
+              $ref: '#/components/headers/RiftClusterBindFailures'
             Rift-Cluster-Warnings:
               $ref: '#/components/headers/RiftClusterWarnings'
           content:
@@ -412,6 +418,8 @@ paths:
           headers:
             Rift-Cluster-Revision:
               $ref: '#/components/headers/RiftClusterRevision'
+            Rift-Cluster-Bind-Failures:
+              $ref: '#/components/headers/RiftClusterBindFailures'
             Rift-Cluster-Op-Id:
               $ref: '#/components/headers/RiftClusterOpId'
           content:
@@ -465,6 +473,8 @@ paths:
           headers:
             Rift-Cluster-Revision:
               $ref: '#/components/headers/RiftClusterRevision'
+            Rift-Cluster-Bind-Failures:
+              $ref: '#/components/headers/RiftClusterBindFailures'
             Rift-Cluster-Op-Id:
               $ref: '#/components/headers/RiftClusterOpId'
           content:
@@ -538,6 +548,8 @@ paths:
           headers:
             Rift-Cluster-Revision:
               $ref: '#/components/headers/RiftClusterRevision'
+            Rift-Cluster-Bind-Failures:
+              $ref: '#/components/headers/RiftClusterBindFailures'
             Rift-Cluster-Op-Id:
               $ref: '#/components/headers/RiftClusterOpId'
           content:
@@ -599,6 +611,8 @@ paths:
           headers:
             Rift-Cluster-Revision:
               $ref: '#/components/headers/RiftClusterRevision'
+            Rift-Cluster-Bind-Failures:
+              $ref: '#/components/headers/RiftClusterBindFailures'
             Rift-Cluster-Op-Id:
               $ref: '#/components/headers/RiftClusterOpId'
           content:
@@ -692,6 +706,8 @@ paths:
           headers:
             Rift-Cluster-Revision:
               $ref: '#/components/headers/RiftClusterRevision'
+            Rift-Cluster-Bind-Failures:
+              $ref: '#/components/headers/RiftClusterBindFailures'
             Rift-Cluster-Op-Id:
               $ref: '#/components/headers/RiftClusterOpId'
           content:
@@ -740,6 +756,8 @@ paths:
           headers:
             Rift-Cluster-Revision:
               $ref: '#/components/headers/RiftClusterRevision'
+            Rift-Cluster-Bind-Failures:
+              $ref: '#/components/headers/RiftClusterBindFailures'
             Rift-Cluster-Op-Id:
               $ref: '#/components/headers/RiftClusterOpId'
           content:
@@ -824,6 +842,8 @@ paths:
           headers:
             Rift-Cluster-Revision:
               $ref: '#/components/headers/RiftClusterRevision'
+            Rift-Cluster-Bind-Failures:
+              $ref: '#/components/headers/RiftClusterBindFailures'
             Rift-Cluster-Op-Id:
               $ref: '#/components/headers/RiftClusterOpId'
           content:
@@ -875,6 +895,8 @@ paths:
           headers:
             Rift-Cluster-Revision:
               $ref: '#/components/headers/RiftClusterRevision'
+            Rift-Cluster-Bind-Failures:
+              $ref: '#/components/headers/RiftClusterBindFailures'
             Rift-Cluster-Op-Id:
               $ref: '#/components/headers/RiftClusterOpId'
           content:
@@ -2993,6 +3015,17 @@ components:
       example: ['method=POST', 'header:Content-Type=application/json']
 
   headers:
+    RiftClusterBindFailures:
+      description: >
+        Present when the answering node holds the addressed imposter but could not bind its
+        port, as `<port>=<reason>` (D-81). The imposter is committed fleet-wide and this
+        node serves it in-process only; other nodes may be bound normally. Carried on reads
+        of the imposter and on writes to it — a pause or stub patch that succeeds does not
+        clear it, because neither attempts the bind. Distinct from `Rift-Cluster-Warnings:
+        local-engine=…`, which covers every way this node failed to realize the config.
+      schema:
+        type: string
+        example: '4545=Address already in use (os error 98)'
     RiftClusterWarnings:
       description: >
         Present when the answering node has something to say that did not change the

@@ -102,6 +102,15 @@ Two client-facing conveniences round this out: `GET /_cluster/ops/:op_id` →
 for its own write deterministically; `--cluster-admin-async` flips the API to
 `202 Accepted + op-id` for bulk provisioning that would rather poll than block.
 
+These settings — `--cluster-write-barrier`, its timeout, `--cluster-admin-async`
+and `--cluster-flow-fsync-interval-ms` — decide what a `2xx` promises, so each
+node reports the values it is actually running: a `write_path` object on its own
+`GET /_cluster/members` row, folded per voter into `GET /_fleet/members`, where a
+voter that did not answer reads `null` rather than a default (D-82). A rolling
+deploy whose nodes disagree is visible there, and on the console's *Durability &
+write path* panel, which reads the values and has no control to change them
+(Chapter 10).
+
 ## The barrier's escape hatches — and the net under them
 
 `--cluster-write-barrier=none` exists for mass-provisioning bursts that will

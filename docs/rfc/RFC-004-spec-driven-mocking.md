@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | v1 — design draft for review |
+| **Status** | v1 — **partly retired**: the compiler (§3.1–§3.2) ships as the stateless `POST /specs/compile` (D-72); stored specs, deploy, drift, traffic validation, the data model and the admin surface (§3.3–§5) were removed by D-71/D-72 (RFC-007 §3.2) |
 | **Tracking issue** | [achird-labs/rift-cluster#148](https://github.com/achird-labs/rift-cluster/issues/148) (milestone M4) |
 | **Canonical location** | `rift-cluster:docs/rfc/RFC-004-spec-driven-mocking.md` |
 | **Depends on** | **ADR-001** (Raft control plane) — spec records live in its state machine; **RFC-002** (#17) — tenancy scoping and the closed Action set this RFC extends; **#20 / U-12** (`ImposterSource` SPI, Ch. 13) — for the `openapi+…:` source kinds only, and only that part blocks on it |
@@ -259,6 +259,10 @@ scripted responses cannot be checked statically and are skipped; they are
 exactly what runtime validation (§3.6) exists for.
 
 ### 3.3 Deploy path — nothing new to trust
+
+> **Retired by D-71** (RFC-007 §3.2, #549): there is no `POST /specs/:id/deploy` and no stored
+> spec to deploy. `POST /specs/compile` answers the imposter JSON and stores nothing; the caller
+> `PUT`s the result, which is the ordinary write path this section describes (D-72).
 
 `POST /specs/:id/deploy` (§5) compiles and submits an ordinary
 `PutImposter` through the same code path as a client `PUT /imposters`

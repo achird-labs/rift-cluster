@@ -46,6 +46,7 @@ from __future__ import annotations
 
 import argparse
 import fnmatch
+import functools
 import json
 import os
 import re
@@ -402,6 +403,27 @@ def scan_all(root: Path) -> list[Citation]:
 # --------------------------------------------------------------------------- checks
 
 
+@functools.lru_cache(maxsize=None)
+def _file_lines(path: Path) -> tuple[str, ...]:
+    try:
+        return tuple(path.read_text(encoding="utf-8", errors="replace").splitlines())
+    except OSError:
+        return ()
+
+
+def cites_successor_nearby(root: Path, c: Citation, successors: list[str]) -> bool:
+    """Whether a superseded citation is already written as history.
+
+    A comment that names the decision that replaced it within a line of the old id ("D-73
+    supersedes D-44", "D-55, superseded by D-72 with the blob store") is recording provenance,
+    which is what the warning asks for. Without this, the only way to silence the warning was to
+    delete the old id — and with it the reason the code is shaped as it is.
+    """
+    lines = _file_lines(root / c.file)
+    window = " ".join(lines[max(c.line - 2, 0) : c.line + 1])
+    return any(re.search(rf"\b{re.escape(s)}\b", window) for s in successors)
+
+
 def check_resolution(root: Path, cites: list[Citation], decisions: dict[str, Decision]) -> list[Finding]:
     unverifiable = vendor_unverifiable(root)
     findings: list[Finding] = []
@@ -413,7 +435,10 @@ def check_resolution(root: Path, cites: list[Citation], decisions: dict[str, Dec
             if c.key not in decisions:
                 findings.append(Finding("error", "unresolved-decision", f"{c.key} is not in the register", c.file, c.line))
             elif not c.in_doc and decisions[c.key].status == "superseded":
-                by = ", ".join(decisions[c.key].superseded_by) or "?"
+                successors = decisions[c.key].superseded_by
+                if cites_successor_nearby(root, c, successors):
+                    continue
+                by = ", ".join(successors) or "?"
                 findings.append(Finding("warning", "superseded-cited", f"{c.key} is superseded by {by}; code should cite the successor (or say it is history)", c.file, c.line))
         elif c.kind == "rfc":
             m = re.match(r"RFC-(\d{3})(?: §(.+))?$", c.key)

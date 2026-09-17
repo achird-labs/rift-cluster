@@ -662,16 +662,16 @@ Both are deliberate, and recorded here rather than left to be re-discovered as
 "the CI doesn't match the spec".
 
 - **`cluster-smoke` runs 1 iteration, not the specified 3.** Flake detection is
-  the nightly soak's job, and it does it far better: 60–100 iterations of each
+  the nightly soak's job, and it does it far better: 20–100 iterations of each
   scenario against 3 on a PR. Tripling the most expensive job on every
   cluster-touching PR buys very little the soak does not already catch, and it
   buys it by taxing every change. If a scenario is suspected flaky, soak that
   one on demand via `workflow_dispatch` rather than making every PR pay for the
   general case.
-- **The nightly iterates 60–100 per scenario, not a flat 100.** 100× everything
+- **The nightly iterates 20–100 per scenario, not a flat 100.** 100× everything
   does not fit the 2 h cap: C6 alone carries an irreducible 60 s toxic window,
   which puts it at ~3.6 h by itself. The table is sized to the cap, with the
-  cheapest scenarios at 100 and the longest at 60. The first nightly publishes
+  cheapest scenarios at 100 and the heaviest (C10) at 20. The first nightly publishes
   measured per-iteration wall clock as a step summary, so the table can be tuned
   against real numbers rather than estimates.
 

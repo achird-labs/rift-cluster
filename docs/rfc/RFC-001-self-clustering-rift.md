@@ -222,10 +222,13 @@ issues — an implementer reading only the RFC would have built the wrong thing.
 
 ## 1. Summary
 
+> **Amended by D-73** (2026-09-07, #550): tenancy is no longer part of the control plane; nothing
+> in the fleet is tenant-scoped. The summary below lists what the log carries today.
+
 Run Rift as a **fully distributed, self-clustering application** — a fleet of active-active
 nodes behind a load balancer that share one imposter set and behave correctly for stateful
 features cluster-wide, **without any mandatory external dependency**. The control plane
-(membership, configs, tenancy, admin intents) is an **embedded Raft group** (`openraft`,
+(membership, configs, the route table, admin intents) is an **embedded Raft group** (`openraft`,
 in-process; ADR-001); the data plane's flow state stays off consensus (single-writer
 rendezvous-hash ownership + write-ahead durability). Redis remains an optional backend behind
 the same traits — the **supported path for customers who require strict sequencing /
@@ -279,7 +282,10 @@ RPS, so raw throughput is rarely the driver — four goals justify a cluster:
 
 ### 2.1 Non-goals
 
-- **Not a database.** Durability covers configs, tenancy, admin intents, and — at the chosen
+> **Amended by D-73** (2026-09-07, #550): the multi-tenancy non-goal below became permanent —
+> RFC-002's tenancy was built, then removed (D-71, D-73).
+
+- **Not a database.** Durability covers configs, the route table, admin intents, and — at the chosen
   per-imposter level (#16) — flow state. Response cursors, the recorded-request journal, and
   in-flight proxy claims stay deliberately volatile (v3: flow state is *no longer* volatile,
   correcting v2 — see R3, ADR-001, and #16; the survival matrix is architecture-guide Ch. 9).
@@ -296,8 +302,9 @@ RPS, so raw throughput is rarely the driver — four goals justify a cluster:
 - **No intercept mode, injection gate, or TUI in cluster mode** (v3). These are single-node
   OSS surfaces; `--cluster` with intercept mode is rejected at startup, alongside the per-core
   runtime rejection (D-14).
-- **No multi-tenancy in this RFC.** Tenant-scoped configs, per-user RBAC, and audit are
-  **RFC-002** (#17) — orthogonal, and absent from both v2 and upstream.
+- **No multi-tenancy.** Tenant-scoped configs, per-user RBAC, and audit were designed in
+  **RFC-002** (#17), built, and then removed (D-71, D-73): the fleet has one tenant and one
+  credential.
 
 ## 3. Current state (grounding — verified at `aaa6042` (v0.15.0))
 
@@ -635,8 +642,9 @@ Phase-1 exit test: "unreachable seeds ⇒ never Ready" (§10).
 > `xxh3(roster)` + `EPOCH_MISMATCH` retries, the 3 s settle delay, and per-key-class ownership
 > generations + persisted floors. Under Raft the ring is a pure function of the **applied**
 > membership, and the fencing token is `m_idx` (the log index of the last applied membership
-> change); the one residual window is closed by the **isolated-owner rule** (a node that has not
-> heard a leader heartbeat within 3× the election timeout rejects owner-side ops). See ADR-001
+> change); the one residual window is closed by the **isolated-owner rule** (a node that has lost
+> contact with the quorum rejects owner-side ops — a follower as soon as it knows no leader,
+> 450–600 ms after the last heartbeat, a leader after 900 ms without a quorum ack; D-17). See ADR-001
 > §Ring & fencing and issue #7. Read `(g, v, origin)` below as `(m_idx, v, origin)`.
 
 - **Ring:** rendezvous (HRW) hashing: `owner(key) = argmax_{n ∈ eligible} h(n.node_id, key)`

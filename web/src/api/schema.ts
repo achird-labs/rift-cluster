@@ -1611,6 +1611,8 @@ export interface components {
     };
     requestBodies: never;
     headers: {
+        /** @description Present when the answering node holds the addressed imposter but could not bind its port, as `<port>=<reason>` (D-81). The imposter is committed fleet-wide and this node serves it in-process only; other nodes may be bound normally. Carried on reads of the imposter and on writes to it — a pause or stub patch that succeeds does not clear it, because neither attempts the bind. Distinct from `Rift-Cluster-Warnings: local-engine=…`, which covers every way this node failed to realize the config. */
+        RiftClusterBindFailures: string;
         /**
          * @description Present when the answering node has something to say that did not change the outcome. A comma-separated list of `key=value` items. `local-engine=<reason>` means THIS node failed to realize the addressed imposter's committed config — a stored record that will not parse, a refused enable/disable or stub patch, an unreadable TLS cert, or a `flowState` this build will not honour (D-76). The record is committed fleet-wide either way, and other nodes may be serving it normally; this is a per-node observation.
          *     Distinct from `Rift-Cluster-Bind-Failures`, which asserts the narrower "holds the imposter but never bound its port". Both may appear for one port. On a write the list may also carry `unapplied=<node-ids>`.
@@ -1730,6 +1732,7 @@ export interface operations {
             201: {
                 headers: {
                     "Rift-Cluster-Revision": components["headers"]["RiftClusterRevision"];
+                    "Rift-Cluster-Bind-Failures": components["headers"]["RiftClusterBindFailures"];
                     "Rift-Cluster-Op-Id": components["headers"]["RiftClusterOpId"];
                     [name: string]: unknown;
                 };
@@ -1799,6 +1802,7 @@ export interface operations {
             200: {
                 headers: {
                     "Rift-Cluster-Revision": components["headers"]["RiftClusterRevision"];
+                    "Rift-Cluster-Bind-Failures": components["headers"]["RiftClusterBindFailures"];
                     "Rift-Cluster-Warnings": components["headers"]["RiftClusterWarnings"];
                     [name: string]: unknown;
                 };
@@ -1843,6 +1847,7 @@ export interface operations {
             200: {
                 headers: {
                     "Rift-Cluster-Revision": components["headers"]["RiftClusterRevision"];
+                    "Rift-Cluster-Bind-Failures": components["headers"]["RiftClusterBindFailures"];
                     "Rift-Cluster-Op-Id": components["headers"]["RiftClusterOpId"];
                     [name: string]: unknown;
                 };
@@ -1891,6 +1896,7 @@ export interface operations {
             200: {
                 headers: {
                     "Rift-Cluster-Revision": components["headers"]["RiftClusterRevision"];
+                    "Rift-Cluster-Bind-Failures": components["headers"]["RiftClusterBindFailures"];
                     "Rift-Cluster-Op-Id": components["headers"]["RiftClusterOpId"];
                     [name: string]: unknown;
                 };
@@ -1942,6 +1948,7 @@ export interface operations {
             200: {
                 headers: {
                     "Rift-Cluster-Revision": components["headers"]["RiftClusterRevision"];
+                    "Rift-Cluster-Bind-Failures": components["headers"]["RiftClusterBindFailures"];
                     "Rift-Cluster-Op-Id": components["headers"]["RiftClusterOpId"];
                     [name: string]: unknown;
                 };
@@ -2035,6 +2042,7 @@ export interface operations {
             200: {
                 headers: {
                     "Rift-Cluster-Revision": components["headers"]["RiftClusterRevision"];
+                    "Rift-Cluster-Bind-Failures": components["headers"]["RiftClusterBindFailures"];
                     "Rift-Cluster-Op-Id": components["headers"]["RiftClusterOpId"];
                     [name: string]: unknown;
                 };
@@ -2093,6 +2101,7 @@ export interface operations {
             200: {
                 headers: {
                     "Rift-Cluster-Revision": components["headers"]["RiftClusterRevision"];
+                    "Rift-Cluster-Bind-Failures": components["headers"]["RiftClusterBindFailures"];
                     "Rift-Cluster-Op-Id": components["headers"]["RiftClusterOpId"];
                     [name: string]: unknown;
                 };
@@ -2185,6 +2194,7 @@ export interface operations {
             200: {
                 headers: {
                     "Rift-Cluster-Revision": components["headers"]["RiftClusterRevision"];
+                    "Rift-Cluster-Bind-Failures": components["headers"]["RiftClusterBindFailures"];
                     "Rift-Cluster-Op-Id": components["headers"]["RiftClusterOpId"];
                     [name: string]: unknown;
                 };
@@ -2237,6 +2247,7 @@ export interface operations {
             200: {
                 headers: {
                     "Rift-Cluster-Revision": components["headers"]["RiftClusterRevision"];
+                    "Rift-Cluster-Bind-Failures": components["headers"]["RiftClusterBindFailures"];
                     "Rift-Cluster-Op-Id": components["headers"]["RiftClusterOpId"];
                     [name: string]: unknown;
                 };
@@ -2327,6 +2338,7 @@ export interface operations {
             200: {
                 headers: {
                     "Rift-Cluster-Revision": components["headers"]["RiftClusterRevision"];
+                    "Rift-Cluster-Bind-Failures": components["headers"]["RiftClusterBindFailures"];
                     "Rift-Cluster-Op-Id": components["headers"]["RiftClusterOpId"];
                     [name: string]: unknown;
                 };
@@ -2379,6 +2391,7 @@ export interface operations {
             200: {
                 headers: {
                     "Rift-Cluster-Revision": components["headers"]["RiftClusterRevision"];
+                    "Rift-Cluster-Bind-Failures": components["headers"]["RiftClusterBindFailures"];
                     "Rift-Cluster-Op-Id": components["headers"]["RiftClusterOpId"];
                     [name: string]: unknown;
                 };

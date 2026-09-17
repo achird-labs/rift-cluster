@@ -1910,9 +1910,9 @@ impl RedbStateMachine {
     /// **Every stored route is compiled in.** Before #550 this filtered to the default
     /// tenant's routes, because the front door is a single listener with no tenant
     /// discriminator and a unioned table would have let any tenant publish a catch-all
-    /// that captured the whole fleet's traffic (D-68). With one fleet-wide table there is
-    /// nothing to filter and nobody to shadow: what is stored is what dispatches, which is
-    /// why D-68's `installed` field went with tenancy.
+    /// that captured the whole fleet's traffic (D-68, since superseded by D-73). With one
+    /// fleet-wide table there is nothing to filter and nobody to shadow: what is stored is what
+    /// dispatches, which is why D-68's `installed` field went with tenancy (D-73).
     ///
     /// `Ok(Err((id, reason)))` means a stored record failed to parse — this
     /// crate is the only writer of `sm_routes`, so it should never happen in
@@ -2983,6 +2983,8 @@ impl RaftStateMachine<TypeConfig> for RedbStateMachine {
                     EntryPayload::Blank => {
                         responses.push(ControlResponse::applied(log_id.index));
                     }
+                    // The entry carries the config body itself, not a digest to fetch (D-4, as
+                    // amended by D-15 and D-72): there is no second transport to consult here.
                     EntryPayload::Normal(request) => {
                         applied.logical_clock_secs =
                             applied.logical_clock_secs.max(request.issued_at_secs);

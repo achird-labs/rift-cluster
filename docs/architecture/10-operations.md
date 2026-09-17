@@ -20,8 +20,13 @@ rift-cluster-server \
   --cluster-state-dir /var/lib/rift  # redb: identity, raft log/vote/snapshot + flow shard;
                                       # default <datadir>/_cluster
   --cluster-write-barrier ready-nodes|none    # Ch.4; default ready-nodes
+  --cluster-write-barrier-timeout 2  # seconds (default 2); stragglers are named, not waited on
+  --cluster-admin-async              # writes answer 202 + op-id instead of waiting (Ch.4)
+  --cluster-flow-fsync-interval-ms 50   # flow-shard group fsync for `async` imposters (default 50)
   --cluster-leave-timeout 10         # seconds (default 10); orchestrator grace ≥ 2× this
   --cluster-probe-bind 0.0.0.0:2526  # unauthenticated /readyz + /healthz (default shown)
+  --require-admin-auth / --local-only   # upstream's flags, judged against the front's
+                                      # address under --cluster (D-79, below)
 ```
 
 Every flag has an `RIFT_CLUSTER_*` environment form (`crates/rift-cluster-server/src/cli.rs`

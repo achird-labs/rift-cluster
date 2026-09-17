@@ -119,7 +119,7 @@ that single-node benchmarks regress ≤ 2% with clustering compiled in but off.
 ## One request, three planes — a preview
 
 To make the split concrete, here is where work happens for the three request
-categories (Chapters 4, 5 and 7 walk each in full):
+categories (Chapters 4, 5 and 6 walk each in full):
 
 ```mermaid
 flowchart LR

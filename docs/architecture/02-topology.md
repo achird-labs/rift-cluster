@@ -123,9 +123,11 @@ Two port-level details complete the picture:
 
 - **Bind divergence.** Binds can fail on individual nodes (a port taken by an
   unrelated local process). The imposter still exists cluster-wide; the failing
-  node reports per-`(port, node)` bind status to the leader (surfaced via
-  `GET /_cluster/imposters` and a `Rift-Cluster-Warnings` header on create),
-  and can still serve that imposter via the gateway listener. In L4/port-based
+  node keeps the reason locally and reports it itself — on its own
+  `GET /_cluster/imposters` and members projection, merged fleet-wide by whichever
+  node answers `GET /_fleet/members`, and as a `Rift-Cluster-Bind-Failures` header
+  on the reads and writes of that port it answers (D-81) — and can still serve that
+  imposter via the gateway path prefix. In L4/port-based
   deployments, per-port LB health checks route around the failed bind.
 
   Each node also reports its own bind state on the members projection —

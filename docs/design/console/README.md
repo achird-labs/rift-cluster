@@ -22,11 +22,13 @@ their two groups. There is no greyed "planned" run any more: RFC-006 §4's roadm
 screens that were promised and unbuilt, and every screen the reduced console promises is built.
 
 > **Amended by D-71** (RFC-007 §3.2, #553) and **D-73** (#550): this document used to describe
-> the RFC-006 §4 screen list — Administration, Sources, Specs, a fleet-merged Requests view, the
-> route table's Hits column and not-installed treatment — through a self-contained prototype,
-> `console-prototype.html`. Those screens are gone from the fleet. The prototype is kept in this
-> directory as a **design artifact, not a client**: it still renders them, and the "state explorer"
-> notes near the end of this file say how to read it. Nothing below that names them is normative.
+> the RFC-006 §4 screen list — Administration, Sources, Specs, a fleet-merged Requests view, and
+> (in the separate, uncommitted mockup the *do not rebuild* sections below refer to) the route
+> table's Hits column and not-installed treatment. Those are gone from the fleet. The prototype in
+> this directory, `console-prototype.html`, is kept as a **design artifact, not a client**: it still
+> renders Administration, the Sources and Specs entries and the merged Requests view, and the
+> "state explorer" notes near the end of this file say how to read it. Nothing below that names them
+> is normative.
 
 ## Imposters
 
@@ -41,7 +43,10 @@ fifth, **Record**, is on the imposter detail, because it acts on one imposter:
 
 - **Export** — a dialog, because what lands in the file (replay-ready vs as-configured, proxies
   kept or folded) needs more than a button label. A whole-set export is byte-preserving so the
-  same fleet exports to the same file (`features/imposters/portable.ts`).
+  same fleet exports to the same file (`features/imposters/portable.ts`). The dialog also carries
+  an *include TLS material* toggle, off by default, that the export route does not yet honour
+  (`EXPORT_TLS_IS_INERT`); whether an export should carry an https imposter's private key unless
+  asked is an open decision, #367, and this line changes with it.
 - **Import** — this console's own export format back in: a single imposter, an
   `{"imposters": [...]}` document or a bare list, with a pre-flight (which ports, which already
   exist, which repeat) and a choice between *Add* (N calls, reported per item) and *Replace all*
@@ -78,6 +83,14 @@ fifth, **Record**, is on the imposter detail, because it acts on one imposter:
 - **Record** — proxy-and-record against a real upstream, review the recorded stubs, and save them
   into the imposter. It needs an imposter to record *into*, which the list screen has not chosen
   yet. The recording panel is `web/src/screens/RecordingPanel.tsx`.
+
+**Bind failures are shown, not inferred** (D-81). The list's *Bind failures* quick filter narrows
+to imposters some node holds but could not bind, read from each voter's `bind_failures` on the
+fleet projection; when this node served no fleet reading the pill says so rather than filtering
+nothing, because "no failures" and "could not check" are different facts. The API also answers a
+read or write of such a port with `Rift-Cluster-Bind-Failures`, and one this node's engine could
+not realize with `Rift-Cluster-Warnings: local-engine=<reason>` (D-76). The console does not read
+either header today: the pill is where a bind failure shows.
 
 The **detail** carries the stubs (the form ⟷ raw-JSON editor, with lint-on-save and the
 `If-Match` 409 that names both edits and offers reapply-or-discard, never an auto-merge), this
@@ -343,8 +356,9 @@ merged Requests view and the Hits column in RFC-007.
 
 `console-prototype.html` is the self-contained, zero-dependency prototype the shipped console was
 built from. It predates RFC-007 and still renders screens the fleet no longer has (Administration
-with its tenant switcher, role matrix and key-shown-once panel; Sources; the merged Requests view;
-the route table's Hits and not-installed treatment); it also still shows camelCase route fields,
+with its tenant switcher, role matrix and key-shown-once panel; Sources and Specs; the merged
+Requests view). It never had an export dialog, a Hits column or a not-installed treatment. It also
+still shows camelCase route fields,
 which were corrected to snake_case in #189. It is kept because it is a **state explorer**, and
 states are what mockups habitually omit. The violet strip at the top is scaffolding, and the state is
 readable from the query string:

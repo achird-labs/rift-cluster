@@ -10,7 +10,7 @@ the wire contract alone — the path `/front-door/routes`, the `--front-door` fl
 `rift-http-proxy::front_door` module (U-11) all keep their names. Read #19 as amended by D-68 and
 D-73: the design it describes was tenant-scoped, and is not.
 
-> **Retired by D-71** (RFC-007 §3.2, #549): this chapter used to carry a second
+> **Retired by D-72** (RFC-007 §3.2, #549): this chapter used to carry a second
 > half on *imposter sources* — tracking source records, the `git+`/`s3:`/
 > `registry:` providers, the leader poll scheduler, drift policy and `authRef`.
 > All of it is gone. Imposters now arrive one of two ways: an ordinary
@@ -78,7 +78,8 @@ Design points that carry weight (full spec in #19):
   table, every route in it is compiled into the listener, and a route may target
   any imposter the fleet holds. `PUT /front-door/routes` replaces it as a unit,
   `DELETE /front-door/routes/{id}` removes one entry, and `GET` answers the table;
-  every body is a plain `RouteTable`. The `installed`
+  `PUT` and `GET` bodies are a plain `RouteTable`, and `DELETE` answers the route it
+  removed. The `installed`
   decoration D-68 added is gone — with nothing filtered out of the compiled set
   it could only ever say `true`.
 

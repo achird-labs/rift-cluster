@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | v1 — design draft for review |
+| **Status** | v1 — **partly retired**: §8 (MCP) by D-71; tenancy and principals throughout by D-73; the fleet request-log merge by D-74 (RFC-007 §3.2). The console design (§3–§7, §9) stands as amended at each section |
 | **Tracking issue** | [achird-labs/rift-cluster#150](https://github.com/achird-labs/rift-cluster/issues/150) (console, M6a) · [#151](https://github.com/achird-labs/rift-cluster/issues/151) (MCP, M6b) |
 | **Canonical location** | `rift-cluster:docs/rfc/RFC-006-web-console-and-mcp.md` |
 | **Depends on** | **RFC-002** (principals, roles, API keys — the console's auth substrate); **ADR-001 / #14** (the control plane every write lands in). References, without depending on for v1: RFC-004 (spec-driven mocking), RFC-005 (data sources & state), `docs/architecture/07-verification-plane.md`, `docs/architecture/13-router.md` |
@@ -13,6 +13,9 @@
 ---
 
 ## 1. Summary
+
+> **Amended by D-71** (RFC-007 §3.2, #547): the MCP server (item 2 below) was built and then
+> removed; this RFC's live subject is the console. §8 and §9.4 are kept as history.
 
 RiftCluster is administered today by curl, SDKs, and a terminal UI that ships with
 the core engine. That is the right *foundation* — everything is an API — but it
@@ -139,8 +142,8 @@ Three rules, in priority order:
 | **Front-door routes** — table editor | `GET/PUT /front-door/routes`, `DELETE /front-door/routes/:id` (`admin_front.rs`) | v1 |
 | ~~**Tenants / principals / roles / tokens / audit**~~ | ~~RFC-002 §5 admin surface + `GET /admin/audit`~~ | removed by D-71/D-73 |
 | **Scenarios & state** — scenario states per space, a space's scoped stubs, flow-state entries; set/reset/tear down/clear | `GET/POST/PUT /imposters/:port/scenarios*`, `GET/DELETE /imposters/:port/spaces/:flowId(/stubs)`, `GET/PUT/DELETE /admin/imposters/:port/flow-state/:flowId(/:key)` — all upstream routes that already ship and are contracted in `openapi-ee.yaml` | v1 (#232) |
-| **Sources** — declared sources, their drift policy, the ports they own, and drift state; declare, edit, delete and refresh-now | Reads: `GET /admin/sources` / `GET /admin/sources/{id}` (#239/#240), gated by `source.read` (Viewer+). Writes (#253): `POST /admin/sources`, `DELETE /admin/sources/{id}`, `POST /admin/sources/{id}/pull` — the verbs the cluster port already served, promoted to the RBAC'd front and tenant-resolved. Authorized as `imposter.write` / `imposter.delete`, matching the names the audit stream already emits for these ops rather than minting a `SourceWrite` the audit and the gate would disagree about | v1 (#233), writes #253 |
-| **Specs** — imported OpenAPI/proto specs | RFC-004 admin surface | with RFC-004 |
+| ~~**Sources** — declared sources, their drift policy, the ports they own, and drift state; declare, edit, delete and refresh-now~~ | Reads: `GET /admin/sources` / `GET /admin/sources/{id}` (#239/#240), gated by `source.read` (Viewer+). Writes (#253): `POST /admin/sources`, `DELETE /admin/sources/{id}`, `POST /admin/sources/{id}/pull` — the verbs the cluster port already served, promoted to the RBAC'd front and tenant-resolved. Authorized as `imposter.write` / `imposter.delete`, matching the names the audit stream already emits for these ops rather than minting a `SourceWrite` the audit and the gate would disagree about | removed by D-72 (#549) |
+| ~~**Specs** — imported OpenAPI/proto specs~~ | ~~RFC-004 admin surface~~ | removed by D-72 (#549); import is the stateless `POST /specs/compile` |
 
 Screens whose backend has not shipped render as a named, greyed nav entry with
 a link to the tracking issue — visible roadmap, not a 404.
@@ -236,11 +239,14 @@ The console's TypeScript client is **generated** from this schema
 plus a thin fetch wrapper at `web/src/api/client.ts`) and the generated output is
 committed so `web/` builds without the binary present. CI regenerates it and
 fails on any diff (`console-web` job), so "committed" cannot quietly become
-"stale". The MCP server's tool input schemas derive
-from the same document (§8.2). One contract, three consumers — drift between
-them becomes a CI failure.
+"stale". (The MCP server's tool schemas were a third consumer until D-71 removed
+the server, §8.) One contract, two consumers — drift between them becomes a CI
+failure.
 
 ### 5.2 Fleet reads on the admin port
+
+> **Amended by D-73** (RFC-007 §3.2, #550): there is no tenant-filtered subset and no role
+> split — the admin credential reads all three routes, and RFC-002 will not land.
 
 The console cannot hold the cluster secret (§2), so the front terminates a
 read-only projection of the operator surface on the admin port:
@@ -252,9 +258,7 @@ GET /_fleet/ops/:id     → op status: applied | failed | pending (poll target f
 ```
 
 Same JSON shapes as `cluster_api.rs:115-190` — one projection, not a second
-report. Authorization: the admin credential today; `ClusterAdmin` (fleet) or
-in-tenant `Viewer` for a tenant-filtered subset once RFC-002 lands — the
-precise split is settled in the RFC-002 T2 review, noted in §12 Q3.
+report. Authorization: the admin credential (D-73).
 `/_cluster/*` on the cluster port is unchanged; node-vs-node comparison
 (its stated purpose, `cluster_api.rs:5-8`) still requires asking each node.
 
@@ -273,32 +277,29 @@ precise split is settled in the RFC-002 T2 review, noted in §12 Q3.
 > now runs upstream's own key gate, so the front injects the configured key on its internal legs
 > — a cookie-authenticated request has no `Authorization` to forward.
 
-The API keeps accepting `Authorization` bearers unchanged (curl, SDKs, MCP).
+The API keeps accepting `Authorization` bearers unchanged (curl, SDKs).
 Browsers get a **session exchange**:
 
 ```
 POST   /session        body: {apiKey}  → Set-Cookie: rift_session=…; HttpOnly; Secure; SameSite=Strict; Max-Age=28800
 DELETE /session        → cookie cleared
-GET    /admin/whoami   → identity + bindings (RFC-002 §5; pre-RFC-002: synthetic single principal)
 ```
 
-The user pastes an API key once, at login. The server verifies it (today:
-the static-key comparison; post-RFC-002: argon2id lookup), then mints a
+The user pastes the fleet's API key once, at login. The server verifies it (a
+constant-time comparison against `--api-key`), then mints a
 session token the key never rides again — the cookie is `HttpOnly`, so no
 script in the page, injected or otherwise, can read either the key or the
 session (§9).
 
 **Token shape: stateless, fleet-verifiable.** The token is
-`{principal_id, issued_at, expiry}` HMAC-signed with a **session-signing key**
-minted once by the leader and stored as a control-plane record — every node
-verifies without coordination, and a login is not a Raft write. Revocation is
-honest about its bounds: the cookie only proves *authentication*; every
-request still resolves the principal and its bindings from local applied
-state, so disabling a principal or deleting a binding cuts access with
-RFC-002 §3.1's committed-or-not semantics. The 8-hour `Max-Age` bounds only
-the window in which a *stolen cookie* outlives its theft, and rotating the
-signing key (a `FleetAdmin` control-plane write) invalidates every session at
-once. What v1 does not have is per-session server-side revocation — stated in
+`{"pid": "admin", "iat", "exp", "kr"}` HMAC-signed with a **session-signing key**
+minted once and stored as a control-plane record (`ControlOp::SessionKeyPut`) —
+every node verifies without coordination, and a login is not a Raft write.
+Revocation is honest about its bounds: the cookie proves authentication and
+there is no identity behind it to disable, so the 8-hour `Max-Age` bounds the
+window in which a *stolen cookie* outlives its theft, and rotating the signing
+key (a new `SessionKeyPut`; `kr` is its revision) invalidates every session on
+every node at once. What v1 does not have is per-session server-side revocation — stated in
 §10, not hidden.
 
 **CSRF.** `SameSite=Strict` plus a double-submit custom header: the SPA sends
@@ -562,6 +563,9 @@ individually revocable) rather than pasting a fleet-admin key.
 
 ### 9.4 MCP credential scope
 
+> **Retired by D-71** (RFC-007 §3.2, #547): there is no MCP server, so this threat has no
+> surface. Kept as the record of how it was bounded while the server existed.
+
 The stdio transport means the key lives in the agent-host process
 environment or a key file — outside this system's control, which is exactly
 why §8.3 insists the key be a narrowly-bound principal: the threat model
@@ -601,6 +605,9 @@ RFC-002. The cluster *secret* and the write/RPC surface stay where they are.
   docs artifact we can ship later without design work here.
 
 ## 11. Phasing
+
+> **Amended by D-71** (RFC-007 §3.2, #547): milestones M1–M3 shipped and were then removed with
+> the MCP server; the console milestones stand.
 
 Console slices `feat(console): …`, MCP slices `feat(mcp): …`, ~1 PR each.
 C1–C3 are strictly ordered; C4+ and M1+ parallelize.

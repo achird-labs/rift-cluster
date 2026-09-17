@@ -46,10 +46,16 @@ service.
 
 ## Decision
 
+> **Amended by D-73** (2026-09-07, #550): tenancy and RBAC records are no longer among the log's
+> contents — the fleet has one tenant and one credential, and no `ControlOp` carries either. The
+> audit trail named under *Consequences* was removed with the audit projection (D-71). The
+> text below says what was decided in 2026-07 and is kept; read "tenancy/RBAC" and "audit" in it
+> as history.
+
 Adopt an **embedded Raft group** — [`openraft`](https://docs.rs/openraft), in
 process, over the existing HMAC-authenticated cluster port — as the control plane
-for **membership, imposter configs, the `enabled` bit, tenancy/RBAC records, and
-the admin intent log**. Persist the Raft log, vote, and snapshot metadata — and
+for **membership, imposter configs, the `enabled` bit, and the admin intent log**
+(and, until D-73, tenancy/RBAC records). Persist the Raft log, vote, and snapshot metadata — and
 the durable flow-state tier of #16 — in an embedded ACID store,
 [`redb`](https://docs.rs/redb). Both are pure Rust and safe for the static-musl /
 `FROM scratch` builds; neither is a service.
@@ -64,8 +70,8 @@ Putting membership *itself* into the Raft log is the move that pays for
 everything else: the roster becomes a linearizable value, so at any log index
 every node computes byte-identical membership and therefore byte-identical
 ownership. The settle delay, the generations, the epoch-mismatch retries are
-**deleted, not mitigated**. The same log then carries configs, tenancy, and admin
-intents, so R1 (a committed entry the fleet has applied), R3 (fsynced on a
+**deleted, not mitigated**. The same log then carries configs, the route table, and
+admin intents, so R1 (a committed entry the fleet has applied), R3 (fsynced on a
 majority before ack), and R4 (the log *is* the durable intent record) come from
 one primitive instead of three bespoke protocols.
 
@@ -87,7 +93,8 @@ one primitive instead of three bespoke protocols.
 - **One mechanism for R1/R3/R4.** Append → replicate to majority (fsync) → commit
   → apply → read-after-write barrier. Committed means durably held by a majority;
   a node serves reads once its apply index reaches the commit index; the log
-  doubles as the durable admin-intent record and the audit trail (#17).
+  doubles as the durable admin-intent record. (It was also the audit trail (#17)
+  until D-71 removed the audit projection.)
 - **Deleted machinery.** chitchat + gossip KV + payload budget; node incarnations;
   ring epochs + `EPOCH_MISMATCH` retries; the 3 s settle delay; per-key ownership
   generations + persisted floors; config digest pointers + anti-entropy body
@@ -95,8 +102,9 @@ one primitive instead of three bespoke protocols.
   rules; cold-start `(g,revision,origin)` merge. Net line count very likely goes
   *down*, and the dual-owner fork class (chaos C9) stops being a scenario that can
   fail.
-- **Strongly consistent authorization data** for tenancy/RBAC (#17) — the right
-  property for authz, which eventually-consistent RBAC is not.
+- ~~**Strongly consistent authorization data** for tenancy/RBAC (#17)~~ — held while
+  tenancy existed; D-73 removed it, and the one credential left is a flag, not replicated
+  data.
 - **Full-restart recovery is log + snapshot replay**, with deletions that cannot
   resurrect and an all-empty fleet that loudly refuses to serve.
 
@@ -121,8 +129,11 @@ one primitive instead of three bespoke protocols.
 
 A node partitioned away that has not yet applied the membership entry deposing it
 could briefly still believe it owns a key. Closed by the **isolated-owner rule**:
-a node that has not heard a leader heartbeat within `3 × election_timeout` marks
-itself *isolated* and rejects owner-side stateful ops. A new owner is by
+a node that has lost contact with the quorum marks itself *isolated* and rejects
+owner-side stateful ops. As built (D-17, measured), the two sides differ: a **follower**
+isolates as soon as it knows no leader — openraft's lease puts that 450–600 ms after the
+last heartbeat — and a **leader** isolates when no quorum has acknowledged it for 900 ms
+(`ISOLATION_WINDOW_MS`, 3 × `election_timeout_max`). A new owner is by
 definition on the quorum side and has applied the deposing entry, so the two
 serving windows cannot overlap by more than the heartbeat bound, and the
 `(m_idx, v, origin)` fencing tuple resolves anything written inside it. Enforced
@@ -164,7 +175,7 @@ at the owner, not assumed at the caller.
 
 This ADR records **D-15** (embedded Raft), **D-16** (`redb`, amended by #436), **D-17** (flow state
 off consensus), **D-18** (every member holds every live blob) and **D-19** (joint-consensus blob
-quorum). Their normative text lives in the decision register,
+quorum) — the last two superseded by D-72 with the blob store. Their normative text lives in the decision register,
 [`docs/decisions/DECISIONS.md`](../decisions/DECISIONS.md) — the only place a `D-n` is defined —
 so it is not repeated here. The *argument* for D-15–D-17 is the body of this ADR; the argument
 for D-18/D-19 is the "Object-store tiering" rejection above and issues #432/#438.

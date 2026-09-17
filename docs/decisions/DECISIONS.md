@@ -857,7 +857,11 @@ the committed row instead.
 - **Code:** .github/workflows/ci.yml, .github/workflows/nightly-chaos.yml
 
 PR-time `cluster-smoke` runs each container chaos scenario once and is a required status check;
-`nightly-chaos.yml` iterates 60–100× per scenario under a 2 h cap and is where flakes surface.
+`nightly-chaos.yml` iterates each scenario 20–100× under a 2 h cap and is where flakes surface.
+Each count is sized from that scenario's measured per-iteration cost: the cheapest single-write
+scenarios run 100×, and the heaviest — C10's two kill→restart phases — 20×. (This entry said
+60–100× until 2026-09-17; the floor fell as costlier scenarios joined the matrix, and the rule it
+states — size to the cap, not a flat count — did not change.)
 
 *Rejected:* RFC-001 §12's three iterations per PR (~25 → 70+ min per cluster-touching PR for
 little the soak does not catch) and a flat 100× nightly (C6's 60 s toxic window alone is ~3.6 h).
@@ -2650,6 +2654,7 @@ and an unknown are different claims.
 
 - **Status:** active
 - **Decided:** 2026-09-06 · RFC-007 · #544
+- **Supersedes:** D-70
 - **Implemented by:** #556, #557, #558, #559, #560, #562, #563, #564, #566, #567, #568, #569, #570, #571, #572, #573, #577
 - **Code:** crates/rift-cluster/src/control.rs, crates/rift-cluster-server/src/admin_front.rs, crates/rift-cluster/src/raft/node.rs, deploy/compose/smoke.sh
 
@@ -2864,7 +2869,7 @@ provably empty.
 - **Status:** active
 - **Decided:** 2026-09-07 · RFC-007 §3.2 · #550
 - **Supersedes:** D-44, D-45, D-46, D-68
-- **Amends:** RFC-006 §5.3
+- **Amends:** RFC-006 §5.3, RFC-001 §1, RFC-001 §2.1, docs/adr/ADR-001-raft-control-plane.md
 - **Implemented by:** #550
 - **Code:** crates/rift-cluster-server/src/admin_front.rs, crates/rift-cluster-server/src/session.rs, crates/rift-cluster-server/src/compose.rs, crates/rift-cluster/src/control.rs, crates/rift-cluster/src/raft/store.rs
 
