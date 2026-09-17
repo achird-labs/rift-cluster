@@ -964,6 +964,15 @@ binds can fail on some nodes (port taken by an unrelated process). Built (#143):
   /_cluster/imposters`, all below) already reads it from the node that owns the
   observation, never from a peer's replicated view of it. A future reader should not
   "restore" this as a missing feature.
+
+  > **Amended by D-81** (2026-09-16, #586): the bind *reason* no longer lives in
+  > `apply_failures()`. That map records the outcome of the last engine drive per port, and a
+  > pause or stub patch — drives that never touch the socket — reaped it, so one `disable` left a
+  > port unbound and reported healthy. The reason now has its own node-local map, written and
+  > cleared only by `record_report`, i.e. only by drives that attempt the bind; `apply_failures()`
+  > still carries the bind failure as that drive's outcome, for the write-path warning. The write
+  > path below also stamps `rift-cluster-bind-failures` whenever the written port is served unbound,
+  > so a successful pause of a diverged imposter does not answer as if it were healthy.
 - **Observability, per node:** `rift_cluster_bind_failures{port}` (gauge, resampled after
   every engine drive so healing clears it), the `cluster.bind_failures` annotation, and
   `record_report` (`crates/rift-cluster/src/raft/store.rs`) track a bind failure

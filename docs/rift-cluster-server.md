@@ -849,7 +849,10 @@ control-plane object**, exactly like the imposter config set.
   healing). A port-addressed admin read of that imposter — `GET
   /imposters/:port` through the clustered front — answers its normal `200`
   plus `rift-cluster-bind-failures: <port>=<reason>`; the response body stays
-  core-shaped, so the divergence is a header only. Two things stay
+  core-shaped, so the divergence is a header only. A successful write to that
+  port (a pause, a stub patch) carries the same header, and neither erases it:
+  the reason is cleared only by a drive that re-attempts the bind, or by the
+  imposter being deleted (D-81). Two things stay
   all-or-nothing regardless of the flag: `create_imposter` (the direct,
   non-apply path) and any bind failure that isn't a plain `BindError` on an
   explicit port (`PortInUse`, or an auto-assigned port — which `--cluster`
