@@ -156,6 +156,15 @@ pub mod seams {
     /// `..` rather than destructuring exhaustively.
     pub use rift_http_proxy::admin_api::authz::{AuthzTarget, SCOPE_HEADER, classify};
 
+    /// U-19: every `(method, path)` upstream's admin listener dispatches (upstream #1145).
+    ///
+    /// [`classify`] answers "what is this request"; this answers "what requests exist". The
+    /// clustered admin front terminates part of the admin surface and proxies the rest, and its
+    /// OpenAPI parity oracle needs the served set to prove every route is declared on one side.
+    /// It used to scrape the vendored router's source for it; this is the same set, maintained and
+    /// pinned upstream, where the router is.
+    pub use rift_http_proxy::admin_api::{ADMIN_ROUTES, AdminRoute, RouteFamily};
+
     /// The config types a replicated control op carries (ADR-001 §4.1): the
     /// imposter config itself, the stub type its edit scripts address, and the
     /// error the engine reports when an apply side-effect fails.
@@ -392,6 +401,9 @@ mod tests {
         _named::<ApplyReport>();
         _named::<ImposterEvent>();
         _named::<ImposterConfig>();
+        _named::<AdminRoute>();
+        _named::<RouteFamily>();
+        assert!(!ADMIN_ROUTES.is_empty());
         _named::<ImposterError>();
         _named::<Stub>();
         _named::<RiftScriptConfig>();

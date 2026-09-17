@@ -20,15 +20,15 @@
 //!    closes the rest with `EnumDiscriminants`: the representative list cannot fall behind the enum.
 //! 2. **Both directions at runtime.** Every EE path in the contract is fed through the real
 //!    `classify`, and every route the exhaustive matches produce must appear in the contract.
-//! 3. **Upstream by declaration.** `ImposterRoute` is `pub(crate)` inside the vendored submodule and
-//!    unreachable from here, so the proxied surface is a declared table pinned by asserting each
-//!    entry does *not* terminate locally — i.e. it really does proxy.
+//! 3. **Upstream from its own table.** Upstream exports `ADMIN_ROUTES` (upstream #1145) and pins it
+//!    against its router. The proxied surface here is still a declared table, kept for the history
+//!    in its comments, but it is *checked*: it must equal upstream's table minus what the front
+//!    terminates, in both directions.
 //!
-//! **What is still not enforced, stated plainly.** Two route shapes have no compile-time tripwire,
-//! because neither acquires a `Terminated` variant to hang one on:
+//! **What is still not enforced, stated plainly.** One route shape has no compile-time tripwire,
+//! because it acquires no `Terminated` variant to hang one on. (A new upstream route arriving in a
+//! submodule bump used to be the second; layer 3 now fails on it and names it.)
 //!
-//! - a **new upstream route** arriving in a submodule bump — layer 3 is a declared table, so this
-//!   needs a human;
 //! - a **new read served directly from `handle`** — it never reaches `classify`, so it would be
 //!   absent from [`HANDLE_DIRECT_ROUTES`] *and* from the contract, and the parity comparison would
 //!   stay green comparing two sets that are each missing it. The *declared* half of that list is
@@ -52,18 +52,18 @@
 //! **`/__rift/{port}/*` is the other deliberate exclusion**, and unlike `/console` it went unstated
 //! until #575. It is the data plane: `admin_front::handle` short-circuits the prefix to
 //! `ProxyLeg::Gateway` before authentication, RFC-002 §7 makes it an open plane, and it has no
-//! operation, schema or origin to declare. It lives in `deliberately_undeclared` so the
-//! source-derived layer can see that it was excluded on purpose rather than forgotten — which is
-//! the distinction the whole of #575 turned on.
+//! operation, schema or origin to declare. It lives in `deliberately_undeclared` so the exclusion is
+//! a recorded decision rather than an absence — the distinction the whole of #575 turned on.
+//! Upstream's route table leaves it out for the same reason.
 //!
 //! **The weakest layer, and what replaced it.** `upstream_proxied_routes` is hand-written, so this
 //! module used to have no way to tell "upstream stopped serving that" from "someone deleted it from
-//! both sides". `every_route_upstream_serves_is_declared_on_one_side_or_the_other` closes that by
-//! deriving the served set from the vendored router's own source at the pinned sha, as a *lower
-//! bound*: a scrape that matches too little weakens the guard, but one that matches too much fails
-//! loudly, so it cannot produce a false green about a route that exists. `GET /events` is what it
+//! both sides". `every_route_upstream_serves_is_declared_on_one_side_or_the_other` closes that
+//! against upstream's exported route table, and `the_declared_proxied_table_is_exactly_the_computed_one`
+//! makes the hand-written table exact rather than merely present. `GET /events` is what the first
 //! was written for — served, undocumented, and therefore missing from the generated client's path
-//! union.
+//! union. Both used to read a scrape of the vendored router's source, a lower bound that could not
+//! see routes dispatched by prefix; #588 replaced it.
 
 use std::sync::OnceLock;
 
@@ -143,6 +143,8 @@ mod parity {
     use std::collections::BTreeSet;
 
     use hyper::Method;
+
+    use rift_cluster_base::seams::{ADMIN_ROUTES, RouteFamily};
 
     use crate::admin_front::{Terminated, classify};
 
@@ -373,13 +375,6 @@ mod parity {
             .collect()
     }
 
-    /// The upstream surface a client reaches *through* the front.
-    ///
-    /// Declared rather than derived: `ImposterRoute` and `route_by_path` are `pub(crate)` inside the
-    /// vendored submodule and unreachable from this crate. `declared_upstream_routes_are_not_terminated_locally`
-    /// pins every entry by asserting the front really does proxy it, but a genuinely new upstream route
-    /// appearing in a submodule bump still needs a human to notice — this is the weakest layer of the
-    /// guard and is documented as such rather than dressed up.
     /// A route's identity for this comparison: its literal segments, with every parameter reduced
     /// to `{}`.
     ///
@@ -403,8 +398,8 @@ mod parity {
 
     /// Routes upstream serves that neither side declares **on purpose**, each with the reason.
     ///
-    /// Kept as an explicit list rather than a filter in the scraper, so that adding one is a
-    /// decision a reviewer sees rather than a regex growing a clause.
+    /// Kept as an explicit list rather than a filter on the served set, so that adding one is a
+    /// decision a reviewer sees rather than a predicate growing a clause.
     pub(crate) fn deliberately_undeclared() -> BTreeSet<RouteKey> {
         [
             // The data plane, not the admin API. `admin_front::handle` short-circuits this prefix
@@ -422,104 +417,40 @@ mod parity {
         .collect()
     }
 
-    /// Every route the **vendored** admin API's source shows it serving, at the pinned sha.
+    /// Every route upstream's admin listener dispatches, shaped for comparison.
     ///
-    /// `None` when `vendor/rift` is not checked out.
+    /// Read from upstream's own exported table (`ADMIN_ROUTES`, upstream #1145), which upstream
+    /// pins against its router: every per-imposter route variant, every authorization action,
+    /// every entry dispatched by a live listener, and no unlisted method on a listed path. This
+    /// used to be a line-oriented scrape of the vendored router's source — a lower bound that could
+    /// not see routes dispatched by prefix, and that needed the submodule checked out.
     ///
-    /// Line-oriented, because the three shapes upstream uses are each a literal a regex can read
-    /// and none of them needs the syntax tree:
-    ///
-    /// * the system fast path — `(&Method::GET, "/health")` pairs in one `match`;
-    /// * the `/imposters` collection — one `path ==` guard and a method match;
-    /// * `ImposterRoute`'s variants, whose **doc comments** state the methods and the path
-    ///   (`/// GET/DELETE /imposters/:port`) and are the maintained statement of what each serves;
-    /// * `events::stream_target`'s two literals, which is where `/events` lives — dispatched before
-    ///   the router, which is exactly why it escaped every other layer.
-    ///
-    /// A variant whose doc comment does not parse is reported rather than skipped: a silently
-    /// dropped variant is the failure mode this whole layer exists to prevent.
-    pub(crate) fn upstream_routes_from_source() -> Option<BTreeSet<RouteKey>> {
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../vendor/rift");
-        let router =
-            std::fs::read_to_string(root.join("crates/rift-http-proxy/src/admin_api/router.rs"))
-                .ok()?;
-        let events = std::fs::read_to_string(
-            root.join("crates/rift-http-proxy/src/admin_api/handlers/events.rs"),
-        )
-        .ok()?;
-
-        let mut routes = BTreeSet::new();
-        let mut add = |method: &str, path: &str| {
-            routes.insert(RouteKey {
-                path: route_shape(path),
-                method: method.to_owned(),
-            });
-        };
-
-        // The system fast path: `(&Method::GET, "/health") => ...`
-        for line in router.lines() {
-            let line = line.trim();
-            if let Some(rest) = line.strip_prefix("(&Method::")
-                && let Some((method, tail)) = rest.split_once(',')
-                && let Some(path) = tail.split('"').nth(1)
-                && path.starts_with('/')
-            {
-                add(method.trim(), path);
-            }
-        }
-
-        // The `/imposters` collection block: one guard, then a method match.
-        if router.contains(r#"if path == "/imposters" {"#) {
-            for method in ["GET", "POST", "PUT", "DELETE"] {
-                add(method, "/imposters");
-            }
-        }
-
-        // `ImposterRoute`'s variants, from their doc comments.
-        let mut variants = 0usize;
-        let enum_start = router.find("pub(crate) enum ImposterRoute {")?;
-        let enum_end = router[enum_start..].find("\n}\n")? + enum_start;
-        for line in router[enum_start..enum_end].lines() {
-            let line = line.trim();
-            let Some(doc) = line.strip_prefix("/// ") else {
-                continue;
-            };
-            let Some((methods, path)) = doc.split_once(" /imposters/") else {
-                continue;
-            };
-            variants += 1;
-            // Upstream's doc comments carry a trailing issue reference on some variants
-            // (`/// POST /imposters/:port/verify (issue #494)`); it is prose, not path.
-            let path = path.split(" (").next().unwrap_or(path).trim();
-            let path = format!("/imposters/{path}");
-            for method in methods.split('/') {
-                add(method.trim(), &path);
-            }
-        }
-        assert!(
-            variants >= 12,
-            "read only {variants} documented ImposterRoute variants; upstream's doc-comment \
-             convention has changed and this scraper no longer sees its routes"
-        );
-
-        // The SSE targets, dispatched before the router — `/events` is the route #575 was filed for.
-        if events.contains(r#"if path == "/events" {"#) {
-            add("GET", "/events");
-        }
-        if events.contains(r#"[port, "savedRequests", "stream"]"#) {
-            add("GET", "/imposters/{port}/savedRequests/stream");
-        }
-
-        Some(routes)
+    /// The intercept family is left out: `--cluster` refuses intercept mode at startup (D-14), so
+    /// no clustered front ever serves those routes.
+    pub(crate) fn upstream_served_routes() -> BTreeSet<RouteKey> {
+        ADMIN_ROUTES
+            .iter()
+            .filter(|route| route.family != RouteFamily::Intercept)
+            .map(|route| RouteKey {
+                path: route_shape(route.path),
+                method: route.method.as_str().to_owned(),
+            })
+            .collect()
     }
 
+    /// The upstream surface a client reaches *through* the front.
+    ///
+    /// Declared, and checked: `the_declared_proxied_table_is_exactly_the_computed_one` requires it
+    /// to equal upstream's route table minus what the front terminates, so a route a submodule bump
+    /// adds fails a test by name. It stays hand-written because its comments are the history of
+    /// what moved between the two sides and why.
     pub(crate) fn upstream_proxied_routes() -> BTreeSet<RouteKey> {
         [
             ("GET", "/"),
             // Dispatched before upstream's router (`events::stream_target`), so it is not one of
             // the paths `classify` can terminate — the front proxies it like any other read. It was
-            // served and declared nowhere until #575; the source-derived layer above is what would
-            // now catch that.
+            // served and declared nowhere until #575; the table-derived layer is what would now
+            // catch that.
             ("GET", "/events"),
             ("GET", "/health"),
             ("GET", "/config"),
@@ -592,6 +523,9 @@ mod parity {
             .replace("{routeId}", "svc")
             .replace("{scenarioName}", "checkout")
             .replace("{flowId}", "flow-1")
+            // Upstream's table names the same two parameters as `classify` reports them.
+            .replace("{scenario}", "checkout")
+            .replace("{space}", "flow-1")
             // A real UUID: `/_fleet/ops/{opId}` parses the segment, and a malformed id names no op at
             // all, so a placeholder like "op-1" would probe a different code path than the live route.
             .replace("{opId}", "0189dcf0-0454-4e0b-a10c-8a8f8dccce1f")
@@ -625,6 +559,8 @@ mod parity {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
+
+    use rift_cluster_base::seams::ADMIN_ROUTES;
 
     use super::parity::*;
     use super::*;
@@ -713,45 +649,22 @@ mod tests {
     }
 
     /// AC1, the headline criterion: the contract's path set equals the served route set.
-    /// Every route upstream's own source shows it serving must be accounted for — the layer that
-    /// closes #575.
+    /// Every route upstream serves must be accounted for — the layer that closes #575.
     ///
     /// The three layers that existed compared *declarations* against each other:
     /// `ee_served_routes()` derives from `Terminated` (exhaustive, so a new EE route is a compile
     /// error) but `upstream_proxied_routes()` is hand-written. So dropping a route from the contract
     /// **and** from that table left both sides equal and every layer green while the front went on
     /// serving it — which is how `GET /events` came to be served, undocumented, and absent from the
-    /// generated client's `ApiPath` union. `openapi.rs`'s own module doc called that table "the
-    /// weakest layer of the guard"; this is the layer that stops it being load-bearing.
+    /// generated client's `ApiPath` union.
     ///
-    /// **A lower bound, deliberately, and that asymmetry is what makes reading upstream's source
-    /// acceptable here.** `upstream_routes_from_source` scrapes the vendored router at the pinned
-    /// sha. If the scrape ever matches less than it should the guard weakens but never lies; if it
-    /// invents a route the assertion fails and a human looks. It cannot produce a false green about
-    /// a route that exists. The alternative — a route table upstream owns and exports — is the
-    /// better long-term shape and is filed as a follow-up; it needs a change in another repo, and
-    /// this closes the hole in this one meanwhile.
-    ///
-    /// The submodule may be absent (a fresh worktree without `git submodule update`), in which case
-    /// this skips rather than fails: an environment gap is not a contract gap. `design-check` makes
-    /// the same distinction for the same reason.
+    /// The served set is upstream's exported route table (#588), no longer a scrape of its source,
+    /// so it needs no submodule and has no floor to keep honest.
     #[test]
     fn every_route_upstream_serves_is_declared_on_one_side_or_the_other() {
-        let Some(derived) = upstream_routes_from_source() else {
-            eprintln!("vendor/rift is not checked out; skipping the upstream-source parity layer");
-            return;
-        };
+        let served = upstream_served_routes();
 
-        // Not a census — a floor. If the scrape stops matching, every assertion below passes
-        // against an empty set, which is the one way this layer could go quietly useless.
-        assert!(
-            derived.len() >= 25,
-            "scraped only {} routes from upstream's router; the scraper is broken, not the \
-             topology: {derived:?}",
-            derived.len()
-        );
-
-        // Shaped, like the derived side: the two sides name path parameters differently.
+        // Shaped, like the served side: the two sides name path parameters differently.
         let declared: BTreeSet<RouteKey> = ee_served_routes()
             .into_iter()
             .chain(upstream_proxied_routes())
@@ -762,13 +675,60 @@ mod tests {
             })
             .collect();
 
-        let missing: Vec<&RouteKey> = derived.iter().filter(|r| !declared.contains(r)).collect();
+        let missing: Vec<&RouteKey> = served.iter().filter(|r| !declared.contains(r)).collect();
         assert!(
             missing.is_empty(),
             "upstream serves these and nothing on either side declares them — the #575 hole. \
              Add each to docs/api/openapi-ee.yaml (with `x-rift-origin: upstream`) and to \
              `upstream_proxied_routes`, or to `deliberately_undeclared` with a reason: {missing:?}"
         );
+    }
+
+    /// `upstream_proxied_routes` is exactly what upstream serves minus what the front terminates
+    /// (#588) — checked rather than sourced, so its comments keep their history and the table
+    /// still cannot drift.
+    ///
+    /// Both directions: an upstream route the front proxies but the table omits (a submodule bump
+    /// that adds a route), and a table entry upstream no longer serves or the front now terminates.
+    #[test]
+    fn the_declared_proxied_table_is_exactly_the_computed_one() {
+        let computed: BTreeSet<RouteKey> = upstream_served_routes()
+            .into_iter()
+            .filter(|r| {
+                let sampled = sample_path(&upstream_template(r));
+                // An upstream placeholder `sample_path` does not know would reach `classify`
+                // verbatim and misclassify; name that cause rather than a confusing drift.
+                assert!(
+                    !sampled.contains('{'),
+                    "sample_path has no value for a placeholder in {sampled}"
+                );
+                !is_terminated_here(&r.method, &sampled)
+            })
+            .collect();
+        let declared: BTreeSet<RouteKey> = upstream_proxied_routes()
+            .into_iter()
+            .map(|r| RouteKey {
+                path: route_shape(&r.path),
+                method: r.method,
+            })
+            .collect();
+
+        let undeclared: Vec<_> = computed.difference(&declared).collect();
+        let stale: Vec<_> = declared.difference(&computed).collect();
+        assert!(
+            undeclared.is_empty() && stale.is_empty(),
+            "upstream_proxied_routes has drifted from upstream's route table.\n  proxied but not \
+             declared: {undeclared:?}\n  declared but not proxied: {stale:?}"
+        );
+    }
+
+    /// The upstream template a shaped key came from, so it can be sampled with real values.
+    fn upstream_template(key: &RouteKey) -> String {
+        ADMIN_ROUTES
+            .iter()
+            .find(|r| r.method.as_str() == key.method && route_shape(r.path) == key.path)
+            .map(|r| r.path.to_owned())
+            .unwrap_or_else(|| panic!("{key} is not in upstream's table"))
     }
 
     #[test]
