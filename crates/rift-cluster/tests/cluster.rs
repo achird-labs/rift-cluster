@@ -1445,11 +1445,13 @@ async fn a_joiner_is_caught_up_by_a_multi_mebibyte_snapshot() {
     // margin problem instead of a route problem (#492).
     //
     // **Polling alone can wait forever (#610).** openraft evaluates the snapshot policy only when
-    // the commit index advances, and skips the evaluation while a build is running; nothing
-    // re-evaluates when that build lands. If a build was still running when the last entry
-    // committed, it lands short of the tip and stays there — CI saw `snapshot=7`/`8` against
-    // `applied=9` for the full minute. So the loop commits one more entry, but only at a moment
-    // when no build can be running:
+    // the commit index advances — and `LogsSinceLast(2)` wants two entries past the snapshot — and
+    // skips the evaluation while a build is running; nothing re-evaluates when that build lands.
+    // So a snapshot one entry short of the tip is stable by the threshold alone, and one two or
+    // more short is stranded when a build was still running at the last commit. CI saw both,
+    // `snapshot=8` and `snapshot=7` against `applied=9`, for the full minute. So the loop commits
+    // one more entry, which clears the threshold either way, but only at a moment when no build
+    // can be running:
     //
     // - **right after it sees a build land behind the tip.** That build has finished, every
     //   trigger during it was skipped, and this test is the only writer, so the nudge's commit
