@@ -57,6 +57,7 @@ import {
   importPlan,
   parseImportDocument,
   renderSetDocument,
+  renderSetExport,
 } from "../features/imposters/portable.ts";
 import { type Finding, lintStub } from "../features/stubs/lint.ts";
 import type { CommitOutcome } from "../features/writes/commit.ts";
@@ -172,8 +173,8 @@ function ImposterTiles({
 }
 
 /**
- * Trigger a browser download of text this console already has in hand — never re-fetched, never
- * re-serialized. `apiGetText`'s whole point (#251) is bytes the download path must not touch.
+ * Trigger a browser download of text this console already has in hand — never re-fetched, and
+ * written exactly as given: whatever the file should contain is decided before this is called.
  */
 function downloadText(filename: string, text: string): void {
   const blob = new Blob([text], { type: "application/json" });
@@ -1260,12 +1261,28 @@ function ExportSetControl({
     setError(null);
     setBusy(true);
     try {
-      const text = await apiGetText(`/imposters${exportOptionsQuery(options)}`);
+      const setText = await apiGetText(`/imposters${exportOptionsQuery(options)}`);
+      const rendered = renderSetExport(setText, options.tls);
+      if (rendered.kind === "error") throw new Error(rendered.message);
       const filename = EXPORT_SET_FILENAME;
-      downloadText(filename, text);
+      downloadText(filename, rendered.text);
       // A download is the one action with no on-screen consequence at all: the dialog closes and the
-      // file lands somewhere the console cannot see. Saying so is the whole point of the toast.
-      toast({ tone: "good", message: `Exported ${String(count)} imposters`, meta: filename });
+      // file lands somewhere the console cannot see. Saying so is the whole point of the toast — and
+      // naming the imposters whose key went into the file, or was left out of it (D-84), is the
+      // part an operator cannot work out from the dialog.
+      const exported = `Exported ${String(count)} imposters`;
+      const carriers = carrierList(rendered.tlsPorts, rendered.tlsWithoutPort);
+      toast(
+        carriers === null
+          ? { tone: "good", message: exported, meta: filename }
+          : {
+              tone: "warn",
+              message: options.tls
+                ? `${exported} — private keys included for ${carriers}`
+                : `${exported} — key and cert removed from ${carriers}`,
+              meta: filename,
+            },
+      );
       onClose();
     } catch (error_) {
       setError(errorText(error_));
@@ -1292,6 +1309,16 @@ function ExportSetControl({
       )}
     </>
   );
+}
+
+/** The imposters an export's TLS material belonged to, in words; `null` when there were none. */
+function carrierList(ports: readonly number[], withoutPort: number): string | null {
+  const parts: string[] = [];
+  if (ports.length > 0) parts.push(`${ports.length === 1 ? "port" : "ports"} ${ports.join(", ")}`);
+  if (withoutPort > 0) {
+    parts.push(`${String(withoutPort)} imposter${withoutPort === 1 ? "" : "s"} with no port`);
+  }
+  return parts.length === 0 ? null : parts.join(" and ");
 }
 
 /** One imposter's outcome from an `Add` run. */

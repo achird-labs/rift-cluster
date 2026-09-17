@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import {
   cloneImposter,
@@ -7,7 +7,10 @@ import {
   PROJECTION_OPTIONS,
   exportOptionsQuery,
   exportQuery,
+  exportCurl,
   EXPORT_SET_FILENAME,
+  renderImposterExport,
+  renderSetExport,
   importPlan,
   parseImportDocument,
   renderSetDocument,
@@ -37,16 +40,18 @@ describe("export projections", () => {
     // is the same request, said out loud. It has to be: the export dialog shows the operator the
     // curl it is about to run, and a preview that hides a parameter is a preview of a different
     // command.
-    //
-    // `tls` is the design's third option and the route does not implement it yet
-    // (`EXPORT_TLS_IS_INERT`). It is sent regardless so that the day the route learns it, this
-    // works with no further change — and so the curl an operator copies out of the dialog is the
-    // one the console ran.
-    expect(exportQuery("replay-ready")).toBe(
-      "?replayable=true&removeProxies=true&tls=false",
+    expect(exportQuery("replay-ready")).toBe("?replayable=true&removeProxies=true");
+    expect(exportQuery("as-configured")).toBe("?replayable=true&removeProxies=false");
+  });
+
+  // Pins D-84: TLS material is kept or removed by the console, after the read. A `tls=` on the
+  // wire told anyone reading the request that the server decided, and it never did.
+  it("never sends tls, whichever way the option is set — the route has no such flag (D-84)", () => {
+    expect(exportOptionsQuery({ replayable: true, removeProxies: false, tls: true })).toBe(
+      "?replayable=true&removeProxies=false",
     );
-    expect(exportQuery("as-configured")).toBe(
-      "?replayable=true&removeProxies=false&tls=false",
+    expect(exportOptionsQuery({ replayable: false, removeProxies: true, tls: false })).toBe(
+      "?replayable=false&removeProxies=true",
     );
   });
 
@@ -123,6 +128,291 @@ describe("selecting one imposter out of a set export", () => {
   });
 });
 
+/*
+ * Pins D-84: the route's replayable projection is the imposter's config verbatim, so an https
+ * imposter created with its own `cert` and `key` comes back with both. The console removes that pair
+ * from a downloaded file unless the operator asked to keep it — and removes nothing else, because
+ * `ca`, `mutualAuth` and `rejectUnauthorized` are public and change what the imposter does.
+ */
+describe("TLS material in an export (D-84)", () => {
+  const HTTPS = {
+    port: 4545,
+    protocol: "https",
+    name: "billing",
+    cert: "-----BEGIN CERTIFICATE-----\nCERT\n-----END CERTIFICATE-----\n",
+    key: "-----BEGIN PRIVATE KEY-----\nKEY\n-----END PRIVATE KEY-----\n",
+    mutualAuth: true,
+    rejectUnauthorized: true,
+    ca: ["-----BEGIN CERTIFICATE-----\nCA\n-----END CERTIFICATE-----\n"],
+    stubs: [],
+  };
+  // An https imposter with no material of its own serves the server default or a generated cert;
+  // neither is in its config, so there is nothing to remove and nothing to report.
+  const HTTPS_BARE = { port: 4546, protocol: "https", stubs: [] };
+  const HTTP = { port: 4547, protocol: "http", stubs: [] };
+
+  // What the route sends: `serde_json::to_string_pretty`, no trailing newline.
+  const SET_TEXT = JSON.stringify({ imposters: [HTTPS, HTTPS_BARE, HTTP] }, null, 2);
+
+  // Pins D-84: the pair goes, both halves; `ca`, `mutualAuth` and `rejectUnauthorized` stay.
+  it("removes cert and key from every imposter, and keeps the client-auth settings", () => {
+    const rendered = renderSetExport(SET_TEXT, false);
+    expect(rendered).toEqual({
+      kind: "ok",
+      tlsPorts: [4545],
+      tlsWithoutPort: 0,
+      text: `{
+  "imposters": [
+    {
+      "port": 4545,
+      "protocol": "https",
+      "name": "billing",
+      "mutualAuth": true,
+      "rejectUnauthorized": true,
+      "ca": [
+        "-----BEGIN CERTIFICATE-----\\nCA\\n-----END CERTIFICATE-----\\n"
+      ],
+      "stubs": []
+    },
+    {
+      "port": 4546,
+      "protocol": "https",
+      "stubs": []
+    },
+    {
+      "port": 4547,
+      "protocol": "http",
+      "stubs": []
+    }
+  ]
+}
+`,
+    });
+  });
+
+  // Pins D-84: kept means the route's bytes.
+  it("hands back the route's bytes untouched when the operator keeps TLS material", () => {
+    // Deliberately not the indentation a re-serialization would produce: kept means kept.
+    const raw = `{"imposters":[{"port":4545,"protocol":"https","cert":"C","key":"K"},{"port":4547,"protocol":"http"}]}`;
+    expect(renderSetExport(raw, true)).toEqual({ kind: "ok", tlsPorts: [4545], tlsWithoutPort: 0, text: raw });
+  });
+
+  it("removes and reports half a pair — a lone key is still a private key", () => {
+    const text = JSON.stringify({
+      imposters: [
+        { port: 1, protocol: "https", key: "K" },
+        { port: 2, protocol: "https", cert: "C" },
+      ],
+    });
+    const rendered = renderSetExport(text, false);
+    expect(rendered.kind).toBe("ok");
+    if (rendered.kind !== "ok") return;
+    expect(rendered.tlsPorts).toEqual([1, 2]);
+    expect(JSON.parse(rendered.text)).toEqual({
+      imposters: [
+        { port: 1, protocol: "https" },
+        { port: 2, protocol: "https" },
+      ],
+    });
+  });
+
+  it("removes material from an imposter with no usable port, and counts the ones it cannot name", () => {
+    const text = JSON.stringify({ imposters: [{ protocol: "https", cert: "C", key: "K" }] });
+    const rendered = renderSetExport(text, false);
+    expect(rendered).toEqual({
+      kind: "ok",
+      tlsPorts: [],
+      tlsWithoutPort: 1,
+      text: '{\n  "imposters": [\n    {\n      "protocol": "https"\n    }\n  ]\n}\n',
+    });
+  });
+
+  it("hands back the route's bytes when there is nothing to remove", () => {
+    // Nothing to take out means nothing to rewrite: the default export of a fleet with no inline
+    // material is the route's document, digit for digit.
+    const raw = '{"imposters":[{"port":4547,"protocol":"http","stubs":[{"responses":[{"is":{"body":{"id":1234567890123456789,"ratio":1.0}}}]}]}]}';
+    expect(renderSetExport(raw, false)).toEqual({ kind: "ok", tlsPorts: [], tlsWithoutPort: 0, text: raw });
+    expect(renderSetExport('{"imposters":[]}', false)).toEqual({
+      kind: "ok",
+      tlsPorts: [],
+      tlsWithoutPort: 0,
+      text: '{"imposters":[]}',
+    });
+  });
+
+  // Pins D-84: removing the pair rewrites the document, and the rewrite changes nothing else — not
+  // an integer past 2^53, not `1.0`, not `1e3`. `JSON.parse` alone would turn the first into
+  // 1234567890123456800 and the others into 1 and 1000, with no error anywhere.
+  it("keeps every number's own digits when it rewrites a document to remove the pair", () => {
+    const raw =
+      '{"imposters":[{"port":4545,"protocol":"https","cert":"C","key":"K","stubs":[{"responses":[{"is":{"body":{"id":1234567890123456789,"ratio":1.0,"big":1e3,"neg":-0,"plain":7}}}]}]}]}';
+    expect(renderSetExport(raw, false)).toEqual({
+      kind: "ok",
+      tlsPorts: [4545],
+      tlsWithoutPort: 0,
+      text: `{
+  "imposters": [
+    {
+      "port": 4545,
+      "protocol": "https",
+      "stubs": [
+        {
+          "responses": [
+            {
+              "is": {
+                "body": {
+                  "id": 1234567890123456789,
+                  "ratio": 1.0,
+                  "big": 1e3,
+                  "neg": -0,
+                  "plain": 7
+                }
+              }
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
+`,
+    });
+    expect(renderImposterExport(raw, 4545, false)).toMatchObject({ kind: "ok" });
+    const one = renderImposterExport(raw, 4545, false);
+    if (one.kind !== "ok") throw new Error("expected an export");
+    expect(one.text).toContain('"id": 1234567890123456789,');
+    expect(one.text).toContain('"ratio": 1.0,');
+    // Duplicate reads through the same selection, and POSTs what it read.
+    const selected = selectImposter(raw, 4545);
+    if (selected.kind !== "ok") throw new Error("expected a selection");
+    expect(selected.text).toContain('"id": 1234567890123456789,');
+  });
+
+  it("does not mistake a lone out-of-range number for an imposter", () => {
+    expect(renderSetExport('{"imposters":[1.0]}', false).kind).toBe("error");
+  });
+
+  describe("in a browser that cannot parse JSON without rounding", () => {
+    // `JSON.rawJSON` and the reviver's `source` shipped together (Chrome 114, Firefox 135,
+    // Safari 18.4). Without them a rewrite could change a number and say nothing.
+    let rawJSON: unknown;
+    beforeEach(() => {
+      rawJSON = Reflect.get(JSON, "rawJSON");
+      Reflect.deleteProperty(JSON, "rawJSON");
+    });
+    afterEach(() => {
+      Reflect.set(JSON, "rawJSON", rawJSON);
+    });
+
+    // Pins D-84: an export that would need a rewrite is refused, not rounded.
+    it("refuses an export that would have to rewrite the document", () => {
+      const rendered = renderSetExport(SET_TEXT, false);
+      expect(rendered.kind).toBe("error");
+      if (rendered.kind !== "error") return;
+      expect(rendered.message).toMatch(/curl/);
+      expect(renderImposterExport(SET_TEXT, 4546, false).kind).toBe("error");
+    });
+
+    it("still exports what needs no rewrite", () => {
+      expect(renderSetExport(SET_TEXT, true)).toEqual({
+        kind: "ok",
+        tlsPorts: [4545],
+        tlsWithoutPort: 0,
+        text: SET_TEXT,
+      });
+      const bare = JSON.stringify({ imposters: [HTTP] });
+      expect(renderSetExport(bare, false)).toEqual({ kind: "ok", tlsPorts: [], tlsWithoutPort: 0, text: bare });
+    });
+
+    it("still duplicates, as it did before exports learned to keep digits", () => {
+      expect(selectImposter(SET_TEXT, 4545).kind).toBe("ok");
+    });
+  });
+
+  it("refuses a document it cannot read, in both modes, rather than downloading it", () => {
+    // Fail closed: with the option off, passing unreadable bytes through would be passing through
+    // whatever key they hold.
+    expect(renderSetExport("{not json", false).kind).toBe("error");
+    expect(renderSetExport("{not json", true).kind).toBe("error");
+    expect(renderSetExport('"a string"', false).kind).toBe("error");
+  });
+
+  it("strips one selected imposter the same way", () => {
+    expect(renderImposterExport(SET_TEXT, 4545, false)).toEqual({
+      kind: "ok",
+      tlsPorts: [4545],
+      tlsWithoutPort: 0,
+      text: `{
+  "port": 4545,
+  "protocol": "https",
+  "name": "billing",
+  "mutualAuth": true,
+  "rejectUnauthorized": true,
+  "ca": [
+    "-----BEGIN CERTIFICATE-----\\nCA\\n-----END CERTIFICATE-----\\n"
+  ],
+  "stubs": []
+}
+`,
+    });
+  });
+
+  it("keeps one selected imposter's material when asked, and reports it", () => {
+    const rendered = renderImposterExport(SET_TEXT, 4545, true);
+    expect(rendered.kind).toBe("ok");
+    if (rendered.kind !== "ok") return;
+    expect(rendered.tlsPorts).toEqual([4545]);
+    expect(JSON.parse(rendered.text)).toEqual(HTTPS);
+  });
+
+  it("reports nothing for a selected imposter with no material of its own", () => {
+    expect(renderImposterExport(SET_TEXT, 4546, false)).toEqual({
+      kind: "ok",
+      tlsPorts: [],
+      tlsWithoutPort: 0,
+      text: '{\n  "port": 4546,\n  "protocol": "https",\n  "stubs": []\n}\n',
+    });
+  });
+
+  it("says so when the selected port is not in the set", () => {
+    const rendered = renderImposterExport(SET_TEXT, 9999, false);
+    expect(rendered.kind).toBe("error");
+    if (rendered.kind !== "error") return;
+    expect(rendered.message).toContain("9999");
+  });
+
+  // Pins D-84: `selectImposter` feeds Duplicate. Stripping there would quietly turn a pinned-cert
+  // copy into one serving the fleet default, in a fleet that already holds the key.
+  it("leaves the duplicate path's selection alone — a clone in the same fleet keeps its key", () => {
+    const selected = selectImposter(SET_TEXT, 4545);
+    if (selected.kind !== "ok") throw new Error("expected a selection");
+    expect(JSON.parse(selected.text)).toEqual(HTTPS);
+  });
+
+  it("shows a curl that produces the same file: a jq filter when material is removed", () => {
+    const off = { replayable: true, removeProxies: true, tls: false };
+    const on = { ...off, tls: true };
+    expect(exportCurl({ kind: "all" }, off)).toBe(
+      "curl -s '/imposters?replayable=true&removeProxies=true' | jq '.imposters[] |= del(.cert, .key)' > imposters.json",
+    );
+    expect(exportCurl({ kind: "all" }, on)).toBe(
+      "curl -s '/imposters?replayable=true&removeProxies=true' > imposters.json",
+    );
+  });
+
+  it("shows a one-imposter curl that selects from the set route, as the console does", () => {
+    // `/imposters/:port` ignores `replayable` and answers with the request journal; the preview
+    // must not name a route the console deliberately does not use.
+    const off = { replayable: true, removeProxies: false, tls: false };
+    expect(exportCurl({ kind: "one", port: 4545 }, off)).toBe(
+      "curl -s '/imposters?replayable=true&removeProxies=false' | jq '.imposters[] | select(.port == 4545) | del(.cert, .key)' > imposter-4545.json",
+    );
+    expect(exportCurl({ kind: "one", port: 4545 }, { ...off, tls: true })).toBe(
+      "curl -s '/imposters?replayable=true&removeProxies=false' | jq '.imposters[] | select(.port == 4545)' > imposter-4545.json",
+    );
+  });
+});
+
 describe("an import accepts exactly what an export produces", () => {
   it("reads a single imposter object — what a one-imposter export downloads", () => {
     const entries = entriesOf(JSON.stringify(IMPOSTER));
@@ -130,6 +420,12 @@ describe("an import accepts exactly what an export produces", () => {
     expect(entries[0]?.port).toBe(4545);
     expect(entries[0]?.name).toBe("billing");
     expect(entries[0]?.imposter).toEqual(IMPOSTER);
+  });
+
+  it("imports a number exactly as the file spells it", () => {
+    // A fixture's `1234567890123456789` must reach the fleet as that, not as the nearest double.
+    const text = '{"imposters":[{"port":4545,"stubs":[{"responses":[{"is":{"body":{"id":1234567890123456789,"ratio":1.0}}}]}]}]}';
+    expect(JSON.stringify(renderSetDocument(entriesOf(text)))).toBe(text);
   });
 
   it("reads an `{imposters: [...]}` document — what a whole-set export downloads", () => {

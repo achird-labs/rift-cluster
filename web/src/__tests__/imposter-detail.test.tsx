@@ -1,10 +1,10 @@
 /** @vitest-environment jsdom */
-import { screen } from "@testing-library/react";
+import { screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { ImposterDetail } from "../screens/ImposterDetail.tsx";
-import { onDetailTab, renderInApp, stubFetch } from "./harness.tsx";
+import { captureDownloads, onDetailTab, renderInApp, stubFetch } from "./harness.tsx";
 
 const IMPOSTER = {
   port: 4545,
@@ -282,5 +282,125 @@ describe("bind status per node", () => {
     const unknown = await screen.findByTestId(`bind-node-${B}`);
     expect(unknown.textContent).toMatch(/unknown/i);
     expect(unknown.textContent).not.toMatch(/bound/i);
+  });
+});
+
+/*
+ * Pins D-84 on the detail screen. Export and Duplicate read the same set route, which carries an
+ * https imposter's own cert and key; only the file leaving the fleet loses them.
+ */
+describe("an https imposter's own key and cert (D-84)", () => {
+  const HTTPS = {
+    port: 4545,
+    protocol: "https",
+    name: "billing",
+    cert: "CERT-PEM",
+    key: "KEY-PEM",
+    stubs: [],
+  };
+
+  // Pins D-84: the detail screen's export always removes the pair.
+  it("leaves them out of the downloaded file, and says so", async () => {
+    onDetailTab("settings");
+    stubFetch({
+      "/imposters/4545": { json: { ...IMPOSTER, protocol: "https" } },
+      "GET /imposters?replayable=true&removeProxies=true": { json: { imposters: [HTTPS] } },
+    });
+    const downloads = captureDownloads();
+    renderInApp(<ImposterDetail port={4545} />);
+
+    await userEvent.click(await screen.findByRole("button", { name: "Replay-ready" }));
+
+    await waitFor(async () => expect(await downloads.texts()).toHaveLength(1));
+    const [file] = await downloads.texts();
+    expect(JSON.parse(file ?? "")).toEqual({ port: 4545, protocol: "https", name: "billing", stubs: [] });
+    expect((await screen.findByTestId("export-imposter-tls")).textContent).toMatch(
+      /key and cert removed/i,
+    );
+  });
+
+  it("downloads nothing, and says why, when the imposter is not in the fleet's export", async () => {
+    onDetailTab("settings");
+    stubFetch({
+      "/imposters/4545": { json: IMPOSTER },
+      "GET /imposters?replayable=true&removeProxies=true": { json: { imposters: [] } },
+    });
+    const downloads = captureDownloads();
+    renderInApp(<ImposterDetail port={4545} />);
+
+    await userEvent.click(await screen.findByRole("button", { name: "Replay-ready" }));
+
+    expect((await screen.findByTestId("export-imposter-error")).textContent).toContain("4545");
+    expect(await downloads.texts()).toEqual([]);
+    expect(screen.queryByTestId("export-imposter-tls")).toBeNull();
+  });
+
+  it("says nothing about TLS material for an imposter that had none", async () => {
+    onDetailTab("settings");
+    stubFetch({
+      "/imposters/4545": { json: IMPOSTER },
+      "GET /imposters?replayable=true&removeProxies=true": {
+        json: { imposters: [{ port: 4545, protocol: "http", stubs: [] }] },
+      },
+    });
+    const downloads = captureDownloads();
+    renderInApp(<ImposterDetail port={4545} />);
+
+    await userEvent.click(await screen.findByRole("button", { name: "Replay-ready" }));
+
+    await waitFor(async () => expect(await downloads.texts()).toHaveLength(1));
+    expect(screen.queryByTestId("export-imposter-tls")).toBeNull();
+  });
+
+  // Pins D-84: Duplicate keeps the pair.
+  it("keeps them in a duplicate — the copy is made in a fleet that already holds the key", async () => {
+    const fetched = stubFetch({
+      "/imposters/4545": { json: { ...IMPOSTER, protocol: "https" } },
+      "GET /imposters?replayable=true&removeProxies=false": { json: { imposters: [HTTPS] } },
+      "POST /imposters": { status: 201, json: { ...HTTPS, port: 4600 } },
+    });
+    renderInApp(<ImposterDetail port={4545} />);
+
+    await userEvent.click(await screen.findByTestId("clone-imposter"));
+    await userEvent.type(screen.getByLabelText("New port"), "4600");
+    await userEvent.click(within(screen.getByTestId("clone-form")).getByRole("button", { name: "Duplicate" }));
+
+    await waitFor(() =>
+      expect(fetched.requests.some((request) => request.method === "POST")).toBe(true),
+    );
+    const post = fetched.requests.find((request) => request.method === "POST");
+    expect(JSON.parse(String(post?.body))).toMatchObject({
+      port: 4600,
+      cert: "CERT-PEM",
+      key: "KEY-PEM",
+    });
+  });
+
+  it("sends a duplicate's numbers exactly as the fleet spelled them", async () => {
+    // `stubFetch` would re-serialize a `json` reply, so the export text is built by hand here.
+    const setText =
+      '{"imposters":[{"port":4545,"protocol":"http","stubs":[{"responses":[{"is":{"body":{"id":1234567890123456789,"ratio":1.0}}}]}]}]}';
+    const fetched = stubFetch({
+      "/imposters/4545": { json: IMPOSTER },
+      "POST /imposters": { status: 201, json: { port: 4600 } },
+    });
+    const stubbed = vi.mocked(fetch);
+    const route = stubbed.getMockImplementation();
+    stubbed.mockImplementation((input, init) =>
+      String(input) === "/imposters?replayable=true&removeProxies=false"
+        ? Promise.resolve(new Response(setText, { status: 200 }))
+        : (route?.(input, init) ?? Promise.reject(new Error("no stub"))),
+    );
+    renderInApp(<ImposterDetail port={4545} />);
+
+    await userEvent.click(await screen.findByTestId("clone-imposter"));
+    await userEvent.type(screen.getByLabelText("New port"), "4600");
+    await userEvent.click(within(screen.getByTestId("clone-form")).getByRole("button", { name: "Duplicate" }));
+
+    await waitFor(() =>
+      expect(fetched.requests.some((request) => request.method === "POST")).toBe(true),
+    );
+    const post = fetched.requests.find((request) => request.method === "POST");
+    expect(String(post?.body)).toContain('"id":1234567890123456789,"ratio":1.0');
   });
 });

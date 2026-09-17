@@ -2,11 +2,9 @@ import { type ReactNode, useState } from "react";
 
 import {
   type ExportOptions,
-  exportOptionsQuery,
+  type ExportScope,
+  exportCurl,
 } from "../features/imposters/portable.ts";
-
-/** What the export covers. The imposter list offers only the whole set; a detail screen offers both. */
-export type ExportScope = { kind: "all" } | { kind: "one"; port: number };
 
 /**
  * The export dialog.
@@ -44,8 +42,6 @@ export function ExportDialog({
   });
 
   const holes = options.removeProxies && !options.replayable;
-  const path = scope.kind === "one" ? `/imposters/${String(scope.port)}` : "/imposters";
-  const file = scope.kind === "one" ? `imposter-${String(scope.port)}.json` : "imposters.json";
 
   return (
     <div
@@ -112,7 +108,7 @@ export function ExportDialog({
             label="include TLS material"
             checked={options.tls}
             warn={options.tls}
-            note="https imposters carry key and cert in the document. Off by default — an export with this on is a private key in a file someone will commit."
+            note="Keep each https imposter's own key and cert in the file. Off by default — the fleet hands them over in plaintext, and a private key in a committed fixture is a leak nobody notices. Server-wide and generated certificates are never exported."
             onChange={(next) => setOptions({ ...options, tls: next })}
           />
         </div>
@@ -120,7 +116,7 @@ export function ExportDialog({
         <div className="field">
           <span className="eyebrow">Request</span>
           <pre className="payload" data-testid="export-curl">
-            {`curl -s '${path}${exportOptionsQuery(options)}' > ${file}`}
+            {exportCurl(scope, options)}
           </pre>
         </div>
 
@@ -138,8 +134,8 @@ export function ExportDialog({
             </Line>
             <Line ok={options.tls}>
               {options.tls
-                ? "TLS keys and certs in plaintext"
-                : "No TLS material — https imposters import needing key and cert supplied again"}
+                ? "Each https imposter's own key and cert, in plaintext"
+                : "No keys or certs — an https imposter that carried its own will serve the importing server's default certificate, or a self-signed one"}
             </Line>
             <Line ok={false}>
               No flow state, no scenario positions, no recorded requests — those are runtime, and an
@@ -156,10 +152,10 @@ export function ExportDialog({
             <div>
               {options.tls ? (
                 <>
-                  <strong>This file will contain private keys.</strong>
+                  <strong>Any private key an https imposter carries will be in this file.</strong>
                   <p>
-                    Treat it as a secret, or export without TLS material and supply key and cert at
-                    import.
+                    Treat it as a secret, or leave TLS material out and supply key and cert again
+                    when it is imported.
                   </p>
                 </>
               ) : (

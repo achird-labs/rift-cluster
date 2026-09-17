@@ -11,6 +11,11 @@ import { createQueryClient } from "../app/query.ts";
 // still holding the previous test's DOM — so "there is no enable button" would pass or fail on
 // whatever ran before it.
 afterEach(cleanup);
+// `captureDownloads` spies on the anchor prototype; a spy left behind would swallow every later
+// click in the file. Suites already undo their own `vi.stubGlobal` calls.
+afterEach(() => {
+  vi.restoreAllMocks();
+});
 
 /**
  * One route's canned reply: either a JSON body, or a status to fail with.
@@ -127,4 +132,31 @@ export function setTabVisibility(state: "visible" | "hidden"): void {
  */
 export function onDetailTab(tab: "stubs" | "requests" | "ownership" | "settings"): void {
   window.location.hash = tab === "stubs" ? "#/" : `#/?tab=${tab}`;
+}
+
+/**
+ * Capture what the screen hands the browser to download.
+ *
+ * jsdom has no `URL.createObjectURL`, so the screens' download path would throw before the file
+ * existed. This installs one that keeps each blob and returns its text on demand — the file an
+ * operator would actually receive, which is what an export test has to assert on.
+ *
+ * The `URL` stub is undone by the `vi.unstubAllGlobals()` every suite runs in `afterEach`; the click
+ * spy by this module's own `afterEach`.
+ */
+export function captureDownloads(): { texts: () => Promise<string[]> } {
+  const blobs: Blob[] = [];
+  vi.stubGlobal(
+    "URL",
+    Object.assign(class extends URL {}, {
+      createObjectURL: (blob: Blob) => {
+        blobs.push(blob);
+        return `blob:test/${String(blobs.length)}`;
+      },
+      revokeObjectURL: () => undefined,
+    }),
+  );
+  // Clicking the anchor would ask jsdom to navigate to the blob URL, which it does not implement.
+  vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(() => undefined);
+  return { texts: () => Promise.all(blobs.map((blob) => blob.text())) };
 }

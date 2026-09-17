@@ -3679,3 +3679,58 @@ is openraft's. **Longer election timeouts** —
 moves D-17's isolation window and the #411 timer coupling for a defect in our ticker. **A smaller
 test fixture** — the test is right; the fixture change exposed a production defect, since a real
 fleet's snapshot is tens of MiB and a voter caught up by one would campaign mid-install.
+
+### D-84 — An export is the imposter's config verbatim; the console leaves an https imposter's own cert and key out of a downloaded file unless asked
+
+- **Status:** active
+- **Decided:** 2026-09-17 · #367
+- **Implemented by:** #367
+- **Code:** web/src/features/imposters/portable.ts, web/src/components/exportDialog.tsx, web/src/screens/Imposters.tsx, web/src/screens/ImposterDetail.tsx
+
+**What the route returns.** Upstream's `GET /imposters?replayable=true` renders each imposter's
+stored `ImposterConfig` as it is (`handle_list`). So an https imposter created with its own inline
+`cert` and `key` comes back with both, exactly as Mountebank's export does, and
+`GET` then `PUT /imposters` restores it with the same certificate. An https imposter with no
+material of its own takes the server's `--default-tls-*` pair or a generated self-signed one
+(`resolve_tls_acceptors`); neither is part of its config, and neither is ever exported.
+`GET /imposters/:port` builds an `ImposterDetail` with no TLS fields and ignores `replayable`, which
+is why the console exports a single imposter by selecting it out of the set.
+
+**The route is left alone.** There is no `tls` parameter, and the console does not send one. The
+round trip is what `replayable` is for, and every other client — curl scripts, rift-tui — depends
+on it. Redacting at the route would not protect the key anyway: the same caller reads it from the
+same route, and it is already in the Raft log on every node.
+
+**The console decides what a downloaded file holds.** It is the one surface that tells an operator
+to commit the result, and a private key committed to git is quiet and irreversible, while a wrong
+certificate after import fails loudly at the handshake. So the export dialog's *include TLS
+material* option is off by default, and with it off the console removes `cert` and `key` from every
+imposter before the download. Both fields, always: the engine refuses an imposter carrying one
+without the other, and a lone `key` is still a private key. `ca`, `mutualAuth` and
+`rejectUnauthorized` stay — they are public, and they change what the imposter does. The detail
+screen's export has no such option and always removes the pair.
+
+**Kept, or nothing to remove, means the route's bytes; removed means a re-serialization that keeps
+every number's digits.** Taking a field out of JSON requires parsing it, so a file with material
+removed is re-indented; two exports of an unchanged fleet are still identical. A stub body is
+free-form JSON, and plain `JSON.parse` silently turns `1234567890123456789` into
+`1234567890123456800` and `1.0` into `1`, so the console parses with the reviver's `source` and
+writes such numbers back with `JSON.rawJSON`. A browser without that API (before Chrome 114,
+Firefox 135, Safari 18.4) is refused any export that needs a rewrite — rounding would be a silent
+change to the fixture — and pointed at the curl command. Import and Duplicate read with the same
+parser, and fall back to plain `JSON.parse` there, as they always did. A document that does not
+parse is refused in both modes rather than downloaded. The dialog's curl preview carries the
+matching `jq` filter, which keeps digits too, so a copied command writes the same file. After a
+download the screen names the imposters whose material was kept or removed — by port, and by count
+for any without one — because the dialog cannot know before the read which imposters carry any.
+
+**Duplicate keeps the pair.** It copies an imposter within the fleet that already holds the key;
+removing it there would silently turn a pinned-certificate copy into one serving the fleet default.
+
+*Rejected:* **redacting at the route by default** — breaks the round trip for every client, diverges
+from Mountebank, and hides nothing from a caller who can already read the route. **A `tls=true`
+flag that adds material** — the only material an imposter does not already export is the
+server-wide or generated pair, and a server-wide private key does not belong in a per-imposter
+fixture. **Warning only when the fleet holds keys, decided before the read** — neither the list nor
+the single-imposter read carries TLS fields, so the dialog would have to fetch every key to decide
+whether to mention them.

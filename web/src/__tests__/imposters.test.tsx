@@ -5,8 +5,9 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { CSRF_HEADER } from "../api/client.ts";
 import { IMPOSTER_COLUMNS } from "../app/contract.ts";
+import { ToastHost } from "../components/toast.tsx";
 import { Imposters } from "../screens/Imposters.tsx";
-import { renderInApp, stubFetch } from "./harness.tsx";
+import { captureDownloads, renderInApp, stubFetch } from "./harness.tsx";
 
 const TWO = {
   imposters: [
@@ -758,5 +759,120 @@ describe("the parked-intent depth tile (#360)", () => {
     await screen.findByText("billing");
 
     expect(screen.queryByTestId("tile-parked")).toBeNull();
+  });
+});
+
+/*
+ * Pins D-84 on the screen: the route returns an https imposter's own cert and key verbatim, and the
+ * file the operator downloads carries them only when they asked for it.
+ */
+describe("exporting the whole set (D-84)", () => {
+  const WITH_KEY = {
+    imposters: [
+      {
+        port: 4546,
+        protocol: "https",
+        name: "shipping",
+        cert: "CERT-PEM",
+        key: "KEY-PEM",
+        mutualAuth: true,
+        stubs: [],
+      },
+    ],
+  };
+  const EXPORT_ROUTE = "GET /imposters?replayable=true&removeProxies=true";
+
+  async function openExport(exported: unknown = WITH_KEY) {
+    const fetched = stubFetch({
+      "/imposters": { json: TWO },
+      [EXPORT_ROUTE]: { json: exported },
+      "/_fleet/members": { status: 404 },
+      "/_fleet/health": { status: 404 },
+    });
+    const downloads = captureDownloads();
+    renderInApp(
+      <ToastHost>
+        <Imposters />
+      </ToastHost>,
+    );
+    await screen.findByText("billing");
+    await userEvent.click(screen.getByTestId("export-imposters"));
+    return { fetched, downloads, dialog: within(await screen.findByTestId("export-dialog")) };
+  }
+
+  // Pins D-84: off by default, and the screen names what it removed.
+  it("downloads the set without cert and key by default, and says which imposters lost them", async () => {
+    const { fetched, downloads, dialog } = await openExport();
+    await userEvent.click(dialog.getByTestId("export-download"));
+
+    await waitFor(async () => expect(await downloads.texts()).toHaveLength(1));
+    const [file] = await downloads.texts();
+    expect(file).not.toContain("KEY-PEM");
+    expect(file).not.toContain("CERT-PEM");
+    expect(JSON.parse(file ?? "")).toEqual({
+      imposters: [{ port: 4546, protocol: "https", name: "shipping", mutualAuth: true, stubs: [] }],
+    });
+    expect(fetched.calls.filter((call) => call.includes("replayable"))).toEqual([
+      "/imposters?replayable=true&removeProxies=true",
+    ]);
+    const toast = await screen.findByTestId("toast");
+    expect(toast.className).toContain("is-warn");
+    expect(toast.textContent).toContain("4546");
+    expect(toast.textContent).toMatch(/key and cert removed/i);
+  });
+
+  it("names an imposter it could not name by port, rather than leaving it out of the toast", async () => {
+    const { downloads, dialog } = await openExport({
+      imposters: [...WITH_KEY.imposters, { protocol: "https", cert: "C2", key: "K2" }],
+    });
+    await userEvent.click(dialog.getByTestId("export-download"));
+
+    await waitFor(async () => expect(await downloads.texts()).toHaveLength(1));
+    expect((await screen.findByTestId("toast")).textContent).toContain(
+      "key and cert removed from port 4546 and 1 imposter with no port",
+    );
+  });
+
+  // Pins D-84: a document the console cannot read is never downloaded — it might hold a key.
+  it("downloads nothing, and says why, when the fleet's export cannot be read", async () => {
+    const { downloads, dialog } = await openExport("not an export");
+    await userEvent.click(dialog.getByTestId("export-download"));
+
+    expect((await screen.findByTestId("export-imposters-error")).textContent).toMatch(
+      /export could not be read/i,
+    );
+    expect(await downloads.texts()).toEqual([]);
+    expect(screen.queryByTestId("toast")).toBeNull();
+  });
+
+  it("downloads the route's own bytes, key included, when TLS material is kept — and warns", async () => {
+    const { fetched, downloads, dialog } = await openExport();
+    await userEvent.click(dialog.getByTestId("export-opt-tls"));
+    await userEvent.click(dialog.getByTestId("export-download"));
+
+    await waitFor(async () => expect(await downloads.texts()).toHaveLength(1));
+    // `stubFetch` sends `JSON.stringify(json)`, so these are the bytes the route answered with.
+    expect(await downloads.texts()).toEqual([JSON.stringify(WITH_KEY)]);
+    expect(fetched.calls.some((call) => call.includes("tls="))).toBe(false);
+    const toast = await screen.findByTestId("toast");
+    expect(toast.className).toContain("is-warn");
+    expect(toast.textContent).toContain("4546");
+    expect(toast.textContent).toMatch(/private key/i);
+  });
+
+  // Pins D-84: the dialog says only what is true of every fleet, before the read.
+  it("never tells the operator the file has no TLS material while it can hold a key", async () => {
+    const { dialog } = await openExport();
+    const contents = dialog.getByText(/What lands in the file/).parentElement;
+    expect(contents?.textContent).not.toMatch(/No TLS material/i);
+    expect(contents?.textContent).not.toMatch(/supplied again/i);
+    expect(contents?.textContent).toMatch(/serve the importing server.s default/i);
+    expect(dialog.getByTestId("export-curl").textContent).toContain("del(.cert, .key)");
+    expect(dialog.getByTestId("export-curl").textContent).not.toContain("tls=");
+    expect(dialog.queryByTestId("export-warning")).toBeNull();
+
+    await userEvent.click(dialog.getByTestId("export-opt-tls"));
+    expect(dialog.getByTestId("export-warning").textContent).toMatch(/private key/i);
+    expect(dialog.getByTestId("export-curl").textContent).not.toContain("del(");
   });
 });

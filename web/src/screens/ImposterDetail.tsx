@@ -23,6 +23,9 @@ import {
   cloneImposter,
   exportFilename,
   exportQuery,
+  parseJson,
+  PROJECTION_OPTIONS,
+  renderImposterExport,
   selectImposter,
 } from "../features/imposters/portable.ts";
 import { matchOrder } from "../features/stubs/matchOrder.ts";
@@ -36,8 +39,8 @@ type Imposter = components["schemas"]["Imposter"];
 type Stub = components["schemas"]["Stub"];
 
 /**
- * Trigger a browser download of text this console already has in hand — never re-fetched, never
- * re-serialized. `apiGetText`'s whole point (#251) is bytes the download path must not touch.
+ * Trigger a browser download of text this console already has in hand — never re-fetched, and
+ * written exactly as given: whatever the file should contain is decided before this is called.
  */
 function downloadText(filename: string, text: string): void {
   const blob = new Blob([text], { type: "application/json" });
@@ -525,9 +528,11 @@ function ExportImposterControl({
 }): ReactNode {
   const [busy, setBusy] = useState<ExportProjection | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [tlsRemoved, setTlsRemoved] = useState(false);
 
   async function run(projection: ExportProjection): Promise<void> {
     setError(null);
+    setTlsRemoved(false);
     setBusy(projection);
     try {
       /*
@@ -538,10 +543,10 @@ function ExportImposterControl({
        * credentials into a file this screen tells the operator to commit. See `portable.ts`.
        */
       const setText = await apiGetText(`/imposters${exportQuery(projection)}`);
-      const selected = selectImposter(setText, port);
-      if (selected.kind === "error") throw new Error(selected.message);
-      const text = selected.text;
-      downloadText(exportFilename(port, name), text);
+      const rendered = renderImposterExport(setText, port, PROJECTION_OPTIONS[projection].tls);
+      if (rendered.kind === "error") throw new Error(rendered.message);
+      downloadText(exportFilename(port, name), rendered.text);
+      setTlsRemoved(rendered.tlsPorts.length > 0);
     } catch (error_) {
       setError(errorText(error_));
     } finally {
@@ -577,6 +582,13 @@ function ExportImposterControl({
           </button>
           <span className="note">Proxy stubs kept, so the importer goes on recording.</span>
         </div>
+        {tlsRemoved ? (
+          <p className="note" data-testid="export-imposter-tls" role="status">
+            Key and cert removed from the file (D-84): wherever it is imported, this imposter serves
+            that server&rsquo;s default certificate, or a self-signed one, until they are supplied
+            again. Duplicate keeps them.
+          </p>
+        ) : null}
         {error === null ? null : (
           <p className="error" data-testid="export-imposter-error" role="alert">
             {error}
@@ -628,7 +640,8 @@ function CloneImposter({
       const text = selected.text;
       let parsed: unknown;
       try {
-        parsed = JSON.parse(text) as unknown;
+        // The selection kept every number's digits; a plain `JSON.parse` here would round them.
+        parsed = parseJson(text);
       } catch (cause) {
         throw new Error(
           `the exported imposter could not be read as JSON: ${cause instanceof Error ? cause.message : String(cause)}`,
