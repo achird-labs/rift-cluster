@@ -50,10 +50,11 @@ export function matchOrder(stubs: readonly Stub[] | undefined): MatchOrderEntry[
     if (projection.kind === "predicates" && projection.items.length > 0) {
       const sample = sampleRequest(projection.items);
       // `sampleRequest` fills its defaults so it can build a sendable request. Here a default would
-      // be a claim about the stub, so only values the predicates actually pinned are shown.
-      const pinned = JSON.stringify(projection.items);
-      method = pinned.includes('"method"') ? sample.method : null;
-      target = pinned.includes('"path"') ? sample.target : null;
+      // be a claim about the stub, so only values the predicates actually pinned are shown — as
+      // `sampleRequest` itself reports them, not by looking for the field's name, which a regex, an
+      // `or` branch or a query parameter called `path` would all satisfy.
+      method = sample.pinned.method ? sample.method : null;
+      target = sample.pinned.path ? sample.target : null;
     }
 
     const labels = describeResponses(stub);

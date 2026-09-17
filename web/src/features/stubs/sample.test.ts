@@ -31,6 +31,7 @@ describe("sampleRequest", () => {
     expect(sample.headers).toEqual([{ name: "Content-Type", value: "application/json" }]);
     expect(sample.body).toBe('{"id":1}');
     expect(sample.caveats).toEqual([]);
+    expect(sample.pinned).toEqual({ method: true, path: true });
   });
 
   it("defaults to GET / for a stub with no predicates, and says nothing is caveated", () => {
@@ -40,6 +41,8 @@ describe("sampleRequest", () => {
     expect(sample.method).toBe("GET");
     expect(sample.target).toBe("/");
     expect(sample.caveats).toEqual([]);
+    // The defaults are the request's, not the stub's — a caller describing the stub needs to know.
+    expect(sample.pinned).toEqual({ method: false, path: false });
   });
 
   it("carries a startsWith path verbatim, because that path satisfies the predicate", () => {

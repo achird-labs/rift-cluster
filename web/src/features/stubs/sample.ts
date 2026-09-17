@@ -28,6 +28,12 @@ export type Sample = {
    * is a starting point and may not match — which the UI has to say, or it is lying by omission.
    */
   caveats: string[];
+  /**
+   * Whether `method` and the path in `target` came from a predicate, rather than being the `GET`
+   * and `/` a sendable request needs. Only a caller describing the *stub* needs this; one building a
+   * request to send uses the defaults as they are.
+   */
+  pinned: { method: boolean; path: boolean };
 };
 
 /** Operators that name an exact value, so a request can be built from them without guessing. */
@@ -81,6 +87,7 @@ export function sampleRequest(items: readonly PredicateItem[]): Sample {
   const query: { key: string; value: string }[] = [];
   const headers: { name: string; value: string }[] = [];
   let body: string | null = null;
+  const pinned = { method: false, path: false };
 
   for (const clause of clauses) {
     for (const entry of clause.entries) {
@@ -88,15 +95,19 @@ export function sampleRequest(items: readonly PredicateItem[]): Sample {
       const exact = EXACT.has(clause.operator);
 
       if (entry.field === "method") {
-        if (exact && text !== null) method = text.toUpperCase();
-        else caveats.push(`Method uses \`${clause.operator}\`, so no exact method could be derived; GET is used.`);
+        if (exact && text !== null) {
+          method = text.toUpperCase();
+          pinned.method = true;
+        } else caveats.push(`Method uses \`${clause.operator}\`, so no exact method could be derived; GET is used.`);
         continue;
       }
       if (entry.field === "path") {
         // `startsWith` is the one inexact operator that still names a value the request can carry
         // verbatim — a path beginning with it satisfies the predicate by construction.
-        if ((exact || clause.operator === "startsWith") && text !== null) path = text;
-        else caveats.push(`Path uses \`${clause.operator}\`, so no exact path could be derived; \`/\` is used.`);
+        if ((exact || clause.operator === "startsWith") && text !== null) {
+          path = text;
+          pinned.path = true;
+        } else caveats.push(`Path uses \`${clause.operator}\`, so no exact path could be derived; \`/\` is used.`);
         continue;
       }
       if (entry.field === "query") {
@@ -127,6 +138,7 @@ export function sampleRequest(items: readonly PredicateItem[]): Sample {
     headers,
     body,
     caveats,
+    pinned,
   };
 }
 
