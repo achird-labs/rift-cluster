@@ -915,6 +915,13 @@ impl RedbStateMachine {
             .db
             .begin_read()
             .map_err(|e| StorageIOError::read_state_machine(&e))?;
+        Self::read_applied_in(&read_txn)
+    }
+
+    /// [`Self::read_applied`] within a transaction the caller already holds, so the applied
+    /// position and the tables read beside it describe the same instant.
+    #[allow(clippy::result_large_err)]
+    fn read_applied_in(read_txn: &redb::ReadTransaction) -> StorageResult<AppliedState> {
         let table = read_txn
             .open_table(SM_APPLIED_TABLE)
             .map_err(|e| StorageIOError::read_state_machine(&e))?;
@@ -2766,110 +2773,96 @@ impl RaftSnapshotBuilder<TypeConfig> for RedbStateMachine {
 }
 
 impl RedbStateMachine {
-    /// [`RaftSnapshotBuilder::build_snapshot`]'s body, off the runtime.
+    /// Everything a snapshot carries, read in one transaction.
     ///
-    /// `&self` rather than `&mut self`: it mutates no field, which is what makes the `self.clone()`
-    /// above sound — a clone shares the redb handle and the engine handle, so a mutation
-    /// here would be lost, and there is none to lose.
+    /// openraft builds a snapshot on a detached task while the state machine keeps applying, so
+    /// the applied position must come from the same read transaction as the tables. Read in a
+    /// transaction of its own, an entry applied in between lands in tables labelled one index
+    /// lower, and a node installing that snapshot replays an entry its state already contains.
+    /// The dedup rows travelling in the same tables usually absorb that replay; they do not once
+    /// `gc_dedup` has already dropped the row, so the label has to be right rather than lucky.
     #[allow(clippy::result_large_err)]
-    fn build_snapshot_blocking(&self) -> StorageResult<Snapshot<TypeConfig>> {
-        let applied = self.read_applied()?;
-
-        let (configs, routes, routes_revision, session_key, fleet_name, proxy_recorded, dedup) = {
-            let read_txn = self
-                .db
-                .begin_read()
-                .map_err(|e| StorageIOError::read_state_machine(&e))?;
-            let configs_table = read_txn
-                .open_table(SM_CONFIGS_TABLE)
-                .map_err(|e| StorageIOError::read_state_machine(&e))?;
-            let mut configs = Vec::new();
-            for item in configs_table
-                .iter()
-                .map_err(|e| StorageIOError::read_state_machine(&e))?
-            {
-                let (key, value) = item.map_err(|e| StorageIOError::read_state_machine(&e))?;
-                configs.push((key.value(), value.value().to_owned()));
-            }
-            let routes_table = read_txn
-                .open_table(SM_ROUTES_TABLE)
-                .map_err(|e| StorageIOError::read_state_machine(&e))?;
-            let mut routes = Vec::new();
-            for item in routes_table
-                .iter()
-                .map_err(|e| StorageIOError::read_state_machine(&e))?
-            {
-                let (key, value) = item.map_err(|e| StorageIOError::read_state_machine(&e))?;
-                routes.push((key.value().to_owned(), value.value().to_owned()));
-            }
-            // Travels with the routes themselves (issue #210). Omitting it
-            // would not lose data, but it would silently reset the table to
-            // revision 0 on the joining node — see the field's doc.
-            let routes_revision = read_txn
-                .open_table(SM_ROUTES_REVISION_TABLE)
-                .map_err(|e| StorageIOError::read_state_machine(&e))?
-                .get(ROUTES_REVISION_ROW)
-                .map_err(|e| StorageIOError::read_state_machine(&e))?
-                .map(|v| v.value());
-            // Travels with the snapshot like every other replicated table, with a sharp
-            // failure if it did not: a follower that installs without it and then wins an
-            // election either has no key to sign a login with (if none had ever been minted) or,
-            // worse, mints its own on first login — silently rotating out from under every
-            // session issued by every other node, with nothing reporting that a fleet-wide logout
-            // just happened.
-            let session_key = read_txn
-                .open_table(SM_SESSION_KEY_TABLE)
-                .map_err(|e| StorageIOError::read_state_machine(&e))?
-                .get(SESSION_KEY_ROW)
-                .map_err(|e| StorageIOError::read_state_machine(&e))?
-                .map(|v| v.value().to_owned());
-            // Travels with the snapshot for the same #134/#137 reason. The failure if forgotten
-            // is quieter than most of its siblings but still real: a node that joins by snapshot
-            // would silently forget the fleet's name until the next rename.
-            let fleet_name = read_txn
-                .open_table(SM_FLEET_NAME_TABLE)
-                .map_err(|e| StorageIOError::read_state_machine(&e))?
-                .get(FLEET_NAME_ROW)
-                .map_err(|e| StorageIOError::read_state_machine(&e))?
-                .map(|v| v.value().to_owned());
-            // Travels with the snapshot for the #134/#137 reason every table above does. The
-            // #226-specific failure if forgotten: a snapshot-joined node answers `Claimed`
-            // for signatures the fleet already recorded — a duplicate upstream call.
-            let proxy_recorded_table = read_txn
-                .open_table(SM_PROXY_RECORDED_TABLE)
-                .map_err(|e| StorageIOError::read_state_machine(&e))?;
-            let mut proxy_recorded = Vec::new();
-            for item in proxy_recorded_table
-                .iter()
-                .map_err(|e| StorageIOError::read_state_machine(&e))?
-            {
-                let (key, value) = item.map_err(|e| StorageIOError::read_state_machine(&e))?;
-                let (port, sig_hash) = key.value();
-                proxy_recorded.push((port, sig_hash.to_owned(), value.value().to_owned()));
-            }
-            let dedup_table = read_txn
-                .open_table(SM_DEDUP_TABLE)
-                .map_err(|e| StorageIOError::read_state_machine(&e))?;
-            let mut dedup = Vec::new();
-            for item in dedup_table
-                .iter()
-                .map_err(|e| StorageIOError::read_state_machine(&e))?
-            {
-                let (key, value) = item.map_err(|e| StorageIOError::read_state_machine(&e))?;
-                dedup.push((key.value().to_owned(), value.value().to_owned()));
-            }
-            (
-                configs,
-                routes,
-                routes_revision,
-                session_key,
-                fleet_name,
-                proxy_recorded,
-                dedup,
-            )
-        };
-
-        let payload = SnapshotPayload {
+    fn snapshot_payload(&self, read_txn: &redb::ReadTransaction) -> StorageResult<SnapshotPayload> {
+        let applied = Self::read_applied_in(read_txn)?;
+        let configs_table = read_txn
+            .open_table(SM_CONFIGS_TABLE)
+            .map_err(|e| StorageIOError::read_state_machine(&e))?;
+        let mut configs = Vec::new();
+        for item in configs_table
+            .iter()
+            .map_err(|e| StorageIOError::read_state_machine(&e))?
+        {
+            let (key, value) = item.map_err(|e| StorageIOError::read_state_machine(&e))?;
+            configs.push((key.value(), value.value().to_owned()));
+        }
+        let routes_table = read_txn
+            .open_table(SM_ROUTES_TABLE)
+            .map_err(|e| StorageIOError::read_state_machine(&e))?;
+        let mut routes = Vec::new();
+        for item in routes_table
+            .iter()
+            .map_err(|e| StorageIOError::read_state_machine(&e))?
+        {
+            let (key, value) = item.map_err(|e| StorageIOError::read_state_machine(&e))?;
+            routes.push((key.value().to_owned(), value.value().to_owned()));
+        }
+        // Travels with the routes themselves (issue #210). Omitting it
+        // would not lose data, but it would silently reset the table to
+        // revision 0 on the joining node — see the field's doc.
+        let routes_revision = read_txn
+            .open_table(SM_ROUTES_REVISION_TABLE)
+            .map_err(|e| StorageIOError::read_state_machine(&e))?
+            .get(ROUTES_REVISION_ROW)
+            .map_err(|e| StorageIOError::read_state_machine(&e))?
+            .map(|v| v.value());
+        // Travels with the snapshot like every other replicated table, with a sharp
+        // failure if it did not: a follower that installs without it and then wins an
+        // election either has no key to sign a login with (if none had ever been minted) or,
+        // worse, mints its own on first login — silently rotating out from under every
+        // session issued by every other node, with nothing reporting that a fleet-wide logout
+        // just happened.
+        let session_key = read_txn
+            .open_table(SM_SESSION_KEY_TABLE)
+            .map_err(|e| StorageIOError::read_state_machine(&e))?
+            .get(SESSION_KEY_ROW)
+            .map_err(|e| StorageIOError::read_state_machine(&e))?
+            .map(|v| v.value().to_owned());
+        // Travels with the snapshot for the same #134/#137 reason. The failure if forgotten
+        // is quieter than most of its siblings but still real: a node that joins by snapshot
+        // would silently forget the fleet's name until the next rename.
+        let fleet_name = read_txn
+            .open_table(SM_FLEET_NAME_TABLE)
+            .map_err(|e| StorageIOError::read_state_machine(&e))?
+            .get(FLEET_NAME_ROW)
+            .map_err(|e| StorageIOError::read_state_machine(&e))?
+            .map(|v| v.value().to_owned());
+        // Travels with the snapshot for the #134/#137 reason every table above does. The
+        // #226-specific failure if forgotten: a snapshot-joined node answers `Claimed`
+        // for signatures the fleet already recorded — a duplicate upstream call.
+        let proxy_recorded_table = read_txn
+            .open_table(SM_PROXY_RECORDED_TABLE)
+            .map_err(|e| StorageIOError::read_state_machine(&e))?;
+        let mut proxy_recorded = Vec::new();
+        for item in proxy_recorded_table
+            .iter()
+            .map_err(|e| StorageIOError::read_state_machine(&e))?
+        {
+            let (key, value) = item.map_err(|e| StorageIOError::read_state_machine(&e))?;
+            let (port, sig_hash) = key.value();
+            proxy_recorded.push((port, sig_hash.to_owned(), value.value().to_owned()));
+        }
+        let dedup_table = read_txn
+            .open_table(SM_DEDUP_TABLE)
+            .map_err(|e| StorageIOError::read_state_machine(&e))?;
+        let mut dedup = Vec::new();
+        for item in dedup_table
+            .iter()
+            .map_err(|e| StorageIOError::read_state_machine(&e))?
+        {
+            let (key, value) = item.map_err(|e| StorageIOError::read_state_machine(&e))?;
+            dedup.push((key.value().to_owned(), value.value().to_owned()));
+        }
+        Ok(SnapshotPayload {
             configs,
             routes,
             routes_revision,
@@ -2878,18 +2871,34 @@ impl RedbStateMachine {
             proxy_recorded,
             dedup,
             last_applied_log: applied.last_applied_log,
-            last_membership: applied.last_membership.clone(),
+            last_membership: applied.last_membership,
             logical_clock_secs: applied.logical_clock_secs,
+        })
+    }
+
+    /// [`RaftSnapshotBuilder::build_snapshot`]'s body, off the runtime.
+    ///
+    /// `&self` rather than `&mut self`: it mutates no field, which is what makes the `self.clone()`
+    /// above sound — a clone shares the redb handle and the engine handle, so a mutation
+    /// here would be lost, and there is none to lose.
+    #[allow(clippy::result_large_err)]
+    fn build_snapshot_blocking(&self) -> StorageResult<Snapshot<TypeConfig>> {
+        let payload = {
+            let read_txn = self
+                .db
+                .begin_read()
+                .map_err(|e| StorageIOError::read_state_machine(&e))?;
+            self.snapshot_payload(&read_txn)?
         };
         let snapshot_idx = self.snapshot_idx.fetch_add(1, Ordering::Relaxed) + 1;
-        let snapshot_id = match applied.last_applied_log {
+        let snapshot_id = match payload.last_applied_log {
             Some(last) => format!("{}-{}-{snapshot_idx}", last.leader_id, last.index),
             None => format!("--{snapshot_idx}"),
         };
 
         let meta = SnapshotMeta {
-            last_log_id: applied.last_applied_log,
-            last_membership: applied.last_membership,
+            last_log_id: payload.last_applied_log,
+            last_membership: payload.last_membership.clone(),
             snapshot_id,
         };
 
@@ -4510,6 +4519,42 @@ mod tests {
         assert!(shard.get("f:checkout", "checkout").is_some());
 
         engine.shutdown().await;
+    }
+
+    /// A snapshot's applied position describes exactly the tables it carries.
+    ///
+    /// openraft runs the build on a detached task while the state machine keeps applying, so an
+    /// entry can commit between two reads. Here the build's read transaction is held open across
+    /// such an apply: the payload must still say index 1 and carry only index 1's imposter. Read
+    /// in a transaction of its own, the position would say 2 while the tables said 1 — or, in
+    /// the opposite order the build used to have, a snapshot labelled 1 would carry index 2's
+    /// imposter, and a node installing it would replay an entry its state already held.
+    #[tokio::test]
+    async fn a_snapshot_payload_reads_its_position_and_tables_at_one_instant() {
+        let (_td, mut sm) = fresh_sm(None).await;
+        sm.apply(vec![entry(1, put(1, 18201, json!([])))])
+            .await
+            .expect("apply index 1");
+
+        let read_txn = sm.db.begin_read().expect("hold a read transaction");
+        sm.apply(vec![entry(2, put(2, 18202, json!([])))])
+            .await
+            .expect("apply index 2 while the build's transaction is open");
+
+        let payload = sm
+            .snapshot_payload(&read_txn)
+            .expect("payload from the held txn");
+        assert_eq!(
+            payload.last_applied_log.map(|id| id.index),
+            Some(1),
+            "the position must be the one the held transaction sees"
+        );
+        let ports: Vec<u16> = payload.configs.iter().map(|(port, _)| *port).collect();
+        assert_eq!(
+            ports,
+            vec![18201],
+            "the tables must be the ones the held transaction sees"
+        );
     }
 
     /// Snapshot round-trip carries BOTH tables: a follower installed from
