@@ -118,6 +118,10 @@ jobs:
         run: python3 -m unittest scripts.tests.test_design_check -v
       - name: design-check --strict
         run: python3 scripts/design-check.py --strict
+      # Rides this job because it is the pure-Python one. The human-run scripts must answer
+      # `--help` before any side effect (#379); nothing else exercises them in CI.
+      - name: script --help contract
+        run: python3 -m unittest scripts.tests.test_script_help -v
 
   public-api:
     runs-on: ubuntu-latest

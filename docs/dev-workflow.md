@@ -45,6 +45,9 @@ Manual/local:
 scripts/sync-upstream.sh
 ```
 
+The human-run scripts (`sync-upstream.sh`, `upstream-pr.sh`, `e2e-console.sh`) print their usage
+for `-h`/`--help` and exit before touching anything; `scripts/tests/test_script_help.py` pins that.
+
 ## Adding a cluster feature
 
 1. Build it in a new or existing cluster crate under `crates/`.

@@ -16,6 +16,9 @@
 # against a fixture that varies is a test that fails for reasons nobody changed.
 set -euo pipefail
 
+# The header above, without its comment markers.
+usage() { sed -n '2,/^set -euo pipefail$/{/^set -euo pipefail$/d;s/^# \{0,1\}//;p;}' "$0"; }
+
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 RUN="${RUN_DIR:-${TMPDIR:-/tmp}/rift-e2e}"
 BIN="${REPO}/target/debug/rift-cluster-server"
@@ -152,5 +155,7 @@ PY
     echo "e2e fixture: node ${node_pid} exited"
     ;;
 
-  *) echo "usage: $0 {up|serve|down}"; exit 2 ;;
+  -h | --help) usage ;;
+
+  *) usage >&2; exit 2 ;;
 esac
