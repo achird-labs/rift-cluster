@@ -2819,13 +2819,29 @@ mod tests {
     /// instead of at campaign: that would silently grow the pause to one election timeout
     /// (150–300 ms) and invalidate the numbers D-17 now records, with no other test noticing.
     ///
-    /// The 400 ms bound is deliberately loose against a measured ~13–40 ms (and a ≤ 300 ms
-    /// split-vote round) so it does not flake on CI's 2-vCPU runners. Red-confirmed by setting the
-    /// bound to zero: this observes a real 32–40 ms window locally, so it is measuring the pause
-    /// rather than passing on a window it never sees. Sampling stalls are the one
-    /// way this could report an isolation it never observed, so the failure message carries the
-    /// largest gap between consecutive samples — a run that failed because the sampler was starved
-    /// says so, instead of looking like a real regression.
+    /// The 400 ms bound is deliberately loose against a measured ~13–40 ms so it does not flake on
+    /// CI's 2-vCPU runners. Red-confirmed by setting the bound to zero: this observes a real
+    /// 32–40 ms window locally, so it is measuring the pause rather than passing on a window it
+    /// never sees. Sampling stalls are the one way this could report an isolation it never
+    /// observed, so the failure message carries the largest gap between consecutive samples — a
+    /// run that failed because the sampler was starved says so, instead of looking like a real
+    /// regression.
+    ///
+    /// **It must start from a quiesced fleet (#606).** Two survivors campaigning at once cannot
+    /// split the vote — votes are ordered by `(term, node_id)`, so the higher id wins the round.
+    /// What adds a round is a survivor that refuses the campaign — here, one still refreshing its
+    /// lease on the dead leader from entries delivered before the kill — so the candidate waits
+    /// out its election timeout. Killing the leader while the last joiner was still a learner, or
+    /// still appending the join, does that; the five CI failures (403 ms – 1.7 s, 5 in 200 runs)
+    /// carry no pre-kill state but are consistent with it. With the joiner's appends slowed by
+    /// 450 ms the old "nobody isolated" start cost one extra round (term +2) in 6/6 and, at 600 ms,
+    /// no election at all (the promotion had not been proposed, so one of two voters survived);
+    /// this start gives one round in 18/18 at up to 900 ms, and 150/150 on a GitHub runner
+    /// (5–145 ms). The voter-set clause is the one that matters there; the applied-index clause
+    /// survives that mutation and is kept so a test that writes before the kill stays quiesced;
+    /// the uniform-config clause closes promotion's joint window, whose voter set already reads
+    /// {1, 2, 3}. The failure message carries the term delta and the survivors' views at the
+    /// kill, so a refused round under this start reads as the D-17 finding it would be.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_routine_election_isolates_a_node_for_the_round_trip_not_the_timeout() {
         use std::time::{Duration, Instant};
@@ -2842,16 +2858,50 @@ mod tests {
         n2.join_via(n1.advertise()).await.expect("n2 join");
         n3.join_via(n1.advertise()).await.expect("n3 join");
 
-        // Start from a genuinely healthy fleet, or "isolated" below would just be "never settled".
+        // Start from a quiesced fleet, or this measures the join rather than an election (#606).
+        // "Nobody isolated" is not enough: a learner that hears the leader is not isolated, and
+        // `join_via` returns once the *learner* entry commits. A kill while n3 is still a learner in
+        // its own view, or still applying the join, leaves it refreshing its lease on the dead
+        // leader from entries delivered before the kill — and it refuses n2's campaign for that
+        // long. So: every node's own view is the *uniform* three-voter config — promotion passes
+        // through a joint config whose voter set already reads {1, 2, 3} but whose old half, {1, 2},
+        // cannot elect without n1 — and has applied what the leader has.
+        let three = BTreeSet::from([1, 2, 3]);
+        let quiesced = || {
+            let leader = n1.status();
+            leader.is_leader
+                && [&n1, &n2, &n3].iter().all(|node| {
+                    let own = node.status();
+                    let uniform = node
+                        .raft
+                        .metrics()
+                        .borrow()
+                        .membership_config
+                        .membership()
+                        .get_joint_config()
+                        .len()
+                        == 1;
+                    !node.is_isolated()
+                        && uniform
+                        && own.voters.iter().copied().collect::<BTreeSet<_>>() == three
+                        && own.learners.is_empty()
+                        && own.last_applied == leader.last_applied
+                })
+        };
         assert!(
-            wait_until(|| n1.status().is_leader
-                && !n1.is_isolated()
-                && !n2.is_isolated()
-                && !n3.is_isolated())
-            .await,
-            "the cluster must be healthy before the leader is killed"
+            wait_until(quiesced).await,
+            "every node must see three voters and have applied what the leader has before the \
+             leader is killed, or the election races the join (#606): {:?} / {:?} / {:?}",
+            n1.status(),
+            n2.status(),
+            n3.status()
         );
 
+        // A routine election advances the term by exactly one. Recorded so a failure says
+        // whether it was one slow round or extra rounds (#606), with the survivors' own views at
+        // the moment of the kill.
+        let pre_kill = (n2.status(), n3.status());
+        let term_before = n2.raft_term().max(n3.raft_term());
         n1.shutdown().await.ok();
 
         // Sample both survivors until each knows a new leader, then settle briefly.
@@ -2895,15 +2945,21 @@ mod tests {
             }
         }
 
+        let term_after = n2.raft_term().max(n3.raft_term());
         for (i, (id, _)) in survivors.iter().enumerate() {
             assert!(
                 longest[i] < Duration::from_millis(400),
                 "node {id} was isolated for {:?} across one routine election; D-17 records ~13–40 ms \
                  and this bound is 400 ms. Largest gap between consecutive samples was {:?} — if \
                  that approaches the reported isolation the sampler was starved and this is a CI \
-                 load artefact, not a regression.",
+                 load artefact, not a regression. The term went {term_before} → {term_after}: a \
+                 delta above 1 means extra campaigns — refused, or unable to reach a quorum — \
+                 which the quiesced start exists to rule out, so it is a finding about D-17, not a \
+                 flake. Survivors at the kill: {:?} / {:?}",
                 longest[i],
-                widest_gap
+                widest_gap,
+                pre_kill.0,
+                pre_kill.1
             );
         }
 

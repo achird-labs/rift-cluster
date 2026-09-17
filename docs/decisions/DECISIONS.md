@@ -394,7 +394,7 @@ the snapshot's metadata; only where the payload bytes are written changed.
 ### D-17 — Flow state stays off consensus
 - **Status:** active
 - **Decided:** 2026-07-21 · ADR-001
-- **Implemented by:** #465 (the isolated-owner rule, for flow KV), #472 (the measured cost)
+- **Implemented by:** #465 (the isolated-owner rule, for flow KV), #472 (the measured cost), #606 (the cost of an extra election round)
 - **Code:** crates/rift-cluster/src/stores/flow.rs, crates/rift-cluster/src/raft/ring.rs
 
 **Paid, honestly — measured (2026-08-28, #472; supersedes the #465 estimate).** Enforcing the
@@ -413,7 +413,17 @@ at ~1 ms, 10 rounds / 20 observations):
 - a **leader** isolates **900 ms** after its last quorum ack (`ISOLATION_WINDOW_MS`);
 - a routine election isolates each node for **tens of milliseconds** — the election round trip
   plus the new leader's first quorum-ack, because `current_leader` is `None` exactly while the
-  node's vote is uncommitted — plus 150–300 ms per extra round on a split vote (0 of 10 rounds).
+  node's vote is uncommitted.
+- **an extra election round costs the candidate 150–375 ms** (measured 204–341 ms, #606): its
+  election timeout — drawn from `[150, 300)` once per Raft instance — reached on openraft's next
+  75 ms election tick. Split votes do not cause one: openraft is built without
+  `single-term-leader`, so votes are ordered by `(term, node_id)` and two survivors campaigning at
+  once resolve in one round (40/40 forced). A *refused* vote does: a survivor whose lease on the
+  dead leader is still live when the campaign arrives — it was behind at the moment of failure,
+  still processing AppendEntries the leader sent before dying — refuses it. A survivor holding a
+  longer log also refuses, and then the candidate additionally waits `smaller_log_timeout`
+  (600 ms). A leader dying under write load with a follower backlogged can therefore cost one or
+  more such rounds; D-17's pin starts from a quiesced fleet so that it measures the routine case.
   The #472 probe measured **13–31 ms**; re-measuring while writing this entry's guard test, on
   different hardware and with a coarser ~8 ms sampler, gave **32–40 ms**. Both are the same
   quantity and both are two orders of magnitude below the figure this entry used to state; take
