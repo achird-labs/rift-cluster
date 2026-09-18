@@ -123,9 +123,10 @@ pub enum ControlOp {
     /// per-session revocation because there is no per-session server state to revoke. Recorded in
     /// `docs/architecture/10-operations.md`.
     SessionKeyPut {
-        /// 32 random bytes, hex-encoded. Hex rather than raw so the op stays printable in a log
-        /// dump and survives JSON without a base64 alphabet decision.
-        key: String,
+        /// 32 random bytes, hex-encoded. Hex rather than raw so the op survives JSON without a
+        /// base64 alphabet decision; a [`SessionKeyHex`] so this enum's derived `Debug` never
+        /// prints it (D-86).
+        key: SessionKeyHex,
     },
     /// Set or rename the fleet's operator-facing name (issue #373).
     ///
@@ -196,12 +197,44 @@ pub enum RecordedStubPlacement {
     AfterProxyMerging,
 }
 
+/// The fleet's session-signing key, hex-encoded: the one secret the replicated log carries.
+///
+/// A newtype only so that no `Debug` — this one, [`SessionKey`]'s, or [`ControlOp`]'s derived
+/// one — can print it (D-86). Serializes as the bare string, so the log entry, the stored record
+/// and the snapshot are byte-for-byte what they were when this was a `String`.
+///
+/// Deliberately not validated here: `control::validate` refuses a malformed key at admission, and
+/// the server's `SigningKey::derive` refuses one at use; a value decoded from the log reaches
+/// neither through a constructor anyway.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct SessionKeyHex(String);
+
+impl SessionKeyHex {
+    #[must_use]
+    pub fn new(hex: String) -> Self {
+        Self(hex)
+    }
+
+    /// The key itself. Named for what it does, so every read of the secret is greppable.
+    #[must_use]
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for SessionKeyHex {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("\"<redacted>\"")
+    }
+}
+
 /// The fleet's session-signing key, as applied state (issue #185).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionKey {
     /// Hex-encoded HMAC-SHA256 key.
-    pub key: String,
+    pub key: SessionKeyHex,
     /// The revision of the [`ControlOp::SessionKeyPut`] that produced this record. Bound into every
     /// token, so a rotation invalidates outstanding cookies by construction rather than by sweeping
     /// a table: a cookie minted under revision N stops verifying the moment N+1 is applied.
@@ -365,8 +398,8 @@ pub fn validate(op: &ControlOp) -> Result<(), String> {
             // Checked at admission rather than trusted from the caller: a short or malformed key
             // would still verify its own tokens, so the weakness would be silent — every session
             // would work, and only the security property would be gone.
-            let decoded =
-                hex_decode(key).ok_or_else(|| "session key must be hex-encoded".to_owned())?;
+            let decoded = hex_decode(key.expose())
+                .ok_or_else(|| "session key must be hex-encoded".to_owned())?;
             if decoded.len() != SESSION_KEY_BYTES {
                 return Err(format!(
                     "session key must be exactly {SESSION_KEY_BYTES} bytes, got {}",
@@ -637,6 +670,77 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// A recognisable 32-byte key: if any of these strings appears in a `Debug` rendering, the
+    /// session key leaked.
+    const LEAK_CANARY_KEY: &str =
+        "5ec2e75ec2e75ec2e75ec2e75ec2e75ec2e75ec2e75ec2e75ec2e75ec2e75ec2";
+
+    /// Pins D-86: the replicated session-key record never renders its key in `Debug`, and keeps
+    /// the revision — the half a log line actually needs — visible.
+    #[test]
+    fn a_session_key_records_debug_never_renders_the_key() {
+        let record = SessionKey {
+            key: SessionKeyHex::new(LEAK_CANARY_KEY.to_owned()),
+            revision: 4242,
+        };
+        let rendered = format!("{record:?}");
+        assert!(
+            !rendered.contains("5ec2e7"),
+            "the session key leaked: {rendered}"
+        );
+        assert!(rendered.contains("<redacted>"), "got: {rendered}");
+        assert!(
+            rendered.contains("4242"),
+            "the revision must stay visible: {rendered}"
+        );
+    }
+
+    /// Pins D-86: the op that carries the key into the log is covered too, so `ControlOp`'s
+    /// derived `Debug` — every variant, one `?op` away from a tracing line — cannot print it.
+    #[test]
+    fn a_session_key_put_ops_debug_never_renders_the_key() {
+        let op = ControlOp::SessionKeyPut {
+            key: SessionKeyHex::new(LEAK_CANARY_KEY.to_owned()),
+        };
+        let rendered = format!("{op:?}");
+        assert!(
+            !rendered.contains("5ec2e7"),
+            "the session key leaked: {rendered}"
+        );
+        assert_eq!(rendered, r#"SessionKeyPut { key: "<redacted>" }"#);
+    }
+
+    /// Only `Debug` changed: the key is replicated state and a snapshot field, so the log entry
+    /// and the stored record must serialize byte-for-byte as they did with a bare `String`.
+    #[test]
+    fn the_session_key_wire_and_record_formats_are_unchanged() {
+        let op = ControlOp::SessionKeyPut {
+            key: SessionKeyHex::new(LEAK_CANARY_KEY.to_owned()),
+        };
+        let op_json = format!(r#"{{"SessionKeyPut":{{"key":"{LEAK_CANARY_KEY}"}}}}"#);
+        assert_eq!(serde_json::to_string(&op).expect("serialize op"), op_json);
+        let ControlOp::SessionKeyPut { key } =
+            serde_json::from_str(&op_json).expect("deserialize op")
+        else {
+            panic!("decoded to a different variant");
+        };
+        assert_eq!(key.expose(), LEAK_CANARY_KEY);
+
+        let record = SessionKey {
+            key: SessionKeyHex::new(LEAK_CANARY_KEY.to_owned()),
+            revision: 7,
+        };
+        let record_json = format!(r#"{{"key":"{LEAK_CANARY_KEY}","revision":7}}"#);
+        assert_eq!(
+            serde_json::to_string(&record).expect("serialize record"),
+            record_json
+        );
+        assert_eq!(
+            serde_json::from_str::<SessionKey>(&record_json).expect("deserialize record"),
+            record
+        );
+    }
+
     fn uuid(n: u128) -> Uuid {
         Uuid::from_u128(n)
     }
@@ -732,7 +836,7 @@ mod tests {
             (ControlOp::DeleteRoute { id: "r".to_owned() }, "DeleteRoute"),
             (
                 ControlOp::SessionKeyPut {
-                    key: "00".repeat(SESSION_KEY_BYTES),
+                    key: SessionKeyHex::new("00".repeat(SESSION_KEY_BYTES)),
                 },
                 "SessionKeyPut",
             ),
@@ -1226,7 +1330,7 @@ mod tests {
             },
             ControlOp::DeleteRoute { id: "r".to_owned() },
             ControlOp::SessionKeyPut {
-                key: "00".repeat(SESSION_KEY_BYTES),
+                key: SessionKeyHex::new("00".repeat(SESSION_KEY_BYTES)),
             },
             ControlOp::FleetNamePut {
                 name: "prod".to_owned(),

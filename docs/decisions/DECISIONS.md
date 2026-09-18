@@ -3820,3 +3820,36 @@ operator one query parameter off would read a success for a revocation that neve
 visual baselines for something an operator reaches for a few times a year; the route is the runbook
 lever RFC-006 §12 Q4 asked for. D-24 does not bear on this either way: it governs maintenance the
 cluster performs on its own, and no automatic process can decide that a session is compromised.
+
+### D-86 — The session key never renders in `Debug`: it travels as a redacting `SessionKeyHex`, and the snapshot payload derives no `Debug` at all
+
+- **Status:** active
+- **Decided:** 2026-09-17 · #621
+- **Implemented by:** #621
+- **Refines:** D-85
+- **Code:** crates/rift-cluster/src/control.rs, crates/rift-cluster/src/raft/store.rs
+
+**The gap.** `SessionKey` and `ControlOp::SessionKeyPut` held the fleet's session-signing key as a
+bare `String` under a derived `Debug`, so one `?op` in a tracing line would print the key that
+mints and verifies every console session on every node. Nothing formatted either type, so this was
+latent — but the repo had already ruled twice that secret-bearing types do not derive `Debug`
+(`NodeConfig` redacts its `secret`; D-85's `SigningKey` redacts its MAC key), and `SigningKey` is
+derived *from* `SessionKey`, so the more sensitive of the pair was the unprotected one.
+
+**The rule.** The key is a `SessionKeyHex` newtype wherever it is typed — the op and the record —
+whose `Debug` is `"<redacted>"`. Every containing type keeps its derive and is safe by
+construction, including `ControlOp`, where a hand-written enum `Debug` would have to be re-edited
+for every new variant. Reads of the secret go through `SessionKeyHex::expose`, so they are
+greppable. The private `SnapshotPayload` carries the raw `sm_session_key` row (JSON, key
+included) as a string, and simply derives no `Debug` — nothing formatted it. `revision` stays
+visible: it is what a log line needs and it is not secret.
+
+**No log-format or state change.** `SessionKeyHex` is `#[serde(transparent)]`: the log entry, the
+stored record and the snapshot are byte-for-byte what they were, pinned by literal-JSON tests.
+
+*Rejected:* **hand-writing `Debug` for `SessionKey` and `ControlOp`** (the issue's first proposal) —
+correct today, but the enum's impl would have to enumerate every variant and a new one would
+silently fall back to whatever the author wrote. **Validating in `SessionKeyHex::new`** — admission
+(`control::validate`) and use (`SigningKey::derive`) already refuse a malformed key, and a value
+decoded from the log never passes a constructor. **`zeroize`** — a separate decision about
+in-memory lifetime, not about printing.

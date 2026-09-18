@@ -7,6 +7,7 @@
 use std::time::Duration;
 
 use clap::Parser;
+use rift_cluster::control::SessionKeyHex;
 use rift_cluster::rpc::{AlwaysHealthy, RpcClient, RpcClientConfig, Signer};
 use rift_cluster::{ControlOp, ControlRequest, RaftNode};
 use rift_cluster_server::cli::EeCli;
@@ -465,7 +466,7 @@ async fn rotating_the_signing_key_invalidates_every_session() {
         node,
         op_id,
         ControlOp::SessionKeyPut {
-            key: "f".repeat(64),
+            key: SessionKeyHex::new("f".repeat(64)),
         },
     )
     .await;

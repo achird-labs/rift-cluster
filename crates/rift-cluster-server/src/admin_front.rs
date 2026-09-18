@@ -71,7 +71,7 @@ use hyper_util::client::legacy::Client;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use rand::RngCore;
 use rift_cluster::control::{
-    self, ControlOp, ControlRequest, PreconditionTarget, StubEdit, StubEditScript,
+    self, ControlOp, ControlRequest, PreconditionTarget, SessionKeyHex, StubEdit, StubEditScript,
 };
 use rift_cluster::decorate::{
     HEADER_BIND_FAILURES, HEADER_OP_ID, HEADER_PARTIAL, HEADER_REVISION, HEADER_WARNINGS,
@@ -1424,7 +1424,7 @@ async fn commit_new_session_key(
     let mut bytes = [0u8; SESSION_KEY_BYTES];
     rand::thread_rng().fill_bytes(&mut bytes);
     let op = ControlOp::SessionKeyPut {
-        key: session::hex_encode(&bytes),
+        key: SessionKeyHex::new(session::hex_encode(&bytes)),
     };
     // R4's usual order (validate, park durably, submit) even though a locally-generated key can
     // only fail this for a programming error in this function, not anything a caller controls —
