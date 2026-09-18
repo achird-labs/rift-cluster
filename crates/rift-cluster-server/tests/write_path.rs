@@ -2110,6 +2110,91 @@ async fn ref_scripts_resolve_before_replication() {
     server.shutdown().await;
 }
 
+/// Pins upstream #1159 on the cluster front: a stub arrives without its imposter's `_rift`
+/// block, so resolving it against a hard-coded `rhai` ignored the imposter's
+/// `_rift.scriptEngine.defaultEngine` — an engine-less JavaScript stub was stored as rhai and
+/// refused or mis-run. Both `PatchStubs` shapes that carry a stub (add, replace-by-id) resolve
+/// against the stored imposter's default.
+#[tokio::test]
+async fn a_stub_added_through_the_front_inherits_its_imposters_default_engine() {
+    let _serial = TEST_LOCK.lock().await;
+    let state = TempDir::new().expect("tempdir");
+    let server = compose::start(cluster_cli(
+        &state,
+        &["--cluster-allow-solo", "--allowInjection"],
+    ))
+    .await
+    .expect("solo cluster starts");
+    wait_ready(&server).await;
+    let admin = server.admin_addr();
+    let port = reserve_port();
+    let client = reqwest::Client::new();
+    let js = |body: &str| {
+        json!({ "responses": [{ "_rift": { "script": {
+            "code": format!("function respond(ctx) {{ return http(200, '{body}'); }}")
+        } } }] })
+    };
+
+    let response = client
+        .post(format!("http://{admin}/imposters"))
+        .json(&json!({
+            "port": port,
+            "protocol": "http",
+            "_rift": { "scriptEngine": { "defaultEngine": "javascript" } },
+            "stubs": [],
+        }))
+        .send()
+        .await
+        .expect("post imposter");
+    assert_eq!(response.status().as_u16(), 201);
+
+    let response = client
+        .post(format!("http://{admin}/imposters/{port}/stubs"))
+        .json(&json!({ "stub": js("added") }))
+        .send()
+        .await
+        .expect("add stub");
+    let status = response.status().as_u16();
+    assert_eq!(status, 200, "{}", response.text().await.unwrap_or_default());
+    let (_, body) = rendered_imposter(admin, port).await;
+    assert_eq!(
+        body["stubs"][0]["responses"][0]["_rift"]["script"]["engine"], "javascript",
+        "{body}"
+    );
+    assert!(wait_served(port, "added").await, "the JS stub must serve");
+
+    let mut replacement = js("replaced");
+    replacement["id"] = json!("r");
+    let response = client
+        .post(format!("http://{admin}/imposters/{port}/stubs"))
+        .json(
+            &json!({ "stub": { "id": "r", "responses": [{ "is": { "body": "x" } }] }, "index": 0 }),
+        )
+        .send()
+        .await
+        .expect("add stub to replace");
+    assert_eq!(response.status().as_u16(), 200);
+    let response = client
+        .put(format!("http://{admin}/imposters/{port}/stubs/by-id/r"))
+        .json(&replacement)
+        .send()
+        .await
+        .expect("replace stub by id");
+    let status = response.status().as_u16();
+    assert_eq!(status, 200, "{}", response.text().await.unwrap_or_default());
+    let (_, body) = rendered_imposter(admin, port).await;
+    assert_eq!(
+        body["stubs"][0]["responses"][0]["_rift"]["script"]["engine"], "javascript",
+        "{body}"
+    );
+    assert!(
+        wait_served(port, "replaced").await,
+        "the replaced JS stub must serve"
+    );
+
+    server.shutdown().await;
+}
+
 #[tokio::test]
 async fn add_stub_resolves_ref_against_the_stored_registry() {
     let _serial = TEST_LOCK.lock().await;

@@ -53,20 +53,27 @@ fn main() -> anyhow::Result<()> {
     // on the serving path only, so skipping the bootstrap is now the whole reason.
     if let Some(Commands::Healthcheck { url, timeout }) = cli.oss.command.clone() {
         // With no --url, the target follows the mode (#297): this parse read the
-        // same RIFT_* environment the server's own did, and healthcheck_url
+        // same RIFT_* environment the server's own did, and healthcheck_target
         // double-checks a "no" against the node itself, because cluster flags
         // given as command-line arguments never reach a healthcheck exec's
-        // environment. Passing Some makes dispatch's own host/port fallback
-        // unreachable by construction.
-        let url = url.unwrap_or_else(|| {
-            probes::healthcheck_url(
+        // environment.
+        //
+        // The key goes where upstream's dispatch sends it (#1154): to the admin
+        // plane it derives from --host/--port, and never to an explicit --url,
+        // which it withholds from and names in a 401 verdict. The probe listener
+        // is unauthenticated, so the admin secret is not handed to it at all.
+        let api_key = cli.oss.api_key.as_deref();
+        let (url, key) = match url {
+            Some(explicit) => (Some(explicit), api_key),
+            None => match probes::healthcheck_target(
                 cli.cluster.cluster,
                 cli.cluster.cluster_probe_bind,
-                &cli.oss.host,
-                cli.oss.port,
-            )
-        });
-        return healthcheck::dispatch(Some(url), &cli.oss.host, cli.oss.port, timeout);
+            ) {
+                probes::HealthcheckTarget::ProbeListener(probe) => (Some(probe), None),
+                probes::HealthcheckTarget::AdminPlane => (None, api_key),
+            },
+        };
+        return healthcheck::dispatch(url, &cli.oss.host, cli.oss.port, timeout, key);
     }
 
     // `--debug` is the server-flag spelling of debug mode; `RIFT_DEBUG` is the

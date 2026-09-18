@@ -145,9 +145,9 @@ implementation** rather than reimplementing or declining it:
 | `--local-only` | Under `--cluster`, pins the **admin front** to loopback — the front is the admin plane (D-79). Imposter ports and the front door are not moved by it (the front door binds whatever `--front-door` names), exactly as upstream's flag leaves them. |
 | `--require-admin-auth` | Under `--cluster`, judged against the **front's** address with upstream's own `check_admin_exposure`, before the node binds or joins: an off-host front with no `--api-key` — or with a blank one — refuses startup with upstream's message. |
 | `--pidfile` | one `global` flag, bindable on either side of the subcommand; written on the serving path only — see below |
-| `stop` | SIGTERM the PID in `--pidfile` (default `rift.pid`), then remove the file |
+| `stop` | SIGTERM the PID in `--pidfile` (default `rift.pid`), **wait for it to exit**, then remove the file. The wait is `--cluster-leave-timeout` plus five seconds (D-88) — see below |
 | `restart` | `stop`, then start a new server in the same process. A missing PID file is "nothing to stop", not an error |
-| `save` | fetch `GET /imposters?replayable=true` from the configured `--host`/`--port` and write it to `--savefile` |
+| `save` | fetch `GET /imposters?replayable=true` from the configured `--host`/`--port` and write it to `--savefile`, presenting `--api-key`/`MB_APIKEY` when one is set (rift#1154) — a keyed node answered it with 401 before |
 | `replay` | start a server with `--configfile` set to the replayed file, overriding any top-level `--configfile`. Refused with `--cluster` — see below |
 
 The steps this binary implements run in **upstream's order**, which matters
@@ -419,6 +419,18 @@ uniform one. It is deliberately not demote-then-remove: that shape left the
 departing node a caught-up learner still in membership between its two halves,
 and the leader's promotion sweep would vote it straight back into the quorum
 (D-59).
+
+`stop` and `restart` wait for this whole sequence. A clustered node exits only
+after its full `--cluster-leave-timeout`, so they wait that long plus five seconds
+— upstream's own shutdown bound — before calling the node stuck (D-88). The window
+is read from the `stop` invocation's own flags and `RIFT_CLUSTER_LEAVE_TIMEOUT`; a
+node given a longer window on its command line alone needs the same flag on
+`stop`, or the stop reports failure and keeps the PID file while the node is still
+leaving.
+
+> **Amended by D-88** (2026-09-18, #625): `stop` returned as soon as the signal was
+> sent. Since rift#1155 it waits for the process to exit, and the wait covers the
+> leave window rather than upstream's fixed five seconds.
 
 > **Set the orchestrator's grace period to at least twice
 > `--cluster-leave-timeout`** (`terminationGracePeriodSeconds` on Kubernetes).

@@ -178,7 +178,7 @@ fn place_recorded_stub(
         .position(|s| {
             s.responses
                 .iter()
-                .any(|r| matches!(r, StubResponse::Proxy { proxy } if proxy.to == proxy_to))
+                .any(|r| matches!(r, StubResponse::Proxy { proxy, .. } if proxy.to == proxy_to))
         })
         .unwrap_or(stubs.len());
     match placement {
@@ -5363,6 +5363,51 @@ mod tests {
                 }]
             }]),
         )
+    }
+
+    /// A `_rift` block on a proxy response is kept since upstream #1152 (`ignored_rift`),
+    /// where it used to be dropped at parse. It must not stop that proxy anchoring a
+    /// recording: matched as anything but "any `ignored_rift`", the proxy is not found and
+    /// the recording lands at the end, behind the proxy that shadows it.
+    #[test]
+    fn a_proxy_carrying_a_rift_block_still_anchors_a_recording() {
+        let mut stubs = config(
+            8080,
+            json!([
+                { "responses": [{ "is": { "statusCode": 200, "body": "authored" } }] },
+                { "responses": [{
+                    "proxy": { "to": "http://u.example", "mode": "proxyOnce" },
+                    "_rift": {}
+                }] }
+            ]),
+        )
+        .stubs;
+        assert!(
+            matches!(
+                &stubs[1].responses[0],
+                super::StubResponse::Proxy {
+                    ignored_rift: Some(_),
+                    ..
+                }
+            ),
+            "fixture must carry the _rift block through the parse"
+        );
+        let recorded = recorded_stub("r", crate::control::RecordedStubPlacement::BeforeProxy);
+        let placed = super::place_recorded_stub(
+            &mut stubs,
+            *recorded.stub,
+            recorded.placement,
+            &recorded.proxy_to,
+        );
+        assert!(
+            matches!(placed, super::PlacedRecording::Inserted { index: 1 }),
+            "the recording goes before the proxy, at index 1"
+        );
+        assert_eq!(stubs.len(), 3);
+        assert!(matches!(
+            &stubs[2].responses[0],
+            super::StubResponse::Proxy { .. }
+        ));
     }
 
     fn recorded_stub(

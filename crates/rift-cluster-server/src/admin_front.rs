@@ -4234,16 +4234,18 @@ fn front_script_base(scripts_dir: Option<&Path>) -> ScriptBaseDir {
     }
 }
 
-/// The target imposter's already-resolved `_rift.scripts`, from applied
-/// state; empty when the imposter is absent (resolve → then not-found
-/// ordering: an unknown ref against an empty registry still fails with
-/// `UnknownRef`, the same observable order upstream produces for a genuinely
-/// missing imposter).
+/// The target imposter's already-resolved `_rift.scripts` and its
+/// `_rift.scriptEngine.defaultEngine`, from applied state. A stub arrives
+/// without its imposter's `_rift` block, so the default engine has to come
+/// from here (upstream #1159). An absent imposter yields an empty registry and
+/// `rhai` (resolve → then not-found ordering: an unknown ref against an empty
+/// registry still fails with `UnknownRef`, the same observable order upstream
+/// produces for a genuinely missing imposter).
 #[allow(clippy::result_large_err)]
-fn stored_script_registry(
+fn stored_script_context(
     node: &Arc<RaftNode>,
     port: u16,
-) -> Result<HashMap<String, RiftScriptConfig>, Response<FrontBody>> {
+) -> Result<(HashMap<String, RiftScriptConfig>, String), Response<FrontBody>> {
     // An absent imposter is the domain-optional empty registry: an unknown ref
     // then fails as UnknownRef, upstream's resolve-then-not-found order. A
     // storage or parse failure is a real fault and must not masquerade as
@@ -4252,11 +4254,15 @@ fn stored_script_registry(
         .get_imposter(port)
         .map_err(|e| internal(&e.to_string()))?
     else {
-        return Ok(HashMap::new());
+        return Ok((HashMap::new(), "rhai".to_owned()));
     };
     let config: ImposterConfig = serde_json::from_str(&stored)
         .map_err(|e| internal(&format!("stored config for {port}: {e}")))?;
-    Ok(config.rift.map(|rift| rift.scripts).unwrap_or_default())
+    let default_engine = config.default_script_engine().to_owned();
+    Ok((
+        config.rift.map(|rift| rift.scripts).unwrap_or_default(),
+        default_engine,
+    ))
 }
 
 /// Resolve one terminated op in place; `Err` is the client-shaped 400 with
@@ -4288,18 +4294,22 @@ fn resolve_op_scripts(
             if !needs_registry {
                 return Ok(());
             }
-            let registry = stored_script_registry(node, *port)?;
+            let (registry, default_engine) = stored_script_context(node, *port)?;
             for step in &mut edit.0 {
                 if let StubEdit::Add { stub, .. } | StubEdit::ReplaceById { stub, .. } = step {
-                    resolve_stub_scripts(std::slice::from_mut(stub), &registry, base).map_err(
-                        |e| {
-                            typed_error(
-                                StatusCode::BAD_REQUEST,
-                                ErrorKind::BadData,
-                                &format!("Script resolution failed: {e}"),
-                            )
-                        },
-                    )?;
+                    resolve_stub_scripts(
+                        std::slice::from_mut(stub),
+                        &registry,
+                        &default_engine,
+                        base,
+                    )
+                    .map_err(|e| {
+                        typed_error(
+                            StatusCode::BAD_REQUEST,
+                            ErrorKind::BadData,
+                            &format!("Script resolution failed: {e}"),
+                        )
+                    })?;
                 }
             }
             Ok(())
