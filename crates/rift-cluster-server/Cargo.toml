@@ -82,3 +82,6 @@ reqwest.workspace = true
 # covers every one (issue #184). Dev-only: the derives are `cfg_attr(test, ...)`, so nothing here
 # reaches the shipped binary.
 strum.workspace = true
+# Spawns signal-test servers with a clean signal mask (`pre_exec` + `sigprocmask`), as upstream's
+# own signal suite does: a harness can run with SIGINT blocked, and the mask survives exec.
+libc.workspace = true

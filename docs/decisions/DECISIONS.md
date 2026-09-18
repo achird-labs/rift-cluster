@@ -3914,3 +3914,40 @@ zombie-aware exit probe are private upstream, and D-77's rule is to call the sea
 in step. **Ending the leave early when nothing is in flight** would also fit inside five seconds,
 but it changes the drain contract operators size their grace periods against. That is a separate
 decision, not a side effect of a pin bump.
+
+### D-89 — Both modes stop on SIGTERM/SIGINT through one handler installed before startup; the server removes its own PID file
+
+- **Status:** active
+- **Decided:** 2026-09-18 · #627
+- **Implemented by:** #627
+- **Refines:** D-33, D-88
+- **Code:** crates/rift-cluster-server/src/main.rs, crates/rift-cluster-server/src/bootstrap.rs, crates/rift-cluster-server/src/compose.rs, crates/rift-cluster-server/tests/cli.rs
+
+**The gap.** D-33 promises that without `--cluster` this binary behaves as `rift` does. rift#1155
+gave `rift` a SIGTERM/SIGINT handler, a bounded runtime teardown, and a server that removes its own
+PID file. This binary's unclustered path still returned `join()` with no handler: SIGTERM's default
+action killed it, and as a container's PID 1 — `deploy/Dockerfile` runs it with no init — the kernel
+discarded the signal, so `docker stop` waited out its timeout and SIGKILLed. The PID file was never
+removed.
+
+**The rule.** One `TerminationSignals` handler, installed before `compose` starts anything, serves
+both modes through `ComposedServer::serve_until`. Startup itself is raced against it: a clustered
+start can spend up to 30 s retrying seeds or awaiting a leader, and a node signalled then exits
+promptly (0) instead of joining only to leave — which would also outrun D-88's `stop` ceiling, sized
+for the leave alone. Abandoning a start is crash-equivalent, as the old default action was. Unclustered, the leave window is zero and there is
+no node, so what runs is upstream's own `RunningServer::shutdown`; the unclustered `ComposedServer`
+holds no manager, so `ImposterManager::shutdown` — which unlinks every `--datadir` file — is
+unreachable from a signal. A handler that cannot be installed refuses startup rather than leaving a
+server that cannot stop gracefully. Each runtime's teardown is bounded by upstream's
+`runtime::BLOCKING_DRAIN`. On exit the server removes its PID file only while it still names this
+process. The log writer's guard is held, not leaked, so its tail is flushed.
+`an_unclustered_node_exits_cleanly_on_sigterm_and_removes_its_pidfile` and its SIGINT twin pin the
+exit code and the PID file against the real binary (the flush is not pinned: the writer usually
+drains before exit even with a leaked guard, so no test observes it); `a_node_signalled_while_joining_exits_promptly` pins the startup race; `remove_own_pidfile_removes_only_a_file_naming_this_process` pins
+the ownership rule.
+
+*Rejected:* **an upstream seam for the handler.** Upstream's `TerminationSignals` and
+`remove_own_pidfile` are private to its binary, but this crate already owned its signal handling
+(the clustered path's) and writes its own PID file, so the handler and the removal are this crate's
+own behaviour rather than copies kept in step with a library function.
+

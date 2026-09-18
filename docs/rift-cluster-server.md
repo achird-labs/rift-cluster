@@ -215,6 +215,10 @@ property of the clustered composition rather than of an explicit guard.
   writes no PID file unless one was asked for.
 - `stop` with no PID file is an error; `restart` with no PID file starts fresh,
   since "end up running" is already satisfiable.
+- The server **removes its own PID file on the way out**, however it stops — a
+  clean SIGTERM or SIGINT, or an admin plane that died — but only while the
+  file still names this process, so a successor that took the file over keeps
+  it (rift#1155, #627).
 
 These are upstream's semantics (rift#827), reproduced rather than reinvented,
 because `--cluster`-off parity is the point. They replaced a set of caveats — a
@@ -379,7 +383,15 @@ gate can re-open it.
 
 ## Graceful leave (SIGTERM)
 
-On SIGTERM the node, in this order:
+The SIGTERM/SIGINT handler is installed before the server starts, so a signal
+during startup is held, not lost; a handler that cannot be installed refuses
+startup. Without `--cluster` there is nothing to leave: the node stops accepting,
+shuts down through upstream's own `RunningServer::shutdown` and exits 0 —
+upstream's behaviour since rift#1155, and what makes `docker stop` prompt when
+the binary is the container's PID 1, where an unhandled SIGTERM is discarded
+(D-89).
+
+On SIGTERM a clustered node, in this order:
 
 1. **fails readiness**, so the balancer sheds it before any socket closes;
 2. **leaves the Raft membership** — one voter removal, performed by the leader
