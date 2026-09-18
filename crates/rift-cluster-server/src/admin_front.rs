@@ -752,6 +752,20 @@ async fn handle(state: Arc<FrontState>, req: Request<Incoming>) -> Response<Fron
         };
     }
 
+    // `POST /session/rotate` (D-85, issue #619): the operator-triggered revocation. Beside its two
+    // siblings and directly-served for the same reason — committing a signing key is a credential
+    // operation, not a config mutation any caller can address by resource.
+    if path == "/session/rotate" {
+        return match *req.method() {
+            Method::POST => session_rotate(&state, &req).await,
+            _ => typed_error(
+                StatusCode::METHOD_NOT_ALLOWED,
+                ErrorKind::BadData,
+                "/session/rotate supports POST only",
+            ),
+        };
+    }
+
     // `/_fleet/*` (RFC-006 §5.2, issue #185): the same members/health/op-status projection
     // `/_cluster/*` answers, re-exposed on the admin port so an operator working the admin API
     // does not also need a cluster-port credential to ask "is this node healthy". Behind the
@@ -1007,7 +1021,7 @@ fn authenticate(state: &FrontState, req: &Request<Incoming>) -> Result<(), Respo
         // credential on the same request.
         BearerVerdict::Refused => Err(unauthorized()),
         // Only when the caller presented no bearer at all is the cookie consulted.
-        BearerVerdict::Absent => match resolve_cookie(&node, req) {
+        BearerVerdict::Absent => match resolve_cookie(&node, expected, req) {
             Ok(true) => {
                 csrf_gate(req)?;
                 Ok(())
@@ -1071,23 +1085,44 @@ fn api_key_matches(provided: &str, expected: &str) -> bool {
 /// Whether the request carries a valid `rift_session` cookie (RFC-006 §5.3, issue #185).
 ///
 /// `Ok(false)` flattens every "not authenticated by cookie" case alike — no cookie present, no
-/// signing key committed yet, a token that fails [`session::verify`] for any reason — for the
-/// same reason upstream's key compare does: the caller cannot act on *why*, only on whether the
-/// cookie held up.
+/// signing key committed yet, a record this node cannot derive a signing key from, a token that
+/// fails [`session::verify`] for any reason — for the same reason upstream's key compare does:
+/// the caller cannot act on *why*, only on whether the cookie held up. Every one of those cases
+/// is a refusal, which is the direction a gate that cannot classify its input must fail in.
 ///
-/// Read fresh from applied state on every call, never cached: rotating the signing key
-/// (`ControlOp::SessionKeyPut`) is the only revocation this fleet has, and it must cut a live
+/// `api_key` is this node's configured `--api-key`, which the token was signed under
+/// ([`session::SigningKey::derive`], D-85) — so a node running a different key refuses every
+/// cookie minted under the old one without consulting anything replicated.
+///
+/// Read fresh from applied state on every call, never cached: this fleet has exactly two
+/// revocations and both act here — committing a new signing key (`POST /session/rotate`, or the
+/// `ControlOp::SessionKeyPut` behind it) and changing `--api-key` — and each must cut a live
 /// session on its very next request. Do not add a cache here or in the caller.
 #[allow(clippy::result_large_err)]
-fn resolve_cookie(node: &RaftNode, req: &Request<Incoming>) -> Result<bool, Response<FrontBody>> {
+fn resolve_cookie(
+    node: &RaftNode,
+    api_key: &str,
+    req: &Request<Incoming>,
+) -> Result<bool, Response<FrontBody>> {
     let Some(token) = session_cookie(req) else {
         return Ok(false);
     };
-    let Some(key) = node.session_key().map_err(|e| internal(&e.to_string()))? else {
+    let Some(record) = node.session_key().map_err(|e| internal(&e.to_string()))? else {
         // No console login has ever minted a signing key on this fleet, so no cookie this node
         // issued could exist — but a client can still present garbage, and that is `false`, not
         // an error.
         return Ok(false);
+    };
+    let key = match session::SigningKey::derive(&record, api_key) {
+        Ok(key) => key,
+        Err(e) => {
+            // Applied state holds a key `control::validate` would have refused, so this node
+            // cannot verify any cookie until that is fixed. Logged rather than silent — it is a
+            // state-machine invariant breach, not a client error — but it stays a refusal: a gate
+            // that cannot parse what it is classifying treats it as the dangerous class.
+            tracing::error!(error = %e, "stored session-signing key is not usable; refusing every cookie");
+            return Ok(false);
+        }
     };
     Ok(session::verify(&key, &token, now_secs()).is_ok())
 }
@@ -1212,9 +1247,24 @@ async fn session_login(state: &Arc<FrontState>, req: Request<Incoming>) -> Respo
         return unauthorized();
     }
 
-    let key = match ensure_session_key(state, &node).await {
-        Ok(key) => key,
+    let record = match ensure_session_key(state, &node).await {
+        Ok(record) => record,
         Err(response) => return response,
+    };
+    // The cookie is signed under the key bound to *this* node's `--api-key` (D-85), so it is
+    // accepted exactly where that key is. A record that will not derive is applied state the
+    // control plane should never have admitted, and it is a `500` rather than a cookie signed
+    // with fallback material: minting something that cannot be revoked by changing the key it
+    // stands in for is worse than failing the login.
+    let key = match session::SigningKey::derive(&record, expected) {
+        Ok(key) => key,
+        Err(e) => {
+            // The same applied-state breach `resolve_cookie` logs, reached from the other
+            // direction. Logged in both places on purpose: the response body reaches one caller,
+            // and the operator diagnosing why nobody can log in is not necessarily that caller.
+            tracing::error!(error = %e, "stored session-signing key is not usable; refusing login");
+            return internal(&format!("stored session-signing key is not usable: {e}"));
+        }
     };
     let token = session::mint(&key, now_secs(), session::SESSION_TTL_SECS);
 
@@ -1223,6 +1273,61 @@ async fn session_login(state: &Arc<FrontState>, req: Request<Incoming>) -> Respo
         Err(response) => return response,
     };
     match set_session_cookie(&mut response, &token, session::SESSION_TTL_SECS) {
+        Ok(()) => response,
+        Err(response) => response,
+    }
+}
+
+/// `POST /session/rotate`: end every console session on every node (D-85, issue #619).
+///
+/// The lever RFC-006 §12 Q4 asked for and #185 never built. D-73 left rotating the signing key as
+/// this fleet's only revocation while nothing could issue a rotation, so the 8-hour `Max-Age` was
+/// the only bound that actually held. This commits a fresh [`ControlOp::SessionKeyPut`]
+/// unconditionally — the first mint and a rotation are the same op — and every node refuses every
+/// outstanding cookie the moment it applies it, because each token carries the revision it was
+/// minted under.
+///
+/// **The caller's own session ends too**, and the response clears their cookie. "End the others,
+/// keep mine" was considered and dropped: the operator reaching for this may be evicting someone
+/// who is holding the very cookie making the call, and a revocation with an exception for the
+/// caller keeps the thief.
+///
+/// Behind the ordinary [`authenticate`] chokepoint — the key as a bearer, or a session cookie
+/// plus the CSRF header. A cookie holder may rotate because in a one-credential fleet a cookie
+/// already carries full admin power; this escalates nothing, and it is what lets an operator
+/// evict a thief from the console session they are already in.
+///
+/// The open-plane refusal comes **first**, before `authenticate`: with no `--api-key` that gate
+/// admits everyone (D-73), so checking it second would let any caller at all commit a signing key
+/// to a fleet that has no sessions to end.
+async fn session_rotate(state: &Arc<FrontState>, req: &Request<Incoming>) -> Response<FrontBody> {
+    if state.api_key.is_none() {
+        return typed_error(
+            StatusCode::BAD_REQUEST,
+            ErrorKind::BadData,
+            "this fleet runs with no --api-key, so the admin plane is open and there are no \
+             sessions to end",
+        );
+    }
+    if let Err(refused) = authenticate(state, req) {
+        return refused;
+    }
+    let Some(node) = state.node.upgrade() else {
+        return typed_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            ErrorKind::Unavailable,
+            "cluster node is shutting down",
+        );
+    };
+    if let Err(refused) = commit_new_session_key(state, &node).await {
+        return refused;
+    }
+
+    let mut response = match buffered_response(StatusCode::NO_CONTENT, Bytes::new(), None) {
+        Ok(response) => response,
+        Err(response) => return response,
+    };
+    match clear_session_cookie(&mut response) {
         Ok(()) => response,
         Err(response) => response,
     }
@@ -1262,9 +1367,8 @@ fn session_logout(req: &Request<Incoming>) -> Response<FrontBody> {
     }
 }
 
-/// The fleet's session-signing key, minting one first if no console login has ever committed one
-/// (issue #185). The only branch of this front's entire session surface that is a Raft write —
-/// every other login reads the record this one commits.
+/// The fleet's session-signing key record, minting one first if no console login has ever
+/// committed one (issue #185).
 // The error channel here *is* a rendered HTTP response, which is how a handler returns a
 // refusal with `?` from anywhere in its body. `Response<FrontBody>` is hyper's type and
 // its size is not ours to shrink; boxing it would only move the unboxing to every caller.
@@ -1276,7 +1380,47 @@ async fn ensure_session_key(
     if let Some(key) = node.session_key().map_err(|e| internal(&e.to_string()))? {
         return Ok(key);
     }
+    commit_new_session_key(state, node).await?;
 
+    // Re-read rather than trust the bytes just committed: two concurrent first logins can both
+    // observe `None` above and both submit a `SessionKeyPut`. Both commit — the op is an
+    // unconditional overwrite, not a compare-and-swap — so only the *second* one to apply is the
+    // row every node agrees on, and it is not necessarily this call's own. Minting from anything
+    // else would hand out a cookie under a superseded revision, dead on arrival.
+    //
+    // The `None` arm is reachable: `await_local_applied` is a bounded wait, so a barrier that
+    // timed out lands here with the write committed on a quorum but not yet visible locally.
+    match node.session_key().map_err(|e| internal(&e.to_string()))? {
+        Some(key) => Ok(key),
+        None => {
+            tracing::error!(
+                "session key committed and awaited, but is not visible in applied state"
+            );
+            Err(internal(
+                "session key committed but not yet visible on this node",
+            ))
+        }
+    }
+}
+
+/// Commit a fresh random signing key, unconditionally. The only branch of this front's entire
+/// session surface that is a Raft write — every other login reads the record this one commits.
+///
+/// Returns nothing on purpose. Its two callers want different things from the record afterwards:
+/// [`ensure_session_key`] must read back the row the fleet agreed on before minting a cookie from
+/// it, while [`session_rotate`] must not use a record at all — after a rotation the only honest
+/// statement is "the key that minted the outstanding cookies is gone", not "here is its
+/// replacement", since a concurrent rotation may already have superseded it. Handing back a
+/// `SessionKey` here would make the second caller look like the first and invite a future
+/// rotation path to mint from a record that is a revision behind.
+///
+/// What it *does* guarantee is the same for both: the op committed on a quorum, and this node
+/// waited for its own state machine to catch up to it.
+#[allow(clippy::result_large_err)]
+async fn commit_new_session_key(
+    state: &FrontState,
+    node: &Arc<RaftNode>,
+) -> Result<(), Response<FrontBody>> {
     let mut bytes = [0u8; SESSION_KEY_BYTES];
     rand::thread_rng().fill_bytes(&mut bytes);
     let op = ControlOp::SessionKeyPut {
@@ -1339,16 +1483,7 @@ async fn ensure_session_key(
     node.await_local_applied(committed.revision, state.write_path.barrier_timeout)
         .await;
 
-    // Re-read rather than trust the bytes generated above: two concurrent first logins can both
-    // observe `None` at the top of this function and both submit a `SessionKeyPut`. Both commit —
-    // the op is an unconditional overwrite, not a compare-and-swap — so only the *second* one to
-    // apply is the row every node actually agrees on, and it is not necessarily this call's own.
-    match node.session_key().map_err(|e| internal(&e.to_string()))? {
-        Some(key) => Ok(key),
-        None => Err(internal(
-            "session key committed but not yet visible on this node",
-        )),
-    }
+    Ok(())
 }
 
 /// Render the `Set-Cookie` header for a freshly minted session token.

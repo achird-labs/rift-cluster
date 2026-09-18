@@ -2614,10 +2614,10 @@ paths:
         The cookie proves authentication only — with one credential there
         is no identity for it to resolve to. There is no server-side
         session table and, deliberately, **no per-session revocation**:
-        the documented bounds are the 8-hour `Max-Age` and
-        session-signing-key rotation, which would invalidate every outstanding
-        session at once. No route issues a rotation yet (#619), so `Max-Age`
-        is the bound that holds today.
+        the documented bounds are the 8-hour `Max-Age`, session-signing-key
+        rotation (`POST /session/rotate`), which invalidates every outstanding
+        session at once, and changing the fleet's `--api-key`, which ends the
+        sessions that key minted as each node restarts under the new one.
 
         A fleet running with **no** `--api-key` has an open admin plane
         and nothing to exchange; this answers `400` rather than handing
@@ -2694,6 +2694,61 @@ paths:
           $ref: '#/components/responses/Forbidden'
         '503':
           $ref: '#/components/responses/Unavailable'
+
+  /session/rotate:
+    post:
+      operationId: rotateSessionKey
+      summary: End every console session on every node
+      description: >
+        Terminates. **Is** a Raft write, unlike its two siblings: it commits
+        a fresh session-signing key, and because every token carries the
+        revision it was minted under, every node refuses every outstanding
+        cookie the moment it applies the new record — with no session table
+        to sweep and nothing to coordinate.
+
+        Unlike `createSession` and `deleteSession` this is authenticated:
+        `apiKeyAuth` as a bearer, or a session cookie plus `X-Rift-CSRF`. A
+        cookie holder may call it because in a one-credential fleet a cookie
+        already carries full admin power, and it is what lets an operator
+        evict a thief from the console session they are in.
+
+        **The caller's own session ends too** and the response clears their
+        cookie, so after a rotation every live session was minted by someone
+        who presented the API key since. Works from any node; a follower
+        forwards the write to the leader.
+
+        A fleet running with **no** `--api-key` has an open admin plane and
+        no sessions to end; this answers `400` rather than committing a
+        signing key.
+      tags: [session]
+      x-rift-origin: ee
+      parameters:
+        - $ref: '#/components/parameters/CsrfHeader'
+      responses:
+        '204':
+          description: >
+            Every session on every node is ended; no body. The caller's own
+            cookie is cleared by the `Set-Cookie` below.
+          headers:
+            Set-Cookie:
+              description: >
+                `rift_session=; Max-Age=0; Path=/` — the caller's session
+                ended with the rest, so the browser is told to drop it.
+              schema:
+                type: string
+                example: 'rift_session=; Max-Age=0; Path=/'
+        '400':
+          $ref: '#/components/responses/BadData'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '504':
+          $ref: '#/components/responses/WriteTimeout'
 
   # ---------------------------------------------------------------------
   # upstream: process-level / core admin surface

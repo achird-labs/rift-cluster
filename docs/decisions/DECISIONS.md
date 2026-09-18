@@ -2896,8 +2896,9 @@ authorization data would be a second source of truth for a decision the key alre
 **this supersedes D-46**, which refused the legacy `--api-key` a session because the synthetic
 identity it named had no principal row behind it: with one credential there is no other key, so
 the key *is* what the exchange accepts. Rotating `SessionKeyPut` remains the only revocation.
-(As of 2026-09-17 nothing can issue that rotation — the front mints only the first key — so the
-8-hour `Max-Age` is the bound that holds in practice; the trigger is open in #619.)
+(**Refined by D-85** (#619): that rotation had no trigger — the front minted only the first key —
+so for a time the 8-hour `Max-Age` was the bound that actually held. `POST /session/rotate` now
+issues one, and a changed `--api-key` is a second bound.)
 
 **Keys lose their tenant component — a true removal, not a `default` shim.** `sm_configs` is keyed
 by `u16`, `sm_routes` by route id, `sm_routes_revision` is a one-row table beside
@@ -3741,3 +3742,81 @@ server-wide or generated pair, and a server-wide private key does not belong in 
 fixture. **Warning only when the fleet holds keys, decided before the read** — neither the list nor
 the single-imposter read carries TLS fields, so the dialog would have to fetch every key to decide
 whether to mention them.
+
+
+### D-85 — A console session ends when the operator says so or when the key it stood in for changes: `POST /session/rotate`, and a signing key bound to `--api-key`
+
+- **Status:** active
+- **Decided:** 2026-09-17 · #619
+- **Implemented by:** #619
+- **Amends:** RFC-006 §5.3
+- **Refines:** D-73
+- **Code:** crates/rift-cluster-server/src/admin_front.rs, crates/rift-cluster-server/src/session.rs
+
+**The gap.** D-73 left signing-key rotation as this fleet's only revocation, and nothing could
+issue one. `ensure_session_key` was the codebase's only `SessionKeyPut` submitter and it returned
+early whenever a key already existed; no route, flag or subcommand wrote a second. Every layer
+beneath the trigger was built and tested — the op overwrites unconditionally, `apply` stamps the
+revision from the log index, every token carries `kr`, `verify` refuses a superseded one, and two
+fleet tests pinned that a rotation kills a live cookie on every node — but the two tests reached
+the control plane in-process, "the way an operator tool would", and no such tool existed. So the
+only bound that actually held was the 8-hour `Max-Age`. This is original to #185, not a D-73
+regression: #185, RFC-006 §12 Q4 and RFC-006 §5.3 each named the lever and none gave it a caller.
+D-73 is simply when an unbuilt lever became the *only* one.
+
+**Two rules close it.**
+
+**(1) `POST /session/rotate` commits a fresh key, unconditionally.** Behind the ordinary
+`authenticate` chokepoint — the API key as a bearer, or a session cookie plus `X-Rift-CSRF` — and
+through the same validate → park → submit → await-local-applied path the first mint uses, extracted
+into `commit_new_session_key` so the mint and the rotation are one code path rather than two that
+have to agree. Any node serves it; a follower forwards. **The caller's own session ends too** and
+the response clears their cookie, so afterwards every live session was minted by someone who
+presented the API key since — "end the others, keep mine" keeps the thief if the caller *is* the
+thief. `400` on a fleet with no `--api-key` (no sessions to end), checked **before** authenticating
+because an open plane admits everyone and would otherwise let any caller commit a signing key.
+
+**(2) The signing key is the replicated record bound to this node's `--api-key`:**
+`HMAC-SHA256(session_key, "rift-session/api-key-binding\0" ‖ api_key)`. A node started with a
+different key derives a different MAC key and refuses every cookie minted under the old one — no
+Raft write, no stored fingerprint, nothing to coordinate. Cookie acceptance on a node now tracks
+bearer acceptance on that node exactly, including mid-roll: the nodes already disagree about the
+bearer during a rolling restart, and the cookie now disagrees the same way and for no longer.
+Without this the runbook would read "change the key, then remember to rotate sessions", whose
+forgotten second step fails silently in exactly the situation it exists for.
+
+The unbound state is made unrepresentable rather than left to convention: `SigningKey` is a newtype
+whose only constructor is `SigningKey::derive(&SessionKey, api_key)`, `mint`/`verify` take it, and
+its `Debug` never renders the key. `derive` restates `control::validate`'s own rule — exactly
+`SESSION_KEY_BYTES` of hex — and refuses anything else instead of falling back to the raw string's
+bytes, because fallback material signs and verifies perfectly well against itself and would hide a
+state-machine invariant breach behind sessions that work. `FORMAT_TAG` moves to `v2`: the signed
+span's *meaning* changed with the key under it, so a pre-upgrade cookie must read as a format this
+build does not speak rather than as a forgery. The one upgrade effect is that every console session
+ends once; during a rolling upgrade old and new nodes refuse each other's cookies.
+
+**No log-format or state change.** `ControlOp`, the `SessionKey` record and the snapshot payload
+are untouched — this is a trigger and a key derivation, not a new shape of replicated state.
+
+**Limits, stated rather than fixed.** A partitioned node honours old cookies until it applies the
+rotation, or until they expire; it can serve reads to that cookie meanwhile, never writes. A
+rotation that times out is parked for replay like every write on this front, so a `504` can still
+land later and end sessions minted in between — it fails closed. A login racing a rotation can be
+handed a cookie that is dead on arrival; the next request answers `401` and the console returns to
+the login screen.
+
+*Rejected:* **auto-rotating when a node sees a changed `--api-key` at startup** — needs a key
+fingerprint in replicated state to detect the change, and every restarted node in a roll would
+rotate again, each ending sessions just minted on already-restarted nodes; rule (2) reaches the
+same outcome with no state at all. **A CLI subcommand over the cluster port** — a second client
+mode and a second credential for a write the admin plane already authenticates, forwards, parks and
+deadlines. **Scheduled rotation** (RFC-006 §12 Q4's other branch) — logs everyone out on a timer
+and bounds nothing `Max-Age` does not. **A session table / per-session revocation** — still the
+stated non-goal (#185, RFC-006 §10); sessions stay stateless. **Overloading
+`DELETE /session?all=true`** — `DELETE /session` is unauthenticated and always answers `204`, so an
+operator one query parameter off would read a success for a revocation that never happened;
+`POST /session` without the suffix fails loudly instead. **A console "Sign out everywhere" button**
+— a reasonable follow-up, but it brings a confirm dialog, the design README, the prototype and new
+visual baselines for something an operator reaches for a few times a year; the route is the runbook
+lever RFC-006 §12 Q4 asked for. D-24 does not bear on this either way: it governs maintenance the
+cluster performs on its own, and no automatic process can decide that a session is compromised.

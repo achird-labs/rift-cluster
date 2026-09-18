@@ -457,9 +457,10 @@ async fn rotating_the_signing_key_invalidates_every_session() {
     .await;
     assert_eq!(seen.status, 200, "{seen}");
 
-    // Rotate: a fresh key under a new revision. There is no rotation endpoint by design (a sixth
-    // route would break the contract's parity gate), so this goes through the control plane the
-    // way an operator tool would.
+    // Rotate: a fresh key under a new revision, written straight to the control plane. This test
+    // pins the *mechanism* — a token dies the instant its revision is superseded — independently
+    // of what triggers it, which is why it stays an in-process write now that
+    // `POST /session/rotate` exists (D-85) and is pinned by the two-node test.
     seed(
         node,
         op_id,
@@ -778,9 +779,12 @@ async fn put_fleet_name_refuses_a_malformed_body_without_committing() {
 /// replicated state, so a cookie minted on the founder must verify on the joiner with no second
 /// login and no shared process state beyond the Raft log.
 ///
-/// The same two nodes then pin rotation: a `SessionKeyPut` committed through the founder kills
-/// the cookie on the joiner too. `rotating_the_signing_key_invalidates_every_session` proves the
-/// mechanism solo; this is the only test in which "every session" spans a second node.
+/// The same two nodes then pin rotation end to end — **Pins D-85**: `POST /session/rotate`,
+/// called on the joiner so the write is forwarded to the leader, kills the founder-minted cookie
+/// on *both* nodes, and a fresh login still works afterwards.
+/// `rotating_the_signing_key_invalidates_every_session` proves the mechanism solo; this is the
+/// only test in which "every session" spans a second node, and the only one that proves anything
+/// outside the process can trigger the revocation at all.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_api_key_mints_a_session_and_the_cookie_is_accepted_on_every_node() {
     let founder_state = TempDir::new().expect("tempdir");
@@ -880,17 +884,50 @@ async fn the_api_key_mints_a_session_and_the_cookie_is_accepted_on_every_node() 
     }
 
     // Rotation is the only revocation D-73 leaves, and it has to reach every node: a cookie that
-    // dies on the founder but keeps reading the joiner is a session that was never revoked. There
-    // is no rotation endpoint by design, so this goes through the founder's control plane the way
-    // an operator tool would, and the cookie is then watched die on both nodes.
-    seed(
-        founder.node().expect("clustered"),
-        0x5e55_10f0,
-        ControlOp::SessionKeyPut {
-            key: "f".repeat(64),
-        },
+    // dies on the founder but keeps reading the joiner is a session that was never revoked. It is
+    // triggered here the way an operator does it (D-85) — `POST /session/rotate` — and on the
+    // **joiner**, so the write is one a follower had to forward to the leader before any of it
+    // could be true.
+    //
+    // The two refusals come first, on the same route, because a rotation anyone can call is a
+    // denial of service on every operator at once.
+    let seen = Seen::of(
+        client
+            .post(format!("http://{joiner_admin}/session/rotate"))
+            .send()
+            .await
+            .expect("rotate without a credential"),
     )
     .await;
+    assert_eq!(
+        seen.status, 401,
+        "an unauthenticated rotation must be refused: {seen}"
+    );
+    let seen = Seen::of(
+        client
+            .post(format!("http://{joiner_admin}/session/rotate"))
+            .header("cookie", &cookie)
+            .send()
+            .await
+            .expect("rotate by cookie without the CSRF header"),
+    )
+    .await;
+    assert_eq!(
+        seen.status, 403,
+        "a cookie-authenticated rotation without X-Rift-CSRF is forgeable and must be refused: \
+         {seen}"
+    );
+
+    let seen = Seen::of(
+        client
+            .post(format!("http://{joiner_admin}/session/rotate"))
+            .header("authorization", API_KEY)
+            .send()
+            .await
+            .expect("rotate"),
+    )
+    .await;
+    assert_eq!(seen.status, 204, "the key rotates the signing key: {seen}");
     for admin in [&founder_admin, &joiner_admin] {
         // The joiner applies the rotation through the log, which is not instantaneous — so the
         // answer waited for is the refusal, and a `200` is what must stop appearing.
@@ -916,8 +953,327 @@ async fn the_api_key_mints_a_session_and_the_cookie_is_accepted_on_every_node() 
         }
     }
 
+    // A rotation ends every session; it does not end *sessions*. Logging in again — on the node
+    // that served the rotation — must mint a cookie the other node accepts, or the lever is a
+    // lockout rather than a revocation.
+    let login = Seen::of(
+        client
+            .post(format!("http://{joiner_admin}/session"))
+            .json(&serde_json::json!({ "apiKey": API_KEY }))
+            .send()
+            .await
+            .expect("login after rotation"),
+    )
+    .await;
+    assert_eq!(
+        login.status, 200,
+        "a rotation must not stop the key minting new sessions: {login}"
+    );
+    let fresh = format!("rift_session={}", session_cookie(&login));
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let seen = Seen::of(
+            client
+                .get(format!("http://{founder_admin}/imposters/{port}"))
+                .header("cookie", &fresh)
+                .send()
+                .await
+                .expect("read with the post-rotation cookie"),
+        )
+        .await;
+        if seen.status == 200 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "a cookie minted after the rotation is not accepted on the other node: {seen}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // The mode D-85 advertises most loudly, and the one the bearer rotation above cannot show: an
+    // operator already *in* the console evicts a thief by rotating with the session cookie plus the
+    // CSRF header. It follows structurally from the shared `authenticate`, but nothing pinned it —
+    // a change that made rotation bearer-only would have left the whole suite green. The caller's
+    // own cookie is the one that dies, which is the point rather than a side effect.
+    let seen = Seen::of(
+        client
+            .post(format!("http://{founder_admin}/session/rotate"))
+            .header("cookie", &fresh)
+            .header("x-rift-csrf", "1")
+            .send()
+            .await
+            .expect("rotate by cookie"),
+    )
+    .await;
+    assert_eq!(
+        seen.status, 204,
+        "a session cookie plus the CSRF header must be able to rotate: {seen}"
+    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let seen = Seen::of(
+            client
+                .get(format!("http://{joiner_admin}/imposters/{port}"))
+                .header("cookie", &fresh)
+                .send()
+                .await
+                .expect("read after the cookie-authenticated rotation"),
+        )
+        .await;
+        if seen.status == 401 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the rotating caller's own cookie outlived the rotation it asked for: {seen}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
     joiner.shutdown().await;
     founder.shutdown().await;
+}
+
+/// Pins D-85: a node restarted with a different `--api-key` refuses the cookies minted under the
+/// old one — no rotation written, no coordination, nothing replicated.
+///
+/// The control at the end is the half that makes this a test rather than an assertion that
+/// restarts break sessions: restarted with the *same* key over the same state directory, the very
+/// same cookie still authenticates, which is what chapter 9 promises a session survives.
+#[tokio::test]
+async fn a_changed_api_key_ends_the_sessions_it_minted() {
+    let state = TempDir::new().expect("tempdir");
+    let server = compose::start(cluster_cli(&state, &[]))
+        .await
+        .expect("solo cluster starts");
+    wait_ready(&server).await;
+    let client = reqwest::Client::new();
+
+    let login = Seen::of(
+        client
+            .post(format!("http://{}/session", server.admin_addr()))
+            .json(&serde_json::json!({ "apiKey": API_KEY }))
+            .send()
+            .await
+            .expect("login"),
+    )
+    .await;
+    assert_eq!(login.status, 200, "{login}");
+    let cookie = format!("rift_session={}", session_cookie(&login));
+    server.shutdown().await;
+
+    let mut restarted = cluster_cli(&state, &[]);
+    restarted.oss.api_key = Some("a-completely-different-fleet-key".to_owned());
+    let server = compose::start(restarted)
+        .await
+        .expect("restarts under a new key");
+    wait_ready(&server).await;
+    let seen = Seen::of(
+        client
+            .get(format!("http://{}/_fleet/health", server.admin_addr()))
+            .header("cookie", &cookie)
+            .send()
+            .await
+            .expect("health under the new key"),
+    )
+    .await;
+    assert_eq!(
+        seen.status, 401,
+        "a cookie minted under the old --api-key still authenticates after the key changed: \
+         {seen}"
+    );
+    server.shutdown().await;
+
+    // Control: the same state, the same cookie, the original key — still a live session.
+    let server = compose::start(cluster_cli(&state, &[]))
+        .await
+        .expect("restarts under the original key");
+    wait_ready(&server).await;
+    let seen = Seen::of(
+        client
+            .get(format!("http://{}/_fleet/health", server.admin_addr()))
+            .header("cookie", &cookie)
+            .send()
+            .await
+            .expect("health under the original key"),
+    )
+    .await;
+    assert_eq!(
+        seen.status, 200,
+        "restarting under the unchanged key must not end a session: {seen}"
+    );
+    server.shutdown().await;
+}
+
+/// Pins D-85's fail-closed half: a rotation that cannot commit must not answer as though it had.
+///
+/// `session_rotate` builds its `204` *after* `commit_new_session_key` returns, so dropping that one
+/// guard would report a fleet-wide revocation that never happened — a success status for work that
+/// did not occur, which is the shape this codebase treats as a defect even at a last resort. Every
+/// other rotation test either refuses before the write or lets the write succeed; this is the only
+/// one in which the write itself fails, so without it that guard can be deleted with the suite
+/// still green.
+///
+/// Quorum is broken by killing the founder of a two-node fleet. The joiner is left unable to commit
+/// either way — as a voter it cannot reach a quorum of two alone, and as a learner it has no leader
+/// to forward to — which is the precondition this test needs and the reason it asserts the *class*
+/// of refusal rather than one exact status. What it does assert exactly is that the answer is not
+/// `204` and that no clearing `Set-Cookie` rides along: telling a browser its session is over is
+/// the same lie as the `204`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_rotation_that_cannot_commit_does_not_answer_as_though_it_had() {
+    let founder_state = TempDir::new().expect("tempdir");
+    let joiner_state = TempDir::new().expect("tempdir");
+    let founder_bind = reserve_addr();
+    let founder = compose::start(cluster_on(
+        &founder_state,
+        &founder_bind,
+        &["--cluster-allow-solo"],
+    ))
+    .await
+    .expect("founder starts");
+    wait_ready(&founder).await;
+    let joiner = compose::start(cluster_on(
+        &joiner_state,
+        &reserve_addr(),
+        &["--cluster-seeds", &founder_bind],
+    ))
+    .await
+    .expect("joiner starts");
+    wait_ready(&joiner).await;
+    let joiner_admin = joiner.admin_addr().to_string();
+    let client = reqwest::Client::new();
+
+    // Log in through the joiner while the fleet still has a quorum, so the signing key exists and
+    // the cookie below is a real one — the rotation that fails later is failing to *replace* a key,
+    // not to mint the first.
+    let login = Seen::of(
+        client
+            .post(format!("http://{joiner_admin}/session"))
+            .json(&serde_json::json!({ "apiKey": API_KEY }))
+            .send()
+            .await
+            .expect("login"),
+    )
+    .await;
+    assert_eq!(login.status, 200, "{login}");
+    let cookie = format!("rift_session={}", session_cookie(&login));
+
+    founder.shutdown().await;
+
+    let seen = Seen::of(
+        client
+            .post(format!("http://{joiner_admin}/session/rotate"))
+            .header("authorization", API_KEY)
+            .send()
+            .await
+            .expect("rotate without a quorum"),
+    )
+    .await;
+    assert_ne!(
+        seen.status, 204,
+        "a rotation that never committed answered as though every session had ended: {seen}"
+    );
+    assert!(
+        seen.status == 503 || seen.status == 504,
+        "a rotation that cannot commit must be refused as unavailable or timed out, not {}: {seen}",
+        seen.status
+    );
+    assert!(
+        seen.header("set-cookie").is_none(),
+        "a refused rotation must not tell the browser its session is over: {seen}"
+    );
+    // The cookie is untouched by a rotation that did not happen: same key, same revision.
+    let seen = Seen::of(
+        client
+            .get(format!("http://{joiner_admin}/_fleet/health"))
+            .header("cookie", &cookie)
+            .send()
+            .await
+            .expect("health after the refused rotation"),
+    )
+    .await;
+    assert_ne!(
+        seen.status, 401,
+        "a rotation that was refused must not have ended the caller's session: {seen}"
+    );
+
+    joiner.shutdown().await;
+}
+
+/// The two refusals `POST /session/rotate` owes that a keyed two-node fleet cannot show: a fleet
+/// with no `--api-key` has no sessions to end and must say so rather than commit a signing key,
+/// and every other method on the path is a `405` rather than a silent fall-through to the
+/// classifier.
+#[tokio::test]
+async fn rotate_refuses_an_open_plane_and_every_method_but_post() {
+    let state = TempDir::new().expect("tempdir");
+    let mut open = cluster_cli(&state, &[]);
+    open.oss.api_key = None;
+    let server = compose::start(open).await.expect("open-plane fleet starts");
+    wait_ready(&server).await;
+    let node = server.node().expect("clustered");
+    let client = reqwest::Client::new();
+
+    let seen = Seen::of(
+        client
+            .post(format!("http://{}/session/rotate", server.admin_addr()))
+            .send()
+            .await
+            .expect("rotate on an open plane"),
+    )
+    .await;
+    assert_eq!(
+        seen.status, 400,
+        "an open plane has no sessions to end and must refuse rather than commit a key: {seen}"
+    );
+    assert!(
+        node.session_key().expect("read session key").is_none(),
+        "a refused rotation must not have committed a signing key"
+    );
+    server.shutdown().await;
+
+    let state = TempDir::new().expect("tempdir");
+    let server = compose::start(cluster_cli(&state, &[]))
+        .await
+        .expect("keyed fleet starts");
+    wait_ready(&server).await;
+    let node = server.node().expect("clustered");
+    let seen = Seen::of(
+        client
+            .delete(format!("http://{}/session/rotate", server.admin_addr()))
+            .header("authorization", API_KEY)
+            .send()
+            .await
+            .expect("DELETE on the rotate route"),
+    )
+    .await;
+    assert_eq!(
+        seen.status, 405,
+        "only POST rotates; anything else must be a 405, not a route miss: {seen}"
+    );
+
+    // A *wrong* bearer is a refusal, never a fall-through to the cookie branch — the same rule
+    // `authenticate` applies everywhere, asserted on this route because it is the one that writes.
+    let seen = Seen::of(
+        client
+            .post(format!("http://{}/session/rotate", server.admin_addr()))
+            .header("authorization", "not-this-fleets-key")
+            .send()
+            .await
+            .expect("rotate with the wrong key"),
+    )
+    .await;
+    assert_eq!(
+        seen.status, 401,
+        "a rotation presenting the wrong key must be refused: {seen}"
+    );
+    assert!(
+        node.session_key().expect("read session key").is_none(),
+        "no refused request on this route may have committed a signing key"
+    );
+    server.shutdown().await;
 }
 
 /// The gate is real: with `--api-key` set, an unauthenticated admin request is refused on every

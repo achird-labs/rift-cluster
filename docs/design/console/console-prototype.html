@@ -1861,7 +1861,7 @@
               8-hour <code>Max-Age</code>. Being HttpOnly, no script in the page — injected or
               otherwise — can read the key or the session.</div>
           </div>
-          <p class="hint" style="margin:0">No SSO in v1: the exchange takes an API key, and OIDC arrives later as a second way to mint the same cookie. There is no per-session revocation either — the bounds are the TTL, signing-key rotation, and disabling the principal. Both are stated non-goals rather than gaps.</p>
+          <p class="hint" style="margin:0">No SSO in v1: the exchange takes an API key, and OIDC arrives later as a second way to mint the same cookie. There is no per-session revocation either — the bounds are the TTL, signing-key rotation (POST /session/rotate) and changing the fleet&rsquo;s --api-key. Both are stated non-goals rather than gaps.</p>
         </div>
       </div>`;
   }
