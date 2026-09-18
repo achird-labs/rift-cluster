@@ -5,6 +5,7 @@
 //! the crypto provider and tracing, resolve the runtime topology, then compose
 //! and serve.
 
+use anyhow::Context as _;
 use clap::Parser as _;
 use rift_cluster_base::rift_http_proxy::bootstrap::log_filter;
 use rift_cluster_base::rift_http_proxy::{healthcheck, runtime, script_cli};
@@ -91,7 +92,10 @@ fn main() -> anyhow::Result<()> {
     }
 
     rift_cluster_base::rift_http_proxy::install_default_crypto_provider();
-    init_tracing(&cli)?;
+    // Held for the life of `main` and dropped on every exit path, `?` included:
+    // dropping it is what flushes the log file's non-blocking writer (#627,
+    // upstream #1155).
+    let _log_guard = init_tracing(&cli)?;
     for warning in rcfile_warnings {
         warn!("{warning}");
     }
@@ -113,7 +117,16 @@ fn main() -> anyhow::Result<()> {
         "starting RiftCluster"
     );
 
-    run(cli)
+    // The server removes the PID file it wrote on the way out, success and error
+    // alike (#627, upstream #1155); a Ctrl+C, a plain `kill` or a `docker stop`
+    // used to leave a stale one behind.
+    let written_pidfile = cli.oss.pidfile.clone();
+    let result = run(cli);
+    if let Some(pidfile) = written_pidfile {
+        bootstrap::remove_own_pidfile(&pidfile);
+    }
+    info!("stopped");
+    result
 }
 
 fn run(cli: EeCli) -> anyhow::Result<()> {
@@ -134,7 +147,12 @@ fn run(cli: EeCli) -> anyhow::Result<()> {
             let tokio_runtime = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()?;
-            tokio_runtime.block_on(serve(cli, Vec::new()))
+            let result = tokio_runtime.block_on(serve(cli, Vec::new()));
+            // Bounded, not an implicit drop: a script still running on a
+            // blocking thread would otherwise hold a graceful shutdown for
+            // ever. See `runtime::BLOCKING_DRAIN` (upstream #1155).
+            tokio_runtime.shutdown_timeout(runtime::BLOCKING_DRAIN);
+            result
         }
         runtime::RuntimeTopology::PerCore { workers } => {
             // Unreachable with --cluster: the startup guards refuse the pairing
@@ -156,14 +174,35 @@ fn run(cli: EeCli) -> anyhow::Result<()> {
             info!("Per-core workers up: {}", alive.len());
             let result = control.block_on(serve(cli, workers.handles()));
             workers.shutdown();
+            control.shutdown_timeout(runtime::BLOCKING_DRAIN);
             result
         }
     }
 }
 
 async fn serve(cli: EeCli, accept_runtimes: Vec<tokio::runtime::Handle>) -> anyhow::Result<()> {
+    // Installed before anything starts, so a signal that lands during startup is
+    // held rather than dropped — as a container's PID 1, a SIGTERM with no
+    // handler is discarded by the kernel (D-89, upstream #1155).
+    let mut signals =
+        TerminationSignals::install().context("installing the termination-signal handler")?;
     let clustered = cli.cluster.cluster;
-    let server = compose::start_with_runtimes(cli, accept_runtimes).await?;
+    // Startup is raced against the signal rather than made to finish first: a
+    // clustered start can spend up to 30 s retrying its seeds or waiting for a
+    // leader, and a node told to stop in that window should stop, not join and
+    // then leave — which would also outrun `stop`'s ceiling (D-88). Nothing is
+    // serving yet, so abandoning the start is the old signal-kills-the-process
+    // outcome: crash-equivalent, which a restarting member already tolerates by
+    // resuming from its durable log — minus the dependence on not being PID 1
+    // (D-89).
+    let server = tokio::select! {
+        biased;
+        signal = signals.recv() => {
+            info!(signal, "termination signal received during startup; not starting");
+            return Ok(());
+        }
+        server = compose::start_with_runtimes(cli, accept_runtimes) => server?,
+    };
     info!(admin = %server.admin_addr(), "admin API listening");
     if let Some(probes) = server.probe_addr() {
         info!(%probes, "probes listening");
@@ -172,59 +211,83 @@ async fn serve(cli: EeCli, accept_runtimes: Vec<tokio::runtime::Handle>) -> anyh
         info!(%cluster, "cluster port listening");
     }
 
-    if !clustered {
-        // Without clustering there is nothing to leave gracefully; keep the
-        // open-source binary's behaviour exactly, including ending when the
-        // admin accept loop does.
-        return server.join().await;
-    }
-
-    // SIGTERM is the orchestrator's "you are going away" and must start the
-    // graceful leave rather than drop connections; the pod's grace period is
-    // what bounds it, so set it to at least twice --cluster-leave-timeout.
-    //
-    // The admin plane is raced against the signal, so an accept loop that dies
-    // on its own ends this node too — and its error is what `serve` returns.
+    // One path for both modes. The admin plane is raced against the signal, so
+    // an accept loop that dies on its own ends this node too — and its error is
+    // what `serve` returns. Clustered, the signal starts the graceful leave
+    // (RFC-001 §7.1.2); size the pod's grace period to at least twice
+    // --cluster-leave-timeout. Unclustered there is nothing to leave: the leave
+    // window is zero, and what remains is upstream's own shutdown — stop
+    // accepting, then `RunningServer::shutdown`. Never the manager's shutdown,
+    // which would delete every imposter and unlink its --datadir file: an
+    // unclustered `ComposedServer` holds no manager of its own.
     server
-        .serve_until(async {
-            termination_signal().await;
-            info!("termination signal received; beginning graceful leave");
+        .serve_until(async move {
+            let signal = signals.recv().await;
+            if clustered {
+                info!(
+                    signal,
+                    "termination signal received; beginning graceful leave"
+                );
+            } else {
+                info!(signal, "termination signal received; shutting down");
+            }
         })
         .await
 }
 
-#[cfg(unix)]
-async fn termination_signal() {
-    use tokio::signal::unix::{SignalKind, signal};
-    let mut sigterm = match signal(SignalKind::terminate()) {
-        Ok(sigterm) => sigterm,
-        Err(e) => {
-            // Without SIGTERM there is no graceful leave, and pretending
-            // otherwise would let an operator configure a grace period that
-            // never gets used.
-            tracing::error!(error = %e, "cannot listen for SIGTERM; graceful leave is unavailable");
-            return std::future::pending().await;
+/// The termination signals this binary handles: SIGTERM and SIGINT on unix,
+/// Ctrl+C elsewhere.
+struct TerminationSignals {
+    #[cfg(unix)]
+    term: tokio::signal::unix::Signal,
+    #[cfg(unix)]
+    int: tokio::signal::unix::Signal,
+    #[cfg(windows)]
+    ctrl_c: tokio::signal::windows::CtrlC,
+}
+
+impl TerminationSignals {
+    /// Register the handlers now. A failed install refuses startup: a server
+    /// that silently cannot be stopped gracefully is the defect being fixed.
+    fn install() -> std::io::Result<Self> {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{SignalKind, signal};
+            Ok(Self {
+                term: signal(SignalKind::terminate())?,
+                int: signal(SignalKind::interrupt())?,
+            })
         }
-    };
-    tokio::select! {
-        _ = sigterm.recv() => {}
-        result = tokio::signal::ctrl_c() => {
-            if let Err(e) = result {
-                tracing::error!(error = %e, "ctrl-c handler failed");
+        #[cfg(windows)]
+        {
+            Ok(Self {
+                ctrl_c: tokio::signal::windows::ctrl_c()?,
+            })
+        }
+    }
+
+    /// Resolve on the first signal, naming it for the log.
+    async fn recv(&mut self) -> &'static str {
+        #[cfg(unix)]
+        {
+            tokio::select! {
+                _ = self.term.recv() => "SIGTERM",
+                _ = self.int.recv() => "SIGINT",
             }
         }
+        #[cfg(windows)]
+        {
+            self.ctrl_c.recv().await;
+            "Ctrl+C"
+        }
     }
 }
 
-#[cfg(not(unix))]
-async fn termination_signal() {
-    if let Err(e) = tokio::signal::ctrl_c().await {
-        tracing::error!(error = %e, "ctrl-c handler failed");
-        std::future::pending::<()>().await;
-    }
-}
-
-fn init_tracing(cli: &EeCli) -> anyhow::Result<()> {
+/// Install the subscriber. Returns the file writer's guard, if there is a log
+/// file, for `main` to hold: dropping it flushes the writer.
+fn init_tracing(
+    cli: &EeCli,
+) -> anyhow::Result<Option<tracing_appender::non_blocking::WorkerGuard>> {
     // Upstream's rules, called rather than copied (#594, upstream #1134). This
     // used to be a copy of upstream's `main.rs`, and both copies fell through to
     // `info` for a level that does not exist — `trace` included — and mistook an
@@ -240,17 +303,17 @@ fn init_tracing(cli: &EeCli) -> anyhow::Result<()> {
     // directory cannot be created (`--log /nonexistent-root/x.log`). Upstream
     // behaves identically, and diverging here would be the drift this crate
     // exists to prevent, so it is left alone deliberately.
+    let mut log_guard = None;
     let file_layer: Option<Box<dyn Layer<_> + Send + Sync>> = if !cli.oss.nologfile {
         cli.oss.log.as_ref().and_then(|log_path| {
             let dir = log_path.parent().unwrap_or(std::path::Path::new("."));
             let filename = log_path.file_name()?.to_string_lossy().into_owned();
             let file_appender = tracing_appender::rolling::never(dir, filename);
             let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
-            // Leaked so the writer outlives this function, mirroring upstream.
-            // Returning the guard for `main` to hold would work here — this
-            // binary does have shutdown paths — but would diverge; the cost is
-            // that the tail of the log is not flushed on exit.
-            Box::leak(Box::new(guard));
+            // Returned for `main` to hold, as upstream has since #1155. It
+            // used to be leaked to mirror upstream's old leak, so lines still
+            // queued when the process ended could be lost.
+            log_guard = Some(guard);
             Some(fmt::layer().with_writer(non_blocking).boxed())
         })
     } else {
@@ -262,5 +325,5 @@ fn init_tracing(cli: &EeCli) -> anyhow::Result<()> {
         .with(env_filter)
         .with(file_layer)
         .init();
-    Ok(())
+    Ok(log_guard)
 }

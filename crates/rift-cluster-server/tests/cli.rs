@@ -806,6 +806,182 @@ fn stop_waits_out_a_clustered_nodes_leave_window() {
     assert!(!pidfile.exists(), "a completed stop removes the PID file");
 }
 
+/// Pins #627 (upstream #1155) against the real binary: an unclustered node handles SIGTERM —
+/// it shuts down through the server, exits 0, and removes the PID file it wrote. It installed no
+/// handler, so the signal's default action killed it (as a container's PID 1 the kernel
+/// discards it instead, and `docker stop` waited out its timeout), and the PID file stayed
+/// behind.
+#[cfg(unix)]
+#[test]
+fn an_unclustered_node_exits_cleanly_on_sigterm_and_removes_its_pidfile() {
+    assert_clean_signal_exit("-TERM");
+}
+
+#[cfg(unix)]
+#[test]
+fn an_unclustered_node_exits_cleanly_on_sigint_too() {
+    assert_clean_signal_exit("-INT");
+}
+
+#[cfg(unix)]
+fn assert_clean_signal_exit(signal: &str) {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let pidfile = dir.path().join("node.pid");
+    let admin = closed_addr();
+    let port = admin.rsplit(':').next().expect("port").to_owned();
+    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_rift-cluster-server"));
+    command
+        .env_remove("MB_APIKEY")
+        .env_remove("RIFT_CLUSTER")
+        .args([
+            "--host",
+            "127.0.0.1",
+            "--port",
+            &port,
+            "--cluster-probe-bind",
+            &closed_addr(),
+            "--pidfile",
+            &pidfile.to_string_lossy(),
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    with_clean_signal_mask(&mut command);
+    let mut node = command.spawn().expect("spawn the node");
+
+    // Listening means started, which is after the handler is installed.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while !(pidfile.exists() && std::net::TcpStream::connect(&admin).is_ok()) {
+        if std::time::Instant::now() >= deadline || node.try_wait().ok().flatten().is_some() {
+            let _ = node.kill();
+            panic!("the unclustered node never started listening on {admin}");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+
+    let killed = std::process::Command::new("kill")
+        .args([signal, &node.id().to_string()])
+        .status()
+        .expect("run kill");
+    assert!(killed.success(), "kill {signal} must reach the node");
+
+    let give_up = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = node.try_wait().expect("poll the node") {
+            break status;
+        }
+        if std::time::Instant::now() >= give_up {
+            let _ = node.kill();
+            let _ = node.wait();
+            panic!("the node did not exit within 10s of {signal}");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    };
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "a handled {signal} is a clean exit, not death by signal: {status}"
+    );
+    assert!(!pidfile.exists(), "the node removes the PID file it wrote");
+}
+
+/// A signal mask survives exec, and a test harness can run with SIGINT blocked — then the signal
+/// stays pending and no handler ever runs, which tests the harness rather than the server (this
+/// suite's own runner does exactly that). Docker, systemd, Kubernetes and an interactive shell do
+/// not block it, so start the server with a clean mask, as upstream's signal suite does.
+#[cfg(unix)]
+fn with_clean_signal_mask(command: &mut std::process::Command) {
+    use std::os::unix::process::CommandExt;
+    // SAFETY: `pre_exec` runs in the forked child before exec; sigemptyset and sigprocmask are
+    // async-signal-safe and touch only the child's own mask.
+    unsafe {
+        command.pre_exec(|| {
+            let mut none: libc::sigset_t = std::mem::zeroed();
+            libc::sigemptyset(&mut none);
+            if libc::sigprocmask(libc::SIG_SETMASK, &none, std::ptr::null_mut()) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+}
+
+/// Pins D-89's startup race: a clustered node signalled while it is still retrying its seeds
+/// exits promptly and cleanly. Held until startup finished instead, the signal waited out the
+/// whole 30-second seed deadline — and a node that did reach a seed would have joined only to
+/// leave, past `stop`'s ceiling (D-88).
+#[cfg(unix)]
+#[test]
+fn a_node_signalled_while_joining_exits_promptly() {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let pidfile = dir.path().join("node.pid");
+    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_rift-cluster-server"));
+    command
+        .env_remove("MB_APIKEY")
+        .args([
+            "--cluster",
+            "--cluster-bind",
+            "127.0.0.1:0",
+            "--cluster-secret",
+            "not-a-real-secret",
+            "--cluster-seeds",
+            &closed_addr(),
+            "--cluster-state-dir",
+            &dir.path().join("state").to_string_lossy(),
+            "--cluster-probe-bind",
+            &closed_addr(),
+            "--host",
+            "127.0.0.1",
+            "--port",
+            "0",
+            "--pidfile",
+            &pidfile.to_string_lossy(),
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    with_clean_signal_mask(&mut command);
+    let mut node = command.spawn().expect("spawn the node");
+
+    // The PID file is written just before the runtime starts; a moment later the node is
+    // inside the seed-retry loop, which an unreachable seed keeps it in for 30 s.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while !pidfile.exists() {
+        if std::time::Instant::now() >= deadline || node.try_wait().ok().flatten().is_some() {
+            let _ = node.kill();
+            panic!("the node never wrote its PID file");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    assert!(
+        node.try_wait().expect("poll").is_none(),
+        "the node must still be starting when signalled"
+    );
+
+    let signalled = std::time::Instant::now();
+    let killed = std::process::Command::new("kill")
+        .args(["-TERM", &node.id().to_string()])
+        .status()
+        .expect("run kill");
+    assert!(killed.success(), "kill -TERM must reach the node");
+    let status = loop {
+        if let Some(status) = node.try_wait().expect("poll the node") {
+            break status;
+        }
+        if signalled.elapsed() >= std::time::Duration::from_secs(10) {
+            let _ = node.kill();
+            let _ = node.wait();
+            panic!("a node signalled during startup must not wait out its seed deadline");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    };
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "a handled signal exits cleanly: {status}"
+    );
+    assert!(!pidfile.exists(), "the node removes the PID file it wrote");
+}
+
 /// Pins #594 (upstream #1134) against the real binary: an unrecognised
 /// `--loglevel` refuses startup with the value named. It used to become `info`
 /// silently, in both binaries, because this one carried a copy of upstream's

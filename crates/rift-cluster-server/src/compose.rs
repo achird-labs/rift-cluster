@@ -302,10 +302,15 @@ impl ComposedServer {
     /// the process mid-drain.
     pub async fn graceful_leave(self) {
         self.readiness.start_draining();
-        tracing::info!(
-            timeout_secs = self.leave_timeout.as_secs(),
-            "graceful leave: reporting not-ready and draining in-flight work"
-        );
+        // An unclustered node has no membership to leave and a zero window, so
+        // what follows is only the shutdown; saying "graceful leave" would
+        // describe something that does not happen.
+        if self.node.is_some() {
+            tracing::info!(
+                timeout_secs = self.leave_timeout.as_secs(),
+                "graceful leave: reporting not-ready and draining in-flight work"
+            );
+        }
 
         // The whole departure shares one budget: the orchestrator's grace period
         // is sized against `--cluster-leave-timeout`, so leaving the membership

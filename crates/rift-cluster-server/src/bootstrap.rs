@@ -107,6 +107,33 @@ pub fn write_pidfile(cli: &EeCli) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Remove the PID file this process wrote, on the way out — but only while it
+/// still names this process (D-89, upstream #1155).
+///
+/// A second server started on the same `--pidfile` has overwritten it with its
+/// own PID by then, and deleting that would orphan the live server from `stop`.
+/// Already gone is success: `stop` may have got there first. Any other failure
+/// is logged at error level rather than changing the exit code — the server did
+/// stop, and the file left behind names a process that no longer exists, which
+/// `stop` already treats as stale.
+pub fn remove_own_pidfile(pidfile: &Path) {
+    let ours = std::process::id().to_string();
+    match std::fs::read_to_string(pidfile) {
+        Ok(contents) if contents.trim() == ours => {}
+        Ok(_) => return,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+        Err(e) => {
+            tracing::error!(error = %e, ?pidfile, "could not read the PID file to remove it");
+            return;
+        }
+    }
+    match std::fs::remove_file(pidfile) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => tracing::error!(error = %e, ?pidfile, "could not remove the PID file"),
+    }
+}
+
 /// Reject a PID file body that names something other than a single process.
 ///
 /// `libc::kill` reads `0` as "every process in my process group" and `-1` as
@@ -499,6 +526,28 @@ mod tests {
     #[test]
     fn pidfile_absent_is_not_an_error() {
         write_pidfile(&cli(&[])).expect("no --pidfile is not a failure");
+    }
+
+    /// Pins D-89: the server removes its PID file on the way out only while the
+    /// file still names this process.
+    #[test]
+    fn remove_own_pidfile_removes_only_a_file_naming_this_process() {
+        let dir = TempDir::new().expect("tempdir");
+        let ours = write(&dir, "ours.pid", &std::process::id().to_string());
+        super::remove_own_pidfile(&ours);
+        assert!(!ours.exists(), "our own PID file is removed");
+
+        // A successor server on the same --pidfile has overwritten it.
+        let taken = write(&dir, "taken.pid", "1");
+        super::remove_own_pidfile(&taken);
+        assert_eq!(
+            std::fs::read_to_string(&taken).expect("still there"),
+            "1",
+            "a PID file naming another process is left for its owner"
+        );
+
+        // Already gone (stop got there first) is not an error.
+        super::remove_own_pidfile(&dir.path().join("absent.pid"));
     }
 
     /// AC3: `stop` signals the recorded process and clears the PID file.
