@@ -172,17 +172,29 @@ pub struct NodeConfig {
 }
 
 // Hand-written so the shared secret never lands in a log line — matching the
-// `Signer`/`Verifier` convention of not deriving `Debug` on secret-bearing types.
+// `Signer`/`Verifier` convention of not deriving `Debug` on secret-bearing types (D-87). Every field
+// is named with no `..`, so a new one does not compile until it is given a rendering here.
 impl std::fmt::Debug for NodeConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self {
+            node_id,
+            bind,
+            advertise,
+            data_dir,
+            secret,
+            routes,
+            engine,
+            snapshot_log_entries,
+        } = self;
         f.debug_struct("NodeConfig")
-            .field("node_id", &self.node_id)
-            .field("bind", &self.bind)
-            .field("advertise", &self.advertise)
-            .field("data_dir", &self.data_dir)
-            .field("secret", &self.secret.as_ref().map(|_| "<redacted>"))
-            .field("routes", &self.routes.len())
-            .field("engine", &self.engine.is_some())
+            .field("node_id", node_id)
+            .field("bind", bind)
+            .field("advertise", advertise)
+            .field("data_dir", data_dir)
+            .field("secret", &secret.as_ref().map(|_| "<redacted>"))
+            .field("routes", &routes.len())
+            .field("engine", &engine.is_some())
+            .field("snapshot_log_entries", snapshot_log_entries)
             .finish()
     }
 }
@@ -2234,6 +2246,27 @@ mod tests {
             engine: None,
             snapshot_log_entries: None,
         }
+    }
+
+    /// Pins D-87: a node's config never renders the cluster secret in `Debug`, and renders every
+    /// other field — including `snapshot_log_entries`, which the impl once left out.
+    #[test]
+    fn a_node_configs_debug_never_renders_the_secret() {
+        let dir = TempDir::new().expect("tempdir");
+        let config = NodeConfig {
+            snapshot_log_entries: Some(4242),
+            ..config_in(&dir, 7)
+        };
+        let rendered = format!("{config:?}");
+        assert!(!rendered.contains(SECRET), "the secret leaked: {rendered}");
+        assert!(
+            rendered.contains(r#"secret: Some("<redacted>")"#),
+            "got: {rendered}"
+        );
+        assert!(
+            rendered.contains("snapshot_log_entries: Some(4242)"),
+            "got: {rendered}"
+        );
     }
 
     /// A minimal real config for `port`, tagged with `name` so tests can tell

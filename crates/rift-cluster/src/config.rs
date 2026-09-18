@@ -89,7 +89,7 @@ pub enum ConfigError {
 ///
 /// The `Default` is a single node with clustering off — the same shape an
 /// operator gets by passing no `--cluster*` flags at all.
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct ClusterConfig {
     pub enabled: bool,
     pub bind: Option<SocketAddr>,
@@ -99,6 +99,32 @@ pub struct ClusterConfig {
     pub runtime: RuntimeTopology,
     /// Whether the data plane was asked to run the TLS-MITM intercept listener.
     pub intercept: bool,
+}
+
+// Hand-written so the cluster-port shared secret never lands in a log line (D-87), matching
+// `NodeConfig`. Every field is named with no `..`, so a new one does not compile until it is given
+// a rendering here.
+impl std::fmt::Debug for ClusterConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self {
+            enabled,
+            bind,
+            bind_public_ok,
+            secret,
+            insecure,
+            runtime,
+            intercept,
+        } = self;
+        f.debug_struct("ClusterConfig")
+            .field("enabled", enabled)
+            .field("bind", bind)
+            .field("bind_public_ok", bind_public_ok)
+            .field("secret", &secret.as_ref().map(|_| "<redacted>"))
+            .field("insecure", insecure)
+            .field("runtime", runtime)
+            .field("intercept", intercept)
+            .finish()
+    }
 }
 
 impl ClusterConfig {
@@ -146,6 +172,29 @@ impl ClusterConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Pins D-87: the cluster-port shared secret never renders in `Debug`; whether one is set, and
+    /// every non-secret field, still does.
+    #[test]
+    fn a_cluster_configs_debug_never_renders_the_secret() {
+        let config = ClusterConfig {
+            secret: Some("leak-canary-cluster-secret".into()),
+            ..valid()
+        };
+        let rendered = format!("{config:?}");
+        assert!(
+            !rendered.contains("leak-canary"),
+            "the secret leaked: {rendered}"
+        );
+        assert!(
+            rendered.contains(r#"secret: Some("<redacted>")"#),
+            "got: {rendered}"
+        );
+        assert!(rendered.contains("10.0.0.5:4790"), "got: {rendered}");
+
+        let open = format!("{:?}", ClusterConfig::default());
+        assert!(open.contains("secret: None"), "got: {open}");
+    }
 
     fn valid() -> ClusterConfig {
         ClusterConfig {

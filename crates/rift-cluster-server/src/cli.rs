@@ -12,7 +12,7 @@ use rift_cluster::{Authority, ClusterConfig, ConfigError, RuntimeTopology};
 use rift_cluster_base::seams::Cli as OssCli;
 
 /// The `--cluster*` flags.
-#[derive(clap::Args, Debug, Clone)]
+#[derive(clap::Args, Clone)]
 pub struct ClusterArgs {
     /// Run this node as part of a cluster (the master switch; every other
     /// --cluster* flag is inert without it)
@@ -162,6 +162,63 @@ pub struct ClusterArgs {
         env = "RIFT_CLUSTER_FLOW_FSYNC_INTERVAL_MS"
     )]
     pub cluster_flow_fsync_interval_ms: u64,
+}
+
+// Hand-written so `--cluster-secret` never lands in a log line (D-87). `--cluster-secret-file` is a
+// path, not the secret, and stays visible. Every field is named with no `..`, so a new flag does
+// not compile until it is given a rendering here.
+impl std::fmt::Debug for ClusterArgs {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self {
+            cluster,
+            cluster_bind,
+            cluster_bind_public_ok,
+            cluster_advertise,
+            cluster_seeds,
+            cluster_allow_solo,
+            cluster_secret,
+            cluster_secret_file,
+            cluster_insecure,
+            cluster_state_dir,
+            cluster_node_name,
+            cluster_leave_timeout,
+            cluster_snapshot_log_entries,
+            cluster_probe_bind,
+            cluster_write_barrier,
+            cluster_write_barrier_timeout,
+            cluster_admin_async,
+            cluster_flow_fsync_interval_ms,
+        } = self;
+        f.debug_struct("ClusterArgs")
+            .field("cluster", cluster)
+            .field("cluster_bind", cluster_bind)
+            .field("cluster_bind_public_ok", cluster_bind_public_ok)
+            .field("cluster_advertise", cluster_advertise)
+            .field("cluster_seeds", cluster_seeds)
+            .field("cluster_allow_solo", cluster_allow_solo)
+            .field(
+                "cluster_secret",
+                &cluster_secret.as_ref().map(|_| "<redacted>"),
+            )
+            .field("cluster_secret_file", cluster_secret_file)
+            .field("cluster_insecure", cluster_insecure)
+            .field("cluster_state_dir", cluster_state_dir)
+            .field("cluster_node_name", cluster_node_name)
+            .field("cluster_leave_timeout", cluster_leave_timeout)
+            .field("cluster_snapshot_log_entries", cluster_snapshot_log_entries)
+            .field("cluster_probe_bind", cluster_probe_bind)
+            .field("cluster_write_barrier", cluster_write_barrier)
+            .field(
+                "cluster_write_barrier_timeout",
+                cluster_write_barrier_timeout,
+            )
+            .field("cluster_admin_async", cluster_admin_async)
+            .field(
+                "cluster_flow_fsync_interval_ms",
+                cluster_flow_fsync_interval_ms,
+            )
+            .finish()
+    }
 }
 
 /// `--cluster-write-barrier` modes (issue #9 §4).
@@ -373,6 +430,33 @@ mod tests {
         let mut all = vec!["rift-cluster-server"];
         all.extend_from_slice(args);
         EeCli::try_parse_from(all).expect("parses")
+    }
+
+    /// Pins D-87: the parsed command line — the cluster flags *and* the upstream flags flattened
+    /// into it — never renders a credential in `Debug`. Covers the whole `EeCli`, not only
+    /// `ClusterArgs`, because `EeCli` derives `Debug` over the upstream `Cli` too: this is the
+    /// guard that fails if a pin moves to an upstream whose `Cli` prints its keys again.
+    #[test]
+    fn the_command_lines_debug_never_renders_a_credential() {
+        // Credentials assigned rather than parsed, so a developer's own `MB_APIKEY` or
+        // `RIFT_CLUSTER_SECRET` cannot change what is being rendered.
+        let mut cli = front(&["--cluster", "--cluster-bind", "10.0.0.5:4790"]);
+        cli.oss.api_key = Some("leak-canary-admin-token".to_owned());
+        cli.oss.intercept_auth = Some("leak-canary-user:leak-canary-pass".to_owned());
+        cli.oss.intercept_ca_key_pem = Some("leak-canary-private-key-pem".to_owned());
+        cli.cluster.cluster_secret = Some("leak-canary-cluster-secret".to_owned());
+        let rendered = format!("{cli:?}");
+        assert!(
+            !rendered.contains("leak-canary"),
+            "a credential leaked: {rendered}"
+        );
+        assert!(rendered.contains("10.0.0.5:4790"), "got: {rendered}");
+
+        let cluster = format!("{:?}", cli.cluster);
+        assert!(
+            cluster.contains(r#"cluster_secret: Some("<redacted>")"#),
+            "got: {cluster}"
+        );
     }
 
     /// Pins D-79: `--local-only` decides the **front's** bind, because under

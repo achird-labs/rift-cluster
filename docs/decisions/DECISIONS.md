@@ -3853,3 +3853,34 @@ silently fall back to whatever the author wrote. **Validating in `SessionKeyHex:
 (`control::validate`) and use (`SigningKey::derive`) already refuse a malformed key, and a value
 decoded from the log never passes a constructor. **`zeroize`** — a separate decision about
 in-memory lifetime, not about printing.
+
+### D-87 — No credential this server is configured with renders in `Debug`: the cluster secret, the admin API key, the intercept credentials
+
+- **Status:** active
+- **Decided:** 2026-09-17 · #623
+- **Implemented by:** #623
+- **Refines:** D-86
+- **Code:** crates/rift-cluster/src/config.rs, crates/rift-cluster-server/src/cli.rs, crates/rift-cluster/src/raft/node.rs
+
+**The gap.** D-86 covered the session key. Every other credential this binary is started with still
+sat under a derived `Debug`. `ClusterConfig.secret` and `ClusterArgs.cluster_secret` hold the
+cluster-port shared secret. `EeCli` derives `Debug` over the upstream `Cli` it flattens, which
+carries the admin API key, the intercept listener's `user:pass` and an inline CA private key.
+Nothing formatted any of them, so the leak was latent. One `?cli` in a startup log line would have
+printed all four.
+
+**The rule.** `ClusterConfig` and `ClusterArgs` hand-write `Debug` the way `NodeConfig` does: a set
+secret renders as `Some("<redacted>")` and an unset one as `None`, because whether a secret is
+configured is what a log line needs. Each impl, `NodeConfig`'s included, destructures `Self` with
+no `..` rest pattern, so a new field doesn't compile until someone decides how it renders.
+`NodeConfig`'s impl had already fallen behind its struct: it omitted `snapshot_log_entries`. File *paths*
+(`--cluster-secret-file`) are not secrets and stay visible. The upstream half is upstream's own
+`Cli` `Debug` (achird-labs/rift#1166). `EeCli` keeps its derive and is safe because the pinned
+upstream redacts. `the_command_lines_debug_never_renders_a_credential` asserts over the whole
+parsed `EeCli`, so it is also the guard that fails if a later pin brings the leak back.
+
+*Rejected:* **a redacting newtype for these fields**, the D-86 shape. These are clap-parsed,
+pub-field configuration read with `.as_deref()` at a dozen sites across two repositories. The
+session key's newtype paid for itself by protecting a large derived enum. Here each type gets one
+impl, and that impl is exhaustive. **Dropping `Debug` from `EeCli`** would work only until someone
+re-derives it, and it leaves the upstream `Cli` unprotected for upstream's own binary.
