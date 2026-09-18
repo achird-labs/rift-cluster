@@ -3884,3 +3884,33 @@ pub-field configuration read with `.as_deref()` at a dozen sites across two repo
 session key's newtype paid for itself by protecting a large derived enum. Here each type gets one
 impl, and that impl is exhaustive. **Dropping `Debug` from `EeCli`** would work only until someone
 re-derives it, and it leaves the upstream `Cli` unprotected for upstream's own binary.
+
+### D-88 — `stop` and `restart` wait out a clustered node's leave: the exit wait is `--cluster-leave-timeout` plus upstream's five-second shutdown bound
+
+- **Status:** active
+- **Decided:** 2026-09-18 · #625
+- **Implemented by:** #625
+- **Amends:** docs/rift-cluster-server.md ("Graceful leave")
+- **Code:** crates/rift-cluster-server/src/bootstrap.rs, crates/rift-cluster-server/tests/cli.rs
+
+**The gap.** rift#1155 made upstream's `bootstrap::stop_server` wait for the signalled process to
+exit, with a fixed five-second ceiling, and fail — keeping the PID file — when it is still alive
+after that. Five seconds covers upstream's own shutdown. It does not cover this server's: on SIGTERM
+a clustered node leaves the membership and drains for its whole `--cluster-leave-timeout` (10 s by
+default) before closing its listeners. So after the pin bump every graceful `stop` of a clustered
+node exited non-zero while the node was leaving normally, and `restart` propagated that and never
+started.
+
+**The rule.** `stop`/`restart` call upstream's `stop_server_within` (achird-labs/rift#1178) with a
+ceiling of `--cluster-leave-timeout` plus five seconds, read from the `stop` invocation's own flags and
+`RIFT_CLUSTER_LEAVE_TIMEOUT`. An unclustered target exits well inside it, and the wait returns as soon
+as the process is gone, so the longer ceiling only lengthens the wait for a node that is genuinely
+stuck. `the_stop_ceiling_covers_the_leave_window_and_the_shutdown` pins the arithmetic;
+`stop_waits_out_a_clustered_nodes_leave_window` pins it end to end against a real clustered node with
+a seven-second window.
+
+*Rejected:* **copying upstream's kill-and-wait** into this crate. The errno policy and the
+zombie-aware exit probe are private upstream, and D-77's rule is to call the seam, not keep a copy
+in step. **Ending the leave early when nothing is in flight** would also fit inside five seconds,
+but it changes the drain contract operators size their grace periods against. That is a separate
+decision, not a side effect of a pin bump.

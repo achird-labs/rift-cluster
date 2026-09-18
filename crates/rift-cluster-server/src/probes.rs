@@ -179,7 +179,21 @@ const _: () = assert!(
         < 3000
 );
 
-/// The URL the `healthcheck` subcommand probes when `--url` is not given,
+/// What the `healthcheck` subcommand probes when `--url` is not given. The two
+/// targets differ in more than the URL: the probe listener is unauthenticated,
+/// so the admin API key must never travel to it, while a keyed admin plane
+/// answers `/health` with 401 until the key is presented (upstream #1154).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HealthcheckTarget {
+    /// The clustered node's probe listener, at this `/healthz` URL.
+    ProbeListener(String),
+    /// Upstream's own default — the admin API's `/health`, derived from
+    /// `--host`/`--port` by `healthcheck::dispatch` itself, which is also what
+    /// lets it present the key there and nowhere else.
+    AdminPlane,
+}
+
+/// The target the `healthcheck` subcommand probes when `--url` is not given,
 /// derived from the same flags (and `RIFT_*` environment) the server itself
 /// parses — which is what lets one exec-form container `HEALTHCHECK` line be
 /// correct in both modes (#297).
@@ -202,7 +216,7 @@ const _: () = assert!(
 /// exist). The connect failure is the domain answer "genuinely unclustered",
 /// not a swallowed error.
 #[must_use]
-pub fn healthcheck_url(cluster: bool, probe_bind: SocketAddr, host: &str, port: u16) -> String {
+pub fn healthcheck_target(cluster: bool, probe_bind: SocketAddr) -> HealthcheckTarget {
     let connect_ip = match probe_bind.ip() {
         ip if ip.is_unspecified() => std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
         ip => ip,
@@ -214,9 +228,9 @@ pub fn healthcheck_url(cluster: bool, probe_bind: SocketAddr, host: &str, port: 
     };
     if cluster || std::net::TcpStream::connect_timeout(&connect_addr, PROBE_DETECT_TIMEOUT).is_ok()
     {
-        probe_url
+        HealthcheckTarget::ProbeListener(probe_url)
     } else {
-        rift_cluster_base::rift_http_proxy::healthcheck::default_url(host, port)
+        HealthcheckTarget::AdminPlane
     }
 }
 
@@ -239,64 +253,59 @@ fn json(status: StatusCode, body: &serde_json::Value) -> Response<Full<Bytes>> {
 
 #[cfg(test)]
 mod tests {
-    use super::healthcheck_url;
+    use super::{HealthcheckTarget, healthcheck_target};
 
     /// One test for both sides of the detection, in sequence on one port, so
     /// no sibling test can be handed the port in between and flip an
     /// assertion.
     #[test]
-    fn healthcheck_url_detects_a_bound_probe_listener_and_falls_back_without_one() {
+    fn healthcheck_target_detects_a_bound_probe_listener_and_falls_back_without_one() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
         let addr = listener.local_addr().expect("addr");
         assert_eq!(
-            healthcheck_url(false, addr, "0.0.0.0", 2525),
-            format!("http://127.0.0.1:{}/healthz", addr.port())
+            healthcheck_target(false, addr),
+            HealthcheckTarget::ProbeListener(format!("http://127.0.0.1:{}/healthz", addr.port()))
         );
         drop(listener);
         assert_eq!(
-            healthcheck_url(false, addr, "0.0.0.0", 2525),
-            "http://127.0.0.1:2525/health"
+            healthcheck_target(false, addr),
+            HealthcheckTarget::AdminPlane
         );
     }
 
     #[test]
-    fn healthcheck_url_clustered_probes_the_probe_listener() {
+    fn healthcheck_target_clustered_probes_the_probe_listener() {
         assert_eq!(
-            healthcheck_url(true, "0.0.0.0:2526".parse().expect("addr"), "0.0.0.0", 2525),
-            "http://127.0.0.1:2526/healthz"
+            healthcheck_target(true, "0.0.0.0:2526".parse().expect("addr")),
+            HealthcheckTarget::ProbeListener("http://127.0.0.1:2526/healthz".to_owned())
         );
     }
 
     #[test]
-    fn healthcheck_url_honors_an_overridden_probe_port() {
+    fn healthcheck_target_honors_an_overridden_probe_port() {
         assert_eq!(
-            healthcheck_url(true, "0.0.0.0:9999".parse().expect("addr"), "0.0.0.0", 2525),
-            "http://127.0.0.1:9999/healthz"
+            healthcheck_target(true, "0.0.0.0:9999".parse().expect("addr")),
+            HealthcheckTarget::ProbeListener("http://127.0.0.1:9999/healthz".to_owned())
         );
     }
 
     #[test]
-    fn healthcheck_url_keeps_an_explicit_probe_host() {
+    fn healthcheck_target_keeps_an_explicit_probe_host() {
         assert_eq!(
-            healthcheck_url(
-                true,
-                "10.0.0.7:2526".parse().expect("addr"),
-                "0.0.0.0",
-                2525
-            ),
-            "http://10.0.0.7:2526/healthz"
+            healthcheck_target(true, "10.0.0.7:2526".parse().expect("addr")),
+            HealthcheckTarget::ProbeListener("http://10.0.0.7:2526/healthz".to_owned())
         );
     }
 
     #[test]
-    fn healthcheck_url_brackets_an_ipv6_probe_host() {
+    fn healthcheck_target_brackets_an_ipv6_probe_host() {
         assert_eq!(
-            healthcheck_url(true, "[::1]:2526".parse().expect("addr"), "0.0.0.0", 2525),
-            "http://[::1]:2526/healthz"
+            healthcheck_target(true, "[::1]:2526".parse().expect("addr")),
+            HealthcheckTarget::ProbeListener("http://[::1]:2526/healthz".to_owned())
         );
         assert_eq!(
-            healthcheck_url(true, "[::]:2526".parse().expect("addr"), "0.0.0.0", 2525),
-            "http://127.0.0.1:2526/healthz"
+            healthcheck_target(true, "[::]:2526".parse().expect("addr")),
+            HealthcheckTarget::ProbeListener("http://127.0.0.1:2526/healthz".to_owned())
         );
     }
 }

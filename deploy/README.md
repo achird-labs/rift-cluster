@@ -80,11 +80,14 @@ listener's `/healthz` when `RIFT_CLUSTER` is set *or* a probe listener turns
 out to be bound anyway (a node clustered purely by command-line arguments
 shows the healthcheck exec no environment), and the admin API's `/health`
 otherwise (#297). A bare `docker run` is therefore `healthy` while `/console`
-still answers `404`, and both facts are by design. One caveat travels with the
-fallback: `/health` sits behind `--api-key` like the rest of the admin API, so
-an un-clustered container started with `RIFT_APIKEY` reports `unhealthy`. For
-that shape, run the cluster of one above — its probe listener is deliberately
-unauthenticated — or disable the image's `HEALTHCHECK`.
+still answers `404`, and both facts are by design. `/health` sits behind
+`--api-key` like the rest of the admin API, so on the fallback the probe
+presents the key the process was given (`--api-key`, `MB_APIKEY` or an rcfile
+`apiKey`, rift#1154): an un-clustered container started with `MB_APIKEY` is
+`healthy`. The key goes only to that derived admin URL — never to the
+deliberately unauthenticated probe listener, and never to an explicit
+`healthcheck --url`, which is withheld from and answers with a 401 verdict
+that says so.
 
 Each of the four is load-bearing. `--cluster` turns the composition on;
 `--cluster-secret` authenticates the cluster port and has no default;

@@ -540,6 +540,272 @@ fn a_refused_rcfile_refuses_the_healthcheck_and_names_the_file() {
     );
 }
 
+const SAVED_BODY: &str = r#"{"imposters":[]}"#;
+
+/// A stand-in keyed admin plane that records the `Authorization` header of every request.
+/// With `key: Some(k)` it answers `200` with [`SAVED_BODY`] only to a request carrying exactly
+/// `authorization: k` (the raw token, as upstream's admin plane expects) and `401` otherwise;
+/// with `None` it answers `200` to everyone, like the unauthenticated probe listener.
+fn recording_listener(
+    key: Option<&'static str>,
+) -> (
+    std::net::SocketAddr,
+    std::sync::Arc<std::sync::Mutex<Vec<Option<String>>>>,
+) {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("local_addr");
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let log = std::sync::Arc::clone(&seen);
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { break };
+            let mut buf = [0u8; 4096];
+            let n = stream.read(&mut buf).unwrap_or(0);
+            if n == 0 {
+                // The clustered-mode detection's bare connect: no request, nothing to record.
+                continue;
+            }
+            let head = String::from_utf8_lossy(&buf[..n]).into_owned();
+            let presented = head.lines().find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("authorization")
+                    .then(|| value.trim().to_owned())
+            });
+            let allowed = key.is_none_or(|k| presented.as_deref() == Some(k));
+            log.lock().expect("log").push(presented);
+            let response = if allowed {
+                format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{SAVED_BODY}",
+                    SAVED_BODY.len()
+                )
+            } else {
+                "HTTP/1.1 401 Unauthorized\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+                    .to_owned()
+            };
+            let _ = stream.write_all(response.as_bytes());
+        }
+    });
+    (addr, seen)
+}
+
+fn run_binary(args: &[&str]) -> std::process::Output {
+    std::process::Command::new(env!("CARGO_BIN_EXE_rift-cluster-server"))
+        .env_remove("MB_APIKEY")
+        .env_remove("RIFT_CLUSTER")
+        .args(args)
+        .output()
+        .expect("run the binary")
+}
+
+/// Pins upstream #1154 in this binary: an unclustered node's `healthcheck` probes the admin
+/// plane derived from `--host`/`--port`, and a node started with `--api-key` answers that
+/// plane's `/health` with `401` until the key is sent. It never sent it, so a container that
+/// set `MB_APIKEY` reported unhealthy forever.
+#[test]
+fn an_unclustered_healthcheck_presents_the_api_key() {
+    let (admin, seen) = recording_listener(Some("s3cr3t"));
+    let out = run_binary(&[
+        "--port",
+        &admin.port().to_string(),
+        "--api-key",
+        "s3cr3t",
+        "--cluster-probe-bind",
+        &closed_addr(),
+        "healthcheck",
+    ]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "a keyed admin plane must be probed with its key: {stderr}"
+    );
+    assert_eq!(
+        *seen.lock().expect("log"),
+        vec![Some("s3cr3t".to_owned())],
+        "exactly one probe, carrying the raw key"
+    );
+}
+
+/// The clustered probe listener is unauthenticated: it needs no key, and the admin secret must
+/// not travel to a listener whose whole point is that anything may call it.
+#[test]
+fn a_clustered_healthcheck_never_sends_the_api_key_to_the_probe_listener() {
+    let (probe, seen) = recording_listener(None);
+    let out = run_binary(&[
+        "--api-key",
+        "s3cr3t",
+        "--cluster-probe-bind",
+        &probe.to_string(),
+        "healthcheck",
+    ]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "the probe listener answers 200: {stderr}"
+    );
+    assert_eq!(
+        *seen.lock().expect("log"),
+        vec![None],
+        "one probe, with no Authorization header"
+    );
+}
+
+/// An explicit `--url` is an arbitrary operator-chosen target (commonly an unauthenticated
+/// metrics listener), so the key is withheld from it — upstream's rule, kept by passing the key
+/// through rather than deciding here.
+#[test]
+fn an_explicit_healthcheck_url_is_never_sent_the_api_key() {
+    let (admin, seen) = recording_listener(Some("s3cr3t"));
+    let out = run_binary(&[
+        "--api-key",
+        "s3cr3t",
+        "healthcheck",
+        "--url",
+        &format!("http://{admin}/health"),
+    ]);
+    assert!(
+        !out.status.success(),
+        "a keyed plane probed without its key is a 401 verdict"
+    );
+    assert_eq!(
+        *seen.lock().expect("log"),
+        vec![None],
+        "the key must not be sent to an explicit --url"
+    );
+}
+
+/// Pins upstream #1154's other half in this binary: `save` against a node started with
+/// `--api-key` was always a 401.
+#[test]
+fn save_presents_the_api_key() {
+    let (admin, seen) = recording_listener(Some("s3cr3t"));
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let savefile = dir.path().join("saved.json");
+    let out = run_binary(&[
+        "--port",
+        &admin.port().to_string(),
+        "--api-key",
+        "s3cr3t",
+        "save",
+        "--savefile",
+        &savefile.to_string_lossy(),
+    ]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "save must present the key: {stderr}");
+    assert_eq!(
+        std::fs::read_to_string(&savefile).expect("savefile written"),
+        SAVED_BODY
+    );
+    assert_eq!(*seen.lock().expect("log"), vec![Some("s3cr3t".to_owned())]);
+}
+
+/// Pins D-88 against the real binary: `stop` waits out a clustered node's whole leave window.
+/// Since rift#1155 upstream's `stop_server` fails any process still alive five seconds after
+/// SIGTERM, and a clustered node spends its full `--cluster-leave-timeout` leaving before it
+/// exits — so with a seven-second window every graceful `stop` reported failure and left the
+/// PID file behind, and `restart` never started.
+#[cfg(unix)]
+#[test]
+fn stop_waits_out_a_clustered_nodes_leave_window() {
+    const LEAVE: &str = "7";
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let pidfile = dir.path().join("node.pid");
+    let probe = closed_addr();
+    let mut node = std::process::Command::new(env!("CARGO_BIN_EXE_rift-cluster-server"))
+        .env_remove("MB_APIKEY")
+        .env_remove("RIFT_CLUSTER_LEAVE_TIMEOUT")
+        .args([
+            "--cluster",
+            "--cluster-allow-solo",
+            "--cluster-bind",
+            "127.0.0.1:0",
+            "--cluster-secret",
+            "not-a-real-secret",
+            "--cluster-state-dir",
+            &dir.path().join("state").to_string_lossy(),
+            "--cluster-probe-bind",
+            &probe,
+            "--cluster-leave-timeout",
+            LEAVE,
+            "--host",
+            "127.0.0.1",
+            "--port",
+            "0",
+            "--pidfile",
+            &pidfile.to_string_lossy(),
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn the node");
+
+    // Ready means composed and serving, which is after the SIGTERM handler is armed — a
+    // signal before that would kill the node outright and pass this test for nothing.
+    let ready = || {
+        use std::io::{Read, Write};
+        let Ok(mut stream) = std::net::TcpStream::connect(&probe) else {
+            return false;
+        };
+        let mut head = String::new();
+        stream
+            .write_all(b"GET /readyz HTTP/1.1\r\nhost: probe\r\nconnection: close\r\n\r\n")
+            .is_ok()
+            && stream.read_to_string(&mut head).is_ok()
+            && head.starts_with("HTTP/1.1 200")
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        if pidfile.exists() && ready() {
+            break;
+        }
+        if std::time::Instant::now() >= deadline || node.try_wait().ok().flatten().is_some() {
+            let _ = node.kill();
+            panic!("the clustered node never became ready");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    std::thread::sleep(std::time::Duration::from_millis(500));
+
+    // The node is this test's child, so once it exits it is a zombie until reaped — and a
+    // zombie still answers `stop`'s liveness probe, which would read as "never exited". Reap it
+    // as soon as it goes, the way a real supervisor would, and record when.
+    let reaper = std::thread::spawn(move || {
+        let give_up = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        loop {
+            if let Ok(Some(status)) = node.try_wait() {
+                return Some(status);
+            }
+            if std::time::Instant::now() >= give_up {
+                let _ = node.kill();
+                let _ = node.wait();
+                return None;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    });
+
+    let started = std::time::Instant::now();
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_rift-cluster-server"))
+        .env_remove("RIFT_CLUSTER_LEAVE_TIMEOUT")
+        .args(["--cluster-leave-timeout", LEAVE, "stop", "--pidfile"])
+        .arg(&pidfile)
+        .output()
+        .expect("run stop");
+    let elapsed = started.elapsed();
+    let exited = reaper.join().expect("reaper thread");
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "stop must wait out the leave window, not fail at five seconds ({elapsed:?}): {stderr}"
+    );
+    assert!(
+        exited.is_some(),
+        "the node never exited after a successful stop"
+    );
+    assert!(!pidfile.exists(), "a completed stop removes the PID file");
+}
+
 /// Pins #594 (upstream #1134) against the real binary: an unrecognised
 /// `--loglevel` refuses startup with the value named. It used to become `info`
 /// silently, in both binaries, because this one carried a copy of upstream's

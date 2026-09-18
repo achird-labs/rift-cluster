@@ -12,9 +12,10 @@
 //! without spawning a process, the same split the rest of this crate uses.
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use rift_cluster_base::rift_http_proxy::bootstrap::{
-    DEFAULT_PIDFILE, apply_rcfile_defaults_reporting, save_imposters, stop_server,
+    DEFAULT_PIDFILE, apply_rcfile_defaults_reporting, save_imposters, stop_server_within,
 };
 use rift_cluster_base::seams::Commands;
 use tracing::{info, warn};
@@ -143,11 +144,11 @@ fn validate_pid(raw: &str) -> anyhow::Result<i32> {
 /// between the two reads is still able to choose the PID. Since rift#824 that
 /// second parse does its own non-positive check, so the race no longer has a
 /// dangerous outcome to reach.
-fn stop_via_pidfile(pidfile: &Path) -> anyhow::Result<()> {
+fn stop_via_pidfile(pidfile: &Path, ceiling: Duration) -> anyhow::Result<()> {
     // Upstream's own not-found message, kept ahead of the read so `stop`'s
     // stderr stays identical to the open-source binary's.
     anyhow::ensure!(pidfile.exists(), "PID file not found: {pidfile:?}");
-    stop_present_pidfile(pidfile)
+    stop_present_pidfile(pidfile, ceiling)
 }
 
 /// Stop for `restart`: a missing PID file is a satisfied precondition.
@@ -159,20 +160,37 @@ fn stop_via_pidfile(pidfile: &Path) -> anyhow::Result<()> {
 ///
 /// Not delegated to upstream's function: that one calls `stop_server` directly
 /// and so skips the [`validate_pid`] guard below.
-fn stop_for_restart_via_pidfile(pidfile: &Path) -> anyhow::Result<()> {
+fn stop_for_restart_via_pidfile(pidfile: &Path, ceiling: Duration) -> anyhow::Result<()> {
     if !pidfile.exists() {
         info!("no PID file at {pidfile:?}; nothing to stop, starting fresh");
         return Ok(());
     }
-    stop_present_pidfile(pidfile)
+    stop_present_pidfile(pidfile, ceiling)
 }
 
-/// The shared tail of both: guard the recorded PID, then signal it.
-fn stop_present_pidfile(pidfile: &Path) -> anyhow::Result<()> {
+/// The shared tail of both: guard the recorded PID, then signal it and wait
+/// for it to exit.
+fn stop_present_pidfile(pidfile: &Path, ceiling: Duration) -> anyhow::Result<()> {
     let raw = std::fs::read_to_string(pidfile)
         .map_err(|e| anyhow::anyhow!("cannot read PID file {pidfile:?}: {e}"))?;
     validate_pid(&raw).map_err(|e| anyhow::anyhow!("{pidfile:?}: {e}"))?;
-    stop_server(pidfile)
+    stop_server_within(pidfile, ceiling)
+}
+
+/// Upstream's own bound on the server's shutdown after SIGTERM, which its
+/// `stop_server` waits out (rift#1155).
+const SHUTDOWN_MARGIN: Duration = Duration::from_secs(5);
+
+/// How long `stop`/`restart` wait for the signalled process to exit (D-88).
+///
+/// A clustered node spends its whole `--cluster-leave-timeout` leaving and
+/// draining before it shuts down, so upstream's fixed five seconds failed every
+/// graceful stop of one — and `restart` never started. The window is read from
+/// this invocation's flags and `RIFT_CLUSTER_LEAVE_TIMEOUT`, the same place the
+/// server read it; an unclustered target exits well inside the ceiling, and the
+/// wait returns as soon as it does.
+fn stop_ceiling(cli: &EeCli) -> Duration {
+    Duration::from_secs(cli.cluster.cluster_leave_timeout) + SHUTDOWN_MARGIN
 }
 
 /// The PID file `stop`/`restart` act on.
@@ -198,11 +216,11 @@ fn pidfile_or_default(cli: &EeCli) -> PathBuf {
 pub fn dispatch(cli: &mut EeCli) -> anyhow::Result<AfterBootstrap> {
     match &cli.oss.command {
         Some(Commands::Stop) => {
-            stop_via_pidfile(&pidfile_or_default(cli))?;
+            stop_via_pidfile(&pidfile_or_default(cli), stop_ceiling(cli))?;
             Ok(AfterBootstrap::Done)
         }
         Some(Commands::Restart) => {
-            stop_for_restart_via_pidfile(&pidfile_or_default(cli))?;
+            stop_for_restart_via_pidfile(&pidfile_or_default(cli), stop_ceiling(cli))?;
             Ok(AfterBootstrap::Serve)
         }
         Some(Commands::Save {
@@ -217,7 +235,15 @@ pub fn dispatch(cli: &mut EeCli) -> anyhow::Result<AfterBootstrap> {
                 tokio::runtime::Handle::try_current().is_err(),
                 "`save` must be dispatched from sync context: it builds its own runtime"
             );
-            save_imposters(&cli.oss.host, cli.oss.port, savefile, *remove_proxies)?;
+            // A keyed node answers `GET /imposters` with 401 until the key is
+            // presented (upstream #1154).
+            save_imposters(
+                &cli.oss.host,
+                cli.oss.port,
+                savefile,
+                *remove_proxies,
+                cli.oss.api_key.as_deref(),
+            )?;
             Ok(AfterBootstrap::Done)
         }
         // Upstream's whole implementation of replay is to start normally with
@@ -270,6 +296,24 @@ pub fn dispatch(cli: &mut EeCli) -> anyhow::Result<AfterBootstrap> {
 
 #[cfg(test)]
 mod tests {
+    /// The tests' stop target exits at once, so any ceiling above a moment serves.
+    const TEST_CEILING: std::time::Duration = std::time::Duration::from_secs(5);
+
+    /// Pins D-88: the stop wait covers the whole leave window plus upstream's
+    /// shutdown bound. Upstream's fixed five seconds is below the default
+    /// ten-second window, which failed every graceful stop of a clustered node.
+    #[test]
+    fn the_stop_ceiling_covers_the_leave_window_and_the_shutdown() {
+        assert_eq!(
+            super::stop_ceiling(&cli(&["stop"])),
+            std::time::Duration::from_secs(15)
+        );
+        assert_eq!(
+            super::stop_ceiling(&cli(&["--cluster-leave-timeout", "30", "stop"])),
+            std::time::Duration::from_secs(35)
+        );
+    }
+
     use std::path::PathBuf;
 
     use clap::Parser;
@@ -474,7 +518,7 @@ mod tests {
             .expect("spawn a child to stop");
         let pidfile = write(&dir, "rift.pid", &child.id().to_string());
 
-        super::stop_via_pidfile(&pidfile).expect("stop succeeds");
+        super::stop_via_pidfile(&pidfile, TEST_CEILING).expect("stop succeeds");
 
         let status = child.wait().expect("reap the child");
         assert!(
@@ -624,7 +668,8 @@ mod tests {
         let dir = TempDir::new().expect("tempdir");
         let pidfile = write(&dir, "junk.pid", "not-a-pid");
 
-        super::stop_via_pidfile(&pidfile).expect_err("an unparseable PID file must be refused");
+        super::stop_via_pidfile(&pidfile, TEST_CEILING)
+            .expect_err("an unparseable PID file must be refused");
 
         assert!(
             pidfile.exists(),
@@ -636,7 +681,7 @@ mod tests {
     #[test]
     fn missing_pidfile_reports_upstreams_message() {
         let dir = TempDir::new().expect("tempdir");
-        let err = super::stop_via_pidfile(&dir.path().join("absent.pid"))
+        let err = super::stop_via_pidfile(&dir.path().join("absent.pid"), TEST_CEILING)
             .expect_err("a missing PID file is an error");
         assert!(
             err.to_string().contains("PID file not found"),
