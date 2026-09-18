@@ -286,7 +286,9 @@ struct DedupEntry {
 /// `ControlOp` variants are gone, and redb refuses the old tables — see `ControlOp`'s
 /// doc), so a fleet upgrading across this commit starts from a fresh
 /// `cluster-state-dir`.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+///
+/// No `Debug`: `session_key` is the raw `sm_session_key` row, key included (D-86).
+#[derive(Clone, Default, Serialize, Deserialize)]
 struct SnapshotPayload {
     /// `(port, stored-imposter JSON)` rows of `sm_configs`.
     configs: Vec<(u16, String)>,
@@ -3489,7 +3491,8 @@ mod tests {
 
     use super::{DEDUP_TTL_SECS, DedupEntry, RedbLogStore, RedbStateMachine, SM_DEDUP_TABLE, new};
     use crate::control::{
-        ControlOp, ControlOutcome, ControlRequest, ControlResponse, StubEdit, StubEditScript,
+        ControlOp, ControlOutcome, ControlRequest, ControlResponse, SessionKeyHex, StubEdit,
+        StubEditScript,
     };
     use crate::raft::TypeConfig;
     use crate::stores::flow::FlowNet;
@@ -6541,6 +6544,19 @@ mod tests {
         );
     }
 
+    /// Pins D-86: `SnapshotPayload` carries the raw `sm_session_key` row, key included, so it
+    /// must not implement `Debug`. Checked at compile time: if it ever does, the second impl
+    /// below also applies and the method call is ambiguous, so this module stops compiling.
+    #[test]
+    fn the_snapshot_payload_does_not_implement_debug() {
+        trait AmbiguousIfDebug<A> {
+            fn check() {}
+        }
+        impl<T: ?Sized> AmbiguousIfDebug<()> for T {}
+        impl<T: ?Sized + std::fmt::Debug> AmbiguousIfDebug<u8> for T {}
+        <super::SnapshotPayload as AmbiguousIfDebug<_>>::check();
+    }
+
     /// An older snapshot, written before #185 existed, must still install —
     /// same `#[serde(default)]` contract every table added since #134 carries.
     #[tokio::test]
@@ -6611,7 +6627,7 @@ mod tests {
                 1,
                 1_000,
                 ControlOp::SessionKeyPut {
-                    key: "42".repeat(32),
+                    key: SessionKeyHex::new("42".repeat(32)),
                 },
             ),
         )
@@ -6641,7 +6657,7 @@ mod tests {
                 1,
                 1_000,
                 ControlOp::SessionKeyPut {
-                    key: "42".repeat(32),
+                    key: SessionKeyHex::new("42".repeat(32)),
                 },
             ),
         )

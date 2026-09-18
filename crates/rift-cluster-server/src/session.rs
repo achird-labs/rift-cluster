@@ -160,7 +160,7 @@ impl SigningKey {
     /// hidden behind sessions that verify. The same goes for falling back to the raw string's
     /// bytes on a decode failure, which is why this reports instead.
     pub(crate) fn derive(record: &SessionKey, api_key: &str) -> Result<Self, SessionError> {
-        let key_bytes = hex_decode(&record.key)
+        let key_bytes = hex_decode(record.key.expose())
             .filter(|bytes| bytes.len() == SESSION_KEY_BYTES)
             .ok_or(SessionError::UnusableSigningKey)?;
         // `new_from_slice` is fallible only for algorithms with a fixed key size; HMAC has none —
@@ -319,11 +319,12 @@ fn hex_decode(s: &str) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rift_cluster::control::SessionKeyHex;
 
     /// The replicated record, before it is bound to anything.
     fn test_record(revision: u64) -> SessionKey {
         SessionKey {
-            key: hex_encode(&[0x42; 32]),
+            key: SessionKeyHex::new(hex_encode(&[0x42; 32])),
             revision,
         }
     }
@@ -424,7 +425,7 @@ mod tests {
             assert_eq!(
                 SigningKey::derive(
                     &SessionKey {
-                        key: bad.to_owned(),
+                        key: SessionKeyHex::new(bad.to_owned()),
                         revision: 1,
                     },
                     "the-fleet-api-key",
