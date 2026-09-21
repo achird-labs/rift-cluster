@@ -145,6 +145,14 @@ impl Bridge {
     /// Parks on `std::sync::mpsc` rather than a tokio channel deliberately:
     /// `blocking_recv` panics when called from inside an async context, and this
     /// is reached from both async handlers and blocking script threads.
+    ///
+    /// D-90 widens that from a preference to a requirement: once the pin carries
+    /// rift#1197, a seam call also arrives from a **destructor** — a dropped
+    /// request future, a panicking handler mid-unwind, a runtime torn down with
+    /// the task still parked — where a tokio-side wait would panic, and a panic
+    /// during unwinding aborts the process. `spawn` + this park is what keeps
+    /// all three contexts ordinary; `proxy_claims.rs` pins each of them, and
+    /// that the caller's wait really is synchronous.
     pub fn call<F, T>(&self, class: CallerClass, deadline: Duration, op: F) -> Result<T, RpcError>
     where
         F: Future<Output = Result<T, RpcError>> + Send + 'static,

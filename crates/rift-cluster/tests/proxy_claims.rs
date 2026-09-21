@@ -331,13 +331,31 @@ fn owner_index(members: &[ProxyMember], port: u16, s: &RequestSignature) -> usiz
 /// A signature whose ring owner is `want` — probed through the production key
 /// renderer, so ownership placement is real, not assumed.
 fn sig_owned_by(members: &[ProxyMember], port: u16, want: usize) -> RequestSignature {
-    for i in 0..1000 {
-        let candidate = sig(&format!("/owned/{i}"));
+    sigs_owned_by(members, port, want, 1, "/owned/").remove(0)
+}
+
+/// `n` distinct signatures the ring homes on `want`, probed through the production key renderer
+/// so a test can never disagree with the store about ownership. Callers that release from a
+/// *different* node than `want` are exercising the RPC hop rather than the owner-local map, which
+/// is where a bridge call could block or panic.
+fn sigs_owned_by(
+    members: &[ProxyMember],
+    port: u16,
+    want: usize,
+    n: usize,
+    prefix: &str,
+) -> Vec<RequestSignature> {
+    let mut found = Vec::new();
+    for i in 0..5000 {
+        let candidate = sig(&format!("{prefix}{i}"));
         if owner_index(members, port, &candidate) == want {
-            return candidate;
+            found.push(candidate);
+            if found.len() == n {
+                return found;
+            }
         }
     }
-    panic!("no signature landed on member {want} in 1000 probes");
+    panic!("fewer than {n} signature(s) landed on member {want} in 5000 probes");
 }
 
 /// Config stubs a member's applied state carries for `TEST_PORT`.
@@ -1140,4 +1158,290 @@ async fn proxy_always_never_refuses_on_an_isolated_owner() {
         ),
         "proxyAlways gates nothing, so a partition must not stop it recording"
     );
+}
+
+// ---------------------------------------------------------------------------
+// #629 — the release seam is reached from a destructor (rift#1193, PR #1197).
+// ---------------------------------------------------------------------------
+
+/// The guard rift#1197 wraps a won claim in, reproduced rather than imported. At this repo's pin
+/// (`a85f550`, rift#1179) the engine has no such guard yet; once the pin advances past rift#1197
+/// it is private to `rift-mock-core`. Either way a test has to own one. Upstream's borrows the
+/// request-scoped signature; this one owns store and signature so it can move into a spawned
+/// task. The property under test is shared by both: the claim is given back from `Drop`.
+struct HeldClaim {
+    store: Arc<ClusterProxyStore>,
+    port: u16,
+    sig: RequestSignature,
+    /// Taken by `Drop`. Upstream's guard also clears it in `settle()`; this replica has no settle
+    /// path, so the already-taken arm is unreachable here and exists to mirror the shape.
+    token: Option<ClaimToken>,
+}
+
+impl HeldClaim {
+    fn new(
+        store: &Arc<ClusterProxyStore>,
+        port: u16,
+        sig: &RequestSignature,
+        token: ClaimToken,
+    ) -> Self {
+        Self {
+            store: Arc::clone(store),
+            port,
+            sig: sig.clone(),
+            token: Some(token),
+        }
+    }
+}
+
+impl Drop for HeldClaim {
+    fn drop(&mut self) {
+        if let Some(token) = self.token.take() {
+            self.store.release_claim(self.port, &self.sig, token);
+        }
+    }
+}
+
+/// Wait for the owner's claim table to drop to empty. The cluster's claim TTL is set far above
+/// this bound, so an expiry cannot be what satisfies it — only a release can. Generous against a
+/// loaded CI runner: `release_claim` makes a single un-retried bridge call, so one transient 2 s
+/// timeout must not read as a failure to release.
+async fn await_released(member: &ProxyMember, port: u16, phase: &str) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if member.net.pending_claims(port) == 0 {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{phase}: the owner still holds the claim 5s after the guard was dropped"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+/// Pins D-90: a claim released from a destructor really is freed, in each of the three shapes
+/// rift#1197's guard produces — a task aborted mid-await (imposter stop), a panicking handler,
+/// and a data-plane runtime torn down with the request still parked. What would falsify it: a
+/// `Bridge::call` that waits the async way (`block_on`/`blocking_recv`), since the first two
+/// drops run with a runtime entered, or any arm that panics while unwinding.
+///
+/// The claim TTL is 300 s against a 10 s window, so no expiry can stand in for a release, and the
+/// owner is always the *other* node, so every release is a real RPC hop.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_claim_is_released_when_its_guard_is_dropped() {
+    let _lock = TEST_LOCK.lock().await;
+    let members = proxy_cluster_of(2, Duration::from_secs(300)).await;
+    install_imposter(&members, TEST_PORT, "proxyOnce").await;
+
+    const OWNER: usize = 1;
+    let store = store_on(&members[0]);
+    let sigs = sigs_owned_by(&members, TEST_PORT, OWNER, 3, "/dropped/");
+
+    // -- phase 1: the request task is aborted mid-await (an imposter stop) ---
+    let ClaimOutcome::Claimed(token) = claim(&store, TEST_PORT, &sigs[0]).await else {
+        panic!("phase 1: the first claim on a fresh signature must win");
+    };
+    assert_eq!(
+        members[OWNER].net.pending_claims(TEST_PORT),
+        1,
+        "phase 1: the owner records the claim before the guard is dropped"
+    );
+    let guard = HeldClaim::new(&store, TEST_PORT, &sigs[0], token);
+    let parked = tokio::spawn(async move {
+        let _guard = guard;
+        std::future::pending::<()>().await;
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    parked.abort();
+    // Bounded, because the release runs inside the task's drop glue: a regression that made the
+    // bridge park unbounded would hang here until CI's job timeout instead of failing legibly.
+    let ended = tokio::time::timeout(Duration::from_secs(30), parked)
+        .await
+        .expect("phase 1: the aborted task's drop must not hang");
+    assert!(
+        ended.expect_err("the task was aborted").is_cancelled(),
+        "phase 1: the task must end by abort, so the guard drops without a return"
+    );
+    await_released(&members[OWNER], TEST_PORT, "phase 1 (task abort)").await;
+
+    // -- phase 2: the handler panics; the guard drops mid-unwind ------------
+    // A panic inside `release_claim` here would be a *second* panic while unwinding, which
+    // aborts the process — so this phase fails by killing the test binary, not by assertion.
+    let ClaimOutcome::Claimed(token) = claim(&store, TEST_PORT, &sigs[1]).await else {
+        panic!("phase 2: the first claim on a fresh signature must win");
+    };
+    let guard = HeldClaim::new(&store, TEST_PORT, &sigs[1], token);
+    let panicked = tokio::spawn(async move {
+        let _guard = guard;
+        panic!("the handler panicked mid-request");
+    });
+    let ended = tokio::time::timeout(Duration::from_secs(30), panicked)
+        .await
+        .expect("phase 2: the panicking task's drop must not hang");
+    assert!(
+        ended.expect_err("the task panicked").is_panic(),
+        "phase 2: the task must end by panic, so the guard drops while unwinding"
+    );
+    await_released(&members[OWNER], TEST_PORT, "phase 2 (panic unwind)").await;
+
+    // -- phase 3: the data-plane runtime is dropped, request still parked ---
+    // The guard's release rides the *bridge's* private cluster-io runtime, not the one being
+    // torn down, which is why it can still reach the owner from inside this shutdown.
+    let ClaimOutcome::Claimed(token) = claim(&store, TEST_PORT, &sigs[2]).await else {
+        panic!("phase 3: the first claim on a fresh signature must win");
+    };
+    let guard = HeldClaim::new(&store, TEST_PORT, &sigs[2], token);
+    // Two layers, each load-bearing: the inner `std::thread` is a pristine thread with no runtime
+    // context, because dropping a runtime from inside an async context panics; the outer
+    // `spawn_blocking` keeps the join off this test's async workers, as every other blocking
+    // hand-off in this file does.
+    tokio::task::spawn_blocking(move || {
+        std::thread::spawn(move || {
+            let data_plane = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .expect("a data-plane runtime starts");
+            data_plane.spawn(async move {
+                let _guard = guard;
+                std::future::pending::<()>().await;
+            });
+            std::thread::sleep(Duration::from_millis(50));
+            // Dropping the runtime drops the parked task, and with it the guard.
+            drop(data_plane);
+        })
+        .join()
+        .expect("the data-plane runtime shut down without panicking");
+    })
+    .await
+    .expect("phase 3: the runtime teardown must not hang");
+    await_released(&members[OWNER], TEST_PORT, "phase 3 (runtime shutdown)").await;
+
+    // The releases were effective, not merely quiet: the first signature is claimable again, and
+    // the claim that grants proves the owner's table really is free.
+    assert!(
+        matches!(
+            claim(&store, TEST_PORT, &sigs[0]).await,
+            ClaimOutcome::Claimed(_)
+        ),
+        "a released signature must be immediately re-claimable"
+    );
+}
+
+/// The other half of #629's question: the release also runs when an imposter has been deleted or
+/// the node is mid-shutdown, where the port's identity no longer resolves. That arm must warn and
+/// return.
+///
+/// **The assertion is that the process survives.** A panic in that arm would be a second panic
+/// while unwinding, which aborts — so this test fails by killing the test binary, and there is
+/// deliberately no `pending_claims` check afterwards: the guard's port never held a claim, so any
+/// such assertion would read as coverage while being unable to fail. Mutating the arm to `panic!`
+/// turns this red (SIGABRT), which is what shows it discriminates.
+///
+/// A bogus token on a port with no imposter reaches the same arm as a deleted imposter does,
+/// without waiting out `MODE_CACHE_TTL` for the mode cache to go cold.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_guard_drops_cleanly_when_the_port_identity_is_gone() {
+    let _lock = TEST_LOCK.lock().await;
+    let members = proxy_cluster_of(2, Duration::from_secs(300)).await;
+    install_imposter(&members, TEST_PORT, "proxyOnce").await;
+
+    let store = store_on(&members[0]);
+    let orphan = HeldClaim::new(
+        &store,
+        TEST_PORT + 7,
+        &sig("/never-had-an-imposter"),
+        ClaimToken::new(1),
+    );
+    let panicked = tokio::spawn(async move {
+        let _orphan = orphan;
+        panic!("the handler panicked with no applied imposter on the port");
+    });
+    let ended = tokio::time::timeout(Duration::from_secs(30), panicked)
+        .await
+        .expect("the orphan guard's drop must not hang");
+    assert!(
+        ended.expect_err("the task panicked").is_panic(),
+        "the guard must drop while unwinding, with the port identity unresolvable"
+    );
+}
+
+/// Pins the half of D-90 the phases above cannot reach: the release is **synchronous**. Every
+/// assertion there polls, so a fire-and-forget implementation — the one D-90 rejects, and the one
+/// upstream's SPI recommends for a store that releases over the network — would satisfy all of
+/// them. Here the guard is dropped on a blocking thread and the owner's table is read the instant
+/// `drop` returns, with no polling: a release handed to the bridge instead of waited on would
+/// still be in flight at that point.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_release_reaches_the_owner_before_the_drop_returns() {
+    let _lock = TEST_LOCK.lock().await;
+    let members = proxy_cluster_of(2, Duration::from_secs(300)).await;
+    install_imposter(&members, TEST_PORT, "proxyOnce").await;
+
+    const OWNER: usize = 1;
+    let store = store_on(&members[0]);
+    let s = sigs_owned_by(&members, TEST_PORT, OWNER, 1, "/synchronous/").remove(0);
+
+    let ClaimOutcome::Claimed(token) = claim(&store, TEST_PORT, &s).await else {
+        panic!("the first claim on a fresh signature must win");
+    };
+    assert_eq!(members[OWNER].net.pending_claims(TEST_PORT), 1);
+
+    let guard = HeldClaim::new(&store, TEST_PORT, &s, token);
+    tokio::task::spawn_blocking(move || drop(guard))
+        .await
+        .expect("the guard dropped");
+
+    assert_eq!(
+        members[OWNER].net.pending_claims(TEST_PORT),
+        0,
+        "the owner's claim must already be gone when the drop returns — a handed-off release \
+         would still be travelling to the owner here"
+    );
+}
+
+/// The clustered counterpart of upstream's `a_stale_guard_does_not_release_a_newer_claim`: a
+/// guard dropped after its claim expired and was re-taken must not free the new holder.
+///
+/// `owner_release`'s token check is what refuses it, and **nothing reached that check before**.
+/// The file's only other `release_claim` call passes a live token, and the stale-token test
+/// beside it drives `complete_recorded`, which is `owner_complete`'s separate guard. rift#1197
+/// makes this reachable in production: a slow request whose claim ages out still drops its guard
+/// eventually, by which time the signature may belong to someone else.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stale_guard_drop_does_not_free_the_current_claim() {
+    let _lock = TEST_LOCK.lock().await;
+    let members = proxy_cluster_of(2, Duration::from_millis(300)).await;
+    install_imposter(&members, TEST_PORT, "proxyOnce").await;
+
+    const OWNER: usize = 1;
+    let store = store_on(&members[0]);
+    let s = sigs_owned_by(&members, TEST_PORT, OWNER, 1, "/stale-guard/").remove(0);
+
+    // Win a claim, then let it age past the 300 ms TTL so the signature frees itself and the
+    // first token goes stale — the abandoned winner still holds its guard.
+    let ClaimOutcome::Claimed(stale) = claim(&store, TEST_PORT, &s).await else {
+        panic!("the first claim on a fresh signature must win");
+    };
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    let ClaimOutcome::Claimed(fresh) = claim(&store, TEST_PORT, &s).await else {
+        panic!("an expired claim leaves the signature re-claimable");
+    };
+    assert_eq!(members[OWNER].net.pending_claims(TEST_PORT), 1);
+
+    // The abandoned request finally drops its guard, carrying the stale token.
+    let stale_guard = HeldClaim::new(&store, TEST_PORT, &s, stale);
+    tokio::task::spawn_blocking(move || drop(stale_guard))
+        .await
+        .expect("the stale guard dropped");
+
+    assert_eq!(
+        members[OWNER].net.pending_claims(TEST_PORT),
+        1,
+        "a stale guard must not free the claim that replaced it"
+    );
+    complete_recorded(&store, TEST_PORT, &s, fresh, "recorded-by-the-live-holder")
+        .await
+        .expect("the live claim still settles after a stale guard dropped");
 }
