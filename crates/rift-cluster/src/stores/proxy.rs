@@ -1044,13 +1044,46 @@ impl ProxyRecordingStore for ClusterProxyStore {
         }
     }
 
+    /// D-90: one synchronous bridge call, in **every** calling context — including a destructor.
+    ///
+    /// rift#1197 holds a won claim in a guard that releases it from `Drop`. That commit is *not*
+    /// in this repo's pin yet (`a85f550` = rift#1179, where the engine still releases from
+    /// explicit return paths); once the pin carries it, besides the failed-settle path this is
+    /// reached from a destructor — a request future dropped mid-await (client disconnect,
+    /// imposter stop), and a panicking handler, where it runs on an already-unwinding thread.
+    /// Two properties make that safe, and both are load-bearing:
+    ///
+    /// - **It never blocks the async way.** [`Bridge::call`] parks on `std::sync::mpsc` precisely
+    ///   so it can be called with a runtime entered; `block_on`/`blocking_recv` would panic there.
+    /// - **It cannot panic.** A panic here during unwinding is a second panic, which aborts the
+    ///   process rather than failing one request — so every arm below returns.
+    ///
+    /// What the caller pays is *not* one flat [`CLAIM_OP_DEADLINE`]: `port_identity` below may
+    /// miss its 2 s cache and take a synchronous config read first, and an abandoned request is
+    /// by nature a slow one, so that miss is the common case here. The bound is therefore one
+    /// config read plus one bridge call, not 2 s.
+    ///
+    /// Non-`proxyOnce` modes return before the bridge is touched: their claim is a formality that
+    /// was never registered on an owner, so releasing it would be a fleet round trip for nothing.
+    ///
+    /// Deliberately *not* fire-and-forget, which upstream's SPI recommends for a store that
+    /// releases over the network — D-90 records that divergence and its reason.
     fn release_claim(&self, port: u16, sig: &RequestSignature, token: ClaimToken) {
         let identity = match self.net.port_identity(port) {
             Ok(identity) => identity,
             Err(e) => {
-                // Same self-healing bound as the RPC-failure warn below: the claim frees
-                // itself at the deadline, but the skipped release should not be invisible.
-                tracing::warn!(port, error = %e, "proxy claim release skipped: port identity unresolved");
+                // Reached by more than one cause, and they heal differently. An imposter delete
+                // or replace purges the port's claims on every node as each applies it
+                // (`clear_local`), so the owner's entry goes whether or not this release lands.
+                // The others — this node mid-shutdown, no applied membership yet, a storage read
+                // that failed — purge nothing, and there the claim TTL remains what frees the
+                // signature, exactly as in the RPC-failure arm below.
+                tracing::warn!(
+                    port,
+                    sig_hash = %sig_hash(sig),
+                    error = %e,
+                    "proxy claim release skipped: port identity unresolved"
+                );
                 return;
             }
         };
@@ -1058,7 +1091,11 @@ impl ProxyRecordingStore for ClusterProxyStore {
             return;
         }
         let Some(bridge) = self.net.bridge.get() else {
-            tracing::warn!(port, "proxy claim release before the cluster bound");
+            tracing::warn!(
+                port,
+                sig_hash = %sig_hash(sig),
+                "proxy claim release before the cluster bound"
+            );
             return;
         };
         let net = Arc::clone(&self.net);
@@ -1086,8 +1123,15 @@ impl ProxyRecordingStore for ClusterProxyStore {
         });
         if let Err(e) = released {
             // Not silent, not fatal: an unreleased claim frees itself at the deadline, so
-            // the signature wedges for at most `claim_ttl`, and the log says why.
-            tracing::warn!(port, error = %e, "proxy claim release did not reach the owner");
+            // the signature wedges for at most `claim_ttl`, and the log says why. The hash names
+            // *which* signature — a busy proxyOnce port has several claims in flight, and an
+            // operator chasing one wedged signature cannot use a port-only line.
+            tracing::warn!(
+                port,
+                sig_hash = %sig_hash(sig),
+                error = %e,
+                "proxy claim release did not reach the owner"
+            );
         }
     }
 

@@ -3951,3 +3951,67 @@ the ownership rule.
 (the clustered path's) and writes its own PID file, so the handler and the removal are this crate's
 own behaviour rather than copies kept in step with a library function.
 
+
+---
+### D-90 — `release_claim` stays a synchronous bridge call in every context, including a destructor — diverging from upstream's SPI, deliberately
+
+- **Status:** active
+- **Decided:** 2026-09-21 · #629
+- **Implemented by:** #629
+- **Refines:** D-9, D-40
+- **Code:** crates/rift-cluster/src/stores/proxy.rs, crates/rift-cluster/src/bridge.rs,
+  crates/rift-cluster/tests/proxy_claims.rs
+
+**The change, and where the pin stands.** Engine change rift#1193 (PR rift#1197) holds a won
+`proxyOnce` claim in a guard that releases it from `Drop` unless it was settled, replacing the
+explicit release on each returning path. So every release but the failed-settle one then arrives
+from a destructor, and three of those contexts are new: a request future dropped mid-await (client
+disconnect, timeout), a task aborted when an imposter stops, and a panicking handler unwinding.
+**That commit is not vendored yet** — this repo's pin is `a85f550` (rift#1179), where the
+engine still releases from explicit return paths and no such guard exists; PR #630 is the bump that
+brings it. This entry is written ahead of that bump on purpose, so the contract is already pinned
+when the destructor path goes live. The benefit it unlocks is real: for this store the claim is
+fleet-wide, so an abandoned request frees the signature at once instead of wedging it for the whole
+`claim_ttl` (D-40's fixed 60 s).
+
+**The rule.** `ClusterProxyStore::release_claim` stays exactly what it was — one `Bridge::call` —
+and that is now a requirement rather than an incidental shape. Two properties carry it, both
+already true and both load-bearing from here on:
+
+- **The wait is not a tokio wait.** D-9's bridge parks the caller on `std::sync::mpsc` and runs the
+  op on the private cluster-io runtime. A `block_on` or `blocking_recv` in its place panics with a
+  runtime entered, which is precisely the context a dropped request future is dropped in. The
+  bridge's own runtime is reached through an `Arc<ProxyNet>` the caller holds, so it cannot be torn
+  down underneath the call.
+- **No arm panics.** A panic in a destructor while unwinding is a second panic, and the process
+  aborts rather than failing one request. Every arm that gives up — unresolved port identity, a
+  cluster not yet bound, an RPC error — warns and returns; the `mode != Once` arm returns silently,
+  having done nothing.
+
+Non-`proxyOnce` modes return before the bridge: `try_claim` grants them a formality token that was
+never registered on an owner, so a release would be a fleet round trip that removes nothing.
+
+**What it actually costs — not one flat deadline.** Before the bridge call, `port_identity` may
+miss its 2 s mode cache and take a synchronous config read on the dropping thread; an abandoned
+request is by nature a slow one, so that miss is the *common* case here, not the edge. The cost is
+therefore one config read plus one `Bridge::call` bounded by `CLAIM_OP_DEADLINE`, and earlier
+drafts of this entry that said "bounded by 2 s" were wrong. D-9 caps the blast radius at
+`max(2, workers/2)` parked data-plane threads; past that a caller is shed instantly and the claim
+frees itself at the TTL, which is exactly the pre-rift#1197 behaviour. `ComposedServer::shutdown`
+stops the manager before the node, so a release fired by an imposter stop still reaches a live
+owner.
+
+*Rejected:* **fire-and-forget on drop** — and this diverges from upstream's own guidance, which is
+why the divergence is stated rather than left for a reader to rediscover. rift#1197's
+`docs/embedding/spi.md` says: *"it must not block for long, must not assume an async context … A
+store that releases over the network should hand the release off rather than wait for it."* This
+store does release over the network, so that sentence is addressed to exactly this implementation.
+It is declined because the store **cannot distinguish a drop from the failed-forward return** —
+rift#1197 routes both through the same `Drop` — and on the failed-forward path the synchronous
+release is what orders release-before-error-response, so a client retrying immediately finds the
+signature claimable instead of `InFlight` with nothing recording. Handing off would also need its
+own backpressure, since unbounded spawns onto a two-thread runtime is a failure mode of its own.
+The cost it would remove is the bounded one above, no latency problem has been measured, and the
+reversal is cheap and unobservable outside the store if one ever is — so revisit with a number.
+`the_release_reaches_the_owner_before_the_drop_returns` pins the synchrony this rests on; without
+it a handed-off implementation would satisfy every other test in the file.
