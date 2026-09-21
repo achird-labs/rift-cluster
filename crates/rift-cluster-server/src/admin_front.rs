@@ -159,6 +159,12 @@ pub struct FrontConfig {
     /// The flow-state subsystem: the space listing's fleet-wide fan-out reaches it, and so does
     /// the owner lookup a space read is decorated with.
     pub flow_net: Arc<FlowNet>,
+    /// The address this node's front door bound, or `None` when no `--front-door` was given.
+    /// Reported by `/_fleet/members` as `front_door` (D-91) and used for nothing else here: the
+    /// front does not dispatch through it, it only knows the number so a client can build a URL
+    /// that resolves to something outside the node. The *bound* address, passed in after
+    /// `bind_front_door` has returned, so `:0` reports what the OS assigned.
+    pub front_door: Option<SocketAddr>,
 }
 
 /// A bound, serving admin front.
@@ -276,6 +282,13 @@ struct FrontState {
     readiness: Arc<Readiness>,
     /// See [`FrontConfig::flow_net`].
     flow_net: Arc<FlowNet>,
+    /// See [`FrontConfig::front_door`].
+    front_door: Option<SocketAddr>,
+    /// The admin port this node **bound** — the listener's own `local_addr`, not the configured
+    /// `public_addr`, because `--port 0` resolves to an OS-assigned port and the configured `0` is
+    /// not a port any client reached this node on. Reported so a client can detect address
+    /// translation between itself and the node (D-91).
+    admin_port: u16,
     /// Streams proxied requests through unchanged (SSE included).
     proxy: Client<hyper_util::client::legacy::connect::HttpConnector, Incoming>,
     /// Issues the internal re-reads mutation responses are rendered from.
@@ -301,6 +314,11 @@ pub async fn bind(config: FrontConfig, node: &Arc<RaftNode>) -> std::io::Result<
         write_path: config.write_path,
         readiness: config.readiness,
         flow_net: config.flow_net,
+        front_door: config.front_door,
+        // `local_addr`, not `config.public_addr`: `--port 0` is legal and the configured `0` is
+        // not a port a client could have reached this node on — which is the whole question this
+        // field exists to answer. Same rule as `front_door` beside it.
+        admin_port: local_addr.port(),
         proxy: Client::builder(TokioExecutor::new()).build_http(),
         fetch: Client::builder(TokioExecutor::new()).build_http(),
     });
@@ -781,7 +799,16 @@ async fn handle(state: Arc<FrontState>, req: Request<Incoming>) -> Response<Fron
                         "cluster node is shutting down",
                     );
                 };
-                match fleet::body(&route, &node, &state.readiness, state.write_path).await {
+                match fleet::body(
+                    &route,
+                    &node,
+                    &state.readiness,
+                    state.write_path,
+                    state.front_door,
+                    state.admin_port,
+                )
+                .await
+                {
                     Ok(Some(body)) => match serde_json::to_vec(&body.value) {
                         Ok(bytes) => {
                             let mut response = buffered_response(
@@ -5406,6 +5433,10 @@ mod tests {
                 public_addr: "127.0.0.1:0".parse().expect("valid address"),
                 upstream_admin: "127.0.0.1:1".parse().expect("addr"),
                 api_key: None,
+                // No front door in the unit fronts: `/_fleet/members` then reports
+                // `front_door: null`, which is the shape a node started without `--front-door`
+                // serves in production too.
+                front_door: None,
                 allow_injection: false,
                 scripts_dir: None,
                 write_path: WritePathSettings {
@@ -5792,6 +5823,10 @@ mod tests {
                 public_addr: "127.0.0.1:0".parse().expect("valid address"),
                 upstream_admin: "127.0.0.1:1".parse().expect("addr"),
                 api_key: None,
+                // No front door in the unit fronts: `/_fleet/members` then reports
+                // `front_door: null`, which is the shape a node started without `--front-door`
+                // serves in production too.
+                front_door: None,
                 allow_injection: false,
                 scripts_dir: None,
                 write_path: WritePathSettings {

@@ -866,6 +866,12 @@ async fn attach_data_plane(
             write_path,
             readiness: Arc::clone(readiness),
             flow_net: Arc::clone(&flow_net),
+            // The bound address, read off the listener rather than echoed from
+            // `front_door_addr`: `--front-door 0.0.0.0:0` is legal, and the configured `0` is
+            // not a port anything can connect to. Taken here, after the bind above, for the
+            // same reason `reported_admin_port` is (#598) — what gets reported and what got
+            // bound must be one value.
+            front_door: front_door.as_ref().map(|running| running.local_addr()),
         },
         node,
     )
@@ -2024,6 +2030,113 @@ mod tests {
             config["options"]["localOnly"],
             serde_json::json!(true),
             "the flag is reported, and the bind above now agrees with it: {config}"
+        );
+
+        composed.shutdown().await;
+    }
+
+    /// Pins D-91: `/_fleet/members` reports the address this node's front door **bound**, so a
+    /// client holding an imposter port can build a URL that reaches one.
+    ///
+    /// `--front-door 127.0.0.1:0` is the case that makes this more than an echo of the flag. The
+    /// configured port is `0` — not something anything can connect to — so a version that reported
+    /// what was asked for rather than what was bound passes every assertion about presence and
+    /// fails this one.
+    #[tokio::test]
+    async fn fleet_members_reports_the_bound_front_door() {
+        let state = TempDir::new().expect("tempdir");
+        let mut args: Vec<String> = [
+            "rift-cluster-server",
+            "--port",
+            "0",
+            "--front-door",
+            "127.0.0.1:0",
+            "--metrics-port",
+            "0",
+            "--cluster",
+            "--cluster-bind",
+            "127.0.0.1:0",
+            "--cluster-probe-bind",
+            "127.0.0.1:0",
+            "--cluster-secret",
+            "d-90-secret",
+            "--cluster-allow-solo",
+            "--cluster-leave-timeout",
+            "1",
+            "--cluster-state-dir",
+            &state.path().to_string_lossy(),
+        ]
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+        let cli = EeCli::try_parse_from(args.drain(..)).expect("parses");
+
+        let composed = start(cli).await.expect("solo starts");
+        let front = composed.admin_addr();
+        let door = composed
+            .front_door_addr()
+            .expect("a front door was asked for");
+        assert_ne!(door.port(), 0, "precondition: `:0` resolved to a real port");
+        assert_ne!(
+            door.port(),
+            front.port(),
+            "precondition: the front door is its own listener, or this proves nothing"
+        );
+
+        let members: serde_json::Value = reqwest::get(format!("http://{front}/_fleet/members"))
+            .await
+            .expect("GET /_fleet/members")
+            .json()
+            .await
+            .expect("members is JSON");
+        assert_eq!(
+            members["front_door"],
+            serde_json::json!(door.to_string()),
+            "/_fleet/members must report the bound front door, not the configured `:0`: {members}"
+        );
+        // The second half of D-91: the admin port beside it, so a client can tell whether the
+        // ports in this body survived the trip to it. `--port 0` here too, so this likewise
+        // distinguishes reporting the bind from echoing the flag.
+        assert_eq!(
+            members["admin_port"],
+            serde_json::json!(front.port()),
+            "/_fleet/members must report the admin port this node bound: {members}"
+        );
+
+        composed.shutdown().await;
+    }
+
+    /// The other half, and the reason the field is nullable: a node started without
+    /// `--front-door` has no such listener, and must say so rather than omit the key or report a
+    /// port nothing is on. A console reading this is deciding whether to *offer* a routed address,
+    /// so "absent" and "port 0" would both become a command that cannot connect.
+    #[tokio::test]
+    async fn fleet_members_reports_null_when_there_is_no_front_door() {
+        let state = TempDir::new().expect("tempdir");
+        let composed = start(solo_cli(&state, "1")).await.expect("solo starts");
+        assert!(
+            composed.front_door_addr().is_none(),
+            "precondition: no --front-door was given"
+        );
+
+        let members: serde_json::Value =
+            reqwest::get(format!("http://{}/_fleet/members", composed.admin_addr()))
+                .await
+                .expect("GET /_fleet/members")
+                .json()
+                .await
+                .expect("members is JSON");
+        assert_eq!(
+            members["front_door"],
+            serde_json::Value::Null,
+            "no front door must read as null, present and empty: {members}"
+        );
+        // Not nullable, unlike `front_door`: a node always has an admin port — it is how the
+        // caller reached it — so there is no "none" for this one to report.
+        assert_eq!(
+            members["admin_port"],
+            serde_json::json!(composed.admin_addr().port()),
+            "the admin port is reported whether or not there is a front door: {members}"
         );
 
         composed.shutdown().await;

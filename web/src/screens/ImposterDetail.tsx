@@ -11,6 +11,7 @@ import {
   useFleetView,
   useImportAddImposter,
   useImposter,
+  useRouteTable,
   useTryStub,
 } from "../app/queries.ts";
 import { toHash, useHashQuery } from "../app/routing.ts";
@@ -30,6 +31,11 @@ import {
 } from "../features/imposters/portable.ts";
 import { matchOrder } from "../features/stubs/matchOrder.ts";
 import { projectPredicates } from "../features/stubs/predicates.ts";
+import {
+  type Reach,
+  directReach,
+  frontDoorReach,
+} from "../features/stubs/reachability.ts";
 import { type Sample, sampleRequest, toCurl } from "../features/stubs/sample.ts";
 import { RecordingPanel } from "./RecordingPanel.tsx";
 import { RequestLog } from "./RequestLog.tsx";
@@ -919,6 +925,7 @@ function StubTable({
             </td>
             <td>
               <CopyCurlButton port={port} stub={stub} />
+              <CopyFrontDoorCurlButton port={port} stub={stub} />
               <TryStubButton port={port} stub={stub} />
             </td>
             <td>
@@ -973,7 +980,8 @@ const IDLESS_NOTE_ID = "stub-idless-note";
  * A command the operator runs in their own terminal has no such problem.
  */
 function CopyCurlButton({ port, stub }: { port: number; stub: Stub }): ReactNode {
-  const [state, setState] = useState<"idle" | "copied" | "failed">("idle");
+  const routes = useRouteTable();
+  const fleet = useFleetView({ polled: false });
 
   const projection = projectPredicates(stub);
   // A stub whose predicates the form cannot model is exactly the stub whose request cannot be
@@ -982,21 +990,108 @@ function CopyCurlButton({ port, stub }: { port: number; stub: Stub }): ReactNode
   if (projection.kind !== "predicates") return null;
 
   const sample = sampleRequest(projection.items);
-  const origin = `${window.location.protocol}//${window.location.hostname}:${port}`;
-  const command = toCurl(sample, origin);
+  // Whether the sibling button is going to appear, which changes what this one's caveat should
+  // say: "the port may not be published" is a dead end on its own and a signpost when there is a
+  // routed form beside it.
+  const routed =
+    frontDoorReach(
+      port,
+      sample,
+      routes.data ?? [],
+      fleet.data?.frontDoor ?? null,
+      window.location,
+      fleet.data?.adminPort,
+    ) !== null;
+
+  return (
+    <CopyReachButton
+      label="Copy curl"
+      testId={`copy-curl-${stub.id ?? "unnamed"}`}
+      sample={sample}
+      reach={directReach(port, sample, window.location, routed, fleet.data?.adminPort)}
+    />
+  );
+}
+
+/**
+ * The same stub, addressed through the front door instead of its imposter port (D-91).
+ *
+ * Offered **beside** the direct button rather than instead of it, because neither address is right
+ * everywhere: the imposter port is what you want from inside the node or when it is published, the
+ * front door is what you want from anywhere else, and which of those describes the operator is not
+ * something this console can know. Rendered only when a route actually delivers this stub's sample
+ * request — an imposter no route targets gets the direct button alone, with no empty second slot.
+ */
+function CopyFrontDoorCurlButton({ port, stub }: { port: number; stub: Stub }): ReactNode {
+  const routes = useRouteTable();
+  // `polled: false`: this reads one field that changes when a node restarts, not on a 5s tick.
+  const fleet = useFleetView({ polled: false });
+
+  const projection = projectPredicates(stub);
+  if (projection.kind !== "predicates") return null;
+
+  const sample = sampleRequest(projection.items);
+  const reach = frontDoorReach(
+    port,
+    sample,
+    routes.data ?? [],
+    fleet.data?.frontDoor ?? null,
+    window.location,
+    fleet.data?.adminPort,
+  );
+  // No route reaches it, no front door on this node, or neither read has landed yet. All three are
+  // "there is no routed address to offer", and none of them is an error worth a control that
+  // explains itself — the direct button is still there and still works.
+  if (reach === null) return null;
+
+  return (
+    <CopyReachButton
+      label="Copy curl (front door)"
+      testId={`copy-curl-front-door-${stub.id ?? "unnamed"}`}
+      sample={sample}
+      reach={reach}
+    />
+  );
+}
+
+/**
+ * One copy-a-command control, over whichever address [`Reach`] names.
+ *
+ * Shared so the two buttons cannot drift in the part that matters: the caveats. They ride on the
+ * control that produces the command, so an operator cannot copy a partial or possibly-unreachable
+ * request without the reason being one hover away.
+ */
+function CopyReachButton({
+  label,
+  testId,
+  sample,
+  reach,
+}: {
+  label: string;
+  testId: string;
+  sample: Sample;
+  reach: Reach;
+}): ReactNode {
+  const [state, setState] = useState<"idle" | "copied" | "failed">("idle");
+
+  // The route's headers first: a `Host` an operator is reading is the line that explains why the
+  // command has an origin and a hostname that disagree.
+  const command = toCurl(
+    { ...sample, target: reach.target, headers: [...reach.headers, ...sample.headers] },
+    reach.origin,
+  );
+  // The sample's caveats are about whether the request MATCHES; the reach's are about whether it
+  // ARRIVES. Both belong on the command, and neither substitutes for the other.
+  const caveats = [...sample.caveats, ...reach.caveats];
 
   return (
     <span className="row">
       <button
         className="btn sm"
         type="button"
-        data-testid={`copy-curl-${stub.id ?? "unnamed"}`}
-        // The caveats ride on the control that produces the command, so an operator cannot copy a
-        // partial request without the reason it is partial being one hover away.
+        data-testid={testId}
         title={
-          sample.caveats.length === 0
-            ? command
-            : `${command}\n\nThis request may not match:\n- ${sample.caveats.join("\n- ")}`
+          caveats.length === 0 ? command : `${command}\n\nBefore you run this:\n- ${caveats.join("\n- ")}`
         }
         onClick={() => {
           void navigator.clipboard
@@ -1005,11 +1100,12 @@ function CopyCurlButton({ port, stub }: { port: number; stub: Stub }): ReactNode
             .catch(() => setState("failed"));
         }}
       >
-        Copy curl
+        {label}
       </button>
       {state === "copied" ? (
         <span className="muted" role="status">
-          copied{sample.caveats.length === 0 ? "" : ` · ${sample.caveats.length} caveat(s)`}
+          copied{caveats.length === 0 ? "" : ` · ${caveats.length} caveat(s)`}
+          {reach.routeId === null ? "" : ` · via ${reach.routeId}`}
         </span>
       ) : null}
       {state === "failed" ? (
