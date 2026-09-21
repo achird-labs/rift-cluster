@@ -3962,17 +3962,18 @@ own behaviour rather than copies kept in step with a library function.
 - **Code:** crates/rift-cluster/src/stores/proxy.rs, crates/rift-cluster/src/bridge.rs,
   crates/rift-cluster/tests/proxy_claims.rs
 
-**The change, and where the pin stands.** Engine change rift#1193 (PR rift#1197) holds a won
-`proxyOnce` claim in a guard that releases it from `Drop` unless it was settled, replacing the
-explicit release on each returning path. So every release but the failed-settle one then arrives
-from a destructor, and three of those contexts are new: a request future dropped mid-await (client
-disconnect, timeout), a task aborted when an imposter stops, and a panicking handler unwinding.
-**That commit is not vendored yet** — this repo's pin is `a85f550` (rift#1179), where the
-engine still releases from explicit return paths and no such guard exists; PR #630 is the bump that
-brings it. This entry is written ahead of that bump on purpose, so the contract is already pinned
-when the destructor path goes live. The benefit it unlocks is real: for this store the claim is
-fleet-wide, so an abandoned request frees the signature at once instead of wedging it for the whole
-`claim_ttl` (D-40's fixed 60 s).
+**The change.** Engine change rift#1193 (PR rift#1197) holds a won `proxyOnce` claim in a guard
+that releases it from `Drop` unless it was settled, replacing the explicit release on each
+returning path. So every release but the failed-settle one now arrives from a destructor, and
+three of those contexts are new: a request future dropped mid-await (client disconnect, timeout),
+a task aborted when an imposter stops, and a panicking handler unwinding. The benefit is real: for
+this store the claim is fleet-wide, so an abandoned request frees the signature at once instead of
+wedging it for the whole `claim_ttl` (D-40's fixed 60 s).
+
+*This entry was written and merged (#632) one pin ahead of the mechanism it governs, so the
+contract was already pinned when the destructor path went live; the pin caught up in #630
+(`a85f550` → `24bf587`), which also retired the "not yet vendored" wording here and at the three
+code sites that carried it.*
 
 **The rule.** `ClusterProxyStore::release_claim` stays exactly what it was — one `Bridge::call` —
 and that is now a requirement rather than an incidental shape. Two properties carry it, both

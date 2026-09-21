@@ -1164,11 +1164,10 @@ async fn proxy_always_never_refuses_on_an_isolated_owner() {
 // #629 — the release seam is reached from a destructor (rift#1193, PR #1197).
 // ---------------------------------------------------------------------------
 
-/// The guard rift#1197 wraps a won claim in, reproduced rather than imported. At this repo's pin
-/// (`a85f550`, rift#1179) the engine has no such guard yet; once the pin advances past rift#1197
-/// it is private to `rift-mock-core`. Either way a test has to own one. Upstream's borrows the
-/// request-scoped signature; this one owns store and signature so it can move into a spawned
-/// task. The property under test is shared by both: the claim is given back from `Drop`.
+/// The guard rift#1197 wraps a won claim in, reproduced rather than imported: upstream's is
+/// private to `rift-mock-core`, so a test has to own one. Upstream's borrows the request-scoped
+/// signature; this one owns store and signature so it can move into a spawned task. The property
+/// under test is shared by both: the claim is given back from `Drop`.
 struct HeldClaim {
     store: Arc<ClusterProxyStore>,
     port: u16,
