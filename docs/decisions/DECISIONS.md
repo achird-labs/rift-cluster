@@ -4041,6 +4041,15 @@ tuple, whose `from_reply` folds a reply missing any member of it to "unknown", s
 key would render every not-yet-upgraded peer as a node with nothing bound for the length of a
 rolling deploy. A caller wanting a peer's front door asks that peer.
 
+Both fields are additions the `/_fleet/*` projection makes over `/_cluster/members`, so
+`fleet_projection_matches_the_cluster_port_shapes` lists them beside `members` — and they are there
+for a different reason than `members` is. `members` is a fan-out the cluster port must not serve.
+These two are the **front's own** addresses: not cluster state, since no peer needs to know where
+another node's operator-facing listeners are, and `/_cluster/*` is the node-to-node surface under
+the cluster credential. They are also not knowable where that port's table is built —
+`cluster_api::routes` is constructed well before either listener binds, and reporting the
+*configured* address there would reintroduce the `:0` problem these fields exist to avoid.
+
 `admin_port` is there because it is the only evidence a client can get that there is address
 translation between itself and the node. The client knows the port it dialled; this says what the
 node thinks it answered on; a difference proves a mapping, and the ports in the body are then the

@@ -16,7 +16,7 @@ docker compose -f deploy/compose/docker-compose.yml \
 # preload imposters, stubs and routes (wipes first, then verifies)
 python3 deploy/compose/local-test.seed.py
 
-# verify only
+# verify only — every imposter, on every node, through both its port and the router
 python3 deploy/compose/local-test.seed.py --check
 ```
 
@@ -160,6 +160,25 @@ curl -H 'Host: edge.test' localhost:12527/health    # host match, the "no nginx"
 curl -i localhost:12527/nope                        # 404, no route
 curl localhost:32527/orders-api/health              # same table, node 3
 ```
+
+Every imposter has a route, `payments` included — the router reaches an https imposter over plain
+`http`, because it dispatches in-process and 4547's TLS listener is never involved:
+
+```sh
+curl -k -X POST https://localhost:14547/charge   # direct: TLS
+curl    -X POST  http://localhost:12527/pay/charge  # router: plain http, same stub
+```
+
+**Two stubs answer differently through the two doors**, and both differences are correct:
+
+| | direct | router |
+|---|---|---|
+| `payments` `/reset` (TCP reset fault) | connection dies, `curl` exits 52 | `502` + `x-rift-fault: CONNECTION_RESET_BY_PEER` |
+| `payments` anything | https, needs `-k` | plain http |
+
+The front door terminates its own connection, so it cannot forward a raw reset — it turns the
+fault into a gateway error and names the cause in a header. A retry test written against the
+direct port and then pointed at the router will see a clean `502` where it expected a dead socket.
 
 `path_prefix`, `strip_prefix` and `set_host` are **snake_case** while the rest of the admin API is
 camelCase — `RouteMatch`/`RouteTarget` carry no serde rename, so that is what the fleet accepts.
