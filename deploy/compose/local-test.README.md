@@ -18,7 +18,18 @@ python3 deploy/compose/local-test.seed.py
 
 # verify only — every imposter, on every node, through both its port and the router
 python3 deploy/compose/local-test.seed.py --check
+
+# the per-stub sweep: every stub, both doors, all three nodes
+python3 deploy/compose/local-test.matrix.py
 ```
+
+The two checks answer different questions. `--check` asks whether the seed landed everywhere, one
+probe per imposter. `matrix.py` asks whether each individual **stub** answers the same way
+whichever door the request came in by — 156 checks, and the interesting failures are the ones that
+show up in only one column. It is a separate tool because the stateful stubs cannot be asserted
+with one request each: `cat-cycle` shares its response cursor between both doors on a node, so the
+claim is that consecutive calls *alternate*; the scenario and flow-state walks each take a fresh
+flow id per transport and node, so six runs do not walk one state machine six steps.
 
 `stop` / `start` preserve the Raft log, imposters and routes. **`up -d` after editing any compose
 file replaces the containers and starts from nothing** — the stack declares no volumes. Re-run the
