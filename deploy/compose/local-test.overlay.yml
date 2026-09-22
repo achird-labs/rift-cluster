@@ -1,0 +1,64 @@
+# Overlay for a hand-driven 3-node test fleet, on top of `docker-compose.yml`.
+#
+#     docker compose -f deploy/compose/docker-compose.yml \
+#                    -f deploy/compose/local-test.overlay.yml up -d --build
+#
+# It adds the three things the reference deployment leaves off on purpose, and
+# one thing `smoke.overlay.yml` leaves off on purpose:
+#
+# 1. MB_APIKEY — the admin credential. The reference file leaves the admin plane
+#    open, which is right for a reference and wrong for anything you then poke
+#    at by hand.
+# 2. RIFT_FRONT_DOOR — the router's listener. It dispatches to whatever the
+#    replicated route table names, so it is an operator choice, not a default.
+# 3. Published router ports, one per node (12527 / 22527 / 32527).
+# 4. **Published imposter ports.** `smoke.overlay.yml` deliberately omits these,
+#    because its point is that the router reaches an imposter in-process and a
+#    port Docker never heard of is still routable. Here the point is the
+#    opposite: hitting one imposter on one *named node* is how you see that
+#    replicated state really did reach all three, so each imposter port is
+#    published per node under the same rift-N convention.
+#
+# The stack declares no volumes. `stop`/`start` preserve the Raft log, imposters
+# and routes; `up -d` after editing any compose file replaces the containers and
+# starts from nothing.
+
+x-test-env: &test-env
+  MB_APIKEY: "${RIFT_LOCAL_KEY:-rift-local-key}"
+  RIFT_FRONT_DOOR: "0.0.0.0:2527"
+  # `_rift.script`, `inject`, `decorate` and a function `wait` are all gated on
+  # this, exactly as Mountebank gates `inject` — without it an imposter that
+  # carries one is refused at creation with `400 invalid injection`. The seed
+  # uses a Rhai script stub, so the fleet has to allow it.
+  MB_ALLOW_INJECTION: "true"
+
+services:
+  rift-1:
+    environment: *test-env
+    ports:
+      - "12527:2527"   # front door
+      - "14545:4545"   # catalog-api   (http)
+      - "14546:4546"   # orders-api    (http, scenarios)
+      - "14547:4547"   # payments-api  (https)
+      - "14548:4548"   # edge-proxy    (http, proxy/record)
+      - "14549:4549"   # ledger-api    (http, flow state)
+
+  rift-2:
+    environment: *test-env
+    ports:
+      - "22527:2527"
+      - "24545:4545"
+      - "24546:4546"
+      - "24547:4547"
+      - "24548:4548"
+      - "24549:4549"
+
+  rift-3:
+    environment: *test-env
+    ports:
+      - "32527:2527"
+      - "34545:4545"
+      - "34546:4546"
+      - "34547:4547"
+      - "34548:4548"
+      - "34549:4549"

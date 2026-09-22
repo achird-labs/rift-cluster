@@ -4016,3 +4016,73 @@ The cost it would remove is the bounded one above, no latency problem has been m
 reversal is cheap and unobservable outside the store if one ever is — so revisit with a number.
 `the_release_reaches_the_owner_before_the_drop_returns` pins the synchrony this rests on; without
 it a handed-off implementation would satisfy every other test in the file.
+### D-91 — `/_fleet/members` reports the node's bound front-door address, and the console offers both addresses for a stub
+
+- **Status:** active
+- **Decided:** 2026-09-21
+- **Refines:** D-79, D-82
+- **Code:** crates/rift-cluster-server/src/fleet.rs, crates/rift-cluster-server/src/admin_front.rs, crates/rift-cluster-server/src/compose.rs, web/src/features/stubs/reachability.ts, web/src/screens/ImposterDetail.tsx, docs/api/openapi-ee.yaml
+
+**The gap.** The console's `Copy curl` built its origin as this page's host with the *imposter's*
+port. An imposter port is bound inside the node: `deploy/compose/docker-compose.yml` publishes none
+of them on purpose — the front door reaches an imposter in-process, so a port Docker never heard of
+is still routable — and under Kubernetes the pod's port is not the Service's. So in exactly the
+deployments the front door exists to serve, the console handed the operator a command that could not
+connect, with nothing on screen saying why. Nothing on the admin plane reported an address that
+could: `/config` is upstream's document and stays proxied verbatim, and #598 already settled that
+its `options.port` is the *admin* port.
+
+**The rule.** `/_fleet/members` carries two top-level fields: `front_door`, the address this node's
+front door bound (or `null` when it was started without `--front-door`), and `admin_port`, the
+admin port it bound. The **bound** address, taken off the
+listener after `bind_front_door` returns, for the same reason `reported_admin_port` is (#598) — a
+configured `:0` is not a port anything can connect to, and what gets reported and what got bound
+must be one value. It is deliberately **not** in the `members` rows: those carry the `BindFields`
+tuple, whose `from_reply` folds a reply missing any member of it to "unknown", so a fourth required
+key would render every not-yet-upgraded peer as a node with nothing bound for the length of a
+rolling deploy. A caller wanting a peer's front door asks that peer.
+
+Both fields are additions the `/_fleet/*` projection makes over `/_cluster/members`, so
+`fleet_projection_matches_the_cluster_port_shapes` lists them beside `members` — and they are there
+for a different reason than `members` is. `members` is a fan-out the cluster port must not serve.
+These two are the **front's own** addresses: not cluster state, since no peer needs to know where
+another node's operator-facing listeners are, and `/_cluster/*` is the node-to-node surface under
+the cluster credential. They are also not knowable where that port's table is built —
+`cluster_api::routes` is constructed well before either listener binds, and reporting the
+*configured* address there would reintroduce the `:0` problem these fields exist to avoid.
+
+`admin_port` is there because it is the only evidence a client can get that there is address
+translation between itself and the node. The client knows the port it dialled; this says what the
+node thinks it answered on; a difference proves a mapping, and the ports in the body are then the
+node's rather than the caller's. Neither side can compute the mapping — but its *existence* is
+decidable, which is what lets the console say "this node reports 2525, you reached it on 12525, so
+your front-door port will differ" instead of a disclaimer that fits every deployment equally badly.
+`/config` carries the same number (`options.port`, #598) and is deliberately not used for it: that
+is upstream's document, proxied verbatim, and reading it would cost a second round trip for a fact
+this body is already assembling `front_door` beside.
+
+The host half is the node's *bind* host and is routinely `0.0.0.0`, which nothing can dial. A client
+takes the **port** and keeps the host it already reached the node on — that host demonstrably
+resolves. Address translation between client and node (a published container port, a Service, a load
+balancer) is a mapping the node is never told about and this cannot account for; the console says so
+rather than implying otherwise.
+
+**Both addresses, not the better one.** When a route in the replicated table delivers a stub's
+derived sample request, the console offers a second button beside the first rather than replacing
+it. Neither address is right everywhere — the imposter port is what you want from inside the node,
+from a sidecar, or when it is published; the front-door form is what you want from anywhere else —
+and which describes the operator is not something the console can know. An imposter no route targets
+keeps the direct button alone.
+
+Route choice defers to `effectiveOrder`, the front door's own precedence already ported for the
+routes screen, so the route named is the one that would actually take the request rather than merely
+one that could. `strip_prefix` is not symmetric and inverting it produces a 404: a stripping route
+needs `prefix + path` sent, while a non-stripping one forwards the path whole and can therefore only
+carry a path that already starts with its prefix — a stub it cannot reach is reported as unreachable
+through that route rather than given a command that fails.
+
+`fleet_members_reports_the_bound_front_door` pins the `:0` case for both ports, which distinguishes
+reporting the bind from echoing the flag; `fleet_members_reports_null_when_there_is_no_front_door` pins the nullability
+a console reads to decide whether to offer the button at all; `reachability.test.ts` pins the
+`strip_prefix` asymmetry, the wildcard-host substitution, and that precedence is deferred to rather
+than re-derived.

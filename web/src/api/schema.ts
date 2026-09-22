@@ -1255,6 +1255,21 @@ export interface components {
             /** @description Voter node ids in the currently effective membership. Strings for the same reason as `node_id`. */
             voters: string[];
             /**
+             * @description The address **this node's** front door bound, or `null` when the node was started without `--front-door` (D-91).
+             *     It is here because nothing else on the admin plane reports it and a client holding an imposter port cannot otherwise build a URL that reaches one: an imposter port is bound inside the node and is frequently not published at all, while the front door is the listener an operator deliberately exposed. `/config` is upstream's document, proxied verbatim, and its `options.port` is the admin port (#598).
+             *     The **bound** address, so `--front-door 0.0.0.0:0` reports the port the OS assigned rather than the `0` that was configured. A bind host of `0.0.0.0` is reported as-is and is not a dialable host — a client combines the *port* with the host it already reached this node on. Nothing here accounts for address translation between the client and the node: a published container port or a load-balanced address is a mapping the node has never been told about.
+             *     Top level only. It is deliberately absent from the `members` rows: those carry the `BindFields` tuple, whose reader folds a reply missing any member of it to "unknown", so a fourth key would render every not-yet-upgraded peer as a node with nothing bound for the length of a rolling deploy. Ask a peer for its own.
+             * @example 0.0.0.0:2527
+             */
+            front_door?: string | null;
+            /**
+             * @description The admin port **this node** bound (D-91) — the admin listener's own `local_addr`, not the configured `--port`, since `--port 0` resolves to an OS-assigned port and the configured `0` is not a port any client reached this node on.
+             *     Reported beside `front_door` because together they are "the listeners this node bound", and because it is the only evidence a client has that there is address translation between itself and the node: the client knows the port it dialled, this says what the node thinks it answered on, and a difference proves a mapping (a published container port, a Service, an ingress). Neither side can compute that mapping, but its existence is decidable — which is what lets a client say "the ports in this response are the node's, not yours" instead of a disclaimer that fits every deployment equally badly.
+             *     `/config` carries the same number as `options.port` (#598). That is upstream's document, proxied verbatim; this is the front's own report, assembled in the same body as `front_door`.
+             * @example 2525
+             */
+            admin_port?: number;
+            /**
              * @description The fleet's operator-set name (issue #373), or `null` when nobody has named it yet. A label, not an identity — node ids remain what every endpoint on this document addresses; this exists only so a console user, or an operator with several fleets open, can tell them apart at a glance.
              *     Deliberately **not** in `required`, unlike `current_leader` and `last_applied` which share its always-present-but-nullable shape. Those predate every node in any live fleet; this field does not. During a rolling upgrade the node answering this request may be a pre-#373 build that omits the key altogether, and `/_fleet/members` is answered by whichever node the caller reached — so absent is a genuinely reachable state, not a hypothetical one. Requiring it would make the shape an older node really sends unrepresentable in every generated client.
              *     Consumers therefore fold absent into `null`: both mean "no name to show". What neither means is "the name could not be read" — that is `fleet_name_unavailable` below, and keeping the two apart is the whole point of there being two fields.

@@ -52,6 +52,28 @@ export type FleetView = {
    */
   fleetNameUnavailable: boolean;
   /**
+   * The address the **answering** node's front door bound (D-91), or `null` when it was started
+   * without `--front-door`.
+   *
+   * Carried so a screen holding an imposter port can offer a URL that reaches it from outside the
+   * node. An imposter port is bound inside the node and in a container is frequently not published
+   * at all; the front door is the listener an operator deliberately exposed, so a route through it
+   * is often the only address that resolves.
+   *
+   * The host half is the node's *bind* host and is routinely `0.0.0.0`, which nothing can dial —
+   * a caller takes the port and keeps the host it already reached this node on. See
+   * `frontDoorOrigin` in `features/stubs/reachability.ts`, which is the one place that rule lives.
+   */
+  frontDoor: string | null;
+  /**
+   * The admin port the answering node believes it bound (D-91).
+   *
+   * Compared against the port the browser actually dialled, it is the one proof available that
+   * there is address translation in between — see `reachability.ts`. `null` on a node predating
+   * D-91, which is "unknown", never "no translation".
+   */
+  adminPort: number | null;
+  /**
    * What each voter reports about itself (#361), keyed by node id.
    *
    * The console is served under `default-src 'self'`, so the page can only ever dial the node that
@@ -205,6 +227,13 @@ export function fleetView(
     // `?? false` is a domain-optional read, not a swallow: the field is optional in the contract,
     // and a node that does not send it is one that had nothing to report as unreadable.
     fleetNameUnavailable: members.fleet_name_unavailable ?? false,
+    // `?? null` is a domain-optional read: the field is absent on a node predating D-91 and
+    // `null` on one started without `--front-door`. Both mean "no front-door address to offer",
+    // and the caller's only reaction to either is to not offer the button.
+    frontDoor: members.front_door ?? null,
+    // `?? null` is a domain-optional read: absent on a node predating D-91. Unknown, not zero —
+    // a `0` would compare unequal to every real port and assert a translation that may not exist.
+    adminPort: members.admin_port ?? null,
     /*
      * `?? []` is a domain-optional read, not a swallowed failure: `members` is optional in the
      * contract, so a response without it is a shape the schema permits and every voter simply

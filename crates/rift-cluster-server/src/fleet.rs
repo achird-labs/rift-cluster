@@ -29,6 +29,7 @@
 //! place rather than spread across every route that needs it.
 
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -139,9 +140,13 @@ pub(crate) async fn body(
     node: &Arc<RaftNode>,
     readiness: &Readiness,
     write_path: WritePathSettings,
+    front_door: Option<SocketAddr>,
+    admin_port: u16,
 ) -> Result<Option<FleetBody>, String> {
     match route {
-        FleetRoute::Members => Ok(Some(merged_members(node, write_path).await)),
+        FleetRoute::Members => Ok(Some(
+            merged_members(node, write_path, front_door, admin_port).await,
+        )),
         FleetRoute::Health => Ok(Some(fleet_health(node, readiness).await)),
         FleetRoute::Op(op_id) => op_body(node, op_id)
             .map(|found| found.map(FleetBody::local))
@@ -286,8 +291,51 @@ fn add_peer_depth(total: u64, reply: Option<&serde_json::Value>) -> (u64, bool) 
 ///
 /// Every field `members_body` produced is still there and still means what it did; `members` is
 /// added beside them. An existing reader of `last_applied` (this node's) is unaffected.
-async fn merged_members(node: &Arc<RaftNode>, write_path: WritePathSettings) -> FleetBody {
+async fn merged_members(
+    node: &Arc<RaftNode>,
+    write_path: WritePathSettings,
+    front_door: Option<SocketAddr>,
+    admin_port: u16,
+) -> FleetBody {
     let mut value = members_body(node, write_path);
+
+    // D-91: the address THIS node's front door bound, so a client holding an imposter port can
+    // work out a URL that is actually reachable. An imposter port is bound inside the node — in a
+    // container it is usually not published at all — while the front door is the listener an
+    // operator deliberately exposed, so a route through it is the only address a caller outside
+    // the node can use. Nothing else on the admin plane reports it: `/config` is upstream's
+    // document and stays proxied verbatim, and `options.port` there is the admin port (#598).
+    //
+    // Top-level only, beside `members`, and deliberately NOT folded into `BindFields`. Those three
+    // travel as a tuple and `from_reply` folds a reply missing *any* of them to "unknown" — a
+    // fourth required key would render every not-yet-upgraded peer as a node with nothing bound
+    // for the length of a rolling deploy. A caller wanting a peer's front door asks that peer,
+    // which is the same rule `/_cluster/members` already follows for everything else.
+    //
+    // `null` when no `--front-door` was given, which is the default: absent, not "port 0".
+    // The *bound* address rather than the configured one, so `--front-door 0.0.0.0:0` reports the
+    // port the OS actually assigned instead of the `0` an operator cannot connect to.
+    value["front_door"] = match front_door {
+        Some(addr) => serde_json::Value::String(addr.to_string()),
+        None => serde_json::Value::Null,
+    };
+
+    // The admin port THIS node believes it is on, beside the front door for the same reason and in
+    // the same breath: together they are "the listeners this node bound", and a reader needs both
+    // to say anything useful about either.
+    //
+    // It is the second half of D-91 because it is the only evidence a browser can get that there is
+    // address translation between it and the node. The client knows the port it dialled; this says
+    // what the node thinks it answered on. When they differ there is a mapping — a published
+    // container port, a Service, an ingress — and the front-door port above is then the node's own
+    // rather than the caller's. Neither side can compute the mapping, but its *existence* is
+    // decidable, and that is the difference between a caveat an operator can act on and one they
+    // scroll past.
+    //
+    // `/config` carries this too (`options.port`, #598) and is not used for it: that is upstream's
+    // document, proxied verbatim, so reading it costs a second round trip to a different origin's
+    // contract for a fact this body is already assembling its sibling of.
+    value["admin_port"] = serde_json::json!(admin_port);
     let status = node.status();
     let me = status.node_id;
 

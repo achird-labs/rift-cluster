@@ -254,7 +254,19 @@ async fn fleet_projection_matches_the_cluster_port_shapes() {
         // just as loudly as before.
         let permitted_additions: &[&str] = match fleet_path {
             // #361: each voter's own applied index, folded here.
-            "/_fleet/members" => &["members"],
+            //
+            // `admin_port` and `front_door` (D-91) join it for a different reason than `members`
+            // does, and the difference is the point. `members` is a fan-out the cluster port must
+            // not serve. These two are the **front's own** addresses: the public admin plane and
+            // the router an operator deliberately exposed. They are not cluster state — no peer
+            // needs to know them, and `/_cluster/*` is the node-to-node surface under the cluster
+            // credential. They are also not knowable where the cluster port's table is built:
+            // `cluster_api::routes` is constructed in `compose` well before either listener binds,
+            // and reporting the *configured* address instead would reintroduce the `:0` problem
+            // both fields exist to avoid.
+            //
+            // Alphabetical, because the keys are compared sorted.
+            "/_fleet/members" => &["admin_port", "front_door", "members"],
             // #360: the parked-write depth summed across voters. `parked_intents` itself is NOT
             // listed — it is in the shared `health_body`, so both ports carry it and it is not an
             // addition at all. Only the fleet-wide sum is. Alphabetical, because the keys are

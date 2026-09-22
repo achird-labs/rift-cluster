@@ -248,6 +248,17 @@ failure.
 > **Amended by D-73** (RFC-007 §3.2, #550): there is no tenant-filtered subset and no role
 > split — the admin credential reads all three routes, and RFC-002 will not land.
 
+> **Amended by D-91:** `/_fleet/members` is no longer the *verbatim* `members_body` shape. It is
+> that body plus three additive top-level fields the cluster port does not carry: `members` (#361,
+> the per-voter fan-out), and `front_door` and `admin_port` (D-91, the addresses this node's two
+> listeners bound). All three exist because they answer questions only the front can: `members` is
+> the fan-out `/_cluster/members` is the *target* of, and the two addresses are what the console
+> needs in order to offer a URL that resolves from outside the node — and to detect, from the
+> admin port it reached versus the one reported, that something is translating ports in between.
+> Every field `members_body`
+> produces is still present and still means what it did, so "one projection, not a second report"
+> holds for all of them — the additions sit beside it rather than restating any of it.
+
 The console cannot hold the cluster secret (§2), so the front terminates a
 read-only projection of the operator surface on the admin port:
 
