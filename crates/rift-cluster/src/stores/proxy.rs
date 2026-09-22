@@ -1046,12 +1046,10 @@ impl ProxyRecordingStore for ClusterProxyStore {
 
     /// D-90: one synchronous bridge call, in **every** calling context — including a destructor.
     ///
-    /// rift#1197 holds a won claim in a guard that releases it from `Drop`. That commit is *not*
-    /// in this repo's pin yet (`a85f550` = rift#1179, where the engine still releases from
-    /// explicit return paths); once the pin carries it, besides the failed-settle path this is
-    /// reached from a destructor — a request future dropped mid-await (client disconnect,
-    /// imposter stop), and a panicking handler, where it runs on an already-unwinding thread.
-    /// Two properties make that safe, and both are load-bearing:
+    /// rift#1197 holds a won claim in a guard that releases it from `Drop`, so besides the
+    /// failed-settle path this **is** reached from a destructor — a request future dropped
+    /// mid-await (client disconnect, imposter stop), and a panicking handler, where it runs on an
+    /// already-unwinding thread. Two properties make that safe, and both are load-bearing:
     ///
     /// - **It never blocks the async way.** [`Bridge::call`] parks on `std::sync::mpsc` precisely
     ///   so it can be called with a runtime entered; `block_on`/`blocking_recv` would panic there.
