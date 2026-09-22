@@ -625,8 +625,9 @@ def check() -> None:
     # dark — which it was, for payments, until a route existed for it.
     #
     # One probe per imposter rather than per stub: this is a "did the seed land
-    # everywhere" check, not the stub matrix. The per-stub sweep is a thing a person
-    # runs (see the README), because most of the interesting stubs are stateful.
+    # everywhere" check, not the stub matrix. `local-test.matrix.py` is the per-stub
+    # sweep, kept separate because most of the interesting stubs are stateful and
+    # cannot be asserted with one request each.
     probes = [
         # (imposter port, path on the imposter, router path, extra headers)
         (CATALOG, "/products", "/catalog/products", {}),
