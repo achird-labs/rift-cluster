@@ -4086,3 +4086,41 @@ reporting the bind from echoing the flag; `fleet_members_reports_null_when_there
 a console reads to decide whether to offer the button at all; `reachability.test.ts` pins the
 `strip_prefix` asymmetry, the wildcard-host substitution, and that precedence is deferred to rather
 than re-derived.
+
+### D-92 — The admin front answers `/__rift/*` in-process and applies a TCP fault on its own connection
+
+- **Status:** active
+- **Decided:** 2026-09-29 · #638 · rift#1234
+- **Refines:** D-11, D-73
+- **Code:** crates/rift-cluster-server/src/admin_front.rs, crates/rift-cluster/src/raft/store.rs, crates/rift-cluster/src/raft/node.rs, crates/rift-cluster-base/src/lib.rs
+
+**The gap.** rift 0.19.0 (rift#1234) made a TCP fault reached through a shared listener abort the
+client connection, as it does on the imposter's own port, instead of framing the fault's
+placeholder `502`. The front door got that with the vendor bump — `compose.rs` binds upstream's
+`bind_front_door`. The admin front did not: it proxied the `/__rift/*` leg to the loopback admin
+listener, which now aborted *its* connection to the front, and the front answered its own
+`503 local admin backend unreachable`. A client routed through the admin port exercised its
+error-status handling instead of the connection failure the stub asks for, and could not tell a
+mock's fault from a dead node. Proxying cannot be fixed in place: what a carrier means lives in a
+response extension, which does not cross an HTTP hop, and the aborted loopback socket does not say
+which of the four kinds it was.
+
+**The rule.** The gateway leg is dispatched in-process, through `RaftNode::dispatch_gateway` →
+upstream's `gateway::dispatch_gateway_path` against this node's engine, in an annotation scope whose
+notes the engine's decorator stamps with `ResponsePhase::Admin` — exactly what upstream's admin
+listener does for that route, so an ordinary answer is unchanged. The front wraps each accepted
+connection in `FaultIo` with its own `FaultCell` and passes every response through
+`apply_tcp_fault`; the front is HTTP/1-only, so a carrier always arms the cell and `FaultIo`
+performs that kind on the write. The two gateway strips (D-73's key, the session cookie) run before
+dispatch as they did before the proxy. A connection ended by an injected fault is logged at
+`debug!`, told apart with `is_injected_fault`.
+
+**Not chosen.** Aborting the downstream connection whenever the proxied gateway leg failed:
+it cannot reproduce the kind (a reset, an empty reply, garbage and a broken chunk are different
+failures to a client), and it would turn a genuinely unreachable backend into a silent reset. A node
+with no local engine keeps the proxy leg — the server binary always has one, so this is a fallback
+for embedders of `RaftNode`, not a second behaviour anyone runs.
+
+`h1_fault_through_every_door_matches_the_imposter_port` (`tests/gateway_tcp_fault.rs`) pins the
+per-kind parity on all three doors and goes red with the proxy leg restored (`503` for `/reset`);
+the same file pins the front door's HTTP/2 rule, keep-alive recovery, and the debug log level.

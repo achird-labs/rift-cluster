@@ -82,10 +82,10 @@ use rift_cluster::{
     SESSION_KEY_BYTES, SessionKey,
 };
 use rift_cluster_base::seams::{
-    ErrorKind, ImposterConfig, RiftScriptConfig, RouteTable, ScriptBaseDir, Stub,
-    classify as classify_upstream, config_uses_script_surface, error_response_typed,
-    not_a_stub_reason, resolve_scripts, resolve_stub_scripts, tcp_fault_carrier, validate_stub,
-    validate_stubs,
+    ErrorKind, FaultCell, FaultIo, ImposterConfig, RiftScriptConfig, RouteTable, ScriptBaseDir,
+    Stub, apply_tcp_fault, classify as classify_upstream, config_uses_script_surface,
+    error_response_typed, is_injected_fault, not_a_stub_reason, resolve_scripts,
+    resolve_stub_scripts, tcp_fault_carrier, validate_stub, validate_stubs,
 };
 // The compiler crate (RFC-004 §3.1–§3.3): `POST /specs/compile` runs it on the accepting node and
 // hands the result straight back, storing nothing (D-72, #549). `serde_json::Value` stays
@@ -370,17 +370,36 @@ pub async fn bind(config: FrontConfig, node: &Arc<RaftNode>) -> std::io::Result<
             };
             let state = Arc::clone(&state);
             connections.spawn(async move {
-                let service = service_fn(move |req| {
+                // A TCP-fault stub reached through the gateway leg aborts this connection exactly
+                // as it would on the imposter's own port (D-92, issue #638) — the same wrapping
+                // upstream's own admin listener and front door do (rift#1234). Inert for every
+                // other response: only `apply_tcp_fault` arms the cell, and only for a carrier.
+                let fault_cell = FaultCell::new();
+                let stream = FaultIo::new(stream, fault_cell.clone());
+                let service = service_fn(move |req: Request<Incoming>| {
                     let state = Arc::clone(&state);
-                    async move { Ok::<_, std::convert::Infallible>(handle(state, req).await) }
+                    let fault_cell = fault_cell.clone();
+                    async move {
+                        // Read before `handle` consumes the request: the fault rule is per
+                        // protocol version. This listener is HTTP/1-only, so a carrier always
+                        // arms the cell and is handed back for `FaultIo` to trip on its write;
+                        // the `Err` (an HTTP/2 stream reset) cannot arise here.
+                        let version = req.version();
+                        apply_tcp_fault(handle(state, req).await, version, &fault_cell)
+                    }
                 });
                 if let Err(e) = hyper::server::conn::http1::Builder::new()
                     .serve_connection(TokioIo::new(stream), service)
                     .await
                 {
-                    // Routine for dropped keep-alives; the client saw its
-                    // responses or its own error either way.
-                    tracing::debug!(error = %e, "admin front connection ended with an error");
+                    if is_injected_fault(&e) {
+                        // The configured behaviour of a fault stub, not a server error.
+                        tracing::debug!(error = %e, "admin front connection aborted by an injected TCP fault");
+                    } else {
+                        // Routine for dropped keep-alives; the client saw its
+                        // responses or its own error either way.
+                        tracing::debug!(error = %e, "admin front connection ended with an error");
+                    }
                 }
             });
         }
@@ -738,8 +757,8 @@ async fn handle(state: Arc<FrontState>, req: Request<Incoming>) -> Response<Fron
     // `classify` (which returns `None` for it too) would already exempt it,
     // but a future change to either must not be able to silently start
     // gating it.
-    if path.starts_with("/__rift/") {
-        return proxy(state, req, ProxyLeg::Gateway).await;
+    if let Some(rest) = path.strip_prefix("/__rift/") {
+        return gateway(state, rest, req).await;
     }
 
     // `GET /console` / `GET /console/*` (RFC-006 §7, issue #186): the embedded SPA, served from
@@ -2093,6 +2112,51 @@ async fn proxy(
             StatusCode::SERVICE_UNAVAILABLE,
             ErrorKind::Unavailable,
             &format!("local admin backend unreachable: {e}"),
+        ),
+    }
+}
+
+/// The `/__rift/{port}/*` gateway leg, answered **in-process** by this node's engine (D-92,
+/// issue #638) rather than proxied to the loopback listener.
+///
+/// The reason is the TCP-fault carrier (rift#1234). A fault stub's response is a placeholder
+/// whose meaning — "abort the connection, this way" — lives in a response *extension*, and an
+/// extension does not cross an HTTP hop. Proxied, the loopback listener aborted its own
+/// connection to this front and the front could only answer `503 local admin backend
+/// unreachable`: the client exercised its error-status handling instead of the connection failure
+/// the stub asks for, and could not tell a mock's fault from a dead node. Dispatched here, the
+/// carrier reaches this front's own listener, which applies it on the client's connection with
+/// the same kind the imposter port would (`apply_tcp_fault` in [`bind`]).
+///
+/// Everything else is what the loopback leg did: the same two credential strips, the same
+/// upstream parse and dispatch, the same annotation scope and decorator phase (see
+/// [`RaftNode::dispatch_gateway`]). A node with no local engine — never the case for the server
+/// binary, which always hands the node its engine — keeps the proxy leg, since there is nothing
+/// in-process to dispatch into.
+async fn gateway(
+    state: Arc<FrontState>,
+    rest: &str,
+    mut req: Request<Incoming>,
+) -> Response<FrontBody> {
+    let node = match state.node.upgrade() {
+        Some(node) if node.has_engine() => node,
+        _ => return proxy(state, req, ProxyLeg::Gateway).await,
+    };
+    strip_admin_bearer(req.headers_mut(), state.api_key.as_deref());
+    strip_session_cookie(req.headers_mut());
+    let query = req.uri().query().map(str::to_owned);
+    match node.dispatch_gateway(rest.to_owned(), query, req) {
+        // `Full`'s error is `Infallible`, so the map only names the type `FrontBody` carries. The
+        // carrier's extension survives `map`: it is the response's, not its body's.
+        Some(dispatch) => dispatch
+            .await
+            .map(|body| body.map_err(|never| match never {}).boxed()),
+        // `has_engine` is fixed at construction, so this is unreachable in practice; answered
+        // rather than asserted, and as the loopback leg would answer an engine it cannot reach.
+        None => typed_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            ErrorKind::Unavailable,
+            "this node has no local engine to dispatch the gateway request to",
         ),
     }
 }

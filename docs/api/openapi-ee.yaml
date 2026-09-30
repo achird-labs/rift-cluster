@@ -51,12 +51,14 @@ info:
     is then unknown, not failed).
 
     `/__rift/{port}/*` is served on the admin port too, as data-plane
-    gateway traffic proxied straight to the imposter on that port. It is
+    gateway traffic dispatched straight to the imposter on that port, which
+    answers exactly as on its own port — a TCP-fault stub aborts the
+    connection rather than answering (D-92). It is
     deliberately outside this contract and auth-exempt — the admin key is
     neither required on it nor forwarded to the imposter behind it. That
     holds for a credential the *caller* presents, not only for one the
     front would inject: an `Authorization` whose value is the configured
-    key is dropped before the request is proxied, as is the `rift_session`
+    key is dropped before the request is dispatched, as is the `rift_session`
     cookie. Any other bearer rides through untouched, and so does every
     `Cookie` header that did not carry that pair — byte for byte, not
     re-serialized — so an app under test can still authenticate to its own
