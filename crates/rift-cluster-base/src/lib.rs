@@ -242,6 +242,16 @@ pub mod seams {
     /// readable while the response is still in memory; see `perform_try`.
     pub use rift_mock_core::{TcpFaultKind, tcp_fault_carrier};
 
+    /// The listener half of a TCP fault (upstream #1234): what a listener that owns the client
+    /// connection needs to turn a carrier into the real fault instead of framing its `502`. Wrap
+    /// the accepted stream in [`FaultIo`] with a per-connection [`FaultCell`], and pass every
+    /// finished response through [`apply_tcp_fault`] — HTTP/1 arms the cell and `FaultIo` trips on
+    /// the write; HTTP/2 returns [`InjectedFault`], which resets that one stream.
+    /// [`is_injected_fault`] tells such a connection end from a real error, so it can be logged
+    /// below `error!`.
+    pub use rift_http_proxy::gateway::apply_tcp_fault;
+    pub use rift_mock_core::{FaultCell, FaultIo, InjectedFault, is_injected_fault};
+
     /// Backend-outage reporting and response decoration: how a backend surfaces
     /// as a structured 503, and how per-request annotations become response
     /// headers without the core handlers knowing what they mean.
@@ -250,6 +260,11 @@ pub mod seams {
         with_annotation_scope,
     };
 
+    /// The `/__rift/:port/<path>` parse + dispatch upstream's admin listener runs for its gateway
+    /// route (#212, #317). The admin front answers the gateway leg in-process through it (D-92)
+    /// rather than proxying to the loopback listener, because a TCP-fault carrier is only
+    /// recognizable while the response is still in memory.
+    pub use rift_http_proxy::gateway::dispatch_gateway_path;
     /// Server composition: the bootstrap builder, the metrics listener, and the
     /// single-port gateway dispatch a cluster binary composes rather than
     /// forking.
@@ -426,8 +441,15 @@ mod tests {
             annotate,
             backend_error_response,
             dispatch_to_port,
+            dispatch_gateway_path,
             handle_imposter_request,
         );
+        // The TCP-fault listener seam (upstream #1234), which the admin front applies (D-92).
+        _named::<FaultCell>();
+        _named::<FaultIo>();
+        _named::<InjectedFault>();
+        let _ = is_injected_fault;
+        let _ = apply_tcp_fault::<()>;
         let _ = (
             run_metrics_server,
             with_annotation_scope::<std::future::Ready<()>>,

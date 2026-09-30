@@ -76,8 +76,9 @@ tempfile = "3"
 # for the third time: #335 promoted it so the try endpoint could dial a loopback
 # imposter, #344 answered the try in-process, #292 shipped it inside the stdio
 # agent subcommand, and #547 removed that subcommand — the shipped binary is a
-# server and dials nothing.
-reqwest.workspace = true
+# server and dials nothing. `http2` for the gateway TCP-fault suite (#638), which asserts the
+# front door's HTTP/2 rule over a prior-knowledge client; hyper's own h2 is already in the tree.
+reqwest = { workspace = true, features = ["http2"] }
 # Enumerates `Terminated`'s variants so the route-parity gate can prove its representative list
 # covers every one (issue #184). Dev-only: the derives are `cfg_attr(test, ...)`, so nothing here
 # reaches the shipped binary.

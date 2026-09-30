@@ -1760,6 +1760,24 @@ impl RaftNode {
         self.sm_reader.dispatch_to_imposter(port, req)
     }
 
+    /// Answer a `/__rift/<rest>` gateway request in-process (D-92, issue #638), TCP-fault carrier
+    /// included — see [`RedbStateMachine::dispatch_gateway`]. `None` when this node has no local
+    /// engine; [`Self::has_engine`] answers that before the request is committed to this path.
+    pub fn dispatch_gateway(
+        &self,
+        rest: String,
+        query: Option<String>,
+        req: Request<Incoming>,
+    ) -> Option<impl Future<Output = Response<Full<Bytes>>> + Send + 'static> {
+        self.sm_reader.dispatch_gateway(rest, query, req)
+    }
+
+    /// Whether this node was started with a local engine — fixed for its lifetime.
+    #[must_use]
+    pub fn has_engine(&self) -> bool {
+        self.sm_reader.has_engine()
+    }
+
     /// Why `port`'s flow store is unusable, or `None` when it is fine (#576, D-76). Derived from
     /// the applied config on each call — see [`RedbStateMachine::flow_store_refusal`] for why it is
     /// not recorded.

@@ -70,8 +70,9 @@ use redb::{
     TableDefinition,
 };
 use rift_cluster_base::seams::{
-    ApplyReport, CompiledRoutes, ImposterConfig, ImposterError, ImposterManager, Route, RouteTable,
-    Stub, StubResponse, handle_imposter_request,
+    ApplyReport, CompiledRoutes, ImposterConfig, ImposterError, ImposterManager, ResponsePhase,
+    Route, RouteTable, Stub, StubResponse, dispatch_gateway_path, handle_imposter_request,
+    with_annotation_scope,
 };
 use serde::{Deserialize, Serialize};
 
@@ -1408,6 +1409,51 @@ impl RedbStateMachine {
                 Err(never) => match never {},
             }
         })
+    }
+
+    /// Answer a `/__rift/<rest>` gateway request in-process, exactly as upstream's admin listener
+    /// answers it on the loopback (D-92, issue #638): `rest` is everything after the `/__rift/`
+    /// prefix, parsed and dispatched by the same [`dispatch_gateway_path`] upstream's gateway
+    /// route runs, inside an annotation scope whose notes the engine's response decorator then
+    /// stamps with [`ResponsePhase::Admin`] — the phase every response on that listener gets.
+    ///
+    /// The response is returned **with** any TCP-fault carrier still attached, extension and
+    /// all: applying the fault is the calling listener's job, because only it owns the client
+    /// connection. That is the reason this exists at all — over the loopback the carrier's
+    /// extension never survived the hop, so the admin front could not tell a fault from a dead
+    /// backend.
+    ///
+    /// `None` only when this node has no local engine; unlike [`Self::dispatch_to_imposter`] a
+    /// port the engine does not hold is *answered* (upstream's `404 no imposter on port`), since
+    /// that is what the gateway has always said about it.
+    pub fn dispatch_gateway(
+        &self,
+        rest: String,
+        query: Option<String>,
+        req: Request<Incoming>,
+    ) -> Option<impl Future<Output = Response<Full<Bytes>>> + Send + 'static> {
+        let engine = Arc::clone(self.engine.as_ref()?);
+        Some(async move {
+            let decorator = engine.response_decorator();
+            let (mut response, annotations) =
+                with_annotation_scope(dispatch_gateway_path(&rest, query.as_deref(), req, &engine))
+                    .await;
+            if let Some(decorator) = decorator {
+                decorator.decorate(
+                    ResponsePhase::Admin,
+                    None,
+                    &annotations,
+                    response.headers_mut(),
+                );
+            }
+            response
+        })
+    }
+
+    /// Whether this node has a local engine to dispatch into at all — fixed at construction.
+    #[must_use]
+    pub fn has_engine(&self) -> bool {
+        self.engine.is_some()
     }
 
     /// Every port this node's engine holds, split by whether it actually got the socket (issue
