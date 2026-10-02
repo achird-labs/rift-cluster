@@ -1,20 +1,21 @@
-# How RiftCluster works — an interactive walkthrough
+# How RiftCluster works — a reference guide to the internals
 
 **Read it at <https://achird-labs.github.io/rift-cluster/>.**
 
-These pages build the design up from a single node and show where the obvious approach breaks. Most
-of them include figures you can drive yourself. You can elect a leader, tamper with a signed
-cluster request, commit a write, route a request through the front door, move a flow between
-owners, pull the plug on a node mid-fsync, and watch a lagging node catch up from a snapshot.
+A guide to how the cluster is designed and how it operates today: the two planes, consensus and
+what goes over the wire, the write and request paths, flow ownership and stateful stubs, the
+write-ahead logs and convergence, and membership. Most sections include a figure you can drive. You
+can elect a leader, sign and tamper with a cluster request, route a request through the front door,
+move a flow between owners, cut power mid-fsync, or watch a lagging node catch up from a snapshot.
 
 | Page | Sections |
 |---|---|
-| [Why a cluster, and its two planes](https://achird-labs.github.io/rift-cluster/index.html) | 1 One node, and what it can't do · 2 The fleet and the load balancer · 3 What breaks with the obvious design · 4 Two planes |
-| [Raft, and Raft under the hood](https://achird-labs.github.io/rift-cluster/consensus.html) | 5 Raft: agreeing on the boring things · 6 Raft under the hood (the cluster port, signed requests, discovery, timers, elections, heartbeats, replication) |
-| [Writes, mock requests and routing](https://achird-labs.github.io/rift-cluster/requests.html) | 7 Life of an admin write · 8 Life of a mock request · 9 How a request finds its imposter (ports, spaces, the gateway, the front door, proxy stubs) |
-| [Flow ownership and stateful stubs](https://achird-labs.github.io/rift-cluster/flow-state.html) | 10 Who owns a flow · 11 The state behind a stateful stub · 12 Replicas, handoff and fencing · 13 Flow state on disk |
-| [Write-ahead logs and convergence](https://achird-labs.github.io/rift-cluster/logs.html) | 14 Two write-ahead logs · 15 How the fleet converges |
-| [Membership, and what survives](https://achird-labs.github.io/rift-cluster/membership.html) | 16 Joining, leaving, retiring (including growing a cluster from one node) · 17 What survives what |
+| [What the cluster is, and its two planes](https://achird-labs.github.io/rift-cluster/index.html) | 1 One node, and what it can't do · 2 The fleet and the load balancer · 3 Two planes |
+| [Raft, and Raft under the hood](https://achird-labs.github.io/rift-cluster/consensus.html) | 4 Raft: agreeing on the boring things · 5 Raft under the hood (the cluster port, signed requests, discovery, timers, elections, heartbeats, replication) |
+| [Writes, mock requests and routing](https://achird-labs.github.io/rift-cluster/requests.html) | 6 Life of an admin write · 7 Life of a mock request · 8 How a request finds its imposter (ports, spaces, the gateway, the front door, proxy stubs) |
+| [Flow ownership and stateful stubs](https://achird-labs.github.io/rift-cluster/flow-state.html) | 9 Who owns a flow · 10 The state behind a stateful stub · 11 Replicas, handoff and fencing · 12 Flow state on disk |
+| [Write-ahead logs and convergence](https://achird-labs.github.io/rift-cluster/logs.html) | 13 Two write-ahead logs · 14 How the fleet converges |
+| [Membership, and what survives](https://achird-labs.github.io/rift-cluster/membership.html) | 15 Joining, leaving, retiring (including growing a cluster from one node) · 16 What survives what |
 
 ## What this is, and what it is not
 

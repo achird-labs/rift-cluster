@@ -8,13 +8,13 @@
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500;12..96,700;12..96,800&family=Literata:ital,opsz,wght@0,7..72,400;0,7..72,600;1,7..72,400&family=JetBrains+Mono:wght@400;600&display=swap">
 <link rel="stylesheet" href="assets/explained.css">
 
-<header class="sitenav"><a class="home" href="index.html">How RiftCluster works</a><nav aria-label="Pages"><ol><li><a href="index.html"><span>SECTIONS 1–4</span>Why a cluster, and its two planes</a></li><li><a href="consensus.html" aria-current=page><span>SECTIONS 5–6</span>Raft, and Raft under the hood</a></li><li><a href="requests.html"><span>SECTIONS 7–9</span>Writes, mock requests and routing</a></li><li><a href="flow-state.html"><span>SECTIONS 10–13</span>Flow ownership and stateful stubs</a></li><li><a href="logs.html"><span>SECTIONS 14–15</span>Write-ahead logs and convergence</a></li><li><a href="membership.html"><span>SECTIONS 16–17</span>Membership, and what survives</a></li></ol></nav></header>
-<header class="hero col page-title"><div class="eyebrow">How RiftCluster works · sections 5–6</div><h1 style="font-size:clamp(1.9rem,4.6vw,2.7rem)">Raft, and Raft under the hood</h1></header>
+<header class="sitenav"><a class="home" href="index.html">How RiftCluster works</a><nav aria-label="Pages"><ol><li><a href="index.html"><span>SECTIONS 1–3</span>What the cluster is, and its two planes</a></li><li><a href="consensus.html" aria-current=page><span>SECTIONS 4–5</span>Raft, and Raft under the hood</a></li><li><a href="requests.html"><span>SECTIONS 6–8</span>Writes, mock requests and routing</a></li><li><a href="flow-state.html"><span>SECTIONS 9–12</span>Flow ownership and stateful stubs</a></li><li><a href="logs.html"><span>SECTIONS 13–14</span>Write-ahead logs and convergence</a></li><li><a href="membership.html"><span>SECTIONS 15–16</span>Membership, and what survives</a></li></ol></nav></header>
+<header class="hero col page-title"><div class="eyebrow">How RiftCluster works · sections 4–5</div><h1 style="font-size:clamp(1.9rem,4.6vw,2.7rem)">Raft, and Raft under the hood</h1></header>
 
 <main>
-<!-- 5 -->
+<!-- 4 -->
 <section class="col" id="raft">
-  <h2>5 · Raft: agreeing on the boring things</h2>
+  <h2>4 · Raft: agreeing on the boring things</h2>
   <p>The control plane is an embedded Raft group (<code>openraft</code>), running inside every <code>rift-cluster-server</code> process and talking over the cluster port. Raft keeps a replicated <strong>log</strong>. One node is the <strong>leader</strong>; it appends entries and copies them to followers. An entry is <strong>committed</strong> once a majority has it on disk; after that it can never be lost or reordered, and every node applies committed entries in the same order.</p>
   <p>Followers expect a heartbeat from the leader every 50 ms. A follower that hears nothing for a random 150–300 ms becomes a <strong>candidate</strong>: it increments the <strong>term</strong>, votes for itself, and asks for votes. A node grants at most one vote per term, and only to a candidate whose log is at least as up to date as its own. A majority of votes makes a leader. The randomness keeps two candidates from splitting the vote forever.</p>
   <p>The simulation below runs that algorithm. Time is slowed about 15× and network delay is exaggerated so you can watch messages travel.</p>
@@ -45,10 +45,10 @@
   </ul>
 </section>
 
-<!-- 6 -->
+<!-- 5 -->
 <section class="col" id="wire">
-  <h2>6 · Raft under the hood</h2>
-  <p><a href='consensus.html#raft'>Section 5</a> is the algorithm. This section is what the cluster actually puts on the wire to run it. There are two moving parts. <code>openraft</code> is the engine: it owns terms, votes, logs, timers and the decision of what to send to whom. A small network layer in this crate carries those messages between processes, signs them, and decides how hard to try.</p>
+  <h2>5 · Raft under the hood</h2>
+  <p><a href='consensus.html#raft'>Section 4</a> is the algorithm. This section is what the cluster actually puts on the wire to run it. There are two moving parts. <code>openraft</code> is the engine: it owns terms, votes, logs, timers and the decision of what to send to whom. A small network layer in this crate carries those messages between processes, signs them, and decides how hard to try.</p>
   <h3>One port, signed HTTP</h3>
   <p>Every node binds one <strong>cluster port</strong>: <code>--cluster-bind</code>, which has no default because exposing it should be a deliberate choice. It tells peers where to reach it with <code>--cluster-advertise</code>, which defaults to the bind address and may be a hostname. Everything between nodes is a JSON <code>POST</code> over plain HTTP/1.1 on that port, from a pooled client with <code>TCP_NODELAY</code>, a 500 ms connect timeout and a 2 s request timeout:</p>
   <div class="tablewrap"><table>
@@ -60,7 +60,7 @@
       <tr><td><code>/internal/v1/cluster/join</code> · <code>leave</code> · <code>retire</code></td><td>membership requests, answered by the leader</td></tr>
       <tr><td><code>/internal/v1/cluster/write</code></td><td>an admin write forwarded to the leader</td></tr>
       <tr><td><code>/internal/v1/cluster/membership</code> · <code>/internal/v1/applied</code></td><td>read-only: who are you and what is your membership; how far have you applied</td></tr>
-      <tr><td><code>/_cluster/flow/*</code> · <code>seq/*</code> · <code>proxy/*</code></td><td>the data plane's owner RPCs (sections 11 and 12)</td></tr>
+      <tr><td><code>/_cluster/flow/*</code> · <code>seq/*</code> · <code>proxy/*</code></td><td>the data plane's owner RPCs (sections 10 and 11)</td></tr>
     </tbody></table></div>
   <p>There is no TLS on this port. It is meant for a private network, and a public bind address is refused unless acknowledged. What it does have is authentication on every single request. The sender signs it with HMAC-SHA256 under the shared <code>--cluster-secret</code>, over five length-prefixed fields: a timestamp, a random nonce, the method, the path with its query, and the <em>whole</em> body. The receiver checks in a fixed order, and the order is part of the design: cheap checks that need no secret come first, and the nonce is recorded last, so an unauthenticated sender can't fill the replay cache. Build a request below and tamper with it.</p>
 </section>
@@ -75,7 +75,7 @@
 <section class="col">
   <p>Two details are easy to miss. The protocol check runs before the body is read, so a node on a different major version is turned away with <code>426</code> before it costs any parsing. And the nonce cache (100,000 entries, each kept for 61 s, twice the 30 s skew allowance plus one) fails <em>closed</em>: if it is full of live entries, new requests are refused rather than admitted unchecked. A node run with <code>--cluster-insecure</code> skips signing and verification entirely and says so loudly at startup.</p>
 
-  <h3>Finding each other: no gossip</h3>
+  <h3>Finding each other: seeds and the membership</h3>
   <p>Nodes don't discover each other by broadcasting. A new node knows one thing, its <code>--cluster-seeds</code>, and uses them for exactly one request: <em>join</em>. From then on, the source of truth for “who is in the cluster, and where” is the Raft membership itself. Every member's advertise address is stored, verbatim, in the committed membership entry, so every node reads the same peer list at the same log index.</p>
   <ul>
     <li><strong>Addresses are re-resolved on every send.</strong> A hostname is looked up again each time a message goes out, and every address it yields is tried in the resolver's order (D-28). A pod that comes back with a new IP behind the same name is reachable at once.</li>
@@ -89,7 +89,7 @@
       <tr><td>Heartbeat</td><td>50 ms</td><td>The leader sends AppendEntries to every follower at least this often; each call is given 50 ms before openraft moves on.</td></tr>
       <tr><td>Election timeout</td><td>random 150–300 ms</td><td>How long a node with no leader waits before campaigning. The randomness keeps two nodes from splitting the vote forever.</td></tr>
       <tr><td>Leader lease</td><td>300 ms</td><td>A follower that heard a leader refuses vote requests for this long, and waits lease + election timeout (450–600 ms) before campaigning itself. openraft 0.9 has no pre-vote; the lease is what protects a healthy leader from a node that merely lost touch.</td></tr>
-      <tr><td>Restart grace</td><td>3 s</td><td>A restarting member of a multi-voter fleet may not campaign until it hears a leader or 3 s pass (#431).</td></tr>
+      <tr><td>Restart grace</td><td>3 s</td><td>A restarting member of a multi-voter fleet may not campaign until it hears a leader or 3 s pass.</td></tr>
       <tr><td>Isolation window</td><td>900 ms</td><td>A leader with no quorum acknowledgement for 3 × 300 ms, or a node that knows no leader, reports itself isolated, and refuses owner-side flow operations (D-17).</td></tr>
       <tr><td>Liveness probe</td><td>every 50 ms, 150 ms deadline</td><td>The second heartbeat, explained below.</td></tr>
       <tr><td>Peer health</td><td>3 failures → 5 s, half-open every 250 ms</td><td>Ordinary calls to a peer that keeps failing are refused locally instead of timing out, with one trial call let through per 250 ms (D-78).</td></tr>
@@ -101,13 +101,13 @@
 <div class="fig seq" id="seq-election"></div>
 <section class="col">
   <h3>The second heartbeat</h3>
-  <p>openraft's heartbeat is an ordinary AppendEntries with no entries. It works until the leader has something big in flight to a follower: a multi-megabyte append, or a snapshot being installed chunk by chunk. While that transfer is running, openraft sends that follower nothing else, and a follower that hears nothing for longer than its election timeout campaigns. Its term then runs ahead of the leader's, the leader refuses it, and the pair never reconcile. That standoff was measured: term 3 to 66 over 58 s, with the leader stuck at 1.</p>
+  <p>openraft's heartbeat is an ordinary AppendEntries with no entries. It works until the leader has something big in flight to a follower: a multi-megabyte append, or a snapshot being installed chunk by chunk. While that transfer is running, openraft sends that follower nothing else, and a follower that hears nothing for longer than its election timeout campaigns. Its term then runs ahead of the leader's, the leader refuses it, and the pair never reconcile.</p>
   <p>So the network layer runs its own <strong>liveness ticker</strong> for each peer. Every 50 ms, if this node is the leader <em>right now</em> (read live, not cached) and nothing has gone to that peer in the last 50 ms, it sends a minimal AppendEntries carrying only the leader's vote and no log position. On the follower the vote is checked before the log, so this refreshes its election timer and can never truncate anything. It goes through the <em>probe</em> path, which bypasses the peer-health gate (D-22): a heartbeat refused locally because the peer “recently failed” is exactly how a restarted voter would never hear the leader. It waits at most 150 ms for a reply (D-83), because its job is done once it arrives.</p>
 
   <h3>Replicating entries</h3>
   <ul>
     <li><strong>Batches.</strong> Up to 300 entries per AppendEntries. A follower that answers <code>413</code> makes the leader halve the batch immediately.</li>
-    <li><strong>One transfer per peer.</strong> A large append runs detached with its own deadline (2 s plus 1 s per MiB), and a re-send of the same batch joins it rather than starting a second copy (#411).</li>
+    <li><strong>One transfer per peer.</strong> A large append runs detached with its own deadline (2 s plus 1 s per MiB), and a re-send of the same batch joins it rather than starting a second copy.</li>
     <li><strong>Finding the match point.</strong> If a follower's log disagrees at <code>prev_log_id</code>, it answers <em>conflict</em>, and the leader binary-searches back to the last index they agree on, then sends from there. The follower truncates its unagreed tail.</li>
     <li><strong>Committing.</strong> Once a majority has an entry, the leader advances its commit index; followers learn it from the next AppendEntries, heartbeat or not.</li>
     <li><strong>Snapshots.</strong> A follower that needs purged entries gets the snapshot in 1 MiB chunks, each with 10 s to land. Between chunks, only the liveness ticker keeps its election timer fed.</li>
@@ -115,7 +115,7 @@
 </section>
 <div class="fig seq" id="seq-heartbeat"></div>
 
-<nav class="pager" aria-label="Previous and next"><a href="index.html"><span>← previous</span>Why a cluster, and its two planes</a><a href="requests.html" style="text-align:right"><span>next →</span>Writes, mock requests and routing</a></nav>
+<nav class="pager" aria-label="Previous and next"><a href="index.html"><span>← previous</span>What the cluster is, and its two planes</a><a href="requests.html" style="text-align:right"><span>next →</span>Writes, mock requests and routing</a></nav>
 <footer class="col">Built from docs/architecture (chapters 1–10, 13), docs/decisions/DECISIONS.md through D-95, and the code in crates/rift-cluster and crates/rift-cluster-server in rift-cluster. Where this page and a D-n disagree, the register wins. The Raft and convergence figures are simplified teaching models: the Raft figure ships whole logs and has no snapshots, and the convergence figure keeps one leader and scales the snapshot numbers down. The ownership figure computes the real HRW function.</footer>
 </main>
 

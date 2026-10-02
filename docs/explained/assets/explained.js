@@ -112,39 +112,6 @@ function SeqScene(id, cfg){
 /* ---------- Scenes ---------- */
 const N = {A:"var(--nA)", B:"var(--nB)", C:"var(--nC)", D:"var(--nD)", E:"var(--nE)"};
 
-SeqScene("seq-naive1", {
-  title:"Naive: background copy of config", note:"R1 violation",
-  actors:[{id:"ci",label:"CI job"},{id:"B",label:"Node B",color:N.B},{id:"A",label:"Node A",color:N.A},{id:"t",label:"Test"}],
-  steps:[
-    {caption:"The CI job sends <code>POST /imposters</code> for port 8080. The balancer picks node B.", items:[{f:"ci",t:"B",label:"POST /imposters :8080"}]},
-    {caption:"B stores the config in memory and binds :8080. It has not told anyone yet.", items:[{note:"B",text:"bind :8080 locally",kind:"good"}], state:{B:"imposters: {8080}"}},
-    {caption:"B answers <code>201 Created</code>. From the client's point of view the imposter exists.", items:[{f:"B",t:"ci",label:"201 Created",kind:"reply"}]},
-    {caption:"B starts copying the config to A in the background. The copy is still in flight.", items:[{f:"B",t:"A",label:"copy config (async)"}]},
-    {caption:"The test starts. Its first request goes through the balancer to node A.", items:[{f:"t",t:"A",label:"GET :8080/orders/1"}], state:{A:"imposters: {} <span style='color:var(--bad)'>(copy not here yet)</span>"}},
-    {caption:"A has no imposter on 8080. The test fails with a connection refused or 404, for a config the CI job was told exists.", items:[{f:"A",t:"t",label:"404 / refused",kind:"bad"},{note:["A","t"],text:"✗ acknowledged, but not servable everywhere",kind:"bad"}]},
-  ]});
-
-SeqScene("seq-naive2", {
-  title:"Naive: match against a local replica", note:"R2 violation",
-  actors:[{id:"t",label:"Test",sub:"flow f"},{id:"A",label:"Node A",color:N.A},{id:"B",label:"Node B",color:N.B}],
-  steps:[
-    {caption:"Request 1 for flow <code>f</code> lands on node A.", items:[{f:"t",t:"A",label:"POST /pay  (X-Flow-Id: f)"}], state:{A:"f = Started",B:"f = Started"}},
-    {caption:"A's copy says <code>Started</code>, so the Started stub matches and sets the state to <code>AwaitingPayment</code>.", items:[{note:"A",text:"Started → AwaitingPayment",kind:"good"}], state:{A:"f = AwaitingPayment"}},
-    {caption:"A answers request 1 and starts replicating the new state. Replication is asynchronous.", items:[{f:"A",t:"t",label:"202 payment pending",kind:"reply"},{f:"A",t:"B",label:"replicate f (async)"}]},
-    {caption:"2 ms later, request 2 for the same flow lands on node B. The replication message hasn't arrived.", items:[{f:"t",t:"B",label:"GET /status  (X-Flow-Id: f)"}], state:{B:"f = Started <span style='color:var(--bad)'>(stale)</span>"}},
-    {caption:"B matches the <em>Started</em> stub. No error is raised anywhere; the test just gets the wrong mock response, and may pass or fail for the wrong reason.", items:[{f:"B",t:"t",label:"200 'not started'",kind:"bad"},{note:["t","B"],text:"✗ silently wrong stub",kind:"bad"}]},
-  ]});
-
-SeqScene("seq-naive3", {
-  title:"Naive: owners chosen from gossiped membership", note:"split brain",
-  actors:[{id:"A",label:"Node A",color:N.A,sub:"believes {A,B,C}"},{id:"C",label:"Node C",color:N.C,sub:"believes {A,C}"},{id:"t1",label:"Request 1"},{id:"t2",label:"Request 2"}],
-  steps:[
-    {caption:"A network blip makes C stop hearing from B, so C's gossip view drops B. A still sees all three.", items:[{note:["A","C"],text:"views diverge: {A,B,C} vs {A,C}",kind:"warn"}], state:{A:"members {A,B,C}",C:"members {A,C}"}},
-    {caption:"Each node hashes flow <code>f</code> over the members it believes in. Different inputs, different owners: A computes B, C computes itself.", items:[{note:"A",text:"owner(f) = B"},{note:"C",text:"owner(f) = C"}]},
-    {caption:"Request 1 reaches A, which forwards the write to B (from A's view). Request 2 reaches C, which writes locally.", items:[{f:"t1",t:"A",label:"write f"},{f:"t2",t:"C",label:"write f"}]},
-    {caption:"Two authorities accepted conflicting writes for one flow. Healing needs version vectors and merge rules, and some test saw a wrong answer in between.", items:[{note:["A","C"],text:"✗ two owners for one key",kind:"bad"}], state:{A:"f written via B",C:"f written by C"}},
-  ]});
-
 const WA = [{id:"c",label:"Client (CI)"},{id:"B",label:"Node B",sub:"receives",color:N.B},{id:"L",label:"Node A",sub:"Raft leader",color:N.A},{id:"F",label:"Node C",sub:"follower",color:N.C}];
 const wHead = [
   {caption:"The client sends <code>POST /imposters</code> with <code>Idempotency-Key: k1</code>. The balancer picks node B.", items:[{f:"c",t:"B",label:"POST /imposters  k1"}]},
@@ -648,7 +615,7 @@ SeqScene("seq-election", {
       {caption:"A holds elections for up to 3 s. The current leader is not in A's metrics yet, so A releases the hold only on evidence from the wire: its vote moving, or a log entry arriving.", items:[{note:"A",text:"elect = false (restart grace)"}]},
       {caption:"B's liveness ticker has been sending to A's address every 50 ms through the probe path, which ignores the peer-health mark A's crash left behind. The first one that lands carries <code>vote 8/B</code>.", items:[{f:"B",t:"A",label:"append {vote 8/B} (probe)"},{f:"A",t:"B",label:"success",kind:"reply"}], state:{A:"follower · term 8 · leader B"}},
       {caption:"A adopts term 8 and B as leader; its vote moved, so the hold is released. Normal replication catches it up. No term was burned.", items:[{f:"B",t:"A",label:"append {entries 1040…1050}"},{note:"A",text:"caught up · no election",kind:"good"}]},
-      {caption:"Without the grace and the ticker, A would campaign at about 0.5 s with term 8, then 9, and so on. C refuses it because its lease from B is fresh, and B refuses it too, so A's term climbs alone. When B's replication finally reaches A, A answers with its inflated term, B adopts the higher vote and steps down, and the whole fleet re-elects for nothing. That is the failure #431 measured.", items:[{note:["A","C"],text:"what the grace prevents: a term standoff",kind:"bad"}]},
+      {caption:"Without the grace and the ticker, A would campaign at about 0.5 s with term 8, then 9, and so on. C refuses it because its lease from B is fresh, and B refuses it too, so A's term climbs alone. When B's replication finally reaches A, A answers with its inflated term, B adopts the higher vote and steps down, and the whole fleet re-elects for nothing. The grace and the probe exist to prevent exactly this.", items:[{note:["A","C"],text:"what the grace prevents: a term standoff",kind:"bad"}]},
     ]},
   ]});
 
@@ -770,7 +737,7 @@ SeqScene("seq-heartbeat", {
       let fwd = path;
       if (winner.target.strip_prefix){ const p = winner.match.path_prefix.replace(/\/+$/, ""); fwd = path.slice(p.length) || "/"; }
       out = `→ imposter :${winner.target.port}, path <code>${esc(fwd + q)}</code>`;
-      why = `<span class="stepno">ROUTE ${esc(winner.id).toUpperCase()}</span>The first route in effective order whose every clause matches. ${winner.target.strip_prefix ? "Its target strips the matched prefix before dispatch." : "The path is passed through unchanged."} The request is then dispatched in-process to the imposter on this node, where the flow id and stub matching take over (<a href='requests.html#read'>section 8</a>).`;
+      why = `<span class="stepno">ROUTE ${esc(winner.id).toUpperCase()}</span>The first route in effective order whose every clause matches. ${winner.target.strip_prefix ? "Its target strips the matched prefix before dispatch." : "The path is passed through unchanged."} The request is then dispatched in-process to the imposter on this node, where the flow id and stub matching take over (<a href='requests.html#read'>section 7</a>).`;
     } else if (path.startsWith("/__rift/")){
       const m = path.match(/^\/__rift\/(\d+)(\/.*)?$/);
       out = m ? `→ gateway: imposter :${m[1]}, path <code>${esc((m[2] || "/") + q)}</code>` : "→ gateway: 404 (no port in the path)";
@@ -1066,7 +1033,7 @@ SeqScene("seq-heartbeat", {
   if (!document.getElementById("fig-life")) return;
   const S = [
     ["Discovering","Started with <code>--cluster-seeds</code>. Seeds are re-resolved through DNS on <em>every</em> attempt, because pod IPs churn and a cached-IP join loop after a full restart would brick the fleet. Bootstrap is explicit: exactly one node, once, starts with <code>--cluster-allow-solo</code> and no seeds. A node with peers configured never forms its own group, which rules out split-brain-on-blip by construction."],
-    ["Learner","The joining node calls the leader over the HMAC-signed cluster port. The leader commits a membership entry adding it as a learner and answers <code>admitted</code> at once, with a catch-up estimate. The joiner never waits out its own catch-up inside an RPC deadline (#433, the etcd learner pattern)."],
+    ["Learner","The joining node calls the leader over the HMAC-signed cluster port. The leader commits a membership entry adding it as a learner and answers <code>admitted</code> at once, with a catch-up estimate. The joiner never waits out its own catch-up inside an RPC deadline."],
     ["Catching up","Snapshot install plus log replay. <code>/readyz</code> stays non-200 until the applied index reaches the leader's commit index observed at join and its imposters are bound or reported, so the balancer never routes to a node serving yesterday's config."],
     ["Voter","The leader's promotion sweep (1 s cadence) makes a caught-up learner a voter, while there are fewer than 9 voters. Past 9, nodes stay learners: full data-plane citizens with no election weight. A promotion only ever adds voter ids; it never evicts one (D-27)."],
     ["Leaving","SIGTERM: drain readiness, leave the membership, and let flow ownership move with the committed entry (no pre-leave flush; every write was already replicated). The leader refuses a departure that would leave fewer than two voters (D-25). A node that departed writes a <code>departed</code> marker that decides resume, rejoin or bootstrap on its next start; the state directory is never wiped to force a clean join (D-26)."],

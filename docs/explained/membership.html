@@ -8,13 +8,13 @@
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500;12..96,700;12..96,800&family=Literata:ital,opsz,wght@0,7..72,400;0,7..72,600;1,7..72,400&family=JetBrains+Mono:wght@400;600&display=swap">
 <link rel="stylesheet" href="assets/explained.css">
 
-<header class="sitenav"><a class="home" href="index.html">How RiftCluster works</a><nav aria-label="Pages"><ol><li><a href="index.html"><span>SECTIONS 1–4</span>Why a cluster, and its two planes</a></li><li><a href="consensus.html"><span>SECTIONS 5–6</span>Raft, and Raft under the hood</a></li><li><a href="requests.html"><span>SECTIONS 7–9</span>Writes, mock requests and routing</a></li><li><a href="flow-state.html"><span>SECTIONS 10–13</span>Flow ownership and stateful stubs</a></li><li><a href="logs.html"><span>SECTIONS 14–15</span>Write-ahead logs and convergence</a></li><li><a href="membership.html" aria-current=page><span>SECTIONS 16–17</span>Membership, and what survives</a></li></ol></nav></header>
-<header class="hero col page-title"><div class="eyebrow">How RiftCluster works · sections 16–17</div><h1 style="font-size:clamp(1.9rem,4.6vw,2.7rem)">Membership, and what survives</h1></header>
+<header class="sitenav"><a class="home" href="index.html">How RiftCluster works</a><nav aria-label="Pages"><ol><li><a href="index.html"><span>SECTIONS 1–3</span>What the cluster is, and its two planes</a></li><li><a href="consensus.html"><span>SECTIONS 4–5</span>Raft, and Raft under the hood</a></li><li><a href="requests.html"><span>SECTIONS 6–8</span>Writes, mock requests and routing</a></li><li><a href="flow-state.html"><span>SECTIONS 9–12</span>Flow ownership and stateful stubs</a></li><li><a href="logs.html"><span>SECTIONS 13–14</span>Write-ahead logs and convergence</a></li><li><a href="membership.html" aria-current=page><span>SECTIONS 15–16</span>Membership, and what survives</a></li></ol></nav></header>
+<header class="hero col page-title"><div class="eyebrow">How RiftCluster works · sections 15–16</div><h1 style="font-size:clamp(1.9rem,4.6vw,2.7rem)">Membership, and what survives</h1></header>
 
 <main>
-<!-- 16 -->
+<!-- 15 -->
 <section class="col" id="life">
-  <h2>16 · Joining, leaving, retiring</h2>
+  <h2>15 · Joining, leaving, retiring</h2>
   <p>Membership changes only by a node joining or leaving, or by an operator retiring a member that is gone (D-95). Each transition is a committed log entry that the node does not drive itself. Click a stage.</p>
 </section>
 <div class="fig" id="fig-life">
@@ -30,13 +30,13 @@
   <p>Two details in that sequence carry most of the safety. <strong>Founding is explicit</strong>: only a node started with <code>--cluster-allow-solo</code> and no seeds will found a cluster, and a node that has seeds and can't reach them gives up after 30 s instead of founding its own. Two nodes that each founded a cluster would be two fleets that can never merge, so that mistake is refused at start rather than repaired afterwards. <strong>The joiner asks; the leader decides</strong>: the joining node only ever sends one signed request, and the leader writes the membership entries. That is D-21: what can enter the fleet is bounded by what an operator chose to start, with the cluster secret.</p>
   <p>Past three, every join is the same step. Nodes four through nine become voters (a five-voter fleet survives two failures). The tenth and later stay learners, which serve traffic but neither vote nor own flows. A joiner that needs a large snapshot is answered as a learner with <code>catching_up: true</code> rather than holding its join open; the leader's 1 s sweep promotes it once its replication is within 16 entries.</p>
   <h3>Cold start, the payoff</h3>
-  <p>Under the gossip draft, a full-cluster restart needed merge rules, tombstone vectors, and a rule against empty nodes wiping the fleet's config. Under Raft it collapses: every node reopens its <code>redb</code>, the group re-forms from the persisted vote, log and snapshot, elects a leader, and replays. A deletion is a log entry, so it can't resurrect. An empty-disk node is a learner catching up from a snapshot. If <em>every</em> disk is empty there is no group to re-form, and nothing serves until an operator re-initializes: a loud refusal, as R3 demands.</p>
-  <p>The case that needs care is a single member restarting, not the whole fleet. That is what the 3 s restart grace, the leader's 50 ms retries and the liveness ticker in <a href='consensus.html#raft'>section 5</a> exist for.</p>
+  <p>A full-cluster restart needs no special handling: every node reopens its <code>redb</code>, the group re-forms from the persisted vote, log and snapshot, elects a leader, and replays. A deletion is a log entry, so it can't resurrect. An empty-disk node is a learner catching up from a snapshot. If <em>every</em> disk is empty there is no group to re-form, and nothing serves until an operator re-initializes: a loud refusal, as R3 demands.</p>
+  <p>The case that needs care is a single member restarting, not the whole fleet. That is what the 3 s restart grace, the leader's 50 ms retries and the liveness ticker in <a href='consensus.html#raft'>section 4</a> exist for.</p>
 </section>
 
-<!-- 17 -->
+<!-- 16 -->
 <section class="col" id="survive">
-  <h2>17 · What survives what</h2>
+  <h2>16 · What survives what</h2>
   <p>The volatile rows are decisions, not gaps: each would cost hot-path writes to preserve state whose value ends with the test run.</p>
   <div class="tablewrap"><table>
     <thead><tr><th>State</th><th>Lives in</th><th>Node crash</th><th>Full restart</th></tr></thead>
