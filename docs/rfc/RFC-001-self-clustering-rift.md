@@ -604,6 +604,10 @@ fallback dispatch, §7.4.6) stay cluster.
 
 #### 7.1.2 Node lifecycle & graceful leave
 
+> **Amended by D-94** (2026-10-01): there is no crash path that hands off. A leaver that dies
+> mid-drain, like any crashed voter, stays in the membership and keeps its keys until a committed
+> departure removes it; nothing GCs a dead member. Retiring one that never returns is #641.
+
 States: `Joining → Ready → Live ⇄ Suspect → Dead | Leaving → Left`.
 
 - **Joining:** contact seeds, sync membership, run initial config reconcile (§7.4.5).

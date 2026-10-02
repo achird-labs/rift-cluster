@@ -192,8 +192,9 @@ state dir and recovers them from its own `flow.redb`. Nothing requires an
 operator **if the node comes back**. A node that never does stays a member,
 holding its keys unavailable and counting in the quorum denominator, and there
 is no supported way to remove it yet (#641; the Chapter 10 runbook is a sketch).
-A *graceful* stop is the case that hands off: the departure commits, and the
-successors adopt with staleness ≤ one replication round (Chapter 6).
+A *graceful* stop hands off when its departure commits — not when the D-25
+voter floor refuses it, nor when the leave fails — and the successors adopt
+with staleness ≤ one replication round (Chapter 6).
 
 **Network partition, 5 nodes → 3|2:**
 

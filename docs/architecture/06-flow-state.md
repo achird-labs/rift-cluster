@@ -205,7 +205,7 @@ sequenceDiagram
     participant A as Node A (replica)
 
     Note over B: owner of flow f, replicating to C, A
-    B->>L: SIGTERM → leave (after draining readiness)
+    B->>L: SIGTERM → leave (after failing readiness)
     L->>L: commit membership entry M: B removed
     Note over C: applies M → ring says: I own f (as of m_idx=M)
     C->>A: pull range for f — highest (m_idx, v, origin)
@@ -231,7 +231,8 @@ most the in-flight pushes outstanding (Chapter 3's lifecycle).
 removal, and only a node's own `leave` commits one. A voter that crashes stays in
 the membership, so the ring — and every key's owner — is unchanged: owner-routed
 operations on its keys fail fast (Chapter 9's degradation table) until it restarts
-and reopens its `flow.redb`, and the replicas sit unused. Removing members on suspicion would turn
+and reopens its `flow.redb`, and the replicas sit unused by owner-routed
+operations (a `readConsistency: "local"` read still serves from them). Removing members on suspicion would turn
 every pause and blip into two ownership moves and could shrink the quorum on a
 false positive. A voter that is never coming back has no supported removal yet:
 that is #641.

@@ -1258,8 +1258,8 @@ async fn a_crashed_voter_keeps_its_keys_until_it_leaves() {
     owner.node.shutdown().await.expect("stop the owner");
 
     // Long enough for an election round, a leader promotion sweep (1 s) and
-    // the owner's peers to mark it unhealthy — anything that could remove a
-    // member on failure has had its chance.
+    // the owner's peers to mark it unhealthy. A failure detector slower than
+    // this window would not be caught here; D-94 records that bound.
     tokio::time::sleep(Duration::from_secs(3)).await;
 
     for survivor in members.iter().filter(|m| m.node.id() != owner_id) {

@@ -4161,7 +4161,7 @@ and the learner's own ring, and goes red when the ring is built from every membe
 - **Status:** active
 - **Decided:** 2026-10-01 · follow-up #641
 - **Refines:** D-17, D-21
-- **Amends:** RFC-001 §7.2
+- **Amends:** RFC-001 §7.1.2, RFC-001 §7.2
 - **Code:** crates/rift-cluster/src/raft/node.rs, crates/rift-cluster/src/raft/network.rs
 
 **The rule.** Nothing removes a voter because it stopped answering. A crash, a kill or a lost
@@ -4188,9 +4188,11 @@ such a member keeps 1/N of keys at `503` and stays in the quorum denominator.
 
 **Corrected here.** Chapter 6's handoff diagram and Chapter 9's "one voter crashes" walkthrough
 had the leader commit "B removed" after a crash, with successors adopting and "nothing requires an
-operator". No code path does that.
+operator"; Chapters 14 and 15 called a hard terminate on scale-in "safe". No code path does that,
+and a scaled-in instance is exactly the member that never returns.
 
 `a_crashed_voter_keeps_its_keys_until_it_leaves` (`crates/rift-cluster/tests/flow_store.rs`) pins
 it: after a non-leader owner is stopped without leaving, the survivors' ring keeps it at the same
 `m_idx` well past an election and a promotion sweep, and a write to its flow fails rather than
-being served by a successor.
+being served by a successor. It bounds its own window (3 s): a failure detector slower than that
+would not turn it red.
