@@ -20,9 +20,10 @@ pub mod ring;
 pub(crate) mod store;
 
 pub use identity::NodeIdentity;
-pub use network::ADMIT_CURRENCY_WAIT;
+pub use network::{ADMIT_CURRENCY_WAIT, ProbeEvidence, ProbeSeen, RetireRefusal, RetireReply};
 pub use node::{
-    JoinOutcome, JoinedAs, LeaderWait, LeaveOutcome, NodeConfig, NodeError, RaftNode, StatusReport,
+    JoinOutcome, JoinedAs, LeaderWait, LeaveOutcome, NodeConfig, NodeError, RaftNode,
+    RemovalEvidence, StatusReport, retire_via,
 };
 pub use ring::{KeyClass, OwnStatus, OwnedKey, Ring};
 

@@ -243,7 +243,14 @@ static VERSION_BANNER: LazyLock<String> = LazyLock::new(rift_cluster_base::versi
 
 /// `rift-cluster-server`: the Rift server with cluster clustering.
 #[derive(clap::Parser, Debug)]
-#[command(name = "rift-cluster-server", version = VERSION_BANNER.as_str(), about)]
+#[command(
+    name = "rift-cluster-server",
+    version = VERSION_BANNER.as_str(),
+    about,
+    after_help = "Operator commands for a running fleet: `rift-cluster-server cluster remove-node \
+                  <NODE_ID> --via <HOST:PORT>` retires a member that is gone for good. See \
+                  `rift-cluster-server cluster --help`."
+)]
 pub struct EeCli {
     #[command(flatten)]
     pub oss: OssCli,
@@ -403,7 +410,7 @@ fn xxhash_node_id(name: &str) -> u64 {
     xxhash_rust::xxh64::xxh64(name.as_bytes(), 0).max(1)
 }
 
-fn read_secret_file(path: &std::path::Path) -> Result<String, ConfigError> {
+pub(crate) fn read_secret_file(path: &std::path::Path) -> Result<String, ConfigError> {
     // Fail closed and say which file: degrading an unreadable secret into "no
     // secret" would either start an unauthenticated cluster port or blame the
     // operator for a flag they did pass.

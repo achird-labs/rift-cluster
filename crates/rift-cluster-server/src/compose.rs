@@ -52,6 +52,11 @@ const SEED_JOIN_DEADLINE: Duration = Duration::from_secs(30);
 /// costs a node its start, while waiting costs a moment of an already-slow boot.
 const MEMBERSHIP_LOAD_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// How long a restarting member may spend asking its peers whether it was
+/// retired while it was down (D-95). Inside `RaftNode::RESTART_ELECTION_GRACE`
+/// (3 s) on purpose: the answer has to arrive before the node may campaign.
+const REMOVAL_CHECK_BUDGET: Duration = Duration::from_secs(2);
+
 /// The file a confirmed departure leaves behind in the cluster state directory.
 ///
 /// Presence is the whole signal; the contents are informational. Decision D-26:
@@ -1590,6 +1595,8 @@ async fn join_or_bootstrap(node: &RaftNode, cli: &EeCli) -> anyhow::Result<()> {
     // Where this node may offer itself. Seeds alone until the durable
     // membership is known to have loaded — see below.
     let mut targets = cli.cluster.cluster_seeds.clone();
+    // Set when a peer proves this node was retired while it was down (D-95).
+    let mut retired = None;
 
     if initialized {
         // Every membership read below is meaningless until the durable
@@ -1618,9 +1625,29 @@ async fn join_or_bootstrap(node: &RaftNode, cli: &EeCli) -> anyhow::Result<()> {
         // send a healthy node down the rejoin path and, with nothing to rejoin
         // through, refuse the start of a node that was fine.
         let out_of_membership = loaded && !node.in_membership();
-        if !departed && !out_of_membership {
+        // The third piece of positive evidence (D-95, amending D-26): a member
+        // that crashed and was then *retired* has neither a marker nor a log
+        // that omits it, so only a live peer can tell it. Asked once, bounded to
+        // finish inside the restart election hold — resuming into a membership
+        // it is no longer in, it would campaign against survivors that refuse
+        // it, then inflate the fleet's term when the #72 fallback re-admits it.
+        retired = if loaded && !departed && !out_of_membership {
+            node.removal_evidence(&targets, REMOVAL_CHECK_BUDGET).await
+        } else {
+            None
+        };
+        if !departed && !out_of_membership && retired.is_none() {
             tracing::info!("cluster state present; resuming membership from the durable log");
             return Ok(());
+        }
+        if let Some(evidence) = &retired {
+            tracing::warn!(
+                peer = %evidence.peer,
+                peer_node_id = evidence.peer_node_id,
+                peer_m_idx = evidence.peer_m_idx,
+                own_m_idx = evidence.own_m_idx,
+                "this node was retired from the cluster while it was down; rejoining as a learner"
+            );
         }
 
         anyhow::ensure!(
@@ -1633,6 +1660,7 @@ async fn join_or_bootstrap(node: &RaftNode, cli: &EeCli) -> anyhow::Result<()> {
         tracing::info!(
             departed,
             out_of_membership,
+            retired = retired.is_some(),
             targets = targets.len(),
             "cluster state present but this node is not a member; rejoining through its seeds and \
              the peers its log remembers"
@@ -1658,6 +1686,21 @@ async fn join_or_bootstrap(node: &RaftNode, cli: &EeCli) -> anyhow::Result<()> {
         return Ok(());
     }
 
+    // A retired node's log still lists it as a voter: it must not campaign
+    // while it rejoins, and the restart hold alone ends after 3 s regardless.
+    if retired.is_some() {
+        node.hold_elections();
+    }
+    let joined = join_through(node, &targets, &state_dir).await;
+    if retired.is_some() {
+        node.release_elections();
+    }
+    joined
+}
+
+/// Offer this node to `targets` until one admits it or [`SEED_JOIN_DEADLINE`]
+/// passes, clearing the `departed` marker on success.
+async fn join_through(node: &RaftNode, targets: &[String], state_dir: &Path) -> anyhow::Result<()> {
     // Retried, and re-resolved on every attempt rather than once at parse time.
     // Both halves matter during a rolling deploy: this node routinely starts
     // before its seeds are accepting, and a headless service's DNS record gains
@@ -1669,7 +1712,7 @@ async fn join_or_bootstrap(node: &RaftNode, cli: &EeCli) -> anyhow::Result<()> {
     let mut failures;
     loop {
         failures = Vec::new();
-        for seed in &targets {
+        for seed in targets {
             let resolved = match tokio::net::lookup_host(seed).await {
                 Ok(addrs) => addrs.collect::<Vec<_>>(),
                 Err(e) => {
@@ -1690,7 +1733,7 @@ async fn join_or_bootstrap(node: &RaftNode, cli: &EeCli) -> anyhow::Result<()> {
                             catching_up = outcome.catching_up,
                             "joined the cluster through seed"
                         );
-                        clear_departed_marker(&state_dir);
+                        clear_departed_marker(state_dir);
                         return Ok(());
                     }
                     Err(e) => failures.push(format!("{addr}: {e}")),

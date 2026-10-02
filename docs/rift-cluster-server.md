@@ -511,6 +511,7 @@ its durable log carries.
 | no | — | — | seeds given | seed-join |
 | no | — | — | no seeds | founds a cluster, but only with `--cluster-allow-solo` |
 | yes | no | yes | — | **resume** from the durable log — the cold-start path |
+| yes | no | yes, but a live peer's newer membership omits it | yes | **rejoin**, state retained — it was retired while down (D-95) |
 | yes | yes | any | yes | **rejoin**, state retained |
 | yes | no | no | yes | **rejoin**, state retained |
 | yes | yes / not a member | — | nothing | **start is refused**, naming both recoveries |
@@ -530,9 +531,15 @@ Two more things that are easy to get wrong:
   the first row.
 - **"Still in membership" is local knowledge and can be stale.** A departing
   node often never receives the entry that removes it, so its own log still
-  lists it. That is why the marker exists, and why a node that resumes but then
-  sees **no leader at all for 60 s** starts offering itself to its seeds again —
-  the last-resort path for a node evicted while it was down.
+  lists it. That is why the marker exists. A node that was **retired** while it
+  was down (`cluster remove-node`, below) has no marker either, so before
+  resuming it asks the targets above, once and within 2 s, for their committed
+  membership: one whose membership is at a newer log index than its own and
+  does not list it sends the node down the rejoin row, as a learner. The check
+  finishes inside the 3 s election hold, and the node then keeps its elections
+  held until the rejoin completes. Silence or an older build is not evidence, and the node
+  resumes as before. A node that resumes but then sees **no leader at all for
+  60 s** still starts offering itself to its seeds again — the last-resort path.
 
 A node whose start is refused shows this shape:
 
@@ -541,6 +548,62 @@ this node is no longer part of the cluster it holds state for, and its log
 names no surviving peer to rejoin through; give it --cluster-seeds to rejoin,
 or delete <state-dir> to start it fresh
 ```
+
+## Retiring a member that is gone (`cluster remove-node`, D-95)
+
+A crashed voter is **not** removed by the fleet: it keeps its keys, and its
+place in the quorum, until it leaves (D-94). That is right for a node that is
+restarting. For one that will never come back — a lost volume, a retired host,
+a pod rescheduled without its volume and without `--cluster-node-name` — the
+operator retires it:
+
+```sh
+rift-cluster-server cluster remove-node <NODE_ID> --via <HOST:PORT> \
+    --cluster-secret-file /etc/rift/cluster-secret   # or RIFT_CLUSTER_SECRET[_FILE]
+```
+
+`--via` is the cluster address of **any live member**. A follower answers with
+a redirect, and the command then contacts the leader at its *advertised*
+cluster address, so run it where that address resolves and is reachable:
+inside the fleet's network (`kubectl exec` into a pod), not through a
+port-forward to one member. `<NODE_ID>` is the id `/_fleet/members` shows. The command speaks
+the signed cluster protocol with the cluster secret — the admin key cannot reach
+it, and the console offers nothing. `--cluster-insecure` sends unsigned, for a
+fleet running that way; `--timeout <SECONDS>` (default `30`) bounds the whole
+call.
+
+The leader retires the member only when **none of its advertised addresses
+answers as that member**. Over about 2.5 s it re-resolves the address three
+times and asks every address it yields who is there. These count as gone:
+
+- nothing accepts a connection;
+- the name resolves to no address in any of the three rounds (a headless
+  service drops a gone pod's record);
+- a *different* node id answers (the address was reused by a new pod).
+
+Everything else counts as the member, and the retire is refused. That includes
+a socket that accepts connections but never answers (a paused or wedged
+process), an older build, and a different secret. There is no `--force`: a node
+that answers is alive, and stopping it makes it leave by itself. If it cannot be
+stopped, fence its host first.
+
+| Outcome | Exit | Meaning |
+|---|---|---|
+| `retired node <id>: the membership is now at log index <m>, voters [...]` | 0 | The departure committed. Each probed address is listed with what answered. Successors adopt its flows from replicas (Chapter 6) |
+| `node <id> is not a member of the cluster` | 0 | Nothing to do. A re-run lands here. So does a mistyped id, which is why it is not reported as a removal |
+| `refused: node <id> answers at <addr>, so it is alive` | 1 | Stop it; it leaves on its own |
+| `refused: node <id> is the leader` | 1 | The same: stop it |
+| `refused: something answers at <addr> but could not say which node it is` | 1 | Make sure the node is stopped; upgrade any node older than this command |
+| `refused: retiring node <id> would leave fewer than two voters` | 1 | The D-25 floor |
+| `no leader could act on the request` | 1 | The node at `--via` could not confirm a leader. Retry through another member; if none can, the fleet has lost its majority, which has no supported recovery yet |
+
+**Retire first, then start the replacement.** At the voter ceiling (nine) a new
+node joins as a learner and is promoted only when there is room. Until the dead
+voter is retired, that room does not exist.
+
+A retired node that later comes back on its old state directory is not a
+problem. It rejoins as a learner, through the restart check above, under the
+same id.
 
 ## The `/_cluster/*` operator surface
 

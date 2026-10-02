@@ -12,12 +12,20 @@ use rift_cluster_base::rift_http_proxy::{healthcheck, runtime, script_cli};
 use rift_cluster_base::seams::Commands;
 use rift_cluster_server::bootstrap;
 use rift_cluster_server::cli::EeCli;
+use rift_cluster_server::cluster_cmd;
 use rift_cluster_server::compose;
 use rift_cluster_server::probes;
 use tracing::{info, warn};
 use tracing_subscriber::{Layer, fmt, prelude::*};
 
 fn main() -> anyhow::Result<()> {
+    // Before the server parser: `cluster` is not one of upstream's subcommands, and an operator
+    // command must never fall through to starting a server (#641).
+    let args: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    if cluster_cmd::is_cluster_command(&args) {
+        return cluster_cmd::run(args);
+    }
+
     let mut cli = EeCli::parse();
 
     // `script` is a self-contained program that wants only its own exit code,

@@ -190,8 +190,11 @@ gate, transition and proxyOnce claim; sequencing falls back to the local cursor 
 until the node restarts with its
 state dir and recovers them from its own `flow.redb`. Nothing requires an
 operator **if the node comes back**. A node that never does stays a member,
-holding its keys unavailable and counting in the quorum denominator, and there
-is no supported way to remove it yet (#641; the Chapter 10 runbook is a sketch).
+holding its keys unavailable and counting in the quorum denominator, until the
+operator retires it with `cluster remove-node` (D-95, Chapter 10's crash-retire
+runbook). The leader refuses while the node's address still answers as that
+node. Once the removal commits, the successors adopt exactly as they do after a
+graceful leave.
 A *graceful* stop hands off when its departure commits — not when the D-25
 voter floor refuses it, nor when the leave fails — and the successors adopt
 with staleness ≤ one replication round (Chapter 6).

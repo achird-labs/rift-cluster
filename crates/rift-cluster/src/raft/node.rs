@@ -39,7 +39,8 @@ use uuid::Uuid;
 
 use super::network::{
     self, AdmittedRole, CLUSTER_APPLIED_PATH, CLUSTER_JOIN_PATH, CLUSTER_LEAVE_PATH,
-    CLUSTER_WRITE_PATH, JoinAccepted, JoinRequest, LeaveRequest, RaftSlot, RpcNetwork, WriteReply,
+    CLUSTER_MEMBERSHIP_PATH, CLUSTER_RETIRE_PATH, CLUSTER_WRITE_PATH, JoinAccepted, JoinRequest,
+    LeaveRequest, MembershipView, RaftSlot, RetireReply, RetireRequest, RpcNetwork, WriteReply,
 };
 use super::ring::Ring;
 use super::store::{self, RedbStateMachine};
@@ -458,6 +459,8 @@ pub struct RaftNode {
     // The most recent reason a leave attempt failed, so the deadline's error can
     // name a cause instead of only reporting that time ran out.
     last_leave_error: Mutex<Option<String>>,
+    // Who may lift the restart election hold; see [`ElectionHold`].
+    election_hold: Arc<ElectionHold>,
     // Serializes the membership changes this node arbitrates as leader. Shared
     // with the control routes so a departure this node evicts locally and one
     // it evicts for a peer take the same lock — the voter floor and the
@@ -586,7 +589,10 @@ impl RaftNode {
         });
     }
 
-    async fn hold_elections_until_leader_heard(raft: &Raft<TypeConfig>) -> Result<(), NodeError> {
+    async fn hold_elections_until_leader_heard(
+        raft: &Raft<TypeConfig>,
+        hold: &Arc<ElectionHold>,
+    ) -> Result<(), NodeError> {
         let has_state = raft
             .is_initialized()
             .await
@@ -594,6 +600,7 @@ impl RaftNode {
         if !has_state {
             return Ok(());
         }
+        hold.grace_over.store(false, Ordering::SeqCst);
         // Hold first, decide second — and only on evidence that arrives after
         // the hold begins. Right after `Raft::new` the metrics still carry the
         // *persisted* state: `current_leader` names whoever led before the
@@ -605,12 +612,13 @@ impl RaftNode {
         // exempt outright — it must elect itself.
         raft.runtime_config().elect(false);
         let raft = raft.clone();
+        let hold = Arc::clone(hold);
         tokio::spawn(async move {
             let mut metrics = raft.metrics();
             let (init_vote, init_log, init_applied) = {
                 let m = metrics.borrow();
                 if m.membership_config.membership().voter_ids().count() == 1 {
-                    raft.runtime_config().elect(true);
+                    hold.release_grace(&raft);
                     return;
                 }
                 (m.vote, m.last_log_index, m.last_applied)
@@ -632,7 +640,7 @@ impl RaftNode {
                 }
             };
             let _ = tokio::time::timeout(Self::RESTART_ELECTION_GRACE, heard).await;
-            raft.runtime_config().elect(true);
+            hold.release_grace(&raft);
         });
         Ok(())
     }
@@ -737,6 +745,8 @@ impl RaftNode {
             slot.clone(),
             Arc::clone(&membership_gate),
             Arc::clone(&auto_voter_ceiling),
+            client.clone(),
+            Arc::clone(&resolver),
         );
 
         let server = RpcServer::bind(config.bind, RpcServerConfig::new(verifier, router))
@@ -781,7 +791,8 @@ impl RaftNode {
         .map_err(|e| NodeError::Runtime(e.to_string()))?;
         slot.set(raft.clone())
             .map_err(|_| NodeError::Runtime("raft slot already set".to_owned()))?;
-        Self::hold_elections_until_leader_heard(&raft).await?;
+        let election_hold = Arc::new(ElectionHold::default());
+        Self::hold_elections_until_leader_heard(&raft, &election_hold).await?;
         Self::spawn_promotion_loop(&slot, &membership_gate, &auto_voter_ceiling);
 
         let server_task = tokio::spawn(server.serve());
@@ -796,6 +807,7 @@ impl RaftNode {
             server_task,
             shutdown_invoked: AtomicBool::new(false),
             last_leave_error: Mutex::new(None),
+            election_hold,
             membership_gate,
             auto_voter_ceiling,
             replay_wake: Arc::new(tokio::sync::Notify::new()),
@@ -1136,6 +1148,119 @@ impl RaftNode {
             .filter(|(id, _)| **id != self.id)
             .map(|(_, node)| node.addr.clone())
             .collect()
+    }
+
+    /// Keep this node from campaigning past the restart grace, until
+    /// [`Self::release_elections`]. For a node that must rejoin before it can be
+    /// a voter again (D-95): the restart hold alone ends after 3 s whether or not
+    /// the rejoin has finished, and a node whose own log still lists it as a
+    /// voter campaigns the moment it may.
+    pub fn hold_elections(&self) {
+        self.election_hold.held.store(true, Ordering::SeqCst);
+        self.raft.runtime_config().elect(false);
+    }
+
+    /// Lift [`Self::hold_elections`]. Elections resume only once the restart
+    /// grace has also passed; before that, the grace still decides.
+    pub fn release_elections(&self) {
+        self.election_hold.held.store(false, Ordering::SeqCst);
+        if self.election_hold.grace_over.load(Ordering::SeqCst) {
+            self.raft.runtime_config().elect(true);
+        }
+    }
+
+    /// Positive evidence, from a live peer, that this node was removed from the
+    /// cluster while it was down — a retirement (#641, D-95) — or `None`.
+    ///
+    /// A retired node holds no `departed` marker (it never left) and its own log
+    /// still lists it, because the leader stops replicating to a member once its
+    /// removal takes effect. So the restart asks: each of `targets` is probed
+    /// once for its committed membership, and the answer counts only when that
+    /// membership is at a **higher log index than this node's own** and does not
+    /// list it. The index condition is what makes a stale peer's answer safe to
+    /// act on. Silence, an older build without the route, and every other answer
+    /// are not evidence, and the whole check is bounded by `budget` so it
+    /// finishes inside the restart election hold.
+    #[must_use]
+    pub async fn removal_evidence(
+        &self,
+        targets: &[String],
+        budget: Duration,
+    ) -> Option<RemovalEvidence> {
+        let own_m_idx = {
+            let receiver = self.raft.metrics();
+            let metrics = receiver.borrow();
+            metrics
+                .membership_config
+                .log_id()
+                .map_or(0, |log_id| log_id.index)
+        };
+        let me = self.id;
+        let mut asks = tokio::task::JoinSet::new();
+        let search = async {
+            // Every address of every target is asked concurrently, so one
+            // blackholed address cannot spend the budget the others need.
+            for target in targets {
+                let addrs = match network::resolve_authority(&self.resolver, target).await {
+                    Ok(addrs) => addrs,
+                    Err(e) => {
+                        tracing::debug!(%target, error = %e, "removal check: target did not resolve");
+                        continue;
+                    }
+                };
+                for addr in addrs {
+                    let (client, target) = (self.client.clone(), target.clone());
+                    asks.spawn(async move {
+                        let reply = client
+                            .probe(
+                                addr,
+                                "POST",
+                                CLUSTER_MEMBERSHIP_PATH,
+                                Vec::new(),
+                                REMOVAL_PROBE_DEADLINE,
+                            )
+                            .await;
+                        (target, addr, reply)
+                    });
+                }
+            }
+            while let Some(joined) = asks.join_next().await {
+                let (target, addr, reply) = match joined {
+                    Ok(answer) => answer,
+                    Err(e) => {
+                        tracing::error!(error = %e, "removal check: a probe task failed");
+                        continue;
+                    }
+                };
+                // "Could not tell" is not evidence: every failure here leaves
+                // the node on the resume row it would have taken before D-95.
+                let view = match reply.map(|body| serde_json::from_slice::<MembershipView>(&body)) {
+                    Ok(Ok(view)) => view,
+                    Ok(Err(e)) => {
+                        tracing::debug!(%target, %addr, error = %e, "removal check: undecodable membership view");
+                        continue;
+                    }
+                    Err(e) => {
+                        tracing::debug!(%target, %addr, error = %e, "removal check: no answer");
+                        continue;
+                    }
+                };
+                if removed_from(&view, me, own_m_idx) {
+                    return Some(RemovalEvidence {
+                        peer: target,
+                        peer_node_id: view.node_id,
+                        peer_m_idx: view.m_idx,
+                        own_m_idx,
+                    });
+                }
+            }
+            None
+        };
+        let found = tokio::time::timeout(budget, search).await;
+        if found.is_err() {
+            tracing::debug!(?budget, "removal check: budget spent without evidence");
+        }
+        found.ok().flatten()
     }
 
     /// The advertise authority of a specific member, from the applied
@@ -2181,7 +2306,103 @@ fn map_write_err(e: RaftError<NodeId, ClientWriteError<NodeId, BasicNode>>) -> N
 /// the transport is the closure's business, the give-up rule is this function's.
 /// A leadership that keeps moving must cost a bounded number of round trips,
 /// never a ping-pong between two nodes each naming the other.
-async fn chase_join<T, F, Fut>(seed: &str, max_attempts: usize, mut send: F) -> Result<T, NodeError>
+async fn chase_join<T, F, Fut>(seed: &str, max_attempts: usize, send: F) -> Result<T, NodeError>
+where
+    F: FnMut(String) -> Fut,
+    Fut: Future<Output = Result<T, RpcError>>,
+{
+    chase_leader(seed, max_attempts, send)
+        .await
+        .map_err(|failure| match failure {
+            // Named, because after a hop the failure belongs to the node we
+            // were redirected *to*. The caller prefixes the original seed, so
+            // without this a leader's failure is reported against the follower
+            // that correctly sent us there.
+            ChaseFailure::Stopped { target, error } => {
+                NodeError::Membership(format!("{target}: {error}"))
+            }
+            // Naming the last target separates the two shapes an operator has
+            // to tell apart: a genuine flap (a different leader each attempt,
+            // cluster unstable) and a cycle (two nodes each naming the other, a
+            // real misconfiguration).
+            ChaseFailure::GaveUp { last } => NodeError::Membership(format!(
+                "gave up after {max_attempts} attempts while joining via {seed} \
+                 (last redirected to {last})"
+            )),
+        })
+}
+
+/// How long one restart-check probe of one address may take.
+const REMOVAL_PROBE_DEADLINE: Duration = Duration::from_millis(500);
+
+/// Who may lift the restart election hold: the grace timer
+/// ([`RaftNode::hold_elections_until_leader_heard`]) and a caller holding
+/// elections across a rejoin ([`RaftNode::hold_elections`]). Elections resume
+/// when the grace is over *and* no caller holds them. Each side stores its own
+/// flag and then loads the other's, all `SeqCst`, so whichever acts second sees
+/// the first and at least one of them resumes elections.
+#[derive(Debug)]
+struct ElectionHold {
+    held: AtomicBool,
+    grace_over: AtomicBool,
+}
+
+impl Default for ElectionHold {
+    /// A node with no state has no grace to wait out.
+    fn default() -> Self {
+        Self {
+            held: AtomicBool::new(false),
+            grace_over: AtomicBool::new(true),
+        }
+    }
+}
+
+impl ElectionHold {
+    fn release_grace(&self, raft: &Raft<TypeConfig>) {
+        self.grace_over.store(true, Ordering::SeqCst);
+        if !self.held.load(Ordering::SeqCst) {
+            raft.runtime_config().elect(true);
+        }
+    }
+}
+
+/// A peer's answer that proves this node was removed while it was down; see
+/// [`RaftNode::removal_evidence`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemovalEvidence {
+    /// The authority asked.
+    pub peer: String,
+    /// The node that answered there.
+    pub peer_node_id: NodeId,
+    /// The log index of the peer's committed membership, which omits this node.
+    pub peer_m_idx: u64,
+    /// The log index of this node's own latest membership.
+    pub own_m_idx: u64,
+}
+
+/// Whether a peer's committed membership proves `me` was removed: newer than
+/// anything `me` holds, and without `me` in it. An equal or older view is a
+/// stale peer and proves nothing either way.
+fn removed_from(view: &MembershipView, me: NodeId, own_m_idx: u64) -> bool {
+    view.m_idx > own_m_idx && !view.members.contains(&me)
+}
+
+/// Why [`chase_leader`] stopped without an answer.
+#[derive(Debug)]
+enum ChaseFailure {
+    /// `target` failed with `error`, and `error` names nowhere better to go.
+    Stopped { target: String, error: RpcError },
+    /// Every send was redirected; `last` is where the final one pointed.
+    GaveUp { last: String },
+}
+
+/// The redirect-following loop under [`chase_join`] and [`retire_via`]: at most
+/// `max_attempts` sends, each hop to the leader the previous answer named.
+async fn chase_leader<T, F, Fut>(
+    seed: &str,
+    max_attempts: usize,
+    mut send: F,
+) -> Result<T, ChaseFailure>
 where
     F: FnMut(String) -> Fut,
     Fut: Future<Output = Result<T, RpcError>>,
@@ -2194,23 +2415,109 @@ where
         };
         // Only a named leader is worth another hop. A hintless refusal means an
         // election is unsettled, and there is nowhere better to ask — the
-        // caller's own seed loop backs off, which is the right place to wait.
+        // caller's own loop backs off, which is the right place to wait.
         let Some(next) = next_join_hop(&error) else {
-            // Named, because after a hop the failure belongs to the node we
-            // were redirected *to*. The caller prefixes the original seed, so
-            // without this a leader's failure is reported against the follower
-            // that correctly sent us there.
-            return Err(NodeError::Membership(format!("{target}: {error}")));
+            return Err(ChaseFailure::Stopped { target, error });
         };
         target = next;
     }
-    // Naming the last target separates the two shapes an operator has to tell
-    // apart: a genuine flap (a different leader each attempt, cluster unstable)
-    // and a cycle (two nodes each naming the other, a real misconfiguration).
-    Err(NodeError::Membership(format!(
-        "gave up after {max_attempts} attempts while joining via {seed} \
-         (last redirected to {target})"
-    )))
+    Err(ChaseFailure::GaveUp { last: target })
+}
+
+/// Ask the cluster, through the live node at `via`, to retire `target` — a
+/// member that is gone and so cannot leave by itself (#641, D-95).
+///
+/// The operator's client: it holds no node of its own, only the cluster secret
+/// (`None` for a fleet run with `--cluster-insecure`). `via` may be any member;
+/// a follower's redirect is chased to the leader within
+/// [`RaftNode::FORWARD_ATTEMPTS`] sends, and the whole call never runs past
+/// `timeout`.
+///
+/// A refusal is an `Ok` ([`RetireReply::Refused`]); so is an id that is not a
+/// member. Errors: [`NodeError::Unavailable`] when no leader can confirm itself —
+/// no quorum, or an election that is not settling — and
+/// [`NodeError::Membership`] when `via` (or the leader it named) could not be
+/// reached or refused the request, e.g. on a wrong secret.
+pub async fn retire_via(
+    via: &str,
+    secret: Option<&str>,
+    target: NodeId,
+    timeout: Duration,
+) -> Result<RetireReply, NodeError> {
+    let client = RpcClient::new(
+        secret.map(Signer::new),
+        Arc::new(TrackedPeerHealth::new()),
+        RpcClientConfig::default(),
+    );
+    let resolver: Arc<dyn PeerResolver> = Arc::new(DnsResolver);
+    let body = serde_json::to_vec(&RetireRequest { node_id: target })
+        .map_err(|e| NodeError::Membership(format!("encode retire request: {e}")))?;
+    let deadline = tokio::time::Instant::now() + timeout;
+
+    let chase = chase_leader(via, RaftNode::FORWARD_ATTEMPTS, |authority| {
+        let (client, resolver, body) = (client.clone(), Arc::clone(&resolver), body.clone());
+        async move {
+            let addrs = network::resolve_authority(&resolver, &authority)
+                .await
+                .map_err(|e| RpcError::Transport(format!("resolve {authority}: {e}")))?;
+            let reply = sweep_addresses(&addrs, |peer| {
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                client.call_once(peer, "POST", CLUSTER_RETIRE_PATH, body.clone(), remaining)
+            })
+            .await
+            .map_err(|failure| failure.into_typed(&authority))?;
+            serde_json::from_slice::<RetireReply>(&reply)
+                .map_err(|e| RpcError::Handler(format!("decode retire reply: {e}")))
+        }
+    });
+    match tokio::time::timeout(timeout, chase).await {
+        Ok(Ok(reply)) => Ok(reply),
+        Ok(Err(failure)) => Err(retire_failure(via, failure)),
+        Err(_elapsed) => Err(NodeError::Timeout {
+            what: "cluster retire",
+            detail: format!("no answer through {via} within {timeout:?}"),
+        }),
+    }
+}
+
+/// Render a failed retire chase for the operator. "Nobody here could confirm a
+/// leader" is its own class: it is not necessarily majority loss — the node at
+/// `via` may be the one cut off — so the message says to try another member.
+fn retire_failure(via: &str, failure: ChaseFailure) -> NodeError {
+    match failure {
+        ChaseFailure::Stopped {
+            error: RpcError::NotLeader { leader: None },
+            target,
+        } => NodeError::Unavailable(format!(
+            "{target} knows of no leader; retry through another member — if none knows one, \
+             the fleet is electing or has lost its majority"
+        )),
+        ChaseFailure::Stopped {
+            error: RpcError::Unavailable { detail, .. },
+            target,
+        } => NodeError::Unavailable(format!(
+            "{target}: {detail}; retry through another member — if none can confirm a leader, \
+             the fleet has lost its majority"
+        )),
+        ChaseFailure::Stopped {
+            error: RpcError::UnknownRoute { .. },
+            target,
+        } => NodeError::Membership(format!(
+            "{target} does not know this command (unknown route); it predates \
+             `cluster remove-node` — upgrade it"
+        )),
+        ChaseFailure::Stopped { target, error } if error.is_liveness_failure() => {
+            NodeError::Membership(format!("{target} unreachable ({error})"))
+        }
+        ChaseFailure::Stopped { target, error } => {
+            NodeError::Membership(format!("{target} answered but refused ({error})"))
+        }
+        ChaseFailure::GaveUp { last } => NodeError::Unavailable(format!(
+            "leadership kept moving: gave up after {} attempts via {via} (last redirected to \
+             {last}); retry once it settles",
+            RaftNode::FORWARD_ATTEMPTS
+        )),
+    }
 }
 
 /// Where to re-issue a join after a failed attempt, or `None` to stop.
@@ -2253,6 +2560,35 @@ impl Drop for RaftNode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Pins D-95's restart row (#641): a peer's committed membership proves this node was removed only
+    /// when it is newer than this node's own and omits it. A stale peer — equal or older index —
+    /// proves nothing, which is what lets a lagging seed answer without sending a healthy member
+    /// down the rejoin path.
+    #[test]
+    fn only_a_newer_membership_without_this_node_is_evidence_of_removal() {
+        let view = |m_idx, members: &[NodeId]| MembershipView {
+            node_id: 1,
+            m_idx,
+            members: members.iter().copied().collect(),
+        };
+        assert!(
+            removed_from(&view(12, &[1, 2]), 3, 10),
+            "newer and omits it"
+        );
+        assert!(
+            !removed_from(&view(12, &[1, 2, 3]), 3, 10),
+            "newer but lists it"
+        );
+        assert!(
+            !removed_from(&view(10, &[1, 2]), 3, 10),
+            "same index is not newer"
+        );
+        assert!(
+            !removed_from(&view(4, &[1, 2]), 3, 10),
+            "an older view is a stale peer"
+        );
+    }
     use tempfile::TempDir;
 
     const SECRET: &str = "cluster-test-secret";

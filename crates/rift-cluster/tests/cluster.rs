@@ -1906,3 +1906,475 @@ async fn a_joiner_behind_a_purged_log_starts_as_learner_and_the_leader_promotes_
     }
     cluster.shutdown_all().await;
 }
+
+// ---------------------------------------------------------------------------
+// Operator retirement of a member that is gone (#641, D-95).
+// ---------------------------------------------------------------------------
+
+/// The two non-leaders of a converged three-node cluster, in id order. Every retire test needs a
+/// target that is not the leader (retiring the leader is its own refusal) and a different live node
+/// to send the request through, so the request has to be chased to the leader.
+async fn followers(cluster: &TestCluster) -> (NodeId, NodeId) {
+    let leader = cluster
+        .wait_for_leader(LEADER_DEADLINE)
+        .await
+        .expect("a leader");
+    let mut others = cluster
+        .members
+        .iter()
+        .map(|m| m.id)
+        .filter(|&id| id != leader);
+    (
+        others.next().expect("a follower"),
+        others.next().expect("a second follower"),
+    )
+}
+
+fn ring_of(cluster: &TestCluster, id: NodeId) -> rift_cluster::Ring {
+    cluster.member(id).node.as_ref().expect("live").ring()
+}
+
+/// Poll, bounded, until `id`'s applied ring has exactly `want` as members.
+async fn wait_ring_members(cluster: &TestCluster, id: NodeId, want: &BTreeSet<NodeId>) -> bool {
+    let start = Instant::now();
+    while start.elapsed() < CONVERGE_DEADLINE {
+        if ring_of(cluster, id)
+            .members()
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>()
+            == *want
+        {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    false
+}
+
+/// #641 T1, pins D-95: a voter that stopped without leaving is retired through a *follower*. The request is
+/// chased to the leader, the leader finds the address silent, and the departure commits: the
+/// survivors' ring drops the dead voter at a new `m_idx`, and that is the `m_idx` the reply names.
+#[tokio::test(flavor = "multi_thread")]
+async fn retire_removes_a_crashed_voter() {
+    let _lock = TEST_LOCK.lock().await;
+    let mut cluster = TestCluster::start(3).await;
+    let (via, dead) = followers(&cluster).await;
+    let leader = cluster
+        .wait_for_leader(LEADER_DEADLINE)
+        .await
+        .expect("leader");
+    let before = ring_of(&cluster, via);
+    let dead_addr = cluster.member(dead).addr;
+
+    cluster.kill(dead).await;
+    let reply = rift_cluster::retire_via(
+        &cluster.member(via).addr.to_string(),
+        Some(SECRET),
+        dead,
+        Duration::from_secs(30),
+    )
+    .await
+    .expect("retiring a crashed voter must succeed");
+
+    let survivors = BTreeSet::from([leader, via]);
+    let rift_cluster::RetireReply::Retired {
+        m_idx,
+        voters,
+        evidence,
+    } = reply
+    else {
+        panic!("expected Retired, got {reply:?}");
+    };
+    assert_eq!(
+        voters, survivors,
+        "the reply must name the surviving voters"
+    );
+    assert!(
+        m_idx > before.m_idx(),
+        "the departure must commit a new membership entry"
+    );
+    assert_eq!(
+        evidence,
+        vec![rift_cluster::ProbeEvidence {
+            addr: dead_addr.to_string(),
+            seen: rift_cluster::ProbeSeen::NoAnswer,
+        }],
+        "the evidence is the one address the dead voter advertised, silent"
+    );
+    for id in [leader, via] {
+        assert!(
+            wait_ring_members(&cluster, id, &survivors).await,
+            "node {id}: the ring must drop the retired voter"
+        );
+        assert_eq!(
+            ring_of(&cluster, id).m_idx(),
+            m_idx,
+            "node {id}: ring m_idx"
+        );
+    }
+
+    // Idempotent re-run: the id is gone, which is a distinct answer from a removal.
+    let again = rift_cluster::retire_via(
+        &cluster.member(via).addr.to_string(),
+        Some(SECRET),
+        dead,
+        Duration::from_secs(30),
+    )
+    .await
+    .expect("a re-run must answer");
+    assert_eq!(again, rift_cluster::RetireReply::NotAMember);
+    cluster.shutdown_all().await;
+}
+
+/// #641 T2, pins D-95: every refusal is a typed answer and changes nothing. A target that answers as itself
+/// is alive and must be stopped (and so leave) instead; the leader cannot be retired through
+/// itself; an id that was never a member is `NotAMember`, never a quiet success.
+#[tokio::test(flavor = "multi_thread")]
+async fn retire_refuses_a_live_target_the_leader_and_reports_an_unknown_id() {
+    let _lock = TEST_LOCK.lock().await;
+    let mut cluster = TestCluster::start(3).await;
+    let (via, live) = followers(&cluster).await;
+    let leader = cluster
+        .wait_for_leader(LEADER_DEADLINE)
+        .await
+        .expect("leader");
+    let before = ring_of(&cluster, via);
+    let via_addr = cluster.member(via).addr.to_string();
+    let retire =
+        |target| rift_cluster::retire_via(&via_addr, Some(SECRET), target, Duration::from_secs(30));
+
+    assert_eq!(
+        retire(live).await.expect("answers"),
+        rift_cluster::RetireReply::Refused(rift_cluster::RetireRefusal::Reachable {
+            addr: cluster.member(live).addr.to_string(),
+        }),
+        "a target that answers as itself must be refused"
+    );
+    assert_eq!(
+        retire(leader).await.expect("answers"),
+        rift_cluster::RetireReply::Refused(rift_cluster::RetireRefusal::IsLeader),
+    );
+    assert_eq!(
+        retire(0xdead_beef).await.expect("answers"),
+        rift_cluster::RetireReply::NotAMember,
+        "an unknown id must not read as a removal"
+    );
+
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    for id in [leader, via, live] {
+        let ring = ring_of(&cluster, id);
+        assert_eq!(
+            ring.members(),
+            before.members(),
+            "node {id}: members unchanged"
+        );
+        assert_eq!(
+            ring.m_idx(),
+            before.m_idx(),
+            "node {id}: no entry committed"
+        );
+    }
+    cluster.shutdown_all().await;
+}
+
+/// #641 T2, pins D-95: without a quorum there is nobody to ask, and the answer says so — bounded, and not
+/// dressed up as a refusal. Two voters with one dead: the leader cannot confirm itself.
+#[tokio::test(flavor = "multi_thread")]
+async fn retire_without_a_quorum_reports_unavailable_within_its_deadline() {
+    let _lock = TEST_LOCK.lock().await;
+    let mut cluster = TestCluster::start(2).await;
+    let leader = cluster
+        .wait_for_leader(LEADER_DEADLINE)
+        .await
+        .expect("leader");
+    let dead = cluster
+        .members
+        .iter()
+        .map(|m| m.id)
+        .find(|&id| id != leader)
+        .expect("the follower");
+    cluster.kill(dead).await;
+
+    let timeout = Duration::from_secs(10);
+    let asked = Instant::now();
+    let result = rift_cluster::retire_via(
+        &cluster.member(leader).addr.to_string(),
+        Some(SECRET),
+        dead,
+        timeout,
+    )
+    .await;
+    let took = asked.elapsed();
+    assert!(
+        matches!(result, Err(rift_cluster::NodeError::Unavailable(_))),
+        "no quorum must surface as Unavailable, got {result:?}"
+    );
+    assert!(
+        took < timeout,
+        "the answer took {took:?}, past the {timeout:?} deadline"
+    );
+    cluster.shutdown_all().await;
+}
+
+/// #641 T4, pins D-95: the retire route rides the cluster port's authentication. An unsigned request and a
+/// wrong secret are both refused before the handler runs, so a dead target that the right secret
+/// *would* retire stays a member — and then the right secret retires it, which is what makes the
+/// first two assertions discriminate.
+#[tokio::test(flavor = "multi_thread")]
+async fn retire_without_the_cluster_secret_changes_nothing() {
+    let _lock = TEST_LOCK.lock().await;
+    let mut cluster = TestCluster::start(3).await;
+    let (via, dead) = followers(&cluster).await;
+    let before = ring_of(&cluster, via);
+    cluster.kill(dead).await;
+    let via_addr = cluster.member(via).addr.to_string();
+
+    for (what, secret) in [("unsigned", None), ("wrong secret", Some("not-the-secret"))] {
+        let result =
+            rift_cluster::retire_via(&via_addr, secret, dead, Duration::from_secs(10)).await;
+        assert!(
+            matches!(&result, Err(rift_cluster::NodeError::Membership(msg)) if msg.contains("unauthorized")),
+            "{what}: expected an unauthorized refusal, got {result:?}"
+        );
+    }
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let ring = ring_of(&cluster, via);
+    assert_eq!(
+        ring.members(),
+        before.members(),
+        "membership must be unchanged"
+    );
+    assert_eq!(ring.m_idx(), before.m_idx(), "no entry may commit");
+
+    let reply = rift_cluster::retire_via(&via_addr, Some(SECRET), dead, Duration::from_secs(30))
+        .await
+        .expect("the right secret retires it");
+    assert!(
+        matches!(reply, rift_cluster::RetireReply::Retired { .. }),
+        "got {reply:?}"
+    );
+    cluster.shutdown_all().await;
+}
+
+/// #641 T6, pins D-95: a dead member's address answered by a *different* node — a pod
+/// rescheduled without its volume and without a pinned name, back at the same stable address under
+/// a new id — does not block the retire. Who answered is the evidence, and it is reported.
+///
+/// The newcomer is a stub that answers only the membership route, not a full node. A full node at
+/// a reused address also receives the leader's replication stream for the *dead* id, because Raft
+/// RPCs are addressed by socket only; the leader then sees that "member's" log revert to empty and
+/// openraft's `follower log reversion is not allowed` debug assertion panics its core. That is a
+/// separate defect from the probe this test pins, tracked on its own.
+#[tokio::test(flavor = "multi_thread")]
+async fn retire_proceeds_when_the_dead_members_address_answers_as_another_node() {
+    let _lock = TEST_LOCK.lock().await;
+    let mut cluster = TestCluster::start(3).await;
+    let (via, dead) = followers(&cluster).await;
+    let dead_addr = cluster.member(dead).addr;
+    cluster.kill(dead).await;
+
+    let newcomer = rift_cluster::rpc::Router::new().route(
+        "POST",
+        "/internal/v1/cluster/membership",
+        Arc::new(|_body: Vec<u8>| -> rift_cluster::rpc::HandlerFuture {
+            Box::pin(async { Ok(br#"{"node_id":77,"m_idx":0,"members":[]}"#.to_vec()) })
+        }),
+    );
+    let server = rift_cluster::RpcServer::bind(
+        dead_addr,
+        rift_cluster::rpc::RpcServerConfig::new(
+            Some(Arc::new(rift_cluster::rpc::Verifier::new(SECRET))),
+            newcomer,
+        ),
+    )
+    .await
+    .expect("the newcomer binds the dead member's address");
+    let newcomer_task = tokio::spawn(server.serve());
+
+    let reply = rift_cluster::retire_via(
+        &cluster.member(via).addr.to_string(),
+        Some(SECRET),
+        dead,
+        Duration::from_secs(30),
+    )
+    .await
+    .expect("answers");
+    let rift_cluster::RetireReply::Retired {
+        evidence, voters, ..
+    } = reply
+    else {
+        panic!("a reused address must not block the retire, got {reply:?}");
+    };
+    assert!(!voters.contains(&dead), "the dead voter is gone");
+    assert_eq!(
+        evidence,
+        vec![rift_cluster::ProbeEvidence {
+            addr: dead_addr.to_string(),
+            seen: rift_cluster::ProbeSeen::AnotherNode { node_id: 77 },
+        }],
+        "the evidence must name the id that answered at the dead member's address"
+    );
+    newcomer_task.abort();
+    cluster.shutdown_all().await;
+}
+
+/// #641, pins D-95's fail-closed probe: something at the dead member's address that cannot say who
+/// it is blocks the retire. Two shapes, both of which a "dead" member really presents: a process
+/// whose socket the kernel still accepts but which never answers (paused, wedged), and a server
+/// without the membership route (a build older than D-95). Once the address is genuinely quiet
+/// the same retire goes through, which is what makes the two refusals discriminate.
+#[tokio::test(flavor = "multi_thread")]
+async fn retire_refuses_while_the_members_address_answers_unidentifiably() {
+    let _lock = TEST_LOCK.lock().await;
+    let mut cluster = TestCluster::start(3).await;
+    let (via, dead) = followers(&cluster).await;
+    let before = ring_of(&cluster, via);
+    let dead_addr = cluster.member(dead).addr;
+    cluster.kill(dead).await;
+    let via_addr = cluster.member(via).addr.to_string();
+    let retire =
+        || rift_cluster::retire_via(&via_addr, Some(SECRET), dead, Duration::from_secs(30));
+
+    // Accepted by the kernel's backlog, never answered.
+    let wedged = {
+        let socket = tokio::net::TcpSocket::new_v4().expect("socket");
+        socket.set_reuseaddr(true).expect("reuseaddr");
+        socket
+            .bind(dead_addr)
+            .expect("bind the dead member's address");
+        socket.listen(16).expect("listen")
+    };
+    let reply = retire().await.expect("answers");
+    assert!(
+        matches!(
+            &reply,
+            rift_cluster::RetireReply::Refused(rift_cluster::RetireRefusal::Unidentified { addr, detail })
+                if *addr == dead_addr.to_string() && detail.contains("accepts connections")
+        ),
+        "a socket that accepts but never answers must refuse the retire, got {reply:?}"
+    );
+    drop(wedged);
+
+    // A cluster port that does not know the membership route.
+    let server = rift_cluster::RpcServer::bind(
+        dead_addr,
+        rift_cluster::rpc::RpcServerConfig::new(
+            Some(Arc::new(rift_cluster::rpc::Verifier::new(SECRET))),
+            rift_cluster::rpc::Router::new(),
+        ),
+    )
+    .await
+    .expect("an older build binds the address");
+    let older = tokio::spawn(server.serve());
+    let reply = retire().await.expect("answers");
+    assert!(
+        matches!(
+            &reply,
+            rift_cluster::RetireReply::Refused(rift_cluster::RetireRefusal::Unidentified { detail, .. })
+                if detail.contains("unknown route")
+        ),
+        "an answer without an identity must refuse the retire, got {reply:?}"
+    );
+    older.abort();
+    let _ = older.await;
+
+    let ring = ring_of(&cluster, via);
+    assert_eq!(ring.members(), before.members(), "refusals change nothing");
+    assert_eq!(
+        ring.m_idx(),
+        before.m_idx(),
+        "no entry may commit on a refusal"
+    );
+
+    let reply = retire().await.expect("answers");
+    assert!(
+        matches!(reply, rift_cluster::RetireReply::Retired { .. }),
+        "with the address quiet the retire goes through, got {reply:?}"
+    );
+    cluster.shutdown_all().await;
+}
+
+/// #641, pins D-95 for a learner: a member admitted past the voter ceiling and then lost is retired
+/// the same way, leaves by `RemoveNodes`, and costs the voter set nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn retire_removes_a_crashed_learner_without_touching_the_voters() {
+    let _lock = TEST_LOCK.lock().await;
+    let mut cluster = TestCluster::start(3).await;
+    for node in cluster.live() {
+        node.set_auto_voter_ceiling(3);
+    }
+    let voters: BTreeSet<NodeId> = cluster.members.iter().map(|m| m.id).collect();
+
+    let addr: SocketAddr = format!("127.0.0.1:{}", reserve_ports(1)[0])
+        .parse()
+        .expect("addr");
+    let dir = TempDir::new().expect("tempdir");
+    let learner = spawn(4, addr, dir.path()).await;
+    let outcome = learner
+        .join_via(&Authority::from(cluster.member(1).addr))
+        .await
+        .expect("the learner joins");
+    assert_eq!(
+        outcome.role,
+        rift_cluster::JoinedAs::Learner,
+        "admitted past the ceiling"
+    );
+    cluster.members.push(Member {
+        id: 4,
+        addr,
+        dir,
+        node: Some(learner),
+    });
+    let (via, _) = followers(&cluster).await;
+    let deadline = Instant::now() + CONVERGE_DEADLINE;
+    while !cluster
+        .member(via)
+        .node
+        .as_ref()
+        .expect("live")
+        .status()
+        .learners
+        .contains(&4)
+    {
+        assert!(
+            Instant::now() < deadline,
+            "the learner never reached {via}'s membership"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    cluster.kill(4).await;
+
+    let reply = rift_cluster::retire_via(
+        &cluster.member(via).addr.to_string(),
+        Some(SECRET),
+        4,
+        Duration::from_secs(30),
+    )
+    .await
+    .expect("answers");
+    let rift_cluster::RetireReply::Retired { voters: after, .. } = reply else {
+        panic!("a crashed learner must be retired, got {reply:?}");
+    };
+    assert_eq!(
+        after, voters,
+        "retiring a learner leaves the voters as they were"
+    );
+    let deadline = Instant::now() + CONVERGE_DEADLINE;
+    while cluster
+        .member(via)
+        .node
+        .as_ref()
+        .expect("live")
+        .status()
+        .learners
+        .contains(&4)
+    {
+        assert!(
+            Instant::now() < deadline,
+            "the learner is still a member on {via}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    cluster.shutdown_all().await;
+}

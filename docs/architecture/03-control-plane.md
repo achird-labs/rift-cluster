@@ -116,13 +116,16 @@ Key rules, each carrying weight:
   derived from `--cluster-node-name` when set, otherwise from the clock — and
   persists in the state dir. A pod rescheduled with its volume keeps its
   identity; one rescheduled without it returns as the same node if it carries
-  the same name, and joins as a new node otherwise (the old id is removed via
-  runbook). This replaces the v2 incarnation scheme outright.
+  the same name, and joins as a new node otherwise (the old id is retired with
+  `cluster remove-node`, D-95). This replaces the v2 incarnation scheme outright.
 - **Membership changes only by a node joining or leaving** (D-21). Admission is
   initiated by the joining node over the signed cluster port; no admin route or
   console action adds or removes a learner or a voter — membership is the
   trust boundary, and what can enter the fleet is bounded by what an operator
-  chose to *start*.
+  chose to *start*. The one departure made on a member's behalf is the
+  retirement of a member that is gone (D-95). An operator holding the cluster
+  secret asks the leader over the cluster port, and the leader refuses while
+  the member's address still answers as that member.
 - **Seeds are re-resolved through DNS on every attempt** — pod IPs churn, and a
   cached-IP join loop after a full restart would brick the fleet. Every address
   a name resolves to is dialled, in the resolver's own order; there is no
