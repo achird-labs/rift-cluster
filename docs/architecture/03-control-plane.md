@@ -215,6 +215,16 @@ replication) shares one model:
   Startup refuses clustering without a secret unless `--cluster-insecure` is
   passed, which logs loudly at startup (`cluster port started WITHOUT
   authentication`, with `insecure = true`) so a fleet can be audited for it.
+- **Every message to a member names it** (D-96). Raft messages, member calls
+  and the write barrier's applied-index polls carry the intended member's id
+  as `?to=<id>`, inside the signed path, and a node refuses one named for
+  another node with `409 wrong_node`, after the credential and before any
+  handler. An address says where to dial, not who answers: a pod that comes
+  back at a dead member's address under a new id cannot take that member's
+  replication, votes or member calls as its own. Requests that dial an
+  address to learn who is there (a join through a seed, the retire probe)
+  name no recipient, and a request with no `to` is accepted, so mixed
+  versions interoperate.
 - **Integrity and authenticity, not confidentiality** — the threat model is
   "no unauthenticated peer joins or injects ops", with confidentiality
   delegated to network isolation (VPC/namespace/WireGuard). mTLS between nodes

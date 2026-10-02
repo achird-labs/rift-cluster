@@ -601,6 +601,15 @@ stopped, fence its host first.
 node joins as a learner and is promoted only when there is room. Until the dead
 voter is retired, that room does not exist.
 
+**A new pod at the dead member's address does not stand in for it.** A pod
+rescheduled without its volume comes back under a new id, often at the dead
+member's stable DNS name. Cluster traffic meant for the dead member names it
+(D-96), so the new pod refuses that traffic instead of answering for it. The
+dead member stays unreachable and its flows keep answering `503`. The leader
+logs once that `another node answers at this member's address`, naming the id
+that answered: that line is the cue to retire the old id. The retire's probe
+then sees a different node id at the address and goes ahead.
+
 A retired node that later comes back on its old state directory is not a
 problem. It rejoins as a learner, through the restart check above, under the
 same id.
