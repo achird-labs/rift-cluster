@@ -264,9 +264,8 @@ removed and the features being kept.* Concretely:
 ### 5.1 Baseline
 
 On 2026-09-06 the live three-node fleet (compose, built from `master@5c8dbfb` on 2026-09-01)
-was re-seeded and checked with the vault harness
-(`~/Documents/remote-vault/tasks/rift-enterprise/run-locally/{seed,check}.sh`): **57 passed,
-0 failed**. The sections, by fate:
+was re-seeded and checked with the local seed-and-check harness (since moved into the repository
+as `deploy/compose/local-test.*`): **57 passed, 0 failed**. The sections, by fate:
 
 | Section | Assertions | Fate |
 |---|---|---|

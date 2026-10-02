@@ -2,6 +2,11 @@
 
 ## What Rift is, and what the distributed edition adds
 
+> An interactive companion to these chapters, with figures you can drive (elections, signed
+> requests, routing, flow handoff, fsync windows, convergence), is published at
+> <https://achird-labs.github.io/rift-cluster/> from [`docs/explained/`](../explained/README.md). It
+> explains; this guide and `DECISIONS.md` define.
+
 Rift is a Mountebank-compatible mock/service-virtualization server written in
 Rust: you `POST` an *imposter* (a mock service bound to a TCP port, carrying an
 ordered list of *stubs* — predicate/response pairs), point your system under
