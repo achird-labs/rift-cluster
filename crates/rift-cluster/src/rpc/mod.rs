@@ -15,6 +15,7 @@ pub use client::{
     Admission, AlwaysHealthy, Authority, AuthorityError, DnsResolver, PeerHealth, PeerResolver,
     RpcClient, RpcClientConfig, TrackedPeerHealth,
 };
+pub(crate) use routes::addressed;
 pub use routes::{Handler, HandlerFuture, PROTO_VERSION, PrefixHandler, ProtocolVersion, Router};
 pub use server::{DEFAULT_MAX_BODY_BYTES, RpcServer, RpcServerConfig};
 
@@ -106,6 +107,15 @@ pub enum RpcError {
     /// outlives it.)
     #[error("not found: {what}")]
     NotFound { what: String },
+
+    /// The request was named for another node (D-96). The address it was sent to is now answered
+    /// by node `actual`, not by `expected`, the member the sender meant.
+    ///
+    /// An answer, not silence: the address is healthy and the caller must not count it as the
+    /// member it asked for. Raft senders surface it as an unreachable peer, so no replication
+    /// progress advances and no vote is counted on another node's word.
+    #[error("request for node {expected} was answered by node {actual}")]
+    WrongNode { expected: u64, actual: u64 },
 }
 
 impl RpcError {
@@ -125,6 +135,7 @@ impl RpcError {
             Self::NotLeader { .. } => "not_leader",
             Self::Handler(_) => "handler",
             Self::NotFound { .. } => "not_found",
+            Self::WrongNode { .. } => "wrong_node",
         }
     }
 
@@ -149,6 +160,9 @@ impl RpcError {
             Self::NotLeader { .. } => 421,
             Self::Handler(_) => 500,
             Self::NotFound { .. } => 404,
+            // "Conflict": the request is well formed and authentic, but it names a recipient that
+            // is not the node holding this address.
+            Self::WrongNode { .. } => 409,
         }
     }
 
@@ -217,6 +231,14 @@ mod tests {
             (RpcError::Transport("reset".into()), "transport", 502),
             (RpcError::Shed, "shed", 503),
             (RpcError::Handler("boom".into()), "handler", 500),
+            (
+                RpcError::WrongNode {
+                    expected: 3,
+                    actual: 77,
+                },
+                "wrong_node",
+                409,
+            ),
             (
                 RpcError::NotLeader {
                     leader: Some("10.0.0.7:7000".into()),

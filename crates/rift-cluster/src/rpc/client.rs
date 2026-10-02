@@ -808,6 +808,18 @@ fn status_to_error(status: u16, body: &[u8], method: &str, path: &str) -> RpcErr
             },
         },
         413 => RpcError::BodyTooLarge { limit: 0 },
+        // A refusal naming both ids (D-96). Without them it is a peer answering in a shape this
+        // build does not know, which is reported as such rather than guessed at.
+        409 => match (
+            field("error").as_deref(),
+            field("expected").and_then(|v| v.parse::<u64>().ok()),
+            field("actual").and_then(|v| v.parse::<u64>().ok()),
+        ) {
+            (Some("wrong_node"), Some(expected), Some(actual)) => {
+                RpcError::WrongNode { expected, actual }
+            }
+            _ => RpcError::Handler(detail),
+        },
         // The peer is a follower and named the leader (or an election is in
         // flight and it could not). Recovered as a field rather than parsed out
         // of `message`, so the caller can re-issue to the named node (#391).
@@ -1021,6 +1033,28 @@ mod tests {
         assert!(matches!(mapped(413, b"{}"), RpcError::BodyTooLarge { .. }));
         assert!(matches!(mapped(503, b"{}"), RpcError::Shed));
         assert!(matches!(mapped(504, b"{}"), RpcError::Timeout));
+        // Pins D-96: ids above 2^53 survive the envelope as strings.
+        assert_eq!(
+            mapped(
+                409,
+                br#"{"error":"wrong_node","expected":"18446744073709551615","actual":"77"}"#
+            ),
+            RpcError::WrongNode {
+                expected: 18446744073709551615,
+                actual: 77
+            }
+        );
+        assert!(
+            matches!(mapped(409, br#"{"message":"conflict"}"#), RpcError::Handler(m) if m == "conflict"),
+            "a 409 without the wrong_node shape must not be guessed into one"
+        );
+        assert!(matches!(
+            mapped(
+                409,
+                br#"{"error":"something_else","expected":"3","actual":"77"}"#
+            ),
+            RpcError::Handler(_)
+        ));
         assert!(
             matches!(mapped(500, br#"{"message":"boom"}"#), RpcError::Handler(m) if m == "boom")
         );

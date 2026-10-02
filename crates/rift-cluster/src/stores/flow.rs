@@ -151,7 +151,11 @@ fn rpc_not_ready(reason: String) -> RpcError {
 /// owner. Cluster state — see [`unavailable`] — is unavailability; the peer's
 /// own text is kept as the detail so the D-61 runbook signal survives the wrap.
 fn store_error(e: RpcError) -> anyhow::Error {
-    if matches!(e, RpcError::Unavailable { .. }) || e.is_liveness_failure() {
+    // A wrong-node answer is the owner being unreachable at its address (D-96): cluster state, not
+    // a fault in the request.
+    if matches!(e, RpcError::Unavailable { .. } | RpcError::WrongNode { .. })
+        || e.is_liveness_failure()
+    {
         unavailable(e.to_string())
     } else {
         anyhow::anyhow!("flow store: {e}")
@@ -2494,7 +2498,8 @@ mod tests {
             | RpcError::Unavailable { .. }
             | RpcError::NotLeader { .. }
             | RpcError::Handler(_)
-            | RpcError::NotFound { .. } => {}
+            | RpcError::NotFound { .. }
+            | RpcError::WrongNode { .. } => {}
         };
         let rows = [
             (
@@ -2507,6 +2512,13 @@ mod tests {
             (RpcError::Timeout, true),
             (RpcError::Transport("connection refused".to_owned()), true),
             (RpcError::Shed, true),
+            (
+                RpcError::WrongNode {
+                    expected: 3,
+                    actual: 77,
+                },
+                true,
+            ),
             (RpcError::Unauthorized(AuthError::BadMac), false),
             (
                 RpcError::VersionSkew {

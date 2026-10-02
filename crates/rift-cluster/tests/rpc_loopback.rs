@@ -40,6 +40,7 @@ fn start_server_capped(
                 verifier,
                 router,
                 max_body_bytes,
+                node_id: None,
             },
         )
         .await

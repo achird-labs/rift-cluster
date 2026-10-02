@@ -13,7 +13,7 @@ use tokio::net::TcpListener;
 
 use super::RpcError;
 use super::auth::{AUTH_HEADER, SignedRequest, Verifier};
-use super::routes::{PROTO_HEADER, Router, negotiate};
+use super::routes::{PROTO_HEADER, Router, negotiate, recipient};
 
 /// Default cap on an accepted request body. Cluster payloads are small control
 /// messages; an unbounded reader is a memory bomb, and the *reader* is capped
@@ -30,6 +30,9 @@ pub struct RpcServerConfig {
     pub router: Router,
     /// Cap on a single request body. Defaults to [`DEFAULT_MAX_BODY_BYTES`].
     pub max_body_bytes: u64,
+    /// The node this server answers as. When set, a request addressed to another node is refused
+    /// before any handler runs (D-96). `None` for a server with no member identity.
+    pub node_id: Option<u64>,
 }
 
 impl RpcServerConfig {
@@ -40,7 +43,15 @@ impl RpcServerConfig {
             verifier,
             router,
             max_body_bytes: DEFAULT_MAX_BODY_BYTES,
+            node_id: None,
         }
+    }
+
+    /// Answer as member `node_id`: refuse requests addressed to any other node (D-96).
+    #[must_use]
+    pub fn with_node_id(mut self, node_id: u64) -> Self {
+        self.node_id = Some(node_id);
+        self
     }
 }
 
@@ -168,6 +179,12 @@ fn error_response(err: &RpcError) -> Response<Full<Bytes>> {
     {
         body["leader"] = serde_json::Value::String(leader.clone());
     }
+    // Ids travel as strings: they exceed 2^53, and an envelope a JSON reader rounds would name the
+    // wrong node.
+    if let RpcError::WrongNode { expected, actual } = err {
+        body["expected"] = serde_json::Value::String(expected.to_string());
+        body["actual"] = serde_json::Value::String(actual.to_string());
+    }
     if let RpcError::Unavailable {
         op_id: Some(op_id), ..
     } = err
@@ -233,6 +250,18 @@ async fn dispatch(config: &RpcServerConfig, req: Request<Incoming>) -> Result<Ve
         )?;
     }
 
+    // After the credential, so a caller without the cluster secret learns nothing about which node
+    // answers at this address; before any handler, so a request meant for another member never
+    // touches this node's state (D-96).
+    if let (Some(to), Some(me)) = (recipient(&path)?, config.node_id)
+        && to != me
+    {
+        return Err(RpcError::WrongNode {
+            expected: to,
+            actual: me,
+        });
+    }
+
     if let Some(handler) = config.router.lookup(&method, &path) {
         return handler.call(body.to_vec()).await;
     }
@@ -240,4 +269,159 @@ async fn dispatch(config: &RpcServerConfig, req: Request<Incoming>) -> Result<Ve
         return handler.call(suffix, body.to_vec()).await;
     }
     Err(RpcError::UnknownRoute { method, path })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::*;
+    use crate::rpc::{AlwaysHealthy, HandlerFuture, RpcClient, RpcClientConfig, Signer};
+
+    const SECRET: &str = "addressed-recipient-secret";
+
+    /// A server that believes it is node 77, with one route whose calls are counted.
+    async fn server_as_77() -> (SocketAddr, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&calls);
+        let router = Router::new().route(
+            "POST",
+            "/count",
+            Arc::new(move |_body: Vec<u8>| -> HandlerFuture {
+                let seen = Arc::clone(&seen);
+                Box::pin(async move {
+                    seen.fetch_add(1, Ordering::SeqCst);
+                    Ok(b"{}".to_vec())
+                })
+            }),
+        );
+        let config =
+            RpcServerConfig::new(Some(Arc::new(Verifier::new(SECRET))), router).with_node_id(77);
+        let server = RpcServer::bind("127.0.0.1:0".parse().expect("addr"), config)
+            .await
+            .expect("bind");
+        let addr = server.local_addr().expect("addr");
+        (addr, calls, tokio::spawn(server.serve()))
+    }
+
+    fn client(secret: &str) -> RpcClient {
+        RpcClient::new(
+            Some(Signer::new(secret)),
+            Arc::new(AlwaysHealthy),
+            RpcClientConfig {
+                connect_timeout: Duration::from_millis(500),
+                request_timeout: Duration::from_secs(2),
+                max_retries: 0,
+            },
+        )
+    }
+
+    /// Pins D-96: a request named for another node is refused before any handler runs, naming both
+    /// ids; one named for this node, or not named at all (an older sender), reaches the handler.
+    #[tokio::test]
+    async fn a_request_named_for_another_node_never_reaches_a_handler() {
+        let (addr, calls, _server) = server_as_77().await;
+        let client = client(SECRET);
+
+        let refused = client.call(addr, "POST", "/count?to=3", Vec::new()).await;
+        assert_eq!(
+            refused,
+            Err(RpcError::WrongNode {
+                expected: 3,
+                actual: 77
+            })
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "the handler must not run for another node's request"
+        );
+
+        client
+            .call(addr, "POST", "/count?to=77", Vec::new())
+            .await
+            .expect("named for this node");
+        client
+            .call(addr, "POST", "/count", Vec::new())
+            .await
+            .expect("unnamed, from an older sender");
+        client
+            .call(addr, "POST", "/count?x=1&to=77", Vec::new())
+            .await
+            .expect("named after another parameter");
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+    }
+
+    /// Pins D-96: a signed request with a malformed recipient is a sender bug, and the gate fails
+    /// closed rather than treating it as unnamed.
+    #[tokio::test]
+    async fn a_malformed_recipient_is_refused_as_a_bad_request() {
+        let (addr, calls, _server) = server_as_77().await;
+        let refused = client(SECRET)
+            .call(addr, "POST", "/count?to=abc", Vec::new())
+            .await;
+        assert!(
+            matches!(refused, Err(RpcError::BadRequest(_))),
+            "got {refused:?}"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    /// Pins D-96: the recipient is checked only after the credential, so a caller without the
+    /// cluster secret learns nothing about which node answers at an address.
+    #[tokio::test]
+    async fn an_unauthenticated_caller_is_refused_before_the_recipient_is_compared() {
+        let (addr, _calls, _server) = server_as_77().await;
+        let refused = client("not-the-secret")
+            .call(addr, "POST", "/count?to=3", Vec::new())
+            .await;
+        assert!(
+            matches!(refused, Err(RpcError::Unauthorized(_))),
+            "got {refused:?}"
+        );
+    }
+
+    /// Pins D-96: the recipient is inside the signed string. A request signed for node 3 and
+    /// re-addressed in flight to node 77 fails the MAC instead of reaching node 77's handler.
+    #[test]
+    fn re_addressing_a_signed_request_breaks_its_signature() {
+        let signer = Signer::new(SECRET);
+        let verifier = Verifier::new(SECRET);
+        let header = signer.header(SignedRequest {
+            method: "POST",
+            path: "/internal/v1/raft/vote?to=3",
+            body: b"{}",
+        });
+        let replayed = verifier.verify(
+            Some(&header),
+            SignedRequest {
+                method: "POST",
+                path: "/internal/v1/raft/vote?to=77",
+                body: b"{}",
+            },
+        );
+        assert_eq!(replayed, Err(crate::rpc::AuthError::BadMac));
+    }
+
+    /// Pins D-96: a server that has not been told its id cannot compare, and accepts the request.
+    #[tokio::test]
+    async fn a_server_without_an_identity_ignores_the_recipient() {
+        let router = Router::new().route(
+            "POST",
+            "/count",
+            Arc::new(|_body: Vec<u8>| -> HandlerFuture { Box::pin(async { Ok(b"{}".to_vec()) }) }),
+        );
+        let server = RpcServer::bind(
+            "127.0.0.1:0".parse().expect("addr"),
+            RpcServerConfig::new(Some(Arc::new(Verifier::new(SECRET))), router),
+        )
+        .await
+        .expect("bind");
+        let addr = server.local_addr().expect("addr");
+        let _server = tokio::spawn(server.serve());
+        client(SECRET)
+            .call(addr, "POST", "/count?to=3", Vec::new())
+            .await
+            .expect("no identity, no comparison");
+    }
 }

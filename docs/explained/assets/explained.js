@@ -625,8 +625,8 @@ SeqScene("seq-heartbeat", {
   steps:[
     {caption:"A's 50 ms tick fires. B is caught up, so openraft builds an AppendEntries with no entries: A's vote, the log position B already matches, and the commit index.", items:[{note:"core",text:"tick → heartbeat for B",kind:"commit"},{f:"core",t:"net",label:"append_entries(rpc)"}]},
     {caption:"The network layer records that it sent something to B (so the liveness ticker stays quiet), resolves B's advertise address afresh, and serializes the request as JSON.", items:[{note:"net",text:"note_sent · resolve B · to JSON"}]},
-    {caption:"It signs: a timestamp, a fresh nonce, method, path and body, HMAC-SHA256 under the cluster secret, in <code>x-rift-cluster-auth</code>; plus <code>x-rift-cluster-proto: 1.0</code>. It then POSTs over a pooled HTTP/1.1 connection.", items:[{f:"net",t:"srv",label:"POST /internal/v1/raft/append"}]},
-    {caption:"B's server checks in order: protocol version, body size (32 MiB cap), then the signature (format, clock skew within 30 s, MAC in constant time, nonce not seen). Only then does it look up the route.", items:[{note:"srv",text:"proto ✓ size ✓ skew ✓ MAC ✓ nonce ✓ route ✓",kind:"good"}]},
+    {caption:"The path names B as the recipient (<code>?to=</code> B's id). A signs a timestamp, a fresh nonce, the method, that path and the body, HMAC-SHA256 under the cluster secret, in <code>x-rift-cluster-auth</code>; plus <code>x-rift-cluster-proto: 1.0</code>. It then POSTs over a pooled HTTP/1.1 connection.", items:[{f:"net",t:"srv",label:"POST /internal/v1/raft/append?to=B"}]},
+    {caption:"B's server checks in order: protocol version, body size (32 MiB cap), the signature (format, clock skew within 30 s, MAC in constant time, nonce not seen), then that the request is addressed to B. Only then does it look up the route.", items:[{note:"srv",text:"proto ✓ size ✓ skew ✓ MAC ✓ nonce ✓ to=B ✓ route ✓",kind:"good"}]},
     {caption:"openraft on B checks the vote first. It is A's, at the current term, so B refreshes its election timer and its leader lease. It then checks that its log matches at <code>prev_log_id</code>, and learns the commit index.", items:[{f:"srv",t:"rb",label:"append_entries(rpc)"},{note:"rb",text:"vote ok · timer reset · prev_log ok",kind:"good"}], state:{rb:"leader A · lease fresh"}},
     {caption:"B answers 200 with <code>Success</code>. A's client marks B healthy, and openraft updates B's match index and the time of its last quorum acknowledgement, which is what A's own isolation check reads.", items:[{f:"rb",t:"srv",label:"Success",kind:"reply"},{f:"srv",t:"net",label:"200 {Success}",kind:"reply"},{f:"net",t:"core",label:"Success",kind:"reply"}], state:{core:"B matched · quorum ack fresh"}},
   ]});
@@ -637,12 +637,12 @@ SeqScene("seq-heartbeat", {
   const $ = id => document.getElementById(id);
   const SECRET = "demo-cluster-secret";
   const MSG = {
-    hb:{path:"/internal/v1/raft/append", body:{vote:{leader_id:{term:7,node_id:1},committed:true},prev_log_id:{leader_id:{term:7,node_id:1},index:1042},leader_commit:{leader_id:{term:7,node_id:1},index:1042},entries:[]}, ok:"200 · AppendEntries Success: B resets its election timer"},
-    vote:{path:"/internal/v1/raft/vote", body:{vote:{leader_id:{term:8,node_id:2},committed:false},last_log_id:{leader_id:{term:7,node_id:1},index:1042}}, ok:"200 · a vote answer, granted or not; a refusal is a normal answer, not an error"},
+    hb:{path:"/internal/v1/raft/append?to=7429318812345", body:{vote:{leader_id:{term:7,node_id:1},committed:true},prev_log_id:{leader_id:{term:7,node_id:1},index:1042},leader_commit:{leader_id:{term:7,node_id:1},index:1042},entries:[]}, ok:"200 · AppendEntries Success: B resets its election timer"},
+    vote:{path:"/internal/v1/raft/vote?to=7429318812345", body:{vote:{leader_id:{term:8,node_id:2},committed:false},last_log_id:{leader_id:{term:7,node_id:1},index:1042}}, ok:"200 · a vote answer, granted or not; a refusal is a normal answer, not an error"},
     join:{path:"/internal/v1/cluster/join", body:{node_id:204991441056123,advertise:"rift-3.rift.svc:4790"}, ok:"200 · {admitted: true, role: \"Voter\", catching_up: false}"},
     fwd:{path:"/internal/v1/cluster/write", body:{op_id:"0b6c3f0e-…",principal:null,issued_at_secs:1790952600,expected_revision:null,op:{PutImposter:{config:{port:8080,protocol:"http",stubs:["…"]}}}}, ok:"200 · {\"ForwardTo\": {\"leader_addr\": \"rift-0.rift.svc:4790\"}}: this follower isn't the leader, so the forwarder re-sends to the address it names"},
   };
-  const STAGES = [["proto","x-rift-cluster-proto"],["size","body ≤ 32 MiB"],["parse","auth header"],["skew","clock within 30 s"],["mac","HMAC matches"],["nonce","nonce unseen"],["route","route + handler"]];
+  const STAGES = [["proto","x-rift-cluster-proto"],["size","body ≤ 32 MiB"],["parse","auth header"],["skew","clock within 30 s"],["mac","HMAC matches"],["nonce","nonce unseen"],["to","addressed to this node"],["route","route + handler"]];
   const FAIL = {
     none:null,
     body:["mac","401 · bad_mac","The MAC covers the whole body, so changing one byte anywhere in it makes the signature wrong. The request is refused before any handler sees the bytes."],
@@ -651,6 +651,7 @@ SeqScene("seq-heartbeat", {
     secret:["mac","401 · bad_mac","Without the cluster secret there is no way to produce a MAC the receiver accepts. A node from another fleet, or one with a mistyped secret, is refused on every request."],
     proto:["proto","426 · version skew","Major versions must match. This is checked before the body is even read, so an incompatible node costs one header comparison."],
     big:["size","413 · body too large","The body is capped at 32 MiB while it is being read, before authentication. For AppendEntries the leader reacts by halving its next batch."],
+    wrong:["to","409 · wrong_node","The request names node 7429318812345, and the node holding this address is 204991441056123. It is refused after the signature checks, so a caller without the secret learns nothing about who answers here, and before any handler runs. The sender treats it as an unreachable peer: no replication progress and no vote counted on another node's word."],
   };
   const enc = new TextEncoder();
   async function hmac(text, key){
@@ -678,10 +679,13 @@ SeqScene("seq-heartbeat", {
       `<span class="hl">POST ${esc(m.path)} HTTP/1.1</span>\nhost: 10.0.3.12:4790\ncontent-type: application/json\ncontent-length: ${len}\n` +
       `x-rift-cluster-proto: ${proto}\nx-rift-cluster-auth: t=${tamper === "skew" ? `<span class="bad">${t}</span>` : t},n=${nonce},mac=${macTxt}\n\n${shownBody}` +
       (tamper === "replay" ? `\n\n<span class="bad">(the identical request again, 5 s later)</span>` : "");
-    const f = FAIL[tamper];
+    const unnamed = tamper === "wrong" && !m.path.includes("?to=");
+    const f = unnamed ? null : FAIL[tamper];
     const stop = f ? STAGES.findIndex(([k]) => k === f[0]) : STAGES.length;
     $("wire-pipe").innerHTML = STAGES.map(([k,l],i) => `<div class="stage ${i < stop ? "local" : i === stop ? "fail" : "off"}"><span class="zn">${i+1}</span><b>${i < stop ? "✓" : i === stop ? "✗" : "·"}</b><span class="what">${l}</span></div>`).join("");
-    $("wire-why").innerHTML = f ? `<span class="stepno">${esc(f[1])}</span>${f[2]}` : `<span class="stepno">ACCEPTED</span>${esc(m.ok)}`;
+    $("wire-why").innerHTML = f ? `<span class="stepno">${esc(f[1])}</span>${f[2]}`
+      : unnamed ? `<span class="stepno">ACCEPTED · NO RECIPIENT NAMED</span>This request dials an address on purpose, to find whoever is there, so it names no recipient and whichever node answers handles it.`
+      : `<span class="stepno">ACCEPTED</span>${esc(m.ok)}`;
   }
   fig.addEventListener("change", render);
   render();

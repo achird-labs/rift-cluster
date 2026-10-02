@@ -32,7 +32,7 @@ use tokio::sync::{Mutex, OnceCell};
 
 use super::{NodeId, TypeConfig};
 use crate::control::{ControlRequest, ControlResponse};
-use crate::rpc::{Authority, HandlerFuture, PeerResolver, Router, RpcClient, RpcError};
+use crate::rpc::{Authority, HandlerFuture, PeerResolver, Router, RpcClient, RpcError, addressed};
 
 /// AppendEntries receiving endpoint.
 pub(crate) const RAFT_APPEND_PATH: &str = "/internal/v1/raft/append";
@@ -419,6 +419,9 @@ impl PeerClient {
             .await
             .map_err(|e| RPCError::Unreachable(Unreachable::new(&e)))?;
         let body = serde_json::to_vec(req).map_err(|e| RPCError::Network(NetworkError::new(&e)))?;
+        // Named for the member this client serves, so another node holding its address refuses
+        // the message rather than taking it as its own (D-96).
+        let member_path = addressed(path, self.target);
 
         // Try each resolved address in the resolver's order until one answers
         // (#79).
@@ -459,13 +462,13 @@ impl PeerClient {
                 body.clone()
             };
             let attempt = match budget {
-                None => self.client.call(*peer, "POST", path, payload).await,
+                None => self.client.call(*peer, "POST", &member_path, payload).await,
                 Some(budget) => {
                     let Some(remaining) = budget.checked_sub(started.elapsed()) else {
                         break;
                     };
                     self.client
-                        .call_once(*peer, "POST", path, payload, remaining)
+                        .call_once(*peer, "POST", &member_path, payload, remaining)
                         .await
                 }
             };
@@ -474,7 +477,7 @@ impl PeerClient {
                     return serde_json::from_slice(&response)
                         .map_err(|e| RPCError::Network(NetworkError::new(&e)));
                 }
-                Err(e) => last = Some(e),
+                Err(e) => last = Some(keep_wrong_node(last, e)),
             }
         }
 
@@ -535,6 +538,10 @@ impl PeerClient {
             // this loop runs every tick, and a peer whose name never resolves would otherwise
             // flood the log — or, unlogged, silently never be probed at all.
             let mut unprobeable = false;
+            // The id that answered at this member's address instead of the member, if one did on
+            // the last round that reached anyone. Logged on the transition only, like the above.
+            let mut answered_by: Option<u64> = None;
+            let probe_path = addressed(RAFT_APPEND_PATH, target);
             loop {
                 tokio::time::sleep(LIVENESS_TICK).await;
                 // A node that stopped leading must fall silent: its silence is
@@ -582,20 +589,55 @@ impl PeerClient {
                     // budget spent on a dead first address would never reach the live second
                     // one (D-28 dials every address). The price is a wider gap between rounds
                     // for a peer whose earlier addresses do not answer — see D-83.
+                    let mut heard_from = ProbeHeard::Nobody;
                     for peer in &addrs {
-                        if client
+                        match client
                             .probe(
                                 *peer,
                                 "POST",
-                                RAFT_APPEND_PATH,
+                                &probe_path,
                                 body.clone(),
                                 LIVENESS_PROBE_DEADLINE,
                             )
                             .await
-                            .is_ok()
                         {
-                            break;
+                            Ok(_) => {
+                                heard_from = ProbeHeard::Member;
+                                break;
+                            }
+                            Err(RpcError::WrongNode { actual, .. }) => {
+                                heard_from = ProbeHeard::Another(actual);
+                            }
+                            // Silence, or an answer that says nothing about who is there: the
+                            // health tracker already accounts for it, and the state stands.
+                            Err(_) => {}
                         }
+                    }
+                    let now = match heard_from {
+                        ProbeHeard::Nobody => None,
+                        ProbeHeard::Member => Some(None),
+                        ProbeHeard::Another(actual) => Some(Some(actual)),
+                    };
+                    if let Some(now) = now
+                        && now != answered_by
+                    {
+                        match now {
+                            Some(actual) => tracing::warn!(
+                                peer = target,
+                                addr = %addr,
+                                answered_by = actual,
+                                "another node answers at this member's address and refuses its \
+                                 traffic; the member counts as unreachable until it returns, or \
+                                 until it is retired with `rift-cluster-server cluster remove-node \
+                                 {target}`"
+                            ),
+                            None => tracing::info!(
+                                peer = target,
+                                addr = %addr,
+                                "the member answers at its address again"
+                            ),
+                        }
+                        answered_by = now;
                     }
                 }
             }
@@ -661,17 +703,18 @@ async fn send_append(
     // `call_once`, not `call`: openraft is already the retry loop, so retrying
     // here would re-send the whole body — the very cost this fix exists to stop
     // paying.
+    let path = addressed(RAFT_APPEND_PATH, target);
     let mut last: Option<RpcError> = None;
     for peer in &addrs {
         match client
-            .call_once(*peer, "POST", RAFT_APPEND_PATH, body.clone(), deadline)
+            .call_once(*peer, "POST", &path, body.clone(), deadline)
             .await
         {
             Ok(response) => {
                 return serde_json::from_slice(&response)
                     .map_err(|e| RPCError::Network(NetworkError::new(&e)));
             }
-            Err(e) => last = Some(e),
+            Err(e) => last = Some(keep_wrong_node(last, e)),
         }
     }
 
@@ -682,6 +725,27 @@ async fn send_append(
             "{context}: no addresses to try"
         )))),
     })
+}
+
+/// Who answered a liveness probe round at a member's address.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProbeHeard {
+    /// Nothing that identified itself: silence, or an answer that names nobody.
+    Nobody,
+    /// The member itself.
+    Member,
+    /// A different node now holding the member's address (D-96).
+    Another(u64),
+}
+
+/// The error to report after trying one more address: a wrong-node answer is kept over a later
+/// address's silence, because it is the more useful diagnosis — something does answer there, and
+/// it is not the member (D-96).
+fn keep_wrong_node(last: Option<RpcError>, next: RpcError) -> RpcError {
+    match last {
+        Some(wrong @ RpcError::WrongNode { .. }) if next.is_liveness_failure() => wrong,
+        _ => next,
+    }
 }
 
 /// AppendEntries-specific error mapping: a follower's 413 is an *answer*, not
@@ -2369,6 +2433,75 @@ mod tests {
         assert!(
             reply.is_ok(),
             "the second resolved address answers, so the send must succeed: {reply:?}"
+        );
+    }
+
+    /// Pins D-96: a vote sent to a member's address that another node now answers yields no vote.
+    /// The answer is a refusal naming the node that answered, which openraft sees as an unreachable
+    /// peer; and because it is an answer, the address is not charged as unhealthy (threshold 1
+    /// here, so a single liveness charge would trip it).
+    #[tokio::test]
+    async fn a_vote_to_a_reused_address_is_refused_and_does_not_mark_it_unhealthy() {
+        use crate::rpc::{
+            Admission, PeerHealth, RpcClientConfig, RpcServer, RpcServerConfig, Signer,
+            TrackedPeerHealth, Verifier,
+        };
+        use openraft::Vote;
+        use openraft::error::RPCError;
+        use openraft::network::{RPCOption, RaftNetwork, RaftNetworkFactory};
+        use openraft::raft::VoteRequest;
+
+        let server = RpcServer::bind(
+            "127.0.0.1:0".parse().expect("addr"),
+            RpcServerConfig::new(
+                Some(Arc::new(Verifier::new("reuse-secret"))),
+                crate::rpc::Router::new(),
+            )
+            .with_node_id(77),
+        )
+        .await
+        .expect("bind");
+        let addr = server.local_addr().expect("addr");
+        let _server = tokio::spawn(server.serve());
+
+        let health = Arc::new(TrackedPeerHealth::with_params(1, Duration::from_secs(60)));
+        let client = RpcClient::new(
+            Some(Signer::new("reuse-secret")),
+            health.clone(),
+            RpcClientConfig {
+                connect_timeout: Duration::from_millis(500),
+                request_timeout: Duration::from_secs(2),
+                max_retries: 0,
+            },
+        );
+        let resolver: Arc<dyn PeerResolver> = Arc::new(crate::rpc::DnsResolver);
+        let mut network = RpcNetwork::new(client, resolver, Arc::new(|| true));
+        let mut peer = network
+            .new_client(3, &BasicNode::new(addr.to_string()))
+            .await;
+
+        for _ in 0..3 {
+            let reply = peer
+                .vote(
+                    VoteRequest {
+                        vote: Vote::new(9, 1),
+                        last_log_id: None,
+                    },
+                    RPCOption::new(Duration::from_secs(2)),
+                )
+                .await;
+            let Err(RPCError::Unreachable(unreachable)) = &reply else {
+                panic!("a vote answered by another node must read as unreachable, got {reply:?}");
+            };
+            assert!(
+                unreachable.to_string().contains("77"),
+                "the error must name the node that answered: {unreachable}"
+            );
+        }
+        assert_eq!(
+            health.admit(addr),
+            Admission::Healthy,
+            "an answer must not charge the address"
         );
     }
 

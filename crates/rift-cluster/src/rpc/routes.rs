@@ -125,6 +125,52 @@ fn route_path(path: &str) -> &str {
     path.split_once('?').map_or(path, |(before, _)| before)
 }
 
+/// `path` addressed to member `to` (D-96): the recipient travels as a `to` query parameter, inside
+/// the signed `path_and_query`, so it cannot be rewritten in flight. Routing ignores the query, so
+/// a receiver that predates the parameter dispatches the same handler.
+#[must_use]
+pub(crate) fn addressed(path: &str, to: u64) -> String {
+    let separator = if path.contains('?') { '&' } else { '?' };
+    format!("{path}{separator}to={to}")
+}
+
+/// The member a request is addressed to, read from the raw query the same way [`route_path`]
+/// reads the path: `Ok(None)` when no `to` parameter is present.
+///
+/// # Errors
+///
+/// [`RpcError::BadRequest`] when `to` is empty, not plain decimal digits, out of range, or given
+/// more than once. A signed request that names its recipient badly is a sender bug, and the gate
+/// fails closed rather than treating it as unnamed.
+pub(crate) fn recipient(path_and_query: &str) -> Result<Option<u64>, RpcError> {
+    let Some((_, query)) = path_and_query.split_once('?') else {
+        return Ok(None);
+    };
+    if query.split('&').any(|pair| pair == "to") {
+        return Err(RpcError::BadRequest(
+            "the recipient `to` has no value".into(),
+        ));
+    }
+    let mut found = None;
+    for value in query.split('&').filter_map(|pair| pair.strip_prefix("to=")) {
+        if found.is_some() {
+            return Err(RpcError::BadRequest(
+                "the recipient `to` is given more than once".into(),
+            ));
+        }
+        if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(RpcError::BadRequest(format!(
+                "the recipient `to={value}` is not a node id"
+            )));
+        }
+        let id = value.parse::<u64>().map_err(|_| {
+            RpcError::BadRequest(format!("the recipient `to={value}` is out of range"))
+        })?;
+        found = Some(id);
+    }
+    Ok(found)
+}
+
 /// Method + path registry for the cluster port.
 #[derive(Default, Clone)]
 pub struct Router {
@@ -395,5 +441,67 @@ mod tests {
         assert!(router.lookup("POST", "/internal/v1/ping").is_some());
         assert!(router.lookup("GET", "/internal/v1/ping").is_none());
         assert!(router.lookup("POST", "/internal/v1/pong").is_none());
+    }
+
+    /// Pins D-96: a request addressed to a member names it in the query, and a path that already
+    /// carries one gains the recipient as a further parameter rather than a second `?`.
+    #[test]
+    fn a_member_address_is_carried_in_the_query() {
+        assert_eq!(
+            addressed("/internal/v1/raft/append", 3),
+            "/internal/v1/raft/append?to=3"
+        );
+        assert_eq!(
+            addressed("/_cluster/flow/get?x=1", 18446744073709551615),
+            "/_cluster/flow/get?x=1&to=18446744073709551615"
+        );
+    }
+
+    /// Pins D-96: the recipient parser reads the raw, undecoded query the way `route_path` does,
+    /// and fails closed on anything that is not exactly one decimal id.
+    #[test]
+    fn the_recipient_is_one_decimal_id_or_absent() {
+        assert_eq!(recipient("/internal/v1/raft/vote"), Ok(None));
+        assert_eq!(recipient("/internal/v1/raft/vote?to=77"), Ok(Some(77)));
+        assert_eq!(recipient("/_cluster/flow/get?x=1&to=77&y=2"), Ok(Some(77)));
+        assert_eq!(
+            recipient("/p?too=5"),
+            Ok(None),
+            "a parameter that merely starts with `to` is not it"
+        );
+        for bad in [
+            "/p?to",
+            "/p?x=1&to",
+            "/p?to=",
+            "/p?to=abc",
+            "/p?to=-1",
+            "/p?to=+7",
+            "/p?to=18446744073709551616",
+            "/p?to=1&to=2",
+            "/p?to=0x10",
+            "/p?to=%37%37",
+        ] {
+            assert!(
+                matches!(recipient(bad), Err(RpcError::BadRequest(_))),
+                "{bad} must be refused, got {:?}",
+                recipient(bad)
+            );
+        }
+    }
+
+    /// Pins D-96's mixed-version claim: a receiver that knows nothing of the recipient still routes
+    /// an addressed request to the same handler, because routing ignores the query.
+    #[test]
+    fn an_addressed_path_routes_to_the_same_handler() {
+        let router = Router::new().route(
+            "POST",
+            "/internal/v1/raft/append",
+            Arc::new(|_body: Vec<u8>| -> HandlerFuture { Box::pin(async { Ok(Vec::new()) }) }),
+        );
+        assert!(
+            router
+                .lookup("POST", &addressed("/internal/v1/raft/append", 3))
+                .is_some()
+        );
     }
 }
