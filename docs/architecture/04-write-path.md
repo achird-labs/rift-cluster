@@ -27,12 +27,14 @@ sequenceDiagram
     B-->>L: fsync'd ✓
     Note over L: entry N COMMITTED (majority, on disk)
     L->>L: apply N — sm_configs + ImposterManager::apply_config<br/>revision := N · record sm_op_dedup[k1] = N
-    par barrier: wait for Ready nodes to APPLY N
-        F-->>L: applied ≥ N (piggybacked on AppendEntries resp)
-        B-->>L: applied ≥ N
-    end
     L-->>B: ok {revision: N}
     B->>B: mark intent applied
+    par barrier (D-97): B polls every member that reports itself Ready
+        B->>L: POST /internal/v1/applied?to=A
+        L-->>B: {applied ≥ N, ready: true}
+        B->>F: POST /internal/v1/applied?to=C
+        F-->>B: {applied ≥ N, ready: true}
+    end
     B-->>C: 201 Created<br/>Rift-Cluster-Revision: 8080@N<br/>Rift-Cluster-Op-Id: k1
     Note over C: The next request through the LB —<br/>to ANY node — is served from config N.
 ```
@@ -50,12 +52,16 @@ The steps that make the guarantees:
   node deterministically. Apply uses upstream `apply_config` (#316) — the
   order-aware, incremental reconciler — so applying config for port 8080 never
   disturbs port 8081's scenario state, cursors, or recorded requests.
-- **Steps 9–10 — the read-after-write barrier.** Raft's commit guarantees
+- **The read-after-write barrier (D-97).** Raft's commit guarantees
   durability, not that follower state machines have *applied*. The barrier
-  closes exactly that gap: the leader waits until every **Ready** node reports
-  applied-index ≥ N. Joining/not-Ready nodes are excluded — they are not behind
-  the LB yet, so they cannot violate R1.
-- **Step 12 — the response carries proof.** `Rift-Cluster-Revision` is the log
+  closes exactly that gap. Once the leader has answered, the accepting node
+  polls each member's applied index, and its own, until every member that
+  reports itself **Ready** is at N or beyond. Each member answers with its own
+  `/readyz` verdict. A joining, catching-up or draining node answers `ready:
+  false` and is left out: it is not behind the LB, so it cannot violate R1. A
+  member that never answers is given up after 500 ms, so a crashed voter, which
+  stays a member until it is retired (D-94, D-95), does not hold every write.
+- **Step 16 — the response carries proof.** `Rift-Cluster-Revision` is the log
   index: monotone, fleet-wide, comparable. `GET /_cluster/config` reports every
   node's applied revision against it.
 
@@ -92,7 +98,9 @@ node, and a write that was parked during an outage discovers it through
 | Accepting node dies **after parking, before forward** | On restart, its recovery loop replays pending intents to the current leader; dedup makes replay exactly-once | Connection error; retry with same key is safe, or query op-id later |
 | Leader dies **before commit** | Entry never committed; new leader elected ≤ ~3 s; accepting node's forward retries against new leader | Slightly slower 2xx |
 | Leader dies **after commit, before responding** | Entry is committed — new leader has it; accepting node retries, dedup returns recorded outcome | Slightly slower 2xx, same revision |
-| A Ready follower is slow/wedged during barrier | Barrier caps at `--cluster-write-barrier-timeout` (2 s) | `201` + `Rift-Cluster-Warnings: unapplied=nodeC` — success with a named asterisk |
+| A Ready follower answers but is slow to apply | Barrier caps at `--cluster-write-barrier-timeout` (2 s) | `201` + `Rift-Cluster-Warnings: unapplied=nodeC` — success with a named asterisk |
+| A member is down, wedged, blackholed, or its address answers as another node (D-96) | Given up after 500 ms of silence, or at once on a refusal; the write is not held for the rest of the timeout (D-97) | `201` + `Rift-Cluster-Warnings: unreachable=nodeC` |
+| A member is joining, catching up, or draining | Left out of the barrier: it reports itself not Ready (D-97) | `201`, no warning: the balancer is not sending it traffic |
 | **The answering node's own apply is slow, under `barrier=none`** | Same cap; the node then renders what it can actually read | Usually `201`. If the apply still has not landed, the re-read's real status (a `404`) + `Rift-Cluster-Warnings: unapplied=<this node>` — **a non-2xx here is not proof the write failed**: it committed, and `Rift-Cluster-Revision` names it. Poll `GET /_cluster/ops/:op_id` to settle it |
 | **No quorum reachable** (minority side of a partition) | Intent stays parked; replay fires on leader-change/heal | `503` + `Retry-After` + `Rift-Cluster-Op-Id` — *"durably queued, will converge; poll GET /_cluster/ops/:id or retry with the same key"* |
 | Duplicate delivery (client retry + intent replay race) | Both hit the same dedup entry | One application, both callers get revision N |

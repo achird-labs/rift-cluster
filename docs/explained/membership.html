@@ -56,7 +56,7 @@
   <h3>The whole design in four sentences</h3>
 </section>
 <div class="wide"><div class="recap">
-  <div><b>R1 · visible everywhere</b>The write barrier holds the 2xx until every member has applied the entry (up to 2 s); a straggler is named in <code>Rift-Cluster-Warnings</code>.</div>
+  <div><b>R1 · visible everywhere</b>The write barrier holds the 2xx until every Ready member has applied the entry (up to 2 s); a straggler is named <code>unapplied=</code>, and a member that can't be heard from <code>unreachable=</code>, in <code>Rift-Cluster-Warnings</code>.</div>
   <div><b>R2 · next request sees it</b>Owner-routed reads; if the owner is unreachable, a fast, honest <code>503</code>, not a stale answer.</div>
   <div><b>R3 · survives restart</b>Absolute at <code>sync</code>. At <code>async</code>, the loss window is one fsync interval, and only if all three holders die inside it.</div>
   <div><b>R4 · never lost</b>The intent is parked on disk before forwarding; a <code>503</code> carries an op-id whose fate you can query.</div>

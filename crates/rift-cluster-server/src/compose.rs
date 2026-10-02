@@ -22,7 +22,8 @@ use rift_cluster::stores::{
 };
 use rift_cluster::{
     Authority, ClusterDecorator, ControlOp, ControlOutcome, ControlRequest, LeaderWait,
-    LeaveOutcome, NodeConfig, NodeError, NodeIdentity, PullOnMissInterceptor, RaftNode, metrics,
+    LeaveOutcome, NodeConfig, NodeError, NodeIdentity, PullOnMissInterceptor, RaftNode, ReadyProbe,
+    metrics,
 };
 use rift_cluster_base::seams::{
     CompiledRoutes, FileSource, HttpSource, ImposterConfig, ImposterManager, OutboundTls,
@@ -629,6 +630,12 @@ pub async fn start_with_runtimes(
             .merge(seq_routes(Arc::clone(&sequencer))),
             engine: Some(Arc::clone(&manager)),
             snapshot_log_entries: cli.cluster.cluster_snapshot_log_entries,
+            // The `/readyz` verdict, pending gates and draining included: a peer's write barrier
+            // leaves this node out while the balancer is not sending it traffic (D-97).
+            ready: {
+                let readiness = Arc::clone(&readiness);
+                ReadyProbe::new(move || readiness.state().is_ready())
+            },
         },
         Arc::clone(&front_door_routes),
         // Same before-construction contract as `engine`/`front_door_routes` just above: the

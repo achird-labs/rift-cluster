@@ -1005,6 +1005,7 @@ pub(crate) fn control_routes(
     ceiling: AutoVoterCeiling,
     client: RpcClient,
     resolver: Arc<dyn PeerResolver>,
+    ready: ReadyProbe,
 ) -> Router {
     let admission_ceiling = ceiling;
     let append = slot.clone();
@@ -1044,10 +1045,22 @@ pub(crate) fn control_routes(
             CLUSTER_APPLIED_PATH,
             Arc::new(move |_body: Vec<u8>| -> HandlerFuture {
                 let slot = applied.clone();
+                let ready = ready.clone();
                 Box::pin(async move {
-                    let raft = raft_of(&slot)?;
+                    // Bound before its Raft has started, a node serves nothing and is not Ready
+                    // whatever its probe says: a write barrier leaves it out rather than naming
+                    // it (D-97).
+                    let Some(raft) = slot.get() else {
+                        return encode(&AppliedReply {
+                            applied: None,
+                            ready: Some(false),
+                        });
+                    };
                     let applied = raft.metrics().borrow().last_applied.map(|id| id.index);
-                    encode(&AppliedReply { applied })
+                    encode(&AppliedReply {
+                        applied,
+                        ready: Some(ready.is_ready()),
+                    })
                 })
             }),
         )
@@ -1237,6 +1250,43 @@ pub(crate) enum WriteReply {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct AppliedReply {
     pub applied: Option<u64>,
+    /// The answering node's own readiness verdict (D-97): whether the balancer sends it traffic.
+    /// Absent from a build older than the field, which the barrier reads as Ready, so a rolling
+    /// upgrade keeps the barrier it had.
+    #[serde(default)]
+    pub ready: Option<bool>,
+}
+
+/// How a node answers "are you Ready?" on the applied-index route (D-97).
+///
+/// Readiness belongs to the embedder: in `rift-cluster-server` it is the latch behind `/readyz`,
+/// pending gates and draining included. The default answers Ready, for an embedder with no gate.
+#[derive(Clone)]
+pub struct ReadyProbe(Arc<dyn Fn() -> bool + Send + Sync>);
+
+impl ReadyProbe {
+    /// A probe that asks `ready` each time a peer polls this node.
+    pub fn new(ready: impl Fn() -> bool + Send + Sync + 'static) -> Self {
+        Self(Arc::new(ready))
+    }
+
+    /// This node's verdict right now.
+    #[must_use]
+    pub fn is_ready(&self) -> bool {
+        (self.0)()
+    }
+}
+
+impl Default for ReadyProbe {
+    fn default() -> Self {
+        Self::new(|| true)
+    }
+}
+
+impl std::fmt::Debug for ReadyProbe {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("ReadyProbe").finish_non_exhaustive()
+    }
 }
 
 /// Run a client write on the local Raft, mapping openraft's not-the-leader
@@ -2048,6 +2098,38 @@ fn encode<T: Serialize>(value: &T) -> Result<Vec<u8>, RpcError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Pins D-97: a node whose Raft has not started yet answers the barrier's poll `ready: false`,
+    /// whatever its probe says, so the barrier leaves it out instead of naming it `unreachable` on
+    /// a "not yet initialized" refusal.
+    #[tokio::test]
+    async fn a_node_whose_raft_has_not_started_answers_not_ready() {
+        let routes = control_routes(
+            Router::new(),
+            RaftSlot::default(),
+            MembershipGate::default(),
+            Arc::new(std::sync::atomic::AtomicUsize::new(MAX_AUTO_VOTERS)),
+            RpcClient::new(
+                None,
+                Arc::new(crate::rpc::AlwaysHealthy),
+                crate::rpc::RpcClientConfig::default(),
+            ),
+            Arc::new(crate::rpc::DnsResolver),
+            ReadyProbe::new(|| true),
+        );
+        let handler = routes
+            .lookup("POST", CLUSTER_APPLIED_PATH)
+            .expect("the applied route is registered");
+        let reply = handler
+            .call(Vec::new())
+            .await
+            .expect("answers, not refuses");
+        let reply: serde_json::Value = serde_json::from_slice(&reply).expect("json");
+        assert_eq!(
+            reply,
+            serde_json::json!({ "applied": null, "ready": false })
+        );
+    }
 
     fn view_of(node_id: NodeId) -> Result<Vec<u8>, RpcError> {
         Ok(serde_json::to_vec(&MembershipView {

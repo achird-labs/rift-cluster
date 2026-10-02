@@ -38,7 +38,8 @@ pub const NOTE_BIND_FAILURES: &str = "cluster.bind_failures";
 pub const HEADER_REVISION: &str = "rift-cluster-revision";
 /// The op id a write carried (minted or client-supplied), for correlation.
 pub const HEADER_OP_ID: &str = "rift-cluster-op-id";
-/// Non-fatal write warnings, e.g. `unapplied=<node,…>` on a barrier timeout.
+/// Non-fatal write warnings, e.g. `unapplied=<node,…>` for members still behind at a barrier
+/// timeout, or `unreachable=<node,…>` for members the barrier could not hear from (D-97).
 pub const HEADER_WARNINGS: &str = "rift-cluster-warnings";
 /// This node is serving the addressed imposter in-process only, because it could not bind that
 /// imposter's port (issue #143).

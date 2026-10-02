@@ -44,6 +44,7 @@ async fn start() -> Fixture {
         ),
         engine: None,
         snapshot_log_entries: None,
+        ready: rift_cluster::ReadyProbe::default(),
     };
     let node = Arc::new(RaftNode::start(config).await.expect("node starts"));
     slot.set(&node).expect("the slot is bound exactly once");

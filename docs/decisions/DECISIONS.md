@@ -4367,3 +4367,84 @@ because the id matches.
 (`crates/rift-cluster/src/raft/network.rs`) and
 `retire_proceeds_when_the_dead_members_address_answers_as_another_node`
 (`crates/rift-cluster/tests/cluster.rs`) pin it.
+
+### D-97 — The write barrier waits for the members that report themselves Ready, and names the rest by what it saw
+
+- **Status:** active
+- **Decided:** 2026-10-02 · #649
+- **Refines:** D-15, D-94, D-96
+- **Amends:** RFC-001 §7.4
+- **Implemented by:** #649
+- **Code:** crates/rift-cluster/src/raft/node.rs, crates/rift-cluster/src/raft/network.rs, crates/rift-cluster-server/src/compose.rs, crates/rift-cluster-server/src/admin_front.rs
+
+**The rule.** `--cluster-write-barrier ready-nodes` (the default) means what it says. Once a write
+has committed, the barrier holds the `2xx` until every member that serves traffic has applied it,
+up to `--cluster-write-barrier-timeout`. Each member answers the barrier's poll of
+`/internal/v1/applied` with its applied index and its own readiness verdict, `{ applied, ready }`.
+`ready` is the node's `/readyz` answer: pending gates and draining both read `false`, and so does a
+node whose Raft has not started yet. Per member:
+
+| What the member answers | Barrier | Reported in `Rift-Cluster-Warnings` |
+|---|---|---|
+| applied the write | confirmed | nothing |
+| `ready: false` | left out at once | nothing (logged at debug) |
+| behind | waited for until the timeout | `unapplied=<id>` if still behind |
+| nothing within 500 ms, never having answered (crashed, blackholed) | given up | `unreachable=<id>` |
+| its address does not resolve | given up at once | `unreachable=<id>` |
+| something that cannot speak for it (D-96's `wrong_node`, a refused credential, no such route) | given up at once | `unreachable=<id>` |
+
+A reply without `ready` comes from a build older than the field and is read as Ready, so a rolling
+upgrade keeps the barrier it had. The node running the barrier reads its own applied index from its
+own state; it can only be `unapplied`. Each poll is a single attempt bounded at 250 ms, sent to all
+of a member's addresses at once; the most advanced answer from any of them is the member's, and a
+silent address outranks a refusing one. The polls of one round run in parallel, and rounds repeat
+every 25 ms. A refusal other than `wrong_node`, which the liveness ticker already reports, is logged
+as a warning: it is a misconfiguration. The barrier never fails the write, which
+is already committed; it only reports.
+
+**The mechanism of record.** The node that accepted the write runs the barrier, after the leader
+has answered it, by polling each member's applied index. This replaces RFC-001 §7.4's description
+(the leader waits, with followers' applied indexes piggybacked on AppendEntries responses, before
+answering). The client's guarantee is the same either way.
+
+**Why.**
+- *Ready only.* A member that is not Ready is not behind the load balancer, so read-your-write (R1)
+  does not depend on it. Waiting for it, as the barrier did before this decision, made every admin
+  write during a rollout or a snapshot install wait the full timeout and carry a warning.
+- *Unreachable after 500 ms.* The barrier can only report a member that does not answer; it can
+  never make it apply. Under D-94 a crashed voter stays a member until it is retired, often for a
+  long time, and waiting the full timeout for it taxed every admin write with nothing bought. 500 ms
+  is two polls and the transport's connect timeout: a blip does not name a healthy node.
+- *Single bounded polls.* The transport's retrying call spent up to three retries at the 2 s request
+  timeout per poll, member after member, so one blackholed address held the whole round, and the
+  barrier, past its own deadline.
+- *Accepting node, polling.* That node assembles the client's response and sets the warning header.
+  A leader-side barrier would hold every write on the slowest Ready follower for every caller, and
+  openraft's network trait has no hook to piggyback applied indexes on AppendEntries responses.
+
+**Rejected.** Making the documents follow the old code (it keeps the tax, and leaves `ready-nodes`
+describing something else). Reading readiness from `/_cluster/health` (a second round trip per
+member per round). Stopping on the health tracker's verdict (it is a string inside a transport
+error, and D-78's half-open trial makes a low write rate's every write the trial).
+
+**Not covered.** A member partitioned from the accepting node but still behind the balancer is
+reported `unreachable`, which is all a barrier run from one node can say. A node turns Ready once it
+has applied up to the leader's index as its reconciler read it; a write committed between that read
+and the gate opening is not covered for that node.
+
+`a_member_that_reports_not_ready_is_neither_waited_for_nor_named`,
+`an_older_peer_without_ready_is_waited_for`,
+`a_member_that_answers_behind_is_named_unapplied_at_the_timeout`,
+`a_killed_member_is_named_unreachable_within_half_the_timeout`,
+`an_unreachable_member_does_not_delay_the_others` and
+`an_address_that_answers_as_something_else_is_named_unreachable_at_once`,
+`a_member_that_answers_then_goes_silent_is_named_unapplied` and
+`a_silent_member_is_named_unreachable_when_the_timeout_ends_first`
+(`crates/rift-cluster/tests/cluster.rs`), `a_members_addresses_fold_into_one_verdict`
+(`crates/rift-cluster/src/raft/node.rs`), `a_node_whose_raft_has_not_started_answers_not_ready`
+(`crates/rift-cluster/src/raft/network.rs`),
+`the_barriers_warnings_name_each_state_by_its_own_word`
+(`crates/rift-cluster-server/src/admin_front.rs`),
+`a_dead_follower_is_named_unreachable_in_the_warnings_header` and
+`a_node_reports_its_own_readiness_on_the_applied_route`
+(`crates/rift-cluster-server/tests/write_path.rs`) pin it.

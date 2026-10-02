@@ -147,9 +147,10 @@ Every guarantee in this book comes with its boundary, and the boundaries are
 themselves part of the design — bounded, counted in metrics, and flagged on
 responses (`Rift-Cluster-*` headers), never silent:
 
-- R1 holds via the write barrier; if a Ready node cannot confirm apply within
-  the barrier timeout, the write still succeeds and the response *names the
-  lagging nodes* in a warning header.
+- R1 holds via the write barrier; if a Ready node has not applied the write
+  within the barrier timeout, or a member cannot be heard from at all, the write
+  still succeeds and the response *names those nodes* in a warning header
+  (`unapplied=`, `unreachable=`; D-97).
 - R2 holds via owner-routed reads; if the owner is unreachable, the default is
   a fast, honest `503` — not a stale answer (per-feature overrides exist and
   stamp a degradation header when used).

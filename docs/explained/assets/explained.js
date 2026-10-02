@@ -131,7 +131,7 @@ SeqScene("seq-write", {
     {name:"Normal path", steps:[...wHead, ...wReplicate,
       {caption:"The leader applies N: config into <code>sm_configs</code>, revision := N, <code>sm_op_dedup[k1] = N</code>, and the local engine binds :8080.", items:[{note:"L",text:"apply N · bind :8080",kind:"good"}], state:{L:"log ✓ N · applied N<br>dedup k1→N"}},
       {caption:"The leader returns the committed outcome to B, which clears the parked intent: the request is now in the log, so the intent has done its job.", items:[{f:"L",t:"B",label:"ok {revision: N}",kind:"reply"}], state:{B:"intent k1: done<br>log: …, N"}},
-      {caption:"<b>The barrier.</b> Commit is not apply. B polls every member's applied index (<code>/internal/v1/applied</code>, every 25 ms) until each reports ≥ N, for up to 2 s.", items:[{f:"B",t:"L",label:"applied?"},{f:"L",t:"B",label:"applied N",kind:"ok"},{f:"B",t:"F",label:"applied?"},{f:"F",t:"B",label:"applied N",kind:"ok"}], state:{B:"intent k1: done<br>applied N",F:"applied N"}},
+      {caption:"<b>The barrier.</b> Commit is not apply. B polls every member's applied index (<code>/internal/v1/applied</code>, every 25 ms) until each member that reports itself Ready is at ≥ N, for up to 2 s.", items:[{f:"B",t:"L",label:"applied?"},{f:"L",t:"B",label:"applied N · ready",kind:"ok"},{f:"B",t:"F",label:"applied?"},{f:"F",t:"B",label:"applied N · ready",kind:"ok"}], state:{B:"intent k1: done<br>applied N",F:"applied N"}},
       {caption:"B answers <code>201</code> with proof: <code>Rift-Cluster-Revision: 8080@N</code> and <code>Rift-Cluster-Op-Id: k1</code>. The next request, to any node, is served from config N.", items:[{f:"B",t:"c",label:"201 · Revision 8080@N",kind:"ok"}]},
     ]},
     {name:"Leader dies after commit", steps:[...wHead, ...wReplicate,
@@ -871,7 +871,7 @@ SeqScene("seq-heartbeat", {
 (function conv(){
   const fig = document.getElementById("fig-conv"); if (!fig) return;
   const svg = fig.querySelector("svg"), evEl = fig.querySelector(".events");
-  const SNAP = 20, KEEP = 6, TICKMS = 150, BARRIER_TICKS = 13, BATCH = 4, SHOW = 26;
+  const SNAP = 20, KEEP = 6, TICKMS = 150, BARRIER_TICKS = 13, UNREACH_TICKS = 4, BATCH = 4, SHOW = 26;
   const COL = {A:N.A, B:N.B, C:N.C, D:N.D, E:N.E, F:"var(--muted)"};
   let nodes, L, S, purged, pending, tick, timer, commit = 3;
   const ev = (cls, msg) => {
@@ -880,8 +880,8 @@ SeqScene("seq-heartbeat", {
     evEl.prepend(d); while (evEl.children.length > 60) evEl.lastChild.remove();
   };
   function reset(){
-    nodes = ["A","B","C","D","E"].map(id => ({id, up:true, slow:false, voter:true, member:true, log:3, applied:3, snap:0, slowAcc:0}));
-    nodes.push({id:"F", up:false, slow:false, voter:false, member:false, log:0, applied:0, snap:0, slowAcc:0});
+    nodes = ["A","B","C","D","E"].map(id => ({id, up:true, ready:true, slow:false, voter:true, member:true, log:3, applied:3, snap:0, slowAcc:0}));
+    nodes.push({id:"F", up:false, ready:false, slow:false, voter:false, member:false, log:0, applied:0, snap:0, slowAcc:0});
     L = 3; S = 0; purged = 0; pending = []; tick = 0; commit = 3; evEl.innerHTML = "";
     ev("ev-acc", "A leads a five-voter fleet; every member has applied index 3.");
     sync();
@@ -927,12 +927,23 @@ SeqScene("seq-heartbeat", {
     if (f.member && !f.voter && f.up && L - f.log <= 3 && voters().length < 9){
       f.voter = true; ev("ev-ok", "Promotion sweep: F is caught up, promoted to voter");
     }
+    nodes.forEach(n => {
+      if (n.member && n.up && !n.ready && n.applied >= commit){ n.ready = true; ev("ev-ok", `${n.id} has caught up: /readyz 200, back behind the balancer`); }
+    });
     pending = pending.filter(p => {
       if (p.n > commit) return true;
-      const behind = members().filter(n => n.applied < p.n).map(n => n.id);
       const waited = tick - p.start;
-      if (!behind.length){ ev("ev-ok", `write ${p.n}: 201 (every member applied, ${(waited*TICKMS/1000).toFixed(2)} s)`); return false; }
-      if (waited >= BARRIER_TICKS){ ev("ev-warn", `write ${p.n}: 201 + Rift-Cluster-Warnings: unapplied=${behind.join(",")}`); return false; }
+      // D-97: only Ready members are waited for; a member that never answers is given up early.
+      const behind = members().filter(n => n.up && n.ready && n.applied < p.n).map(n => n.id);
+      const down = members().filter(n => !n.up).map(n => n.id);
+      const silenceOver = waited >= UNREACH_TICKS;
+      const words = list => [behind.length ? `unapplied=${behind.join(",")}` : "", list.length ? `unreachable=${list.join(",")}` : ""].filter(Boolean).join(",");
+      if (!behind.length && (!down.length || silenceOver)){
+        if (!down.length) ev("ev-ok", `write ${p.n}: 201 (every Ready member applied, ${(waited*TICKMS/1000).toFixed(2)} s)`);
+        else ev("ev-warn", `write ${p.n}: 201 + Rift-Cluster-Warnings: ${words(down)} (given up after ${(waited*TICKMS/1000).toFixed(2)} s)`);
+        return false;
+      }
+      if (waited >= BARRIER_TICKS){ ev("ev-warn", `write ${p.n}: 201 + Rift-Cluster-Warnings: ${words(down)}`); return false; }
       return true;
     });
     sync();
@@ -972,7 +983,7 @@ SeqScene("seq-heartbeat", {
     if (a === "write"){ write(); ev("ev-acc", `A appends entry ${L}`); }
     if (a === "burst"){ for (let k = 0; k < 25; k++) write(); ev("ev-acc", `A appends entries up to ${L}`); }
     if (a === "slow"){ const C = nodes[2]; C.slow = !C.slow; ev(C.slow ? "ev-warn" : "ev-ok", C.slow ? "C's apply slows: its log keeps up, its applied index doesn't" : "C's apply is back to normal"); }
-    if (a === "crash"){ const D = nodes[3]; D.up = !D.up; ev(D.up ? "ev-ok" : "ev-bad", D.up ? `D restarts at log ${D.log}; the leader resumes sending from there` : "D crashes. Still a member: it counts in the quorum and in the barrier"); }
+    if (a === "crash"){ const D = nodes[3]; D.up = !D.up; D.ready = false; ev(D.up ? "ev-ok" : "ev-bad", D.up ? `D restarts at log ${D.log} and reports itself not Ready until it catches up; the leader resumes sending from there` : "D crashes. Still a member: it counts in the quorum, and the barrier names it unreachable"); }
     if (a === "join"){ const F = nodes[5]; F.member = true; F.up = true; ev("ev-acc", "F joins: the leader commits it as a learner (empty log)"); }
     if (a === "reset"){ reset(); return; }
     sync();

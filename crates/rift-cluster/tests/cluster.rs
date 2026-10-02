@@ -17,7 +17,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use rift_cluster::{
-    ADMIT_CURRENCY_WAIT, Authority, ControlRequest, NodeConfig, NodeId, RaftNode, Router,
+    ADMIT_CURRENCY_WAIT, Authority, BarrierOutcome, ControlRequest, NodeConfig, NodeId, RaftNode,
+    ReadyProbe, Router,
 };
 use tempfile::TempDir;
 
@@ -80,6 +81,7 @@ async fn spawn_with_snapshot_policy(
         routes: Router::new(),
         engine: None,
         snapshot_log_entries,
+        ready: ReadyProbe::default(),
     };
     // No retry-on-lock-contention: `RaftNode::shutdown` now waits for the Raft
     // core to release its storage handles before returning (#41), so a restart on
@@ -503,48 +505,294 @@ async fn test_leader_failover() {
     cluster.shutdown_all().await;
 }
 
-/// Issue #9: the write barrier degrades to a *warning* on an unreachable node —
-/// the write itself stays committed. A healthy fleet reports nobody unapplied;
-/// with a member killed, exactly that member is named.
+/// Issue #9, pins D-97: a healthy fleet confirms every member, so the barrier reports nobody.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn barrier_names_exactly_the_unapplied_node() {
+async fn a_healthy_fleet_confirms_every_member() {
     let _guard = TEST_LOCK.lock().await;
     let mut cluster = TestCluster::start(3).await;
-    let leader_id = cluster
+    cluster
         .wait_for_leader(LEADER_DEADLINE)
         .await
         .expect("leader");
 
     let revision = cluster.write_on_leader(8080, "barrier-healthy").await;
-    let unapplied = cluster
+    let outcome = cluster
         .leader()
         .expect("leader")
         .await_applied(revision, Duration::from_secs(5))
         .await;
-    assert!(
-        unapplied.is_empty(),
-        "a healthy fleet leaves nobody unapplied: {unapplied:?}"
+    assert_eq!(
+        outcome,
+        BarrierOutcome::default(),
+        "a healthy fleet leaves nobody unapplied or unreachable"
     );
+    cluster.shutdown_all().await;
+}
 
-    // Kill a follower (never the leader) and write again: the commit still
-    // succeeds on the majority, and the barrier names the dead node — only it.
+/// The applied-index route, as the wire spells it. Stated literally: a stub that answered on a
+/// path the barrier no longer polls would make every test below pass vacuously.
+const APPLIED_PATH: &str = "/internal/v1/applied";
+
+/// A three-voter cluster with one follower stopped and `stub` answering the applied-index route at
+/// its address, so the barrier sees that member in whatever state the stub reports. `None` serves
+/// no routes at all: something answers at the address, but not as a member. Writes keep committing
+/// on the other two. Returns the cluster, the stubbed member's id and the stub task.
+async fn cluster_with_a_stubbed_member(
+    stub: Option<serde_json::Value>,
+) -> (TestCluster, NodeId, tokio::task::JoinHandle<()>) {
+    let mut cluster = TestCluster::start(3).await;
+    let leader_id = cluster
+        .wait_for_leader(LEADER_DEADLINE)
+        .await
+        .expect("leader");
     let victim = [1, 2, 3]
         .into_iter()
         .find(|id| *id != leader_id)
         .expect("a follower exists");
     cluster.kill(victim).await;
 
-    let revision = cluster.write_on_leader(8081, "barrier-degraded").await;
-    let unapplied = cluster
-        .leader()
-        .expect("leader")
-        .await_applied(revision, Duration::from_millis(500))
-        .await;
+    let router = match stub {
+        Some(stub) => {
+            let reply = serde_json::to_vec(&stub).expect("stub reply encodes");
+            Router::new().route(
+                "POST",
+                APPLIED_PATH,
+                Arc::new(move |_body: Vec<u8>| -> rift_cluster::rpc::HandlerFuture {
+                    let reply = reply.clone();
+                    Box::pin(async move { Ok(reply) })
+                }),
+            )
+        }
+        None => Router::new(),
+    };
+    // No node id, so D-96's recipient check accepts the polls named for the member it stands in
+    // for.
+    let server = rift_cluster::RpcServer::bind(
+        cluster.member(victim).addr,
+        rift_cluster::rpc::RpcServerConfig::new(
+            Some(Arc::new(rift_cluster::rpc::Verifier::new(SECRET))),
+            router,
+        ),
+    )
+    .await
+    .expect("the stub binds the stopped member's address");
+    let task = tokio::spawn(server.serve());
+    (cluster, victim, task)
+}
+
+/// Run the barrier from the leader for a fresh write, timing it.
+async fn timed_barrier(cluster: &TestCluster, timeout: Duration) -> (BarrierOutcome, Duration) {
+    let revision = cluster.write_on_leader(8090, "barrier-stubbed").await;
+    let leader = cluster.leader().expect("leader");
+    let started = Instant::now();
+    let outcome = leader.await_applied(revision, timeout).await;
+    (outcome, started.elapsed())
+}
+
+/// #649, pins D-97: a member that reports itself not Ready is not behind the balancer, so R1 does
+/// not need it. The barrier neither waits for it nor names it, even though it is behind.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_member_that_reports_not_ready_is_neither_waited_for_nor_named() {
+    let _guard = TEST_LOCK.lock().await;
+    let (mut cluster, _victim, stub) =
+        cluster_with_a_stubbed_member(Some(serde_json::json!({ "applied": 0, "ready": false })))
+            .await;
+
+    let timeout = Duration::from_secs(4);
+    let (outcome, took) = timed_barrier(&cluster, timeout).await;
     assert_eq!(
-        unapplied,
+        outcome,
+        BarrierOutcome::default(),
+        "a not-Ready member is excluded, not named"
+    );
+    assert!(
+        took < timeout / 2,
+        "a not-Ready member must not hold the write: the barrier took {took:?} of {timeout:?}"
+    );
+    stub.abort();
+    cluster.shutdown_all().await;
+}
+
+/// #649, pins D-97: a reply without `ready` comes from a build older than the field, and is read as
+/// Ready, so the barrier keeps waiting for it as it always has.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_older_peer_without_ready_is_waited_for() {
+    let _guard = TEST_LOCK.lock().await;
+    let (mut cluster, victim, stub) =
+        cluster_with_a_stubbed_member(Some(serde_json::json!({ "applied": 0 }))).await;
+
+    let timeout = Duration::from_millis(1500);
+    let (outcome, took) = timed_barrier(&cluster, timeout).await;
+    assert_eq!(outcome.unapplied, vec![victim]);
+    assert_eq!(outcome.unreachable, Vec::<NodeId>::new());
+    assert!(
+        took >= timeout,
+        "an answering, behind member is waited for until the timeout, took {took:?}"
+    );
+    stub.abort();
+    cluster.shutdown_all().await;
+}
+
+/// #649, pins D-97: a Ready member that answers and is behind is waited for until the timeout and
+/// then named `unapplied`, never `unreachable`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_member_that_answers_behind_is_named_unapplied_at_the_timeout() {
+    let _guard = TEST_LOCK.lock().await;
+    let (mut cluster, victim, stub) =
+        cluster_with_a_stubbed_member(Some(serde_json::json!({ "applied": 0, "ready": true })))
+            .await;
+
+    let timeout = Duration::from_millis(1500);
+    let (outcome, took) = timed_barrier(&cluster, timeout).await;
+    assert_eq!(outcome.unapplied, vec![victim]);
+    assert_eq!(outcome.unreachable, Vec::<NodeId>::new());
+    assert!(
+        took >= timeout,
+        "an answering, behind member is waited for until the timeout, took {took:?}"
+    );
+    stub.abort();
+    cluster.shutdown_all().await;
+}
+
+/// #649, pins D-97: an address that answers, but not as this member, is named `unreachable` at
+/// once rather than after the silence window: no later poll will get a different answer. D-96's
+/// `wrong_node` is the same case; a cluster port that does not serve the route stands in here
+/// because it answers in microseconds, so the bound below can sit well under the window.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_address_that_answers_as_something_else_is_named_unreachable_at_once() {
+    let _guard = TEST_LOCK.lock().await;
+    let (mut cluster, victim, stub) = cluster_with_a_stubbed_member(None).await;
+
+    let (outcome, took) = timed_barrier(&cluster, Duration::from_secs(4)).await;
+    assert_eq!(outcome.unreachable, vec![victim]);
+    assert_eq!(outcome.unapplied, Vec::<NodeId>::new());
+    assert!(
+        took < Duration::from_millis(400),
+        "a refusal is final, so it must not wait out the 500 ms silence window: took {took:?}"
+    );
+    stub.abort();
+    cluster.shutdown_all().await;
+}
+
+/// #649, pins D-97: a member that has answered is named `unapplied` at the timeout even if it then
+/// goes silent. It was heard from and was behind; calling it `unreachable` would say it never
+/// answered.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_member_that_answers_then_goes_silent_is_named_unapplied() {
+    let _guard = TEST_LOCK.lock().await;
+    let (mut cluster, victim, stub) =
+        cluster_with_a_stubbed_member(Some(serde_json::json!({ "applied": 0, "ready": true })))
+            .await;
+
+    let revision = cluster.write_on_leader(8091, "barrier-then-silent").await;
+    let leader = cluster.leader().expect("leader");
+    let (outcome, ()) = tokio::join!(
+        leader.await_applied(revision, Duration::from_millis(1500)),
+        async {
+            // Long enough for the first rounds to hear "behind", well inside the 500 ms window.
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            stub.abort();
+        }
+    );
+    assert_eq!(outcome.unapplied, vec![victim]);
+    assert_eq!(outcome.unreachable, Vec::<NodeId>::new());
+    cluster.shutdown_all().await;
+}
+
+/// #649, pins D-97: with a timeout shorter than the 500 ms silence window, a member that never
+/// answers is still named `unreachable` when the timeout ends, not `unapplied`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_silent_member_is_named_unreachable_when_the_timeout_ends_first() {
+    let _guard = TEST_LOCK.lock().await;
+    let mut cluster = TestCluster::start(3).await;
+    let leader_id = cluster
+        .wait_for_leader(LEADER_DEADLINE)
+        .await
+        .expect("leader");
+    let victim = [1, 2, 3]
+        .into_iter()
+        .find(|id| *id != leader_id)
+        .expect("a follower exists");
+    cluster.kill(victim).await;
+
+    let (outcome, _) = timed_barrier(&cluster, Duration::from_millis(200)).await;
+    assert_eq!(outcome.unreachable, vec![victim]);
+    assert_eq!(outcome.unapplied, Vec::<NodeId>::new());
+    cluster.shutdown_all().await;
+}
+
+/// #649, pins D-97: a member that never answers is given up early and named `unreachable`. The
+/// bound is the point: before D-97 the barrier also named a killed member, but only after the whole
+/// timeout, so a test without it passes against the old barrier.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_killed_member_is_named_unreachable_within_half_the_timeout() {
+    let _guard = TEST_LOCK.lock().await;
+    let mut cluster = TestCluster::start(3).await;
+    let leader_id = cluster
+        .wait_for_leader(LEADER_DEADLINE)
+        .await
+        .expect("leader");
+    let victim = [1, 2, 3]
+        .into_iter()
+        .find(|id| *id != leader_id)
+        .expect("a follower exists");
+    cluster.kill(victim).await;
+
+    let timeout = Duration::from_secs(4);
+    let (outcome, took) = timed_barrier(&cluster, timeout).await;
+    assert_eq!(
+        outcome.unreachable,
         vec![victim],
         "the barrier must name the dead node and nothing else"
     );
+    assert_eq!(outcome.unapplied, Vec::<NodeId>::new());
+    assert!(
+        took < timeout / 2,
+        "a member that never answers must not hold the write: took {took:?} of {timeout:?}"
+    );
+    cluster.shutdown_all().await;
+}
+
+/// #649, pins D-97: an address that accepts connections and never answers is the case that cost
+/// the most before D-97, since every poll waited out the transport's whole retry budget. Each poll
+/// is now one bounded attempt, so the member is named `unreachable` early and the live member is
+/// still confirmed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unreachable_member_does_not_delay_the_others() {
+    let _guard = TEST_LOCK.lock().await;
+    let mut cluster = TestCluster::start(3).await;
+    let leader_id = cluster
+        .wait_for_leader(LEADER_DEADLINE)
+        .await
+        .expect("leader");
+    let victim = [1, 2, 3]
+        .into_iter()
+        .find(|id| *id != leader_id)
+        .expect("a follower exists");
+    cluster.kill(victim).await;
+    // Accepted by the kernel's backlog, never answered.
+    let blackhole = {
+        let socket = tokio::net::TcpSocket::new_v4().expect("socket");
+        socket.set_reuseaddr(true).expect("reuseaddr");
+        socket
+            .bind(cluster.member(victim).addr)
+            .expect("bind the dead member's address");
+        socket.listen(16).expect("listen")
+    };
+
+    let timeout = Duration::from_secs(4);
+    let (outcome, took) = timed_barrier(&cluster, timeout).await;
+    assert_eq!(outcome.unreachable, vec![victim]);
+    assert_eq!(
+        outcome.unapplied,
+        Vec::<NodeId>::new(),
+        "the live follower is confirmed despite the blackholed member"
+    );
+    assert!(
+        took < timeout / 2,
+        "a blackholed member must not hold the write: took {took:?} of {timeout:?}"
+    );
+    drop(blackhole);
     cluster.shutdown_all().await;
 }
 
@@ -1434,7 +1682,7 @@ async fn a_joiner_is_caught_up_by_a_multi_mebibyte_snapshot() {
         leader
             .await_applied(last_revision, CONVERGE_DEADLINE)
             .await
-            .is_empty()
+            .is_confirmed()
     );
 
     // Wait for the snapshot policy to run before the joiner arrives, so the log it would
@@ -1699,7 +1947,7 @@ async fn a_snapshot_catch_up_does_not_disturb_a_fleet_that_already_has_quorum() 
     assert!(
         n1.await_applied(last_revision, CONVERGE_DEADLINE)
             .await
-            .is_empty()
+            .is_confirmed()
     );
     // See the sibling test: no public signal for "snapshot built and purged", so this is a settle.
     tokio::time::sleep(Duration::from_secs(2)).await;
@@ -2250,16 +2498,21 @@ async fn retire_proceeds_when_the_dead_members_address_answers_as_another_node()
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    let unconfirmed = cluster
+    let outcome = cluster
         .member(leader_id)
         .node
         .as_ref()
         .expect("live")
         .await_applied(revision, Duration::from_millis(800))
         .await;
+    // Unreachable rather than unapplied (D-97): the newcomer refuses the poll as `wrong_node`,
+    // which says nobody at that address will ever confirm for the dead member.
     assert_eq!(
-        unconfirmed,
-        vec![dead],
+        outcome,
+        BarrierOutcome {
+            unapplied: Vec::new(),
+            unreachable: vec![dead],
+        },
         "only the dead member is unconfirmed; the caught-up newcomer must not confirm on its behalf"
     );
 

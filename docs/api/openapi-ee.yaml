@@ -3158,7 +3158,10 @@ components:
 
         Distinct from `Rift-Cluster-Bind-Failures`, which asserts the narrower "holds the
         imposter but never bound its port". Both may appear for one port. On a write the
-        list may also carry `unapplied=<node-ids>`.
+        list may also carry `unapplied=<node-ids>`, members that answered the write
+        barrier and were still behind at its timeout, and `unreachable=<node-ids>`,
+        members it could not hear from (D-97). A member that reports itself not Ready
+        is not waited for and is not named.
       schema:
         type: string
         example: 'local-engine=flow store refused: flowState.contextScope must be "imposter" or "fleet"'

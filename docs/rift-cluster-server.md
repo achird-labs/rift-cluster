@@ -252,8 +252,8 @@ it, so a stray flag on a single node is not an error.
 | `--cluster-node-name <NAME>` | Operator-facing node name; seeds the first node id only |
 | `--cluster-leave-timeout <SECONDS>` | Drain window after SIGTERM (default `10`) |
 | `--cluster-probe-bind <ADDR>` | Address for `/readyz` and `/healthz` (default `0.0.0.0:2526`) |
-| `--cluster-write-barrier <MODE>` | What a committed admin write waits for before its 2xx: `ready-nodes` (default — every Ready node has applied it, so any node serves it) or `none` (committed and applied locally) |
-| `--cluster-write-barrier-timeout <SECONDS>` | How long the barrier waits (default `2`) before answering anyway with a `Rift-Cluster-Warnings: unapplied=<node,…>` header |
+| `--cluster-write-barrier <MODE>` | What a committed admin write waits for before its 2xx: `ready-nodes` (default — every Ready node has applied it, so any node serves it; a node that is joining, catching up or draining reports itself not Ready and is not waited for, D-97) or `none` (committed and applied locally) |
+| `--cluster-write-barrier-timeout <SECONDS>` | How long the barrier waits (default `2`) for a member that answers but is behind, before answering anyway with a `Rift-Cluster-Warnings: unapplied=<node,…>` header. A member that never answers is given up after 500 ms and named `unreachable=<node,…>` instead, so a crashed voter does not hold every write (D-97) |
 | `--cluster-admin-async` | Answer admin writes with an immediate `202` + op id after durably parking them; poll `GET /_cluster/ops/:id` for the outcome |
 | `--cluster-flow-fsync-interval-ms <MILLIS>` | Group-fsync cadence for `durability: "async"` flow-state writes (default `50`) — the bound on what a whole-fleet crash can lose for imposters that did not choose `"sync"` or `"none"` |
 
@@ -778,8 +778,9 @@ A pause replicates and survives restarts (upstream
 every node, so the paused imposter's scenario state is intact on resume. A 2xx from a mutating route
 means the write is durable on a majority and, with the default
 `--cluster-write-barrier=ready-nodes`, applied on every Ready node; if the
-barrier times out the response still succeeds and names the lagging nodes in
-`Rift-Cluster-Warnings`. Every mutating response carries
+barrier cannot confirm a member the response still succeeds and names it in
+`Rift-Cluster-Warnings`: `unapplied=` for a member that answered and was behind
+at the timeout, `unreachable=` for one that could not be heard from (D-97). Every mutating response carries
 `Rift-Cluster-Revision` (`<port>@<log-index>`, or `routes@<log-index>` for a
 route-table write) and
 `Rift-Cluster-Op-Id`.

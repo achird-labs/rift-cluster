@@ -81,7 +81,7 @@
     <button type="button" data-a="join">Add an empty node F</button>
     <button type="button" data-a="reset">Reset</button>
   </div>
-  <div class="caption" style="border-left-color:var(--muted)"><span class="stepno">TRY THIS</span>Write once: every member applies within a tick and the write returns a clean <code>201</code>. Slow C and write again: the commit is instant (a majority has it on disk) but the <code>201</code> waits out the 2 s barrier and names C. Crash D, send 25 writes, then restart it: D is behind the purge horizon, so it gets a snapshot and then backfill. Add F: it joins as a learner, catches up the same way, and is promoted to voter.</div>
+  <div class="caption" style="border-left-color:var(--muted)"><span class="stepno">TRY THIS</span>Write once: every member applies within a tick and the write returns a clean <code>201</code>. Slow C and write again: the commit is instant (a majority has it on disk) but the <code>201</code> waits out the 2 s barrier and names C <code>unapplied</code>. Crash D and write: the barrier gives up on D after half a second and names it <code>unreachable</code>. Send 25 writes, then restart D: it is behind the purge horizon, so it gets a snapshot and then backfill, and until it has caught up it reports itself not Ready and the barrier doesn't wait for it. Add F: it joins as a learner, catches up the same way, and is promoted to voter.</div>
 </div>
 <section class="col">
   <p><strong>Flow state converges toward its owner.</strong> There is no log to replay. Each key has one writer, the owner at the current <code>m_idx</code>, and every other copy follows it. The owner pushes each accepted write to the key's two successors, fire-and-forget, and acknowledges without waiting for them. Two mechanisms close the gaps a lost push leaves:</p>
@@ -97,7 +97,7 @@
   <div class="tablewrap"><table>
     <thead><tr><th>Question</th><th>Answer</th></tr></thead>
     <tbody>
-      <tr><td>Can two nodes serve different config?</td><td>Only one <em>behind</em> the other, until it applies. The <code>2xx</code> waits up to 2 s for every member and names any straggler in <code>Rift-Cluster-Warnings</code>.</td></tr>
+      <tr><td>Can two nodes serve different config?</td><td>Only one <em>behind</em> the other, until it applies. The <code>2xx</code> waits up to 2 s for every Ready member and names any straggler in <code>Rift-Cluster-Warnings</code>.</td></tr>
       <tr><td>Can two nodes accept writes for one flow?</td><td>No. There is one owner per key at each <code>m_idx</code>; an old owner that is partitioned away refuses because it is isolated (D-17), and a deposed owner's writes lose any comparison by <code>m_idx</code>.</td></tr>
       <tr><td>Can a strong flow read be stale?</td><td>No. The owner answers it. When the owner can't, the read fails with <code>503</code>; it never answers from a copy.</td></tr>
       <tr><td>What is only eventually consistent?</td><td>Flow replicas (push, then the 5 s pull), <code>readConsistency: "local"</code> reads, and config on a member that is lagging.</td></tr>
