@@ -133,10 +133,12 @@ pub struct ClusterArgs {
     )]
     pub cluster_write_barrier: WriteBarrier,
 
-    /// Seconds the write barrier waits before answering anyway with a
-    /// Rift-Cluster-Warnings header naming the unapplied nodes. Bounds both
-    /// levels: under `none` it caps the wait for this node's own apply, and the
-    /// header then names this node
+    /// Seconds the write barrier waits for a member that answers but is
+    /// behind, before answering anyway with a Rift-Cluster-Warnings header
+    /// naming it `unapplied=`. A member that never answers is given up after
+    /// 500 ms and named `unreachable=`. Bounds both levels: under `none` it
+    /// caps the wait for this node's own apply, and the header then names this
+    /// node
     #[arg(
         long,
         value_name = "SECONDS",

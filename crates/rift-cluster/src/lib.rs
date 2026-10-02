@@ -40,9 +40,10 @@ pub use control::{
 pub use decorate::ClusterDecorator;
 pub use pull_on_miss::PullOnMissInterceptor;
 pub use raft::{
-    ADMIT_CURRENCY_WAIT, JoinOutcome, JoinedAs, KeyClass, LeaderWait, LeaveOutcome, NodeConfig,
-    NodeError, NodeId, NodeIdentity, OwnStatus, OwnedKey, ProbeEvidence, ProbeSeen, RaftNode,
-    RemovalEvidence, RetireRefusal, RetireReply, Ring, StatusReport, retire_via,
+    ADMIT_CURRENCY_WAIT, BarrierOutcome, JoinOutcome, JoinedAs, KeyClass, LeaderWait, LeaveOutcome,
+    NodeConfig, NodeError, NodeId, NodeIdentity, OwnStatus, OwnedKey, ProbeEvidence, ProbeSeen,
+    RaftNode, ReadyProbe, RemovalEvidence, RetireRefusal, RetireReply, Ring, StatusReport,
+    retire_via,
 };
 pub use rpc::{Authority, AuthorityError, Router, RpcClient, RpcError, RpcServer};
 

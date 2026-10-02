@@ -9,6 +9,7 @@
 use std::time::Duration;
 
 use clap::Parser;
+use rift_cluster::rpc::{AlwaysHealthy, RpcClient, RpcClientConfig, Signer};
 use rift_cluster_server::cli::EeCli;
 use rift_cluster_server::compose::{self, ComposedServer};
 use serde_json::json;
@@ -1300,8 +1301,11 @@ async fn the_api_key_still_guards_proxied_routes() {
     server.shutdown().await;
 }
 
+/// #649, pins D-97: a dead follower is named `unreachable=` in the warnings header, and the write
+/// is not held for the barrier's whole timeout. Before D-97 the same follower was named
+/// `unapplied=` after the full timeout, so the bound is what tells the two apart.
 #[tokio::test]
-async fn a_dead_follower_is_named_in_the_warnings_header() {
+async fn a_dead_follower_is_named_unreachable_in_the_warnings_header() {
     let _serial = TEST_LOCK.lock().await;
     let leader_state = TempDir::new().expect("tempdir");
     let leader = compose::start(cluster_cli(
@@ -1309,7 +1313,7 @@ async fn a_dead_follower_is_named_in_the_warnings_header() {
         &[
             "--cluster-allow-solo",
             "--cluster-write-barrier-timeout",
-            "1",
+            "4",
         ],
     ))
     .await
@@ -1327,18 +1331,21 @@ async fn a_dead_follower_is_named_in_the_warnings_header() {
         .await
         .expect("follower 2 joins");
     wait_ready(&f2).await;
+    let f2_id = f2.node().expect("clustered").id();
 
-    // Kill one follower: 2 of 3 keep quorum, so the write commits — and the
-    // barrier names exactly the dead node in the warnings header.
+    // Kill one follower: 2 of 3 keep quorum, so the write commits, and the barrier names exactly
+    // the dead node.
     f2.shutdown().await;
 
     let port = reserve_port();
+    let started = std::time::Instant::now();
     let response = reqwest::Client::new()
         .post(format!("http://{}/imposters", leader.admin_addr()))
         .json(&minimal_imposter(port))
         .send()
         .await
         .expect("post with a dead follower");
+    let took = started.elapsed();
     assert_eq!(
         response.status().as_u16(),
         201,
@@ -1348,14 +1355,59 @@ async fn a_dead_follower_is_named_in_the_warnings_header() {
         .headers()
         .get("rift-cluster-warnings")
         .and_then(|v| v.to_str().ok())
-        .expect("warnings header names the unapplied node");
+        .expect("warnings header names the dead node");
+    assert_eq!(warnings, format!("unreachable={f2_id}"));
     assert!(
-        warnings.starts_with("unapplied="),
-        "documented warning shape: {warnings}"
+        took < Duration::from_secs(2),
+        "a dead follower must not hold the write for the 4 s barrier timeout: took {took:?}"
     );
 
     f1.shutdown().await;
     leader.shutdown().await;
+}
+
+/// #649, pins D-97: a node answers the barrier's applied-index poll with its own `/readyz`
+/// verdict, so the barrier can leave out a member the balancer is not sending traffic to. Draining
+/// is the state a node enters on SIGTERM; the latch is the one `/readyz` reads.
+#[tokio::test]
+async fn a_node_reports_its_own_readiness_on_the_applied_route() {
+    let _serial = TEST_LOCK.lock().await;
+    let state = TempDir::new().expect("tempdir");
+    let server = compose::start(cluster_cli(&state, &["--cluster-allow-solo"]))
+        .await
+        .expect("node starts");
+    wait_ready(&server).await;
+    let cluster_addr: std::net::SocketAddr = server
+        .cluster_addr()
+        .expect("cluster addr")
+        .as_str()
+        .parse()
+        .expect("a literal address in tests");
+    let client = RpcClient::new(
+        Some(Signer::new(SECRET)),
+        std::sync::Arc::new(AlwaysHealthy),
+        RpcClientConfig::default(),
+    );
+    let applied = || async {
+        let body = client
+            .call(cluster_addr, "POST", "/internal/v1/applied", Vec::new())
+            .await
+            .expect("the applied route answers");
+        serde_json::from_slice::<serde_json::Value>(&body).expect("json")
+    };
+
+    let reply = applied().await;
+    assert_eq!(reply["ready"], true, "a Ready node says so: {reply}");
+    assert!(reply["applied"].as_u64().is_some(), "{reply}");
+
+    server.readiness().start_draining();
+    let reply = applied().await;
+    assert_eq!(
+        reply["ready"], false,
+        "a draining node is out of the balancer and says so: {reply}"
+    );
+
+    server.shutdown().await;
 }
 
 /// A fixed-bind variant so a node can restart on the same cluster address —

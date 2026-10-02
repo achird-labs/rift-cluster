@@ -78,8 +78,8 @@ use rift_cluster::decorate::{
 };
 use rift_cluster::stores::{ContextScope, FlowConfig, FlowNet, ResolvedKnobs};
 use rift_cluster::{
-    ControlOutcome, ControlResponse, KeyClass, NodeError, NodeId, OwnedKey, RaftNode,
-    SESSION_KEY_BYTES, SessionKey,
+    BarrierOutcome, ControlOutcome, ControlResponse, KeyClass, NodeError, NodeId, OwnedKey,
+    RaftNode, SESSION_KEY_BYTES, SessionKey,
 };
 use rift_cluster_base::seams::{
     ErrorKind, FaultCell, FaultIo, ImposterConfig, RiftScriptConfig, RouteTable, ScriptBaseDir,
@@ -3041,7 +3041,7 @@ async fn run_mutation(
         ));
     };
 
-    let unapplied = match state.write_path.barrier {
+    let barrier = match state.write_path.barrier {
         WriteBarrier::None => {
             // `none` skips the *fleet* barrier, not local coherence. The render
             // below re-reads the resource just committed, so a node that has
@@ -3052,7 +3052,7 @@ async fn run_mutation(
                 .await_local_applied(committed.revision, state.write_path.barrier_timeout)
                 .await
             {
-                Vec::new()
+                BarrierOutcome::default()
             } else {
                 tracing::warn!(
                     revision = committed.revision,
@@ -3063,7 +3063,10 @@ async fn run_mutation(
                 // straggler: the client should learn which node is behind from
                 // the response, not from someone reading our logs. Under `none`
                 // the only node that can be behind is this one.
-                vec![node.id()]
+                BarrierOutcome {
+                    unapplied: vec![node.id()],
+                    unreachable: Vec::new(),
+                }
             }
         }
         WriteBarrier::ReadyNodes => {
@@ -3105,15 +3108,7 @@ async fn run_mutation(
     };
     set_header(&mut response, HEADER_REVISION, &revision);
     set_header(&mut response, HEADER_OP_ID, &op_id.to_string());
-    let mut warnings = Vec::new();
-    if !unapplied.is_empty() {
-        let nodes = unapplied
-            .iter()
-            .map(u64::to_string)
-            .collect::<Vec<_>>()
-            .join(",");
-        warnings.push(format!("unapplied={nodes}"));
-    }
+    let mut warnings = barrier_warnings(&barrier);
     // The bind marker the read carries, on the write too (D-81). A pause or stub patch of a
     // bind-diverged imposter succeeds, and its drive clears `local-engine=` — so without this the
     // response to that write is the one place the operator is looking and it reads healthy.
@@ -4647,8 +4642,48 @@ fn set_header(response: &mut Response<FrontBody>, name: &'static str, value: &st
     }
 }
 
+/// The write barrier's items for `Rift-Cluster-Warnings` (D-97): `unapplied` for members that
+/// answered and were behind at the timeout, `unreachable` for members it could not hear from.
+fn barrier_warnings(barrier: &BarrierOutcome) -> Vec<String> {
+    [
+        ("unapplied", &barrier.unapplied),
+        ("unreachable", &barrier.unreachable),
+    ]
+    .into_iter()
+    .filter(|(_, ids)| !ids.is_empty())
+    .map(|(word, ids)| {
+        let joined = ids.iter().map(u64::to_string).collect::<Vec<_>>().join(",");
+        format!("{word}={joined}")
+    })
+    .collect()
+}
+
 #[cfg(test)]
 mod tests {
+    /// Pins D-97's spelling of the barrier's two warning items, and that a confirmed barrier adds
+    /// none.
+    #[test]
+    fn the_barriers_warnings_name_each_state_by_its_own_word() {
+        assert_eq!(
+            barrier_warnings(&BarrierOutcome::default()),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            barrier_warnings(&BarrierOutcome {
+                unapplied: vec![2, 5],
+                unreachable: vec![4],
+            }),
+            vec!["unapplied=2,5".to_owned(), "unreachable=4".to_owned()]
+        );
+        assert_eq!(
+            barrier_warnings(&BarrierOutcome {
+                unapplied: Vec::new(),
+                unreachable: vec![3],
+            }),
+            vec!["unreachable=3".to_owned()]
+        );
+    }
+
     use super::*;
 
     /// Pins D-73's authentication rule at the seam where it was wrong: an `Authorization` header
@@ -5866,6 +5901,7 @@ mod tests {
             routes: rift_cluster::Router::new(),
             engine: None,
             snapshot_log_entries: None,
+            ready: rift_cluster::ReadyProbe::default(),
         };
         let node = RaftNode::start(config).await.expect("node starts");
         (Arc::new(node), dir)

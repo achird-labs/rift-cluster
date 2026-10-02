@@ -40,7 +40,8 @@ use uuid::Uuid;
 use super::network::{
     self, AdmittedRole, CLUSTER_APPLIED_PATH, CLUSTER_JOIN_PATH, CLUSTER_LEAVE_PATH,
     CLUSTER_MEMBERSHIP_PATH, CLUSTER_RETIRE_PATH, CLUSTER_WRITE_PATH, JoinAccepted, JoinRequest,
-    LeaveRequest, MembershipView, RaftSlot, RetireReply, RetireRequest, RpcNetwork, WriteReply,
+    LeaveRequest, MembershipView, RaftSlot, ReadyProbe, RetireReply, RetireRequest, RpcNetwork,
+    WriteReply,
 };
 use super::ring::Ring;
 use super::store::{self, RedbStateMachine};
@@ -128,6 +129,110 @@ const LEAVE_POLL_INTERVAL: Duration = Duration::from_millis(50);
 /// How often [`RaftNode::await_membership_loaded`] re-reads the metrics watch.
 const MEMBERSHIP_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
+/// The pause between the write barrier's rounds of applied-index polls. A round is also the
+/// barrier's only retry: each poll is a single attempt.
+const BARRIER_POLL_INTERVAL: Duration = Duration::from_millis(25);
+
+/// How long one applied-index poll may take (D-97). A member that has not answered in this long
+/// is treated as silent for the round; the transport's own retry budget is deliberately not used,
+/// since it can outlast the barrier's whole timeout against an address that never answers.
+const BARRIER_POLL_DEADLINE: Duration = Duration::from_millis(250);
+
+/// How long the write barrier keeps polling a member that has never answered before naming it
+/// `unreachable` (D-97). Two polls, equal to the transport's connect timeout: long enough that a
+/// blip does not name a healthy node, short enough that a crashed voter, which stays a member until
+/// retired (D-94), does not tax every admin write.
+const BARRIER_UNREACHABLE_AFTER: Duration = Duration::from_millis(500);
+
+/// What the write barrier could not confirm (D-97). Both empty means every member that serves
+/// traffic has applied the write. The two lists are disjoint and sorted.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[must_use]
+pub struct BarrierOutcome {
+    /// Members that answered and were still behind at the timeout.
+    pub unapplied: Vec<NodeId>,
+    /// Members the barrier could not hear from: no answer within the unreachable window, an address
+    /// that does not resolve, or an answer that cannot be this member's (D-96's `wrong_node`, a
+    /// refused credential).
+    pub unreachable: Vec<NodeId>,
+}
+
+impl BarrierOutcome {
+    /// Every member that serves traffic confirmed the write.
+    #[must_use]
+    pub fn is_confirmed(&self) -> bool {
+        self.unapplied.is_empty() && self.unreachable.is_empty()
+    }
+}
+
+/// One member's answer to one round of the write barrier.
+#[derive(Debug)]
+enum BarrierPoll {
+    /// It has applied the write.
+    Confirmed,
+    /// It reports itself not Ready, so the balancer sends it no traffic and R1 does not need it.
+    NotReady,
+    /// It answered and has not applied the write yet.
+    Behind,
+    /// No address answered in time. It may be down, or the round may have hit a blip.
+    Silent,
+    /// Something answered that cannot speak for this member, and waiting will not change that.
+    Refused(RpcError),
+}
+
+/// A member the write barrier is still waiting for.
+#[derive(Debug)]
+struct BarrierMember {
+    /// Its resolved addresses; empty for the node running the barrier, which reads its own state.
+    peers: Vec<SocketAddr>,
+    /// Whether it has answered at all yet. One that has is waited for until the timeout and named
+    /// `unapplied`; one that never has is named `unreachable`.
+    answered: bool,
+}
+
+/// Fold one member's per-address answers into a single verdict.
+///
+/// Any address answering is the member answering: they are the same process (#79), so the most
+/// advanced answer wins. Failing that, a silent address wins over a refusing one, since the member
+/// may yet answer from the silent address, while another node at a stale address will refuse on
+/// every round. No address at all is silence.
+fn settle_barrier_poll(
+    answers: Vec<Result<network::AppliedReply, RpcError>>,
+    revision: u64,
+) -> BarrierPoll {
+    let mut verdict = None;
+    let mut silent = false;
+    let mut refused = None;
+    for answer in answers {
+        let poll = match answer {
+            Ok(reply) if reply.ready == Some(false) => BarrierPoll::NotReady,
+            Ok(reply) if reply.applied.is_some_and(|a| a >= revision) => BarrierPoll::Confirmed,
+            Ok(_) => BarrierPoll::Behind,
+            Err(e) if e.is_liveness_failure() => {
+                silent = true;
+                continue;
+            }
+            Err(e) => {
+                refused = Some(e);
+                continue;
+            }
+        };
+        let rank = |p: &BarrierPoll| match p {
+            BarrierPoll::Confirmed => 2,
+            BarrierPoll::NotReady => 1,
+            _ => 0,
+        };
+        if verdict.as_ref().is_none_or(|v| rank(&poll) > rank(v)) {
+            verdict = Some(poll);
+        }
+    }
+    match (verdict, refused) {
+        (Some(verdict), _) => verdict,
+        (None, Some(e)) if !silent => BarrierPoll::Refused(e),
+        (None, _) => BarrierPoll::Silent,
+    }
+}
+
 /// Everything a [`RaftNode`] needs to start.
 #[derive(Clone)]
 pub struct NodeConfig {
@@ -170,6 +275,9 @@ pub struct NodeConfig {
     /// path stays unexercised. That is exactly the trap this knob exists to remove: three chaos
     /// scenarios independently discovered it and each wrote the same correction into the README.
     pub snapshot_log_entries: Option<u64>,
+    /// This node's answer to a peer's write barrier asking whether it is Ready (D-97). A node
+    /// that is not is left out of the barrier, because the balancer is not sending it traffic.
+    pub ready: ReadyProbe,
 }
 
 // Hand-written so the shared secret never lands in a log line — matching the
@@ -186,6 +294,7 @@ impl std::fmt::Debug for NodeConfig {
             routes,
             engine,
             snapshot_log_entries,
+            ready,
         } = self;
         f.debug_struct("NodeConfig")
             .field("node_id", node_id)
@@ -196,6 +305,7 @@ impl std::fmt::Debug for NodeConfig {
             .field("routes", &routes.len())
             .field("engine", &engine.is_some())
             .field("snapshot_log_entries", snapshot_log_entries)
+            .field("ready", ready)
             .finish()
     }
 }
@@ -751,6 +861,7 @@ impl RaftNode {
             Arc::clone(&auto_voter_ceiling),
             client.clone(),
             Arc::clone(&resolver),
+            config.ready.clone(),
         );
 
         let server = RpcServer::bind(
@@ -1611,19 +1722,17 @@ impl RaftNode {
         }
     }
 
-    /// Wait until every cluster member's applied index has reached `revision`,
-    /// or `timeout` elapses — the read-after-write barrier (issue #9). Returns
-    /// the ids of members that had NOT confirmed by the deadline; empty means
-    /// the whole fleet has applied the write.
+    /// The read-after-write barrier (issue #9, D-97): wait until every member that serves traffic
+    /// has applied `revision`, or `timeout` elapses, and report who could not be confirmed.
     ///
-    /// Peers report over the cluster applied-index endpoint; this node answers from its
-    /// own state machine. A member that cannot be reached is simply unconfirmed
-    /// — the barrier degrades to a warning, never an error (the write is
-    /// already durable and committed). "Members" is the full membership,
-    /// voters and learners alike: the barrier cannot see a remote node's
-    /// readiness gate, so a deliberately draining node may be named in the
-    /// warning — informational, not a failure.
-    pub async fn await_applied(&self, revision: u64, timeout: Duration) -> Vec<NodeId> {
+    /// Run by the node that accepted the write, after the leader has answered, by polling each
+    /// member's applied index. A member that reports itself not Ready is left out and not named:
+    /// the balancer sends it no traffic, so read-your-write does not depend on it. A member that
+    /// answers and is behind is waited for until `timeout` and then named `unapplied`. One that has
+    /// not answered within [`BARRIER_UNREACHABLE_AFTER`], whose address does not resolve, or whose
+    /// address answers as someone else is named `unreachable` without holding the write any longer.
+    /// The barrier never fails the write, which is already committed; it only reports.
+    pub async fn await_applied(&self, revision: u64, timeout: Duration) -> BarrierOutcome {
         let members: Vec<(NodeId, String)> = {
             let receiver = self.raft.metrics();
             let metrics = receiver.borrow();
@@ -1634,79 +1743,155 @@ impl RaftNode {
                 .collect()
         };
 
-        let deadline = tokio::time::Instant::now() + timeout;
+        let started = tokio::time::Instant::now();
+        let deadline = started + timeout;
+        let mut outcome = BarrierOutcome::default();
 
-        // Resolved once, before the retry loop — not per round. Resolution is a
-        // blocking call on the pool, and `spawn_blocking` cannot be cancelled,
-        // so a name that is slow or dead would add the OS resolver's own
-        // timeout to *every* pass and push this past the `timeout` this
-        // function promises to honour. It is the same hazard `leader_authority`
-        // documents for `leave`. Freshness is not lost that matters: a barrier
-        // is one write, and no address usefully changes inside its window.
-        let mut pending: BTreeMap<NodeId, Vec<SocketAddr>> = BTreeMap::new();
+        // Resolved once, before the rounds, not per round. Resolution is a blocking call on the
+        // pool, and `spawn_blocking` cannot be cancelled, so a name that is slow or dead would add
+        // the OS resolver's own timeout to *every* round and push this past the `timeout` it
+        // promises to honour. It is the same hazard `leader_authority` documents for `leave`. No
+        // address usefully changes inside one write's window.
+        let mut pending: BTreeMap<NodeId, BarrierMember> = BTreeMap::new();
         for (id, addr) in members {
             if id == self.id {
-                pending.insert(id, Vec::new());
+                pending.insert(
+                    id,
+                    BarrierMember {
+                        peers: Vec::new(),
+                        answered: true,
+                    },
+                );
                 continue;
             }
             match self.resolve(&addr).await {
                 Ok(peers) => {
-                    pending.insert(id, peers);
+                    pending.insert(
+                        id,
+                        BarrierMember {
+                            peers,
+                            answered: false,
+                        },
+                    );
                 }
                 Err(e) => {
-                    // Not inserted, so it can never be confirmed — it is
-                    // reported unapplied, which is the barrier's documented
-                    // degrade. Logged once, not once per 25 ms round.
                     tracing::debug!(
                         node_id = id,
                         %addr,
                         error = %e,
-                        "await_applied: peer address did not resolve; leaving it unconfirmed"
+                        "write barrier: member address did not resolve; reporting it unreachable"
                     );
-                    pending.insert(id, Vec::new());
+                    outcome.unreachable.push(id);
                 }
             }
         }
 
         loop {
-            let confirmed: Vec<NodeId> = {
-                let mut confirmed = Vec::new();
-                for (id, peers) in &pending {
-                    if *id == self.id {
-                        let applied = self.raft.metrics().borrow().last_applied.map(|l| l.index);
-                        if applied.is_some_and(|a| a >= revision) {
-                            confirmed.push(*id);
-                        }
-                        continue;
+            let poll_deadline = BARRIER_POLL_DEADLINE
+                .min(deadline.saturating_duration_since(tokio::time::Instant::now()));
+            let polls =
+                futures_util::future::join_all(pending.iter().map(|(id, member)| async move {
+                    (
+                        *id,
+                        self.poll_applied(*id, &member.peers, revision, poll_deadline)
+                            .await,
+                    )
+                }))
+                .await;
+            let given_up = started.elapsed() >= BARRIER_UNREACHABLE_AFTER;
+            for (id, poll) in polls {
+                match poll {
+                    BarrierPoll::Confirmed => {
+                        pending.remove(&id);
                     }
-                    // Any of the peer's addresses confirming is the peer
-                    // confirming: they are the same process. A dead address in
-                    // the set costs one fast-failed call per round, not a
-                    // falsely-unconfirmed member (#79).
-                    // Named for the member, so a node now holding its address cannot confirm on
-                    // its behalf (D-96).
-                    let path = addressed(CLUSTER_APPLIED_PATH, *id);
-                    for peer in peers {
-                        if let Ok(reply) = self.client.call(*peer, "POST", &path, Vec::new()).await
-                            && let Ok(reply) =
-                                serde_json::from_slice::<network::AppliedReply>(&reply)
-                            && reply.applied.is_some_and(|a| a >= revision)
-                        {
-                            confirmed.push(*id);
-                            break;
+                    BarrierPoll::NotReady => {
+                        tracing::debug!(
+                            node_id = id,
+                            revision,
+                            "write barrier: member reports itself not Ready; not waiting for it"
+                        );
+                        pending.remove(&id);
+                    }
+                    BarrierPoll::Behind => {
+                        if let Some(member) = pending.get_mut(&id) {
+                            member.answered = true;
                         }
+                    }
+                    BarrierPoll::Silent => {
+                        if given_up && pending.get(&id).is_some_and(|member| !member.answered) {
+                            pending.remove(&id);
+                            outcome.unreachable.push(id);
+                        }
+                    }
+                    BarrierPoll::Refused(e) => {
+                        // `wrong_node` is the expected answer while a dead member's address is
+                        // reused (D-96), and the liveness ticker already logs it on the transition.
+                        // Anything else is a misconfiguration an operator has to fix.
+                        if matches!(e, RpcError::WrongNode { .. }) {
+                            tracing::debug!(node_id = id, revision, error = %e,
+                                "write barrier: another node answers at this member's address");
+                        } else {
+                            tracing::warn!(node_id = id, revision, error = %e,
+                                "write barrier: the member's address answered but cannot confirm for it");
+                        }
+                        pending.remove(&id);
+                        outcome.unreachable.push(id);
                     }
                 }
-                confirmed
-            };
-            for id in confirmed {
-                pending.remove(&id);
             }
-            if pending.is_empty() || tokio::time::Instant::now() >= deadline {
-                return pending.into_keys().collect();
+            let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if pending.is_empty() || left.is_zero() {
+                break;
             }
-            tokio::time::sleep(Duration::from_millis(25)).await;
+            tokio::time::sleep(BARRIER_POLL_INTERVAL.min(left)).await;
         }
+
+        for (id, member) in pending {
+            if member.answered {
+                outcome.unapplied.push(id);
+            } else {
+                outcome.unreachable.push(id);
+            }
+        }
+        outcome.unreachable.sort_unstable();
+        outcome
+    }
+
+    /// One round of the write barrier for one member: one bounded attempt per address, all of
+    /// them at once, so a member with several addresses costs one `deadline`, not one per address.
+    async fn poll_applied(
+        &self,
+        id: NodeId,
+        peers: &[SocketAddr],
+        revision: u64,
+        deadline: Duration,
+    ) -> BarrierPoll {
+        if id == self.id {
+            let applied = self.raft.metrics().borrow().last_applied.map(|l| l.index);
+            return if applied.is_some_and(|a| a >= revision) {
+                BarrierPoll::Confirmed
+            } else {
+                BarrierPoll::Behind
+            };
+        }
+        // Named for the member, so a node now holding its address cannot confirm on its behalf
+        // (D-96).
+        let path = addressed(CLUSTER_APPLIED_PATH, id);
+        let answers = futures_util::future::join_all(peers.iter().map(|peer| {
+            let path = &path;
+            async move {
+                self.client
+                    .call_once(*peer, "POST", path, Vec::new(), deadline)
+                    .await
+                    .and_then(|reply| {
+                        serde_json::from_slice::<network::AppliedReply>(&reply).map_err(|e| {
+                            RpcError::Handler(format!("undecodable applied reply: {e}"))
+                        })
+                    })
+            }
+        }))
+        .await;
+        settle_barrier_poll(answers, revision)
     }
 
     /// The leader's applied index as it reports it right now — the catch-up
@@ -2575,6 +2760,40 @@ impl Drop for RaftNode {
 
 #[cfg(test)]
 mod tests {
+    /// Pins D-97's fold of one member's per-address answers: the most advanced answer wins, then
+    /// silence over refusal, and no address at all is silence.
+    #[test]
+    fn a_members_addresses_fold_into_one_verdict() {
+        use super::network::AppliedReply;
+        let reply = |applied: u64, ready: Option<bool>| {
+            Ok::<_, RpcError>(AppliedReply {
+                applied: Some(applied),
+                ready,
+            })
+        };
+        let refused = || {
+            Err::<AppliedReply, _>(RpcError::WrongNode {
+                expected: 3,
+                actual: 77,
+            })
+        };
+        let silent = || Err::<AppliedReply, _>(RpcError::Timeout);
+        let verdict = |answers| format!("{:?}", settle_barrier_poll(answers, 10));
+
+        assert_eq!(verdict(vec![refused(), reply(10, Some(true))]), "Confirmed");
+        assert_eq!(
+            verdict(vec![reply(9, Some(true)), reply(10, Some(true))]),
+            "Confirmed"
+        );
+        assert_eq!(verdict(vec![silent(), reply(9, None)]), "Behind");
+        assert_eq!(verdict(vec![reply(9, Some(false)), silent()]), "NotReady");
+        assert_eq!(verdict(vec![reply(12, None)]), "Confirmed");
+        assert_eq!(verdict(vec![refused(), silent()]), "Silent");
+        assert_eq!(verdict(vec![silent(), refused()]), "Silent");
+        assert!(verdict(vec![refused()]).starts_with("Refused(WrongNode"));
+        assert_eq!(verdict(Vec::new()), "Silent");
+    }
+
     use super::*;
 
     /// Pins D-95's restart row (#641): a peer's committed membership proves this node was removed only
@@ -2619,6 +2838,7 @@ mod tests {
             routes: Router::new(),
             engine: None,
             snapshot_log_entries: None,
+            ready: ReadyProbe::default(),
         }
     }
 
@@ -3919,8 +4139,9 @@ mod tests {
         n2.shutdown().await.ok();
     }
 
-    /// Issue #68: the write barrier must report a member it cannot resolve as
-    /// **unapplied**, never as confirmed.
+    /// Issue #68: the write barrier must report a member it cannot resolve, never count it as
+    /// confirmed. Since D-97 it is reported **unreachable**, from the first round: no poll can reach
+    /// a name that does not resolve, so waiting for one buys nothing.
     ///
     /// This is the most dangerous of the resolve-failure paths. `await_applied`
     /// backs the read-after-write guarantee, so counting an unreachable member
@@ -3928,7 +4149,7 @@ mod tests {
     /// established — wrong and quiet, which the project's error rules single out
     /// as worse than failing loudly.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn await_applied_reports_a_member_that_does_not_resolve_as_unapplied() {
+    async fn await_applied_reports_a_member_that_does_not_resolve_as_unreachable() {
         let (n1, n2, _dirs) = cluster_with_unresolvable_leader().await;
 
         let revision = n1
@@ -3939,10 +4160,11 @@ mod tests {
 
         // From n2's side the only other member is n1, whose advertised name
         // does not resolve, so it can never be confirmed.
-        let unapplied = n2.await_applied(revision, Duration::from_millis(500)).await;
-        assert!(
-            unapplied.contains(&1),
-            "an unresolvable member must be reported unapplied, got {unapplied:?}"
+        let outcome = n2.await_applied(revision, Duration::from_millis(500)).await;
+        assert_eq!(
+            outcome.unreachable,
+            vec![1],
+            "an unresolvable member must be reported unreachable, got {outcome:?}"
         );
 
         n1.shutdown().await.ok();

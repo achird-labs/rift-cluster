@@ -818,6 +818,12 @@ Connection pooling per peer.
 
 ### 7.4 Config replication
 
+> **Amended by D-97** (2026-10-02, #649): the barrier is run by the node that accepted the write,
+> after the leader has answered, by polling each member's applied index; nothing is piggybacked on
+> AppendEntries. It waits for the members that report themselves Ready, gives up on one that has not
+> answered within 500 ms, and names the rest `unapplied=` (answered, behind) or `unreachable=`
+> (never heard from) in `Rift-Cluster-Warnings`.
+
 > ⚠️ **Superseded by ADR-001 (v3), decision D-15.** Config is now a **Raft state machine**: an admin write is a
 > `ControlOp` that is validated on the leader, appended, replicated to a fsync'd majority
 > (commit = R3 durability), applied everywhere via the incremental `apply_config` (#316), and

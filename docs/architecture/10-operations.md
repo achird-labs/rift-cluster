@@ -20,7 +20,8 @@ rift-cluster-server \
   --cluster-state-dir /var/lib/rift  # redb: identity, raft log/vote/snapshot + flow shard;
                                       # default <datadir>/_cluster
   --cluster-write-barrier ready-nodes|none    # Ch.4; default ready-nodes
-  --cluster-write-barrier-timeout 2  # seconds (default 2); stragglers are named, not waited on
+  --cluster-write-barrier-timeout 2  # seconds (default 2) a behind Ready member is waited for;
+                                     # then named unapplied=, a silent one unreachable= after 500 ms (D-97)
   --cluster-admin-async              # writes answer 202 + op-id instead of waiting (Ch.4)
   --cluster-flow-fsync-interval-ms 50   # flow-shard group fsync for `async` imposters (default 50)
   --cluster-leave-timeout 10         # seconds (default 10); orchestrator grace ≥ 2× this
