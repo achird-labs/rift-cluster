@@ -96,7 +96,7 @@ stateDiagram-v2
     Voter --> Leaving : SIGTERM — flow-state handoff,<br/>removed as a voter (D-59)
     Learner --> Leaving : SIGTERM
     Leaving --> [*]
-    Voter --> Dead : crash — peers elect ≤ ~1s
+    Voter --> Dead : crash — peers elect ≤ ~1s<br/>· stays a member, keeps its keys (D-94)
     Dead --> Discovering : restart (same node id,<br/>persisted in state dir)
 
     note right of Discovering
@@ -128,9 +128,10 @@ Key rules, each carrying weight:
   a name resolves to is dialled, in the resolver's own order; there is no
   prefer-IPv4 knob (D-28).
 - **Voter cap at 9**: beyond that, nodes join as learners — full data-plane
-  citizens (they bind imposters, own flow-state keys, serve traffic) with no
-  election weight. Consensus latency stays flat as the fleet grows to the
-  16-node ceiling. The cap is a *soft* ceiling on what the fleet does by
+  citizens (they bind imposters, apply the log, serve traffic) with no
+  election weight — and no flow ownership: the ring is the voter set (D-93), so
+  a learner reaches every owner over one RPC. Consensus latency stays flat as
+  the fleet grows to the 16-node ceiling. The cap is a *soft* ceiling on what the fleet does by
   itself, and a promotion only ever adds voter ids — it can never silently
   evict one (D-27).
 - **Admission is two-phase** (#433, the etcd learner pattern): the join RPC

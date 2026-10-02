@@ -2032,6 +2032,10 @@ impl RaftNode {
     /// The ownership ring computed from this node's applied membership. Its
     /// `m_idx` is the membership log index, so every node at the same index
     /// derives byte-identical ownership.
+    ///
+    /// Members are the applied **voters** only: a learner owns no key (D-93).
+    /// Nothing here filters by liveness — a crashed voter stays a member, and an
+    /// owner, until a committed departure removes it (D-94).
     #[must_use]
     pub fn ring(&self) -> Ring {
         let receiver = self.raft.metrics();
@@ -4158,6 +4162,55 @@ mod tests {
             wait_config(&n2, 8080, "ceiling-learner").await,
             "a ceiling-capped learner must still replicate config"
         );
+
+        n1.shutdown().await.ok();
+        n2.shutdown().await.ok();
+    }
+
+    /// Pins D-93: the ownership ring is the applied voter set, so a learner
+    /// owns no key — on the leader's ring and on the learner's own, which is the
+    /// one that would serve a key as owner if it were wrong.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_learner_never_owns_a_flow_key() {
+        use crate::raft::network;
+        use crate::raft::ring::OwnedKey;
+
+        let (d1, d2) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+        let n1 = RaftNode::start(config_in(&d1, 1)).await.expect("start n1");
+        n1.cluster_init().await.expect("init n1");
+        let n2 = RaftNode::start(config_in(&d2, 2)).await.expect("start n2");
+
+        // A ceiling of 1 keeps n2 a learner for the life of the test.
+        let gate = tokio::sync::Mutex::new(());
+        network::admit(&n1.raft, &gate, 2, n2.advertise().to_string(), 1)
+            .await
+            .expect("admit as learner");
+        // A config write applied on n2 proves n2 has also applied the
+        // membership entry that admitted it, which precedes it in the log.
+        n1.put_imposter(imposter(8080, "learner-ring"))
+            .await
+            .expect("leader write");
+        assert!(
+            wait_config(&n2, 8080, "learner-ring").await,
+            "the learner must apply the log"
+        );
+
+        for (name, node) in [("leader", &n1), ("learner", &n2)] {
+            let ring = node.ring();
+            assert_eq!(
+                ring.members(),
+                &[1],
+                "{name}'s ring must hold the voter only, not the learner"
+            );
+            for i in 0..64 {
+                let key = format!("i8080:flow-{i}");
+                assert_eq!(
+                    ring.owner(OwnedKey::flow(&key)),
+                    Some(1),
+                    "{name}'s ring gave {key} to a learner"
+                );
+            }
+        }
 
         n1.shutdown().await.ok();
         n2.shutdown().await.ok();

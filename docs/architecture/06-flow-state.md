@@ -107,11 +107,13 @@ Every flow key has **exactly one authoritative owner node** at any moment,
 computed — not negotiated — by rendezvous (HRW) hashing:
 
 ```
-owner(flow_id) = argmax over Ready nodes n of xxhash64(n.node_id, flow_id)
+owner(key) = argmax over voters n of xxh64(n.node_id ‖ class ‖ key)
 ```
 
 The input roster is the **committed membership from the Raft state machine**
-(Chapter 3), evaluated at this node's applied index. That provenance is the
+(Chapter 3) — its **voter** set, evaluated at this node's applied index (D-93:
+a learner owns nothing). `class` tags the key kind (flow KV, sequence, proxy claim)
+and `key` is the scoped id the store hands down (`i8080:checkout-77`). That provenance is the
 entire trick: because membership changes are totally ordered log entries, any
 two nodes at the same applied index compute identical owners for every key —
 there is nothing to gossip, no epoch to compare, no settle window to wait out.
@@ -198,12 +200,12 @@ it — is enforced at the *owner*, not assumed at callers:
 ```mermaid
 sequenceDiagram
     participant L as Raft leader
-    participant B as Node B (dies)
+    participant B as Node B (leaves)
     participant C as Node C (new owner)
     participant A as Node A (replica)
 
     Note over B: owner of flow f, replicating to C, A
-    B--xB: crash
+    B->>L: SIGTERM → leave (after draining readiness)
     L->>L: commit membership entry M: B removed
     Note over C: applies M → ring says: I own f (as of m_idx=M)
     C->>A: pull range for f — highest (m_idx, v, origin)
@@ -224,6 +226,15 @@ fencing):
 Graceful leave adds no separate flush: every accepted write was already pushed
 to the successors when it was applied, so a planned restart hands off with at
 most the in-flight pushes outstanding (Chapter 3's lifecycle).
+
+**A crash is not a departure** (D-94). The diagram above starts from a committed
+removal, and only a node's own `leave` commits one. A voter that crashes stays in
+the membership, so the ring — and every key's owner — is unchanged: owner-routed
+operations on its keys fail fast (Chapter 9's degradation table) until it restarts
+and reopens its `flow.redb`, and the replicas sit unused. Removing members on suspicion would turn
+every pause and blip into two ownership moves and could shrink the quorum on a
+false positive. A voter that is never coming back has no supported removal yet:
+that is #641.
 
 ## The durable tier
 
