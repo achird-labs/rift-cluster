@@ -4180,7 +4180,10 @@ mod tests {
         n1.cluster_init().await.expect("init n1");
         let n2 = RaftNode::start(config_in(&d2, 2)).await.expect("start n2");
 
-        // A ceiling of 1 keeps n2 a learner for the life of the test.
+        // The ceiling `admit` takes bounds only the admission itself; the
+        // leader's promotion sweep reads the node's own ceiling, so pin that too
+        // or the sweep promotes n2 within a second.
+        n1.set_auto_voter_ceiling(1);
         let gate = tokio::sync::Mutex::new(());
         network::admit(&n1.raft, &gate, 2, n2.advertise().to_string(), 1)
             .await
@@ -4194,6 +4197,10 @@ mod tests {
             wait_config(&n2, 8080, "learner-ring").await,
             "the learner must apply the log"
         );
+        // Outlast at least one promotion sweep (1 s cadence), then confirm the
+        // premise: n2 is still a learner, so what follows is about learners.
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert_eq!(n1.status().voters, vec![1], "n2 must still be a learner");
 
         for (name, node) in [("leader", &n1), ("learner", &n2)] {
             let ring = node.ring();
