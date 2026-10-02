@@ -1,0 +1,69 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Membership, and what survives · How RiftCluster Works</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500;12..96,700;12..96,800&family=Literata:ital,opsz,wght@0,7..72,400;0,7..72,600;1,7..72,400&family=JetBrains+Mono:wght@400;600&display=swap">
+<link rel="stylesheet" href="assets/explained.css">
+
+<nav class="sitenav" aria-label="Pages"><a class="home" href="index.html">How RiftCluster works</a><a href="index.html">Why a cluster, and its two planes</a><a href="consensus.html">Raft, and Raft under the hood</a><a href="requests.html">Writes, mock requests and routing</a><a href="flow-state.html">Flow ownership and stateful stubs</a><a href="logs.html">Write-ahead logs and convergence</a><a href="membership.html" aria-current=page>Membership, and what survives</a></nav>
+<header class="hero col page-title"><div class="eyebrow">How RiftCluster works · sections 16–17</div><h1 style="font-size:clamp(1.9rem,4.6vw,2.7rem)">Membership, and what survives</h1></header>
+
+<main>
+<!-- 16 -->
+<section class="col" id="life">
+  <h2>16 · Joining, leaving, retiring</h2>
+  <p>Membership changes only by a node joining or leaving, or by an operator retiring a member that is gone (D-95). Each transition is a committed log entry that the node does not drive itself. Click a stage.</p>
+</section>
+<div class="fig" id="fig-life">
+  <div class="life" id="life-states"></div>
+  <div class="life-detail caption" id="life-detail"></div>
+</div>
+<section class="col">
+  <h3>From one node to a fleet</h3>
+  <p>A cluster is never “configured” as three nodes. It is founded by one node and grown one join at a time, and every step is a committed membership entry. Step through a three-node fleet forming. The <em>Fleet</em> column tracks the number that matters: how many voters a majority needs, and how many failures the fleet survives.</p>
+</section>
+<div class="fig seq" id="seq-form"></div>
+<section class="col">
+  <p>Two details in that sequence carry most of the safety. <strong>Founding is explicit</strong>: only a node started with <code>--cluster-allow-solo</code> and no seeds will found a cluster, and a node that has seeds and can't reach them gives up after 30 s instead of founding its own. Two nodes that each founded a cluster would be two fleets that can never merge, so that mistake is refused at start rather than repaired afterwards. <strong>The joiner asks; the leader decides</strong>: the joining node only ever sends one signed request, and the leader writes the membership entries. That is D-21: what can enter the fleet is bounded by what an operator chose to start, with the cluster secret.</p>
+  <p>Past three, every join is the same step. Nodes four through nine become voters (a five-voter fleet survives two failures). The tenth and later stay learners, which serve traffic but neither vote nor own flows. A joiner that needs a large snapshot is answered as a learner with <code>catching_up: true</code> rather than holding its join open; the leader's 1 s sweep promotes it once its replication is within 16 entries.</p>
+  <h3>Cold start, the payoff</h3>
+  <p>Under the gossip draft, a full-cluster restart needed merge rules, tombstone vectors, and a rule against empty nodes wiping the fleet's config. Under Raft it collapses: every node reopens its <code>redb</code>, the group re-forms from the persisted vote, log and snapshot, elects a leader, and replays. A deletion is a log entry, so it can't resurrect. An empty-disk node is a learner catching up from a snapshot. If <em>every</em> disk is empty there is no group to re-form, and nothing serves until an operator re-initializes: a loud refusal, as R3 demands.</p>
+  <p>The case that needs care is a single member restarting, not the whole fleet. That is what the 3 s restart grace, the leader's 50 ms retries and the liveness ticker in <a href='consensus.html#raft'>section 5</a> exist for.</p>
+</section>
+
+<!-- 17 -->
+<section class="col" id="survive">
+  <h2>17 · What survives what</h2>
+  <p>The volatile rows are decisions, not gaps: each would cost hot-path writes to preserve state whose value ends with the test run.</p>
+  <div class="tablewrap"><table>
+    <thead><tr><th>State</th><th>Lives in</th><th>Node crash</th><th>Full restart</th></tr></thead>
+    <tbody>
+      <tr><td>Membership, node ids</td><td>Raft log + vote (<code>raft.redb</code>, fsync)</td><td class="yes">survives</td><td class="yes">survives</td></tr>
+      <tr><td>Imposter configs, <code>enabled</code>, revisions</td><td>Raft state machine</td><td class="yes">survives</td><td class="yes">survives</td></tr>
+      <tr><td>Route table, session key</td><td>Raft state machine</td><td class="yes">survives</td><td class="yes">survives</td></tr>
+      <tr><td>Admin intents + op-id dedup</td><td>Raft SM + receiving node's <code>pending_intents</code></td><td class="yes">survives</td><td class="yes">survives</td></tr>
+      <tr><td>Flow state @ <code>sync</code></td><td>FlowShard, fsync per ack</td><td class="yes">survives</td><td class="yes">zero loss</td></tr>
+      <tr><td>Flow state @ <code>async</code> (default)</td><td>FlowShard, group fsync per 50 ms</td><td class="yes">survives</td><td class="part">≤ 1 interval, only if all 3 holders die</td></tr>
+      <tr><td>Flow state @ <code>none</code></td><td>memory</td><td class="part">via replicas</td><td class="no">lost (opted)</td></tr>
+      <tr><td>Sequence cursors</td><td>memory</td><td class="no">reset (D-8)</td><td class="no">reset</td></tr>
+      <tr><td>Request journal, counters</td><td>memory, per node</td><td class="no">that node's lost</td><td class="no">lost</td></tr>
+      <tr><td>proxyOnce <code>Pending</code></td><td>owner memory</td><td class="part">re-claimable</td><td class="no">lost</td></tr>
+      <tr><td>proxyOnce <code>Recorded</code> + stubs</td><td>config (Raft SM)</td><td class="yes">survives</td><td class="yes">survives</td></tr>
+    </tbody></table></div>
+  <h3>The whole design in four sentences</h3>
+</section>
+<div class="wide"><div class="recap">
+  <div><b>R1 · visible everywhere</b>The write barrier holds the 2xx until every member has applied the entry (up to 2 s); a straggler is named in <code>Rift-Cluster-Warnings</code>.</div>
+  <div><b>R2 · next request sees it</b>Owner-routed reads; if the owner is unreachable, a fast, honest <code>503</code>, not a stale answer.</div>
+  <div><b>R3 · survives restart</b>Absolute at <code>sync</code>. At <code>async</code>, the loss window is one fsync interval, and only if all three holders die inside it.</div>
+  <div><b>R4 · never lost</b>The intent is parked on disk before forwarding; a <code>503</code> carries an op-id whose fate you can query.</div>
+</div></div>
+<nav class="pager" aria-label="Previous and next"><a href="logs.html"><span>← previous</span>Write-ahead logs and convergence</a><span></span></nav>
+<footer class="col">Built from docs/architecture (chapters 1–10, 13), docs/decisions/DECISIONS.md through D-95, and the code in crates/rift-cluster and crates/rift-cluster-server in rift-cluster. Where this page and a D-n disagree, the register wins. The Raft and convergence figures are simplified teaching models: the Raft figure ships whole logs and has no snapshots, and the convergence figure keeps one leader and scales the snapshot numbers down. The ownership figure computes the real HRW function.</footer>
+</main>
+
+<script src="assets/explained.js"></script>
+</html>

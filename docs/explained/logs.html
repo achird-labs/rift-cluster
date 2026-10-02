@@ -1,0 +1,113 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Write-ahead logs and convergence · How RiftCluster Works</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500;12..96,700;12..96,800&family=Literata:ital,opsz,wght@0,7..72,400;0,7..72,600;1,7..72,400&family=JetBrains+Mono:wght@400;600&display=swap">
+<link rel="stylesheet" href="assets/explained.css">
+
+<nav class="sitenav" aria-label="Pages"><a class="home" href="index.html">How RiftCluster works</a><a href="index.html">Why a cluster, and its two planes</a><a href="consensus.html">Raft, and Raft under the hood</a><a href="requests.html">Writes, mock requests and routing</a><a href="flow-state.html">Flow ownership and stateful stubs</a><a href="logs.html" aria-current=page>Write-ahead logs and convergence</a><a href="membership.html">Membership, and what survives</a></nav>
+<header class="hero col page-title"><div class="eyebrow">How RiftCluster works · sections 14–15</div><h1 style="font-size:clamp(1.9rem,4.6vw,2.7rem)">Write-ahead logs and convergence</h1></header>
+
+<main>
+<!-- 14 -->
+<section class="col" id="wal">
+  <h2>14 · Two write-ahead logs</h2>
+  <p>Every node keeps two <code>redb</code> files in its state directory, and both are write-ahead logs in the strict sense: nothing is acknowledged until the record that makes it recoverable is on disk, to the degree that write's contract demands. The degree is what differs. <code>raft.redb</code>, the control plane's log, pays an fsync on every append. <code>flow.redb</code>, the data plane's, pays one fsync per 50 ms for everything written in between. They are separate files on purpose: a redb file has one commit lock, and a flow-state group fsync must never queue behind, or in front of, a Raft append.</p>
+  <h3>The one redb rule both depend on</h3>
+  <p>A redb write transaction commits at a <em>durability level</em>. <code>Immediate</code>: the data is on disk when <code>commit()</code> returns, because redb fsyncs before returning. <code>None</code>: the commit is visible to readers and correctly ordered, but sits in the OS page cache, and becomes durable only when a <em>later</em> <code>Immediate</code> commit lands. That second half is the whole trick behind group commit: many cheap <code>None</code> commits, then one <code>Immediate</code> commit makes all of them durable together.</p>
+  <div class="tablewrap"><table>
+    <thead><tr><th></th><th><code>raft.redb</code> (control plane)</th><th><code>flow.redb</code> (data plane)</th></tr></thead>
+    <tbody>
+      <tr><td><b>Holds</b></td><td>The Raft log (<code>raft_log</code>), the vote, snapshot metadata; the state machine's tables (<code>sm_configs</code>, <code>sm_routes</code>, <code>sm_op_dedup</code>, <code>sm_applied</code>, …); and this node's own <code>pending_intents</code>, which are never replicated.</td><td><code>flow_kv</code>: every flow key this node owns <em>or</em> replicates, each value stamped <code>(m_idx, v, origin)</code>; <code>flow_meta</code> per flow for TTL and LRU.</td></tr>
+      <tr><td><b>Written by</b></td><td>openraft's storage callbacks, on every node.</td><td>One <code>flow-shard-writer</code> thread per node, batching up to 256 writes per transaction.</td></tr>
+      <tr><td><b>Fsync</b></td><td>Every log append and every vote: <code>Immediate</code>. Applying committed entries: one transaction per batch at redb's default, which is also <code>Immediate</code>.</td><td>Chosen per imposter. <code>sync</code>: <code>Immediate</code> before the ack. <code>async</code> (default): <code>None</code>, plus one <code>Immediate</code> commit every 50 ms. <code>none</code>: never touches the file.</td></tr>
+      <tr><td><b>Acknowledged</b></td><td>When a majority of voters have the entry fsynced (commit), and then the barrier.</td><td><code>sync</code>: after the fsync. <code>async</code>: as soon as the write is in memory and handed to the writer, which is one channel send.</td></tr>
+      <tr><td><b>After a crash</b></td><td>Everything committed is replayed. Truncations and purges are deliberately not fsynced, because openraft re-drives them after a restart.</td><td><code>recover</code> replays <code>flow_kv</code>, drops expired entries and trims to the flow cap; the first touch of each flow re-checks it against its replicas.</td></tr>
+    </tbody></table></div>
+  <h3>The Raft log, one entry on one follower</h3>
+  <p>The entry itself is small JSON: a <code>ControlRequest</code> carrying the <code>op_id</code>, the operation (<code>PutImposter</code>, a stub patch, a delete…), and <code>issued_at_secs</code>, which is the state machine's only clock. Nothing in apply reads the local time, so every node computes the same result from the same entry.</p>
+</section>
+<div class="fig seq" id="seq-wal-raft"></div>
+<section class="col">
+  <p>Snapshots keep the log from growing forever. Every 5,000 entries openraft builds one from the state machine; the payload is written to a temporary file, fsynced, renamed into place, the directory is fsynced, and only then is a row naming it committed, so a crash at any point leaves either the old snapshot or the new one, never half of one. The 1,000 most recent entries are kept and older ones purged. A follower that needs a purged entry is sent the snapshot instead (<a href='logs.html#converge'>section 15</a>).</p>
+  <p>The third table in <code>raft.redb</code>, <code>pending_intents</code>, is the R4 log from <a href='requests.html#write'>section 7</a>: the receiving node writes each admin request there with an <code>Immediate</code> commit <em>before</em> forwarding it, and clears it once the outcome is committed. It is local to that node: it is never replicated and never part of a snapshot.</p>
+  <h3>The flow log, under load</h3>
+  <p>Flow writes arrive at mock-traffic rates, so the writer never fsyncs per write in the default mode. The figure runs that writer: every acknowledged write is a bar on the top lane, red until a group fsync covers it and green after. The gauge is the node's real metric, <code>rift_cluster_flow_wal_lag_ops</code>: acknowledged writes that are committed at <code>None</code> but not yet fsynced. It is exactly what a power cut on <em>this</em> node, right now, would take off <em>this</em> disk.</p>
+</section>
+<div class="fig" id="fig-wal">
+  <div class="fig-head"><span class="fig-title">One node's flow writer</span><span class="fig-note">live · simulated time at ¼ speed</span></div>
+  <div class="controls" style="margin-top:0" id="wal-modes"></div>
+  <div class="svgwrap"><svg viewBox="0 0 760 196" role="img" aria-label="Flow writes arriving over time, the transactions that commit them, the fsyncs that make them durable, and the unsynced-writes gauge."></svg></div>
+  <div class="range-row"><span>writes / s</span><input type="range" id="wal-rate" min="100" max="3000" step="100" value="600" aria-label="Flow writes per second"><span id="wal-rate-lab" style="min-width:7ch">600/s</span></div>
+  <div class="dur-out">
+    <div><div class="fig-note">WAL LAG (UNSYNCED ACKS)</div><div style="font:800 1.7rem var(--display)" id="wal-lag">0</div></div>
+    <div><div class="fig-note">FSYNCS / S</div><div style="font:800 1.7rem var(--display)" id="wal-fs">0</div></div>
+    <div><div class="fig-note">AN ACK WAITS FOR</div><div style="font:800 1.15rem var(--display);padding-top:.45em" id="wal-ack">—</div></div>
+    <div style="flex:1;min-width:240px;font-size:.92rem" id="wal-text"></div>
+  </div>
+  <div class="controls"><button type="button" class="primary" data-a="run">Pause</button><button type="button" data-a="plug">Pull the plug on this node</button></div>
+</div>
+<section class="col">
+  <p>Two things keep the <code>async</code> window honest. Each write was also pushed to the key's two replicas, which run their own writers and their own 50 ms tickers, so a write is lost from the cluster only if all three holders lose power inside the same interval (<a href='flow-state.html#durable'>section 13</a>'s figure). And replicas persist in the <em>origin's</em> mode: the durability travels with the replication message, so an imposter that asked for <code>none</code> is not quietly written to disk by its replicas, and one that asked for <code>sync</code> is not demoted.</p>
+</section>
+
+<!-- 15 -->
+<section class="col" id="converge">
+  <h2>15 · How the fleet converges</h2>
+  <p>“Consistent” means two different things here, because the two planes make different promises.</p>
+  <p><strong>Config converges by replaying one log.</strong> Every node applies the same committed entries in the same order, and apply is deterministic: the leader validated the entry before appending it, and the only clock apply reads is the entry's own. So two nodes at the same applied index hold identical config, and the revision a client sees <em>is</em> the log index. Two nodes can only ever differ by lag, one behind the other, never by content. Lag is closed three ways:</p>
+  <ol class="steps">
+    <li><strong>Backfill.</strong> The leader tracks how far each follower's log matches its own and resends from there. On a mismatch it walks back until the logs agree, and the follower truncates its unagreed tail. A node that restarts, or comes back from a partition, catches up this way at heartbeat speed.</li>
+    <li><strong>Snapshot install.</strong> If the entries a follower needs have been purged, the leader sends its latest snapshot. The follower replaces every state-machine table in one durable transaction, then continues by backfill from the snapshot's index.</li>
+    <li><strong>Admission.</strong> A new node joins as a learner and catches up by the same two mechanisms. The leader's 1 s sweep promotes it once its replication lag is within 16 entries, while there are fewer than 9 voters.</li>
+  </ol>
+  <p>The barrier from <a href='requests.html#write'>section 7</a> is what turns <em>will converge</em> into R1's <em>has converged by the time you see the 2xx</em>. Drive it below: write, slow a node's apply, crash one, or add an empty node and watch it catch up from a snapshot.</p>
+</section>
+<div class="fig" id="fig-conv">
+  <div class="fig-head"><span class="fig-title">Five members applying one log</span><span class="fig-note">live · a fixed leader; snapshot every 20 entries, keeping 6 (the real numbers are 5,000 and 1,000)</span></div>
+  <div class="conv-grid">
+    <div class="svgwrap narrow"><svg viewBox="0 0 640 300" role="img" aria-label="Each member's log as a row of squares: filled when applied, outlined when in the log but not applied, with the commit index marked."></svg></div>
+    <div style="min-width:0"><div class="events short" aria-live="polite"></div>
+      <div class="legend"><span><i style="background:var(--accent)"></i>applied</span><span><i style="background:transparent;border:1.5px solid var(--accent)"></i>in log, not applied</span><span><i style="background:var(--warn)"></i>snapshot</span></div></div>
+  </div>
+  <div class="controls">
+    <button type="button" class="primary" data-a="write">Admin write</button>
+    <button type="button" data-a="burst">25 writes</button>
+    <button type="button" data-a="slow" aria-pressed="false">Slow C's apply</button>
+    <button type="button" data-a="crash" aria-pressed="false">Crash D</button>
+    <button type="button" data-a="join">Add an empty node F</button>
+    <button type="button" data-a="reset">Reset</button>
+  </div>
+  <div class="caption" style="border-left-color:var(--muted)"><span class="stepno">TRY THIS</span>Write once: every member applies within a tick and the write returns a clean <code>201</code>. Slow C and write again: the commit is instant (a majority has it on disk) but the <code>201</code> waits out the 2 s barrier and names C. Crash D, send 25 writes, then restart it: D is behind the purge horizon, so it gets a snapshot and then backfill. Add F: it joins as a learner, catches up the same way, and is promoted to voter.</div>
+</div>
+<section class="col">
+  <p><strong>Flow state converges toward its owner.</strong> There is no log to replay. Each key has one writer, the owner at the current <code>m_idx</code>, and every other copy follows it. The owner pushes each accepted write to the key's two successors, fire-and-forget, and acknowledges without waiting for them. Two mechanisms close the gaps a lost push leaves:</p>
+  <ul>
+    <li><strong>Anti-entropy.</strong> Every 5 s each node pulls, from their owners, the flows it holds but doesn't own, and merges by the highest <code>(m_idx, v, origin)</code>.</li>
+    <li><strong>Adoption.</strong> The first time a new owner touches a flow after a membership change, it pulls that flow from the other holders and merges before serving.</li>
+  </ul>
+  <p>A strong read always goes to the owner, so a replica's lag is never visible to it. Only an imposter that opted into <code>readConsistency: "local"</code> can see it, by up to one push or one 5 s pull.</p>
+</section>
+<div class="fig seq" id="seq-flowconv"></div>
+<section class="col">
+  <h3>What you can rely on</h3>
+  <div class="tablewrap"><table>
+    <thead><tr><th>Question</th><th>Answer</th></tr></thead>
+    <tbody>
+      <tr><td>Can two nodes serve different config?</td><td>Only one <em>behind</em> the other, until it applies. The <code>2xx</code> waits up to 2 s for every member and names any straggler in <code>Rift-Cluster-Warnings</code>.</td></tr>
+      <tr><td>Can two nodes accept writes for one flow?</td><td>No. There is one owner per key at each <code>m_idx</code>; an old owner that is partitioned away refuses because it is isolated (D-17), and a deposed owner's writes lose any comparison by <code>m_idx</code>.</td></tr>
+      <tr><td>Can a strong flow read be stale?</td><td>No. The owner answers it. When the owner can't, the read fails with <code>503</code>; it never answers from a copy.</td></tr>
+      <tr><td>What is only eventually consistent?</td><td>Flow replicas (push, then the 5 s pull), <code>readConsistency: "local"</code> reads, and config on a member that is lagging.</td></tr>
+      <tr><td>What can be lost?</td><td>Config: nothing once committed. Flow state: writes an owner acknowledged but had not yet pushed, if that owner is then lost for good; and, at <code>async</code>, the last fsync interval if all three holders die together.</td></tr>
+    </tbody></table></div>
+</section>
+
+<nav class="pager" aria-label="Previous and next"><a href="flow-state.html"><span>← previous</span>Flow ownership and stateful stubs</a><a href="membership.html" style="text-align:right"><span>next →</span>Membership, and what survives</a></nav>
+<footer class="col">Built from docs/architecture (chapters 1–10, 13), docs/decisions/DECISIONS.md through D-95, and the code in crates/rift-cluster and crates/rift-cluster-server in rift-cluster. Where this page and a D-n disagree, the register wins. The Raft and convergence figures are simplified teaching models: the Raft figure ships whole logs and has no snapshots, and the convergence figure keeps one leader and scales the snapshot numbers down. The ownership figure computes the real HRW function.</footer>
+</main>
+
+<script src="assets/explained.js"></script>
+</html>

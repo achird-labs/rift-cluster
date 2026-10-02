@@ -1,0 +1,92 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Writes, mock requests and routing · How RiftCluster Works</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500;12..96,700;12..96,800&family=Literata:ital,opsz,wght@0,7..72,400;0,7..72,600;1,7..72,400&family=JetBrains+Mono:wght@400;600&display=swap">
+<link rel="stylesheet" href="assets/explained.css">
+
+<nav class="sitenav" aria-label="Pages"><a class="home" href="index.html">How RiftCluster works</a><a href="index.html">Why a cluster, and its two planes</a><a href="consensus.html">Raft, and Raft under the hood</a><a href="requests.html" aria-current=page>Writes, mock requests and routing</a><a href="flow-state.html">Flow ownership and stateful stubs</a><a href="logs.html">Write-ahead logs and convergence</a><a href="membership.html">Membership, and what survives</a></nav>
+<header class="hero col page-title"><div class="eyebrow">How RiftCluster works · sections 7–9</div><h1 style="font-size:clamp(1.9rem,4.6vw,2.7rem)">Writes, mock requests and routing</h1></header>
+
+<main>
+<!-- 7 -->
+<section class="col" id="write">
+  <h2>7 · Life of an admin write</h2>
+  <p>Admin writes are <code>POST /imposters</code>, a stub edit, disable/enable, a proxy recording, a route-table change. They carry R1, R3 and R4, so the path is specified end to end. Step through the normal path first, then pick a failure from the menu.</p>
+</section>
+<div class="fig seq" id="seq-write"></div>
+<section class="col">
+  <p>Three steps carry the guarantees:</p>
+  <ol class="steps">
+    <li><strong>Park before forward (R4).</strong> The node that received the request writes the intent to its own disk (<code>pending_intents</code>) before doing anything else. From then on, whatever dies, some disk knows the client asked. A recovery loop replays parked intents to whoever is leader.</li>
+    <li><strong>Commit means fsynced on a majority (R3).</strong> Not “in memory on a majority”.</li>
+    <li><strong>The barrier (R1).</strong> Raft's commit guarantees durability, not that followers have <em>applied</em> the entry. Once the leader answers, the node that accepted the request polls every member's applied index (every 25 ms, for up to 2 s) and holds the <code>2xx</code> until all of them report ≥ N. That is every member, voters and learners alike: the barrier can't see another node's readiness, so a node that is draining or still catching up may be named in the warning. A node catching up isn't behind the balancer anyway, because its own <code>/readyz</code> stays 503 until it has applied up to the leader's index.</li>
+  </ol>
+  <p>The op-id makes retries safe. Appending a stub twice is not idempotent by content, so every mutation carries an <code>op_id</code> (the client's <code>Idempotency-Key</code>, or one minted for it). The dedup map lives <em>inside</em> the replicated state machine, so it survives failover and full restart. A replayed op returns its original outcome and revision and applies nothing.</p>
+  <p>One more safety net covers the gaps. If a mock request finds no matching imposter or stub <em>and</em> the node's applied index trails the commit index it last heard, the node waits up to 500 ms for apply and retries the match once. It only fires on requests that were about to fail anyway, so it costs nothing on the hot path.</p>
+</section>
+
+<!-- 8 -->
+<section class="col" id="read">
+  <h2>8 · Life of a mock request</h2>
+  <p>A mock request crosses three zones with very different costs. The <strong>stateless zone</strong> is unmodified open-source engine code: prefilter indexes, predicates, templates, scripts. The cluster doesn't exist there, which is why throughput survives clustering (the standing gate is ≤ 2% regression with clustering compiled in). The <strong>owner zone</strong> costs one LAN round-trip to the flow's owner per stateful operation, unless this node is the owner. The <strong>local-append zone</strong> records the request in this node's own journal and never waits on anyone.</p>
+</section>
+<div class="fig" id="fig-req">
+  <div class="fig-head"><span class="fig-title">Which stages a request touches, and what they cost</span><span class="fig-note">pick a stub type</span></div>
+  <div class="controls" style="margin-top:0" id="req-types"></div>
+  <div class="zonebar" style="margin-top:14px"><span>entry</span><span>entry</span><span style="border-color:var(--ok)">stateless</span><span style="border-color:var(--accent)">owner</span><span style="border-color:var(--ok)">stateless*</span><span style="border-color:var(--ok)">stateless</span><span style="border-color:var(--accent)">owner</span><span style="border-color:var(--ok)">local append</span></div>
+  <div class="pipeline" id="req-pipe"></div>
+  <div class="verdict"><div><div class="lab">owner RPCs</div><div class="big" id="req-rpc">0</div></div><div><div class="lab">answer</div><div class="big" id="req-status">200</div></div><div style="flex:1;min-width:240px;font-size:.92rem" id="req-text"></div></div>
+  <div class="controls"><label class="toggle"><input type="checkbox" id="req-self"> This node happens to own the flow</label></div>
+</div>
+<section class="col">
+  <p>When the owner is gone, the read path neither hangs nor guesses. If local health tracking already marks the owner unhealthy, the operation fails at once instead of burning a 2 s timeout per request. A scenario-gated request with an unreachable owner answers <code>503</code>: a test that fails loudly beats a test that passes on a stale answer. Owner calls from the engine's sync code wait on a bounded bridge, so when an owner black-holes, stateful requests shed while stateless traffic keeps full speed.</p>
+  <div class="callout"><b>Two deliberate exceptions.</b> An imposter can opt into <code>readConsistency: "local"</code> for script reads (speed over freshness, its choice). And cycling responses fall back to the node-local cursor when the cursor owner can't answer, counted in <code>rift_cluster_sequence_fallbacks_total</code>: blocking every cyclic response during a blip is worse than a possibly repeated index (D-10).</div>
+</section>
+
+<!-- 9 -->
+<section class="col" id="route">
+  <h2>9 · How a request finds its imposter</h2>
+  <p>Every node runs every imposter, so routing never asks <em>which node</em>: the load balancer settles that. It asks <em>which imposter on this node</em>. There are four doors, and all of them end in the same in-process call into the engine:</p>
+  <div class="tablewrap"><table>
+    <thead><tr><th>Door</th><th>Looks like</th><th>Chooses the imposter by</th></tr></thead>
+    <tbody>
+      <tr><td><b>Its own port</b></td><td><code>http://node:8080/orders/7</code></td><td>The TCP port: the Mountebank default. Every node binds every imposter port.</td></tr>
+      <tr><td><b>A space on a shared port</b></td><td>one port, stubs tagged <code>space: "team-a"</code></td><td>The port picks the imposter; the request's flow id then decides which stubs are eligible, because a stub only matches when the flow id equals its space.</td></tr>
+      <tr><td><b>The gateway</b></td><td><code>/__rift/8080/orders/7</code></td><td>The port in the path. The request is handed to imposter 8080 as <code>/orders/7</code> without touching a socket, so it works even where that port failed to bind. It answers on the admin port and on the front door, with no admin credential.</td></tr>
+      <tr><td><b>The front door</b></td><td>a <code>--front-door</code> listener</td><td>A route table: host, path prefix, headers and method pick a target port, optionally stripping the prefix or rewriting the host.</td></tr>
+    </tbody></table></div>
+  <p>The route table is control-plane state, so it behaves like any config. <code>PUT /front-door/routes</code> becomes one Raft op, validated before it enters the log: a table with two enabled routes that match identically at the same priority is refused as ambiguous. Applying it rewrites the node's route rows and stamps the table revision (<code>routes@N</code>, usable with <code>If-Match</code>), and each node compiles the table into an ordered list and swaps it in atomically as part of that apply. Every node therefore routes by the same table at the same log index, and no request ever sees half a table.</p>
+  <p>Try it against a small table. The figure runs the same rules as the router: enabled routes ordered by priority (higher first), then exact host before wildcard before none, then longer path prefix, then more header matches, then id; the first route whose every clause matches wins. A path prefix matches on whole segments, so <code>/orders</code> matches <code>/orders/7</code> but not <code>/ordersX</code>.</p>
+</section>
+<div class="fig" id="fig-route">
+  <div class="fig-head"><span class="fig-title">The front door resolving one request</span><span class="fig-note">live · the router's matching and ordering rules</span></div>
+  <div class="controls" style="margin-top:0" id="route-presets"></div>
+  <div class="route-in">
+    <label>Host header<input type="text" id="rt-host" value="api.shop.test" spellcheck="false"></label>
+    <label>Method<select id="rt-method"><option>GET</option><option>POST</option><option>PUT</option><option>DELETE</option></select></label>
+    <label>Path<input type="text" id="rt-path" value="/orders/7" spellcheck="false"></label>
+    <label>x-api-version header<select id="rt-ver"><option value="">(absent)</option><option>1</option><option>2</option></select></label>
+  </div>
+  <div class="tablewrap" style="margin-bottom:0"><table class="scoretable rt" id="rt-table"></table></div>
+  <div class="route-out" id="rt-out"></div>
+  <div class="caption" id="rt-why" style="border-left-color:var(--muted)"></div>
+</div>
+<section class="col">
+  <p>A request that matches no route still gets one more chance: a path starting with <code>/__rift/</code> goes through the gateway. Anything else is a <code>404</code> carrying <code>x-rift-front-door: no-route</code>, so a missing route is distinguishable from an imposter that answered 404 itself.</p>
+  <h3>The admin port, under <code>--cluster</code></h3>
+  <p>The public admin address belongs to the <strong>admin front</strong>, and the upstream admin API moves behind it to loopback (D-79). The front decides each request in order. <code>/__rift/*</code> is mock traffic, dispatched in-process, with no credential required or forwarded (D-92). The console and the session routes are served by the front itself. Every write that changes config (imposters, stubs, routes, spaces) is <em>terminated</em> here and turned into a Raft op, which is how <a href='requests.html#write'>section 7</a> begins. Reads and everything else are proxied to the local core. One credential, <code>--api-key</code>, guards all of it (D-73).</p>
+  <h3>Proxy stubs: when the imposter calls the real service</h3>
+  <p>A stub can answer by forwarding to a real upstream (<code>proxy.to</code>). <code>proxyTransparent</code> forwards every time and records nothing. <code>proxyAlways</code> forwards every time and keeps adding what it sees to a recorded stub placed after it. <code>proxyOnce</code> calls upstream once per request signature, records the answer as a new stub placed <em>before</em> itself, and from then on that stub answers and upstream is never called again.</p>
+  <p>On one node that is easy. On a fleet, three nodes can take the same first request at once, and “once” has to mean once cluster-wide. The claim is owned like a flow: its key is the port plus a hash of the request signature, and its HRW owner arbitrates it (D-66). The recording is not flow state at all: it is a config change, committed through Raft as a single op that writes the stub and the “recorded” marker together (D-40). Every node applies it like any other stub edit.</p>
+</section>
+<div class="fig seq" id="seq-proxy"></div>
+<nav class="pager" aria-label="Previous and next"><a href="consensus.html"><span>← previous</span>Raft, and Raft under the hood</a><a href="flow-state.html" style="text-align:right"><span>next →</span>Flow ownership and stateful stubs</a></nav>
+<footer class="col">Built from docs/architecture (chapters 1–10, 13), docs/decisions/DECISIONS.md through D-95, and the code in crates/rift-cluster and crates/rift-cluster-server in rift-cluster. Where this page and a D-n disagree, the register wins. The Raft and convergence figures are simplified teaching models: the Raft figure ships whole logs and has no snapshots, and the convergence figure keeps one leader and scales the snapshot numbers down. The ownership figure computes the real HRW function.</footer>
+</main>
+
+<script src="assets/explained.js"></script>
+</html>

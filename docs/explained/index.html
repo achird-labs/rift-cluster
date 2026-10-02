@@ -1,0 +1,122 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>How RiftCluster Works</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500;12..96,700;12..96,800&family=Literata:ital,opsz,wght@0,7..72,400;0,7..72,600;1,7..72,400&family=JetBrains+Mono:wght@400;600&display=swap">
+<link rel="stylesheet" href="assets/explained.css">
+
+<nav class="sitenav" aria-label="Pages"><a class="home" href="index.html">How RiftCluster works</a><a href="index.html" aria-current=page>Why a cluster, and its two planes</a><a href="consensus.html">Raft, and Raft under the hood</a><a href="requests.html">Writes, mock requests and routing</a><a href="flow-state.html">Flow ownership and stateful stubs</a><a href="logs.html">Write-ahead logs and convergence</a><a href="membership.html">Membership, and what survives</a></nav>
+<header class="hero col">
+  <div class="eyebrow">rift-cluster · distributed edition · an interactive walkthrough</div>
+  <h1>How RiftCluster works</h1>
+  <p class="lede">Three copies of one mock server, behind a load balancer, that behave like one. This page builds the design up from the obvious approach, shows where it breaks, and lets you drive each mechanism yourself: elect a leader, commit a write, move a flow between owners, crash the fleet mid-fsync.</p>
+  <div class="meta"><span>Sources: docs/architecture, DECISIONS.md through D-95</span><span>Code: crates/rift-cluster</span><span>Figures marked “live” run real logic</span></div>
+  <nav class="toc" aria-label="Contents">
+    <a href="index.html#one-node"><span>1</span>One node, and what it can't do</a>
+    <a href="index.html#fleet"><span>2</span>The fleet and the load balancer</a>
+    <a href="index.html#breaks"><span>3</span>What breaks with the obvious design</a>
+    <a href="index.html#planes"><span>4</span>Two planes</a>
+    <a href="consensus.html#raft"><span>5</span>Raft: agreeing on the boring things</a>
+    <a href="consensus.html#wire"><span>6</span>Raft under the hood</a>
+    <a href="requests.html#write"><span>7</span>Life of an admin write</a>
+    <a href="requests.html#read"><span>8</span>Life of a mock request</a>
+    <a href="requests.html#route"><span>9</span>How a request finds its imposter</a>
+    <a href="flow-state.html#ring"><span>10</span>Who owns a flow</a>
+    <a href="flow-state.html#state"><span>11</span>The state behind a stateful stub</a>
+    <a href="flow-state.html#handoff"><span>12</span>Replicas, handoff and fencing</a>
+    <a href="flow-state.html#durable"><span>13</span>Flow state on disk</a>
+    <a href="logs.html#wal"><span>14</span>Two write-ahead logs</a>
+    <a href="logs.html#converge"><span>15</span>How the fleet converges</a>
+    <a href="membership.html#life"><span>16</span>Joining, leaving, retiring</a>
+    <a href="membership.html#survive"><span>17</span>What survives what</a>
+  </nav>
+</header>
+
+<main>
+<!-- 1 -->
+<section class="col" id="one-node">
+  <h2>1 · One node, and what it can't do</h2>
+  <p>Rift is a Mountebank-compatible mock server written in Rust. You <code>POST</code> an <strong>imposter</strong>: a fake service bound to a TCP port, carrying an ordered list of <strong>stubs</strong>. Each stub is a predicate (“<code>GET /orders/*</code>”) and a response. Your system under test calls the imposter as if it were the real service, and afterwards your test asks Rift what it received.</p>
+  <p>Some stubs are <em>stateful</em>. A <strong>scenario</strong> stub only matches when a little state machine is in a given state (<code>requiredScenarioState: "AwaitingPayment"</code>) and may move it on (<code>willSetStateTo: "Shipped"</code>). That state belongs to a <strong>flow</strong>: one test run, one user session, named by a <code>flow_id</code> taken from a header such as <code>X-Flow-Id</code>. Stubs can also cycle through several responses, or proxy to a real upstream once and replay the recording forever (<code>proxyOnce</code>).</p>
+  <p>A single Rift process serves 20–40k requests per second, so one node usually has enough compute. What one node can't give you is an environment that survives that node dying. The distributed edition exists to meet four requirements. Each one rules out a simpler design:</p>
+  <div class="tablewrap"><table>
+    <thead><tr><th>#</th><th>Requirement</th><th>What it rules out</th></tr></thead>
+    <tbody>
+      <tr><td class="mono">R1</td><td>A config change acknowledged by <em>any</em> node is servable from <em>every</em> node by the time the client sees its 2xx.</td><td>Fire-and-forget replication; “poll until it converges”.</td></tr>
+      <tr><td class="mono">R2</td><td>A flow-state change made while serving one request is visible to the very next request, whichever node gets it.</td><td>Reading local replicas for state that decides which stub matches.</td></tr>
+      <tr><td class="mono">R3</td><td>Nothing is lost on a full-cluster restart: configs <em>and</em> flow state.</td><td>Memory-only state; “durable as long as one node survives”.</td></tr>
+      <tr><td class="mono">R4</td><td>An accepted admin request is never lost, even if the node handling it dies mid-flight.</td><td>Best-effort forwarding; relying on the client to retry.</td></tr>
+    </tbody></table></div>
+  <p>And one founding constraint: <strong>no mandatory external dependency</strong>. No etcd, no Redis, no ZooKeeper. Three Rift binaries behind a load balancer have to <em>be</em> the cluster.</p>
+</section>
+
+<!-- 2 -->
+<section class="col" id="fleet">
+  <h2>2 · The fleet and the load balancer</h2>
+  <p>The cluster is <strong>replicated, not sharded</strong>. Every node holds the full imposter set, binds every imposter port, and can answer any mock request. That is what makes the load balancer trivial: it can send anything anywhere, and losing a node loses no configuration.</p>
+</section>
+<div class="fig" id="fig-topo">
+  <div class="fig-head"><span class="fig-title">Round-robin traffic onto an active-active fleet</span><span class="fig-note">animated · every node binds :8080 and :9090</span></div>
+  <div class="svgwrap"><svg viewBox="0 0 760 300" role="img" aria-label="Test runners send requests through a load balancer to three nodes; the nodes talk to each other over a private cluster port."></svg></div>
+  <div class="controls"><button type="button" data-act="toggle" aria-pressed="true">Pause traffic</button><span class="fig-note">Blue: mock requests. Dashed grey: the private cluster port (Raft and owner RPCs, every message HMAC-signed).</span></div>
+</div>
+<section class="col">
+  <p>Traffic reaches an imposter in one of three ways: on its own port (the Mountebank default), on one shared port with stubs separated by a <code>space</code> that matches the flow id, or through the <strong>gateway</strong>, where the port is carried in the path: <code>/__rift/8080/orders</code> is dispatched in-process to imposter 8080 as <code>/orders</code>. On Kubernetes, where Service ports are fixed, the gateway and the front-door route table are how runtime-minted ports stay reachable.</p>
+  <p>It is tempting to make the load balancer hash the flow-id header so a flow always lands on “its” node. The design records why this doesn't buy correctness (D-13): the balancer hashes onto <em>its own</em> ring over <em>its own</em> endpoint list. It never computes Rift's ownership function, so the sticky node is the state owner about 1/N of the time, by chance.</p>
+  <blockquote>Placement is a latency optimization. Ownership is a correctness mechanism. They are computed by different systems and must be assumed to disagree.</blockquote>
+</section>
+
+<!-- 3 -->
+<section class="col" id="breaks">
+  <h2>3 · What breaks with the obvious design</h2>
+  <p>Start naive: three independent Rift processes behind the balancer, each node copying changes to the others in the background. Step through each scenario to see where it goes wrong.</p>
+  <h3>Scenario 1: config that only one node has seen</h3>
+  <p>A CI job creates an imposter. The balancer sends that request to node B. B saves it, answers <code>201</code>, and starts copying it to A and C in the background. The test starts immediately.</p>
+</section>
+<div class="fig seq" id="seq-naive1"></div>
+<section class="col">
+  <p>The client was told “created”, and the very next request failed. That is an <strong>R1 violation</strong>. Whatever replaces background copying must not answer <code>201</code> until every serving node can serve the change.</p>
+  <h3>Scenario 2: state read from a local copy</h3>
+  <p>Now a scenario. Request 1 for flow <code>f</code> lands on node A, matches the <code>Started</code> stub and moves the flow to <code>AwaitingPayment</code>. Request 2 arrives 2 ms later on node B, whose copy of the flow is updated asynchronously.</p>
+</section>
+<div class="fig seq" id="seq-naive2"></div>
+<section class="col">
+  <p>Nothing errors. The test receives a <em>wrong mock response</em>, which is the one failure a verification tool must never produce. That is an <strong>R2 violation</strong>: state that decides which stub matches must come from one authoritative place.</p>
+  <h3>Scenario 3: nodes that disagree about who is in the cluster</h3>
+  <p>Suppose we fix scenario 2 by giving each flow one owner, chosen by hashing over the member list. An earlier draft of this design (RFC-001 v2) learned the member list by gossip. During a network blip, two nodes can hold different lists:</p>
+</section>
+<div class="fig seq" id="seq-naive3"></div>
+<section class="col">
+  <p>Two nodes each believe they own <code>f</code>, and both accept writes. The v2 draft piled up machinery to manage this: ring epochs, settle delays, per-key generations, version-vector merges on heal. The final design removes the disagreement instead of managing it.</p>
+</section>
+
+<!-- 4 -->
+<section class="col" id="planes">
+  <h2>4 · Two planes</h2>
+  <p>The fix is to sort state by <em>what goes wrong if two nodes disagree about it</em>, and give each class the cheapest mechanism that makes disagreement impossible.</p>
+</section>
+<div class="fig">
+  <div class="planes">
+    <div class="plane cp"><h4>Control plane</h4><span class="sub">Raft · linearizable · durable · needs a quorum</span>
+      <ul><li><strong>Membership</strong>: voters and learners</li><li><strong>Imposter configs</strong> and their <code>enabled</code> bit</li><li><strong>Front-door route table</strong> and its revision</li><li><strong>Admin intent log</strong> and op-id dedup</li></ul>
+      <p style="font-size:.85rem;margin:.8em 0 0;color:var(--muted)">Changes at human or CI speed. Can afford a quorum round-trip and an fsync per write.</p></div>
+    <div class="plane dp"><h4>Data plane</h4><span class="sub">per request · no consensus, ever</span>
+      <ul><li><strong>Stateless stub matching</strong>: 100% in-process</li><li><strong>Flow state</strong> (scenario FSM, flow KV): one owner per key, chosen by hashing, plus 2 async replicas and a write-ahead tier</li><li><strong>Request journal</strong>: upstream's own, per node</li><li><strong>proxyOnce claims</strong>: a small state machine at the owner</li></ul>
+      <p style="font-size:.85rem;margin:.8em 0 0;color:var(--muted)">Changes up to tens of thousands of times a second. A stub with no stateful features never touches the cluster.</p></div>
+  </div>
+  <div class="feed">committed membership (control plane) ──feeds──▶ the ownership ring (data plane)</div>
+</div>
+<section class="col">
+  <p>The arrow between them is the trick. Membership lives <em>in</em> the Raft log, so at any log index every node computes byte-identical membership, and therefore byte-identical owners for every flow. Scenario 3 can't happen. The rule of thumb from chapter 4 of the guide:</p>
+  <blockquote>Raft carries what you'd expect to survive a restart. The ownership ring carries what a running test mutates.</blockquote>
+</section>
+
+<nav class="pager" aria-label="Previous and next"><span></span><a href="consensus.html" style="text-align:right"><span>next →</span>Raft, and Raft under the hood</a></nav>
+<footer class="col">Built from docs/architecture (chapters 1–10, 13), docs/decisions/DECISIONS.md through D-95, and the code in crates/rift-cluster and crates/rift-cluster-server in rift-cluster. Where this page and a D-n disagree, the register wins. The Raft and convergence figures are simplified teaching models: the Raft figure ships whole logs and has no snapshots, and the convergence figure keeps one leader and scales the snapshot numbers down. The ownership figure computes the real HRW function.</footer>
+</main>
+
+<script src="assets/explained.js"></script>
+</html>
