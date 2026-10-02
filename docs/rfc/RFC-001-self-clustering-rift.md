@@ -604,6 +604,10 @@ fallback dispatch, §7.4.6) stay cluster.
 
 #### 7.1.2 Node lifecycle & graceful leave
 
+> **Amended by D-94** (2026-10-01): there is no crash path that hands off. A leaver that dies
+> mid-drain, like any crashed voter, stays in the membership and keeps its keys until a committed
+> departure removes it; nothing GCs a dead member. Retiring one that never returns is #641.
+
 States: `Joining → Ready → Live ⇄ Suspect → Dead | Leaving → Left`.
 
 - **Joining:** contact seeds, sync membership, run initial config reconcile (§7.4.5).
@@ -646,6 +650,14 @@ Phase-1 exit test: "unreachable seeds ⇒ never Ready" (§10).
 > contact with the quorum rejects owner-side ops — a follower as soon as it knows no leader,
 > 450–600 ms after the last heartbeat, a leader after 900 ms without a quorum ack; D-17). See ADR-001
 > §Ring & fencing and issue #7. Read `(g, v, origin)` below as `(m_idx, v, origin)`.
+
+> **Amended by D-93** (2026-10-01): `eligible` below is the applied **voter** set — a learner owns
+> no key and holds no replica by placement.
+>
+> **Amended by D-94** (2026-10-01): there is no Suspect/Dead progression. A crashed voter stays in
+> the membership and keeps its keys (owner-routed ops on them fail fast) until a committed
+> departure removes it; nothing removes a member on failure. A permanently dead member's removal is
+> #641.
 
 - **Ring:** rendezvous (HRW) hashing: `owner(key) = argmax_{n ∈ eligible} h(n.node_id, key)`
   with xxhash64, where `eligible = Live ∪ Suspect − Leaving` (Suspect nodes keep ownership

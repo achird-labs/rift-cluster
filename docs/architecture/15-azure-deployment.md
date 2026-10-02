@@ -217,9 +217,10 @@ does have lifecycle hooks, but they are scoped to automatic OS upgrade phases,
 not to instance deletion, so there is no ASG-style scale-in hook to reach for
 instead.
 
-Skipping the agent entirely is safe but not free: a hard delete is just the
-crash path, so the fleet pays the election and adoption windows instead of a
-zero-cost leave.
+Skipping the agent entirely is **not** safe: a hard delete is the crash path,
+and a crashed voter is never removed from the membership (D-94). The deleted
+instance is not coming back, so its share of flow keys (~1/N) stays unavailable
+and it keeps counting in the quorum denominator until it can be retired (#641).
 
 ## Cost & sizing sketch (per-region, HA baseline)
 

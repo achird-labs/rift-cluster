@@ -182,10 +182,19 @@ entries and multi-MiB `InstallSnapshotRequest`s that used to make the window
 
 **One voter crashes (the common case).** Raft elects within ~1–3 s if it was
 the leader (admin writes pause invisibly — intents park and replay); mock
-traffic unaffected on surviving nodes. Flow keys owned by the dead node are
-adopted by their successors after the membership entry commits — staleness ≤
-one replication round, or a flagged FSM reset if all replicas were lost too.
-LB health checks drain the dead node. Nothing requires an operator.
+traffic unaffected on surviving nodes. LB health checks drain the dead node.
+Its flow keys are **not** handed off (D-94): the crashed voter stays in the
+membership and remains their owner, so owner-routed operations on about 1/N of
+flows fail fast as the degradation table above describes — `503` at the scenario
+gate, transition and proxyOnce claim; sequencing falls back to the local cursor —
+until the node restarts with its
+state dir and recovers them from its own `flow.redb`. Nothing requires an
+operator **if the node comes back**. A node that never does stays a member,
+holding its keys unavailable and counting in the quorum denominator, and there
+is no supported way to remove it yet (#641; the Chapter 10 runbook is a sketch).
+A *graceful* stop hands off when its departure commits — not when the D-25
+voter floor refuses it, nor when the leave fails — and the successors adopt
+with staleness ≤ one replication round (Chapter 6).
 
 **Network partition, 5 nodes → 3|2:**
 

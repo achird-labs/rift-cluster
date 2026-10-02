@@ -4124,3 +4124,75 @@ for embedders of `RaftNode`, not a second behaviour anyone runs.
 `h1_fault_through_every_door_matches_the_imposter_port` (`tests/gateway_tcp_fault.rs`) pins the
 per-kind parity on all three doors and goes red with the proxy leg restored (`503` for `/reset`);
 the same file pins the front door's HTTP/2 rule, keep-alive recovery, and the debug log level.
+
+### D-93 — The ownership ring is the applied **voter** set; a learner owns no key
+
+- **Status:** active
+- **Decided:** 2026-10-01 · RFC-001 §7.2 reconciled with the code
+- **Refines:** D-15, D-27
+- **Amends:** RFC-001 §7.2
+- **Code:** crates/rift-cluster/src/raft/node.rs, crates/rift-cluster/src/raft/ring.rs
+
+**The rule.** `RaftNode::ring` builds the HRW ring from `membership_config.voter_ids()` at this
+node's applied membership, and only from that. A learner — a node admitted past the D-27 voter
+ceiling, or a joiner not yet promoted — binds every imposter, applies the log and serves mock
+traffic, but owns no flow, sequence or proxyOnce key and holds no replica by placement. It reaches
+every owner the way any non-owner does: one RPC.
+
+**Why voters.** A learner is by construction the member that may be behind: it is either catching
+up (snapshot install, log replay) or capped out of the quorum. Making it authoritative for a key
+would put the single writer on the node least likely to have applied the membership entry that
+made it one, and the isolated-owner rule (D-17) is defined by quorum visibility, which a voter has
+and a learner only observes. Ownership moving at promotion is the same deterministic consequence of
+a committed entry as any other membership change.
+
+**What it costs.** Only above nine nodes do learners exist outside a join, and the design target
+is 3–9 voters (Chapter 1); a 16-node fleet spreads ownership over its 9 voters while all 16 serve.
+
+**Corrected here.** Chapter 3 said learners "own flow-state keys" and Chapter 6 wrote the ring as
+an argmax "over Ready nodes"; neither was ever true of the code. RFC-001 §7.2's
+`eligible = Live ∪ Suspect − Leaving` is the gossip-era set this replaces.
+
+`a_learner_never_owns_a_flow_key` (`crates/rift-cluster/src/raft/node.rs`) pins it on the leader's
+and the learner's own ring, and goes red when the ring is built from every member.
+
+### D-94 — A crashed voter keeps its keys until it leaves: ownership moves only on a committed departure
+
+- **Status:** active
+- **Decided:** 2026-10-01 · follow-up #641
+- **Refines:** D-17, D-21
+- **Amends:** RFC-001 §7.1.2, RFC-001 §7.2
+- **Code:** crates/rift-cluster/src/raft/node.rs, crates/rift-cluster/src/raft/network.rs
+
+**The rule.** Nothing removes a voter because it stopped answering. A crash, a kill or a lost
+host leaves the member in the committed membership; the ring is unchanged (same members, same
+`m_idx`), so the crashed node remains the HRW owner of its keys. Owner-routed operations on those
+keys fail fast until the node returns and reopens its `flow.redb` — the scenario gate and
+transition with the D-65 `503`, a proxyOnce claim with `503` (D-66), a script or template read the
+way those doors fail (Chapter 9: a `500` script error, an empty token); sequencing falls back
+locally (D-10) —
+recovery as "a very long partition", Chapter 6's durable tier. Ownership moves only when a
+membership entry removing the node commits, which today happens only through the node's own
+`leave` (SIGTERM; `network::evict`).
+
+**Why not remove on failure.** A failure detector cannot tell a dead node from a paused or
+partitioned one. Auto-removal would turn every GC pause and blip into two ownership moves (out and
+back), resetting sequence cursors (D-8) and re-claiming proxyOnce signatures each time, and
+shrinking the voter set on suspicion is how a minority comes to form a quorum. A visible `503`
+for 1/N of flows while a pod restarts is the honest failure (Chapter 9's standing rule); a silent
+ownership move on a false positive is not. This is the same choice etcd makes.
+
+**The gap it leaves, stated.** A voter that never comes back has no supported removal: D-21 rules
+out an admin route and the Chapter 10 `cluster remove-node` runbook is unbuilt. Until #641 lands,
+such a member keeps 1/N of keys at `503` and stays in the quorum denominator.
+
+**Corrected here.** Chapter 6's handoff diagram and Chapter 9's "one voter crashes" walkthrough
+had the leader commit "B removed" after a crash, with successors adopting and "nothing requires an
+operator"; Chapters 14 and 15 called a hard terminate on scale-in "safe". No code path does that,
+and a scaled-in instance is exactly the member that never returns.
+
+`a_crashed_voter_keeps_its_keys_until_it_leaves` (`crates/rift-cluster/tests/flow_store.rs`) pins
+it: after a non-leader owner is stopped without leaving, the survivors' ring keeps it at the same
+`m_idx` well past an election and a promotion sweep, and a write to its flow fails rather than
+being served by a successor. It bounds its own window (3 s): a failure detector slower than that
+would not turn it red.

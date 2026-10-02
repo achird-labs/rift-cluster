@@ -95,9 +95,11 @@ EBS on each, systemd unit (`ExecStop` = SIGTERM, generous
 `TimeoutStopSec`), seeds via Route 53 private records or an internal NLB DNS
 name (re-resolved per attempt, as always). ASG-managed replacement works with
 one rule: **scale-in must SIGTERM, not terminate** — use lifecycle hooks to
-give graceful leave its window; a hard terminate is just the crash path
-(safe, but takes the election + adoption windows instead of the zero-cost
-leave).
+give graceful leave its window. A hard terminate is **not** safe on
+scale-in: it is the crash path, and a crashed voter is never removed from the
+membership (D-94). The instance is not coming back, so its share of flow keys
+(~1/N) stays unavailable and it keeps counting in the quorum denominator until
+it can be retired (#641).
 
 ## Cost & sizing sketch (per-region, HA baseline)
 

@@ -1219,6 +1219,86 @@ async fn a_new_owner_adopts_from_the_surviving_replica_on_takeover() {
     }
 }
 
+/// Pins D-94: a crash is not a departure. A voter stopped without leaving stays
+/// in the committed membership, so the survivors' ring — members and `m_idx` —
+/// is unchanged and the crashed node is still the owner of its flows. A write to
+/// such a flow fails with the D-65 `503` instead of being served by a successor,
+/// even though the successors hold a replica of it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_crashed_voter_keeps_its_keys_until_it_leaves() {
+    let _lock = TEST_LOCK.lock().await;
+    let members = flow_cluster_of(3, Duration::from_secs(60)).await;
+
+    // A flow owned by a non-leader, so stopping its owner moves no leadership.
+    let ring_before = members[0].node.ring();
+    let leader_id = members[0].node.id();
+    let (flow_id, owner_id) = (0..64)
+        .map(|i| format!("flow-crash-{i}"))
+        .find_map(|candidate| {
+            let owner = ring_before.owner(OwnedKey::new(KeyClass::FlowKv, &stored(&candidate)))?;
+            (owner != leader_id).then_some((candidate, owner))
+        })
+        .expect("some flow is owned by a non-leader");
+    let owner = members
+        .iter()
+        .find(|m| m.node.id() == owner_id)
+        .expect("owner member");
+
+    // Give the flow a value, so its successors hold a replica they could adopt.
+    let store = store_on(&members[0], serde_json::json!({}));
+    {
+        let store = Arc::clone(&store);
+        let flow = flow_id.clone();
+        blocking(move || store.set(&flow, "k", serde_json::json!("before")))
+            .await
+            .expect("write while the owner is up");
+    }
+
+    // Crash-equivalent: the node stops without `leave`, so no departure commits.
+    owner.node.shutdown().await.expect("stop the owner");
+
+    // Long enough for an election round, a leader promotion sweep (1 s) and
+    // the owner's peers to mark it unhealthy. A failure detector slower than
+    // this window would not be caught here; D-94 records that bound.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    for survivor in members.iter().filter(|m| m.node.id() != owner_id) {
+        let ring = survivor.node.ring();
+        assert_eq!(
+            ring.members(),
+            ring_before.members(),
+            "node {}: a crash must not change the voter set",
+            survivor.node.id()
+        );
+        assert_eq!(
+            ring.m_idx(),
+            ring_before.m_idx(),
+            "node {}: no membership entry may commit for a crash",
+            survivor.node.id()
+        );
+        assert_eq!(
+            ring.owner(OwnedKey::new(KeyClass::FlowKv, &stored(&flow_id))),
+            Some(owner_id),
+            "node {}: the crashed voter must still own its flow",
+            survivor.node.id()
+        );
+    }
+
+    let flow = flow_id.clone();
+    let err = tokio::time::timeout(
+        Duration::from_secs(15),
+        blocking(move || store.set(&flow, "k", serde_json::json!("after"))),
+    )
+    .await
+    .expect("a write to a crashed owner's flow must fail, not hang")
+    .expect_err("a crashed owner's flow must not be served by a successor");
+    assert_backend_unavailable(&err, "a write to a crashed owner's flow");
+
+    for member in members.iter().filter(|m| m.node.id() != owner_id) {
+        member.node.shutdown().await.expect("shutdown");
+    }
+}
+
 /// #121: `durability: "none"` means none **fleet-wide**, not just at the owner.
 ///
 /// The replication push carries the write's own durability, so a replica holds
