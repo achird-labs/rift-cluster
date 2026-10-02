@@ -1,4 +1,4 @@
-# Publish the interactive walkthrough in docs/explained/ to GitHub Pages.
+# Publish the reference guide to the internals (docs/explained/) to GitHub Pages.
 #
 # The pages are static HTML with no build step, so this job only uploads the folder and deploys
 # it. It runs on pushes to master that touch the folder (or this file), and by hand. It is kept

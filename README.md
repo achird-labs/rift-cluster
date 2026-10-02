@@ -77,7 +77,7 @@ feature: the un-clustered binary is the open-source server and the open-source s
 
 | | |
 |---|---|
-| [How RiftCluster works](https://achird-labs.github.io/rift-cluster/) ([source](docs/explained/README.md)) | **Start here.** An interactive walkthrough in six pages: why a cluster, Raft and what goes over the wire, admin writes and request routing, flow ownership and stateful stubs, the write-ahead logs and convergence, membership. Explanatory, not normative |
+| [How RiftCluster works](https://achird-labs.github.io/rift-cluster/) ([source](docs/explained/README.md)) | **Start here.** A reference guide to the internals, in six pages with interactive figures: the two planes, Raft and what goes over the wire, admin writes and request routing, flow ownership and stateful stubs, the write-ahead logs and convergence, membership. Explanatory, not normative |
 | [`docs/rift-cluster-server.md`](docs/rift-cluster-server.md) | The binary: flags, startup guards, probes, the `/_cluster/*` operator surface |
 | [`deploy/README.md`](deploy/README.md) | Containers, Compose, Kubernetes, Helm |
 | [`docs/architecture/`](docs/architecture/README.md) | How it works, in 13 live chapters — topology, control plane, read/write paths, flow state, durability, operations, the upstream boundary, testing, the router, two cloud deployments (7 is a retired stub; 8 is retired and kept as the record of the withdrawn tenancy design) |

@@ -8,13 +8,13 @@
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500;12..96,700;12..96,800&family=Literata:ital,opsz,wght@0,7..72,400;0,7..72,600;1,7..72,400&family=JetBrains+Mono:wght@400;600&display=swap">
 <link rel="stylesheet" href="assets/explained.css">
 
-<nav class="sitenav" aria-label="Pages"><a class="home" href="index.html">How RiftCluster works</a><a href="index.html">Why a cluster, and its two planes</a><a href="consensus.html">Raft, and Raft under the hood</a><a href="requests.html">Writes, mock requests and routing</a><a href="flow-state.html">Flow ownership and stateful stubs</a><a href="logs.html" aria-current=page>Write-ahead logs and convergence</a><a href="membership.html">Membership, and what survives</a></nav>
-<header class="hero col page-title"><div class="eyebrow">How RiftCluster works · sections 14–15</div><h1 style="font-size:clamp(1.9rem,4.6vw,2.7rem)">Write-ahead logs and convergence</h1></header>
+<header class="sitenav"><a class="home" href="index.html">How RiftCluster works</a><nav aria-label="Pages"><ol><li><a href="index.html"><span>SECTIONS 1–3</span>What the cluster is, and its two planes</a></li><li><a href="consensus.html"><span>SECTIONS 4–5</span>Raft, and Raft under the hood</a></li><li><a href="requests.html"><span>SECTIONS 6–8</span>Writes, mock requests and routing</a></li><li><a href="flow-state.html"><span>SECTIONS 9–12</span>Flow ownership and stateful stubs</a></li><li><a href="logs.html" aria-current=page><span>SECTIONS 13–14</span>Write-ahead logs and convergence</a></li><li><a href="membership.html"><span>SECTIONS 15–16</span>Membership, and what survives</a></li></ol></nav></header>
+<header class="hero col page-title"><div class="eyebrow">How RiftCluster works · sections 13–14</div><h1 style="font-size:clamp(1.9rem,4.6vw,2.7rem)">Write-ahead logs and convergence</h1></header>
 
 <main>
-<!-- 14 -->
+<!-- 13 -->
 <section class="col" id="wal">
-  <h2>14 · Two write-ahead logs</h2>
+  <h2>13 · Two write-ahead logs</h2>
   <p>Every node keeps two <code>redb</code> files in its state directory, and both are write-ahead logs in the strict sense: nothing is acknowledged until the record that makes it recoverable is on disk, to the degree that write's contract demands. The degree is what differs. <code>raft.redb</code>, the control plane's log, pays an fsync on every append. <code>flow.redb</code>, the data plane's, pays one fsync per 50 ms for everything written in between. They are separate files on purpose: a redb file has one commit lock, and a flow-state group fsync must never queue behind, or in front of, a Raft append.</p>
   <h3>The one redb rule both depend on</h3>
   <p>A redb write transaction commits at a <em>durability level</em>. <code>Immediate</code>: the data is on disk when <code>commit()</code> returns, because redb fsyncs before returning. <code>None</code>: the commit is visible to readers and correctly ordered, but sits in the OS page cache, and becomes durable only when a <em>later</em> <code>Immediate</code> commit lands. That second half is the whole trick behind group commit: many cheap <code>None</code> commits, then one <code>Immediate</code> commit makes all of them durable together.</p>
@@ -32,8 +32,8 @@
 </section>
 <div class="fig seq" id="seq-wal-raft"></div>
 <section class="col">
-  <p>Snapshots keep the log from growing forever. Every 5,000 entries openraft builds one from the state machine; the payload is written to a temporary file, fsynced, renamed into place, the directory is fsynced, and only then is a row naming it committed, so a crash at any point leaves either the old snapshot or the new one, never half of one. The 1,000 most recent entries are kept and older ones purged. A follower that needs a purged entry is sent the snapshot instead (<a href='logs.html#converge'>section 15</a>).</p>
-  <p>The third table in <code>raft.redb</code>, <code>pending_intents</code>, is the R4 log from <a href='requests.html#write'>section 7</a>: the receiving node writes each admin request there with an <code>Immediate</code> commit <em>before</em> forwarding it, and clears it once the outcome is committed. It is local to that node: it is never replicated and never part of a snapshot.</p>
+  <p>Snapshots keep the log from growing forever. Every 5,000 entries openraft builds one from the state machine; the payload is written to a temporary file, fsynced, renamed into place, the directory is fsynced, and only then is a row naming it committed, so a crash at any point leaves either the old snapshot or the new one, never half of one. The 1,000 most recent entries are kept and older ones purged. A follower that needs a purged entry is sent the snapshot instead (<a href='logs.html#converge'>section 14</a>).</p>
+  <p>The third table in <code>raft.redb</code>, <code>pending_intents</code>, is the R4 log from <a href='requests.html#write'>section 6</a>: the receiving node writes each admin request there with an <code>Immediate</code> commit <em>before</em> forwarding it, and clears it once the outcome is committed. It is local to that node: it is never replicated and never part of a snapshot.</p>
   <h3>The flow log, under load</h3>
   <p>Flow writes arrive at mock-traffic rates, so the writer never fsyncs per write in the default mode. The figure runs that writer: every acknowledged write is a bar on the top lane, red until a group fsync covers it and green after. The gauge is the node's real metric, <code>rift_cluster_flow_wal_lag_ops</code>: acknowledged writes that are committed at <code>None</code> but not yet fsynced. It is exactly what a power cut on <em>this</em> node, right now, would take off <em>this</em> disk.</p>
 </section>
@@ -51,12 +51,12 @@
   <div class="controls"><button type="button" class="primary" data-a="run">Pause</button><button type="button" data-a="plug">Pull the plug on this node</button></div>
 </div>
 <section class="col">
-  <p>Two things keep the <code>async</code> window honest. Each write was also pushed to the key's two replicas, which run their own writers and their own 50 ms tickers, so a write is lost from the cluster only if all three holders lose power inside the same interval (<a href='flow-state.html#durable'>section 13</a>'s figure). And replicas persist in the <em>origin's</em> mode: the durability travels with the replication message, so an imposter that asked for <code>none</code> is not quietly written to disk by its replicas, and one that asked for <code>sync</code> is not demoted.</p>
+  <p>Two things keep the <code>async</code> window honest. Each write was also pushed to the key's two replicas, which run their own writers and their own 50 ms tickers, so a write is lost from the cluster only if all three holders lose power inside the same interval (<a href='flow-state.html#durable'>section 12</a>'s figure). And replicas persist in the <em>origin's</em> mode: the durability travels with the replication message, so an imposter that asked for <code>none</code> is not quietly written to disk by its replicas, and one that asked for <code>sync</code> is not demoted.</p>
 </section>
 
-<!-- 15 -->
+<!-- 14 -->
 <section class="col" id="converge">
-  <h2>15 · How the fleet converges</h2>
+  <h2>14 · How the fleet converges</h2>
   <p>“Consistent” means two different things here, because the two planes make different promises.</p>
   <p><strong>Config converges by replaying one log.</strong> Every node applies the same committed entries in the same order, and apply is deterministic: the leader validated the entry before appending it, and the only clock apply reads is the entry's own. So two nodes at the same applied index hold identical config, and the revision a client sees <em>is</em> the log index. Two nodes can only ever differ by lag, one behind the other, never by content. Lag is closed three ways:</p>
   <ol class="steps">
@@ -64,7 +64,7 @@
     <li><strong>Snapshot install.</strong> If the entries a follower needs have been purged, the leader sends its latest snapshot. The follower replaces every state-machine table in one durable transaction, then continues by backfill from the snapshot's index.</li>
     <li><strong>Admission.</strong> A new node joins as a learner and catches up by the same two mechanisms. The leader's 1 s sweep promotes it once its replication lag is within 16 entries, while there are fewer than 9 voters.</li>
   </ol>
-  <p>The barrier from <a href='requests.html#write'>section 7</a> is what turns <em>will converge</em> into R1's <em>has converged by the time you see the 2xx</em>. Drive it below: write, slow a node's apply, crash one, or add an empty node and watch it catch up from a snapshot.</p>
+  <p>The barrier from <a href='requests.html#write'>section 6</a> is what turns <em>will converge</em> into R1's <em>has converged by the time you see the 2xx</em>. Drive it below: write, slow a node's apply, crash one, or add an empty node and watch it catch up from a snapshot.</p>
 </section>
 <div class="fig" id="fig-conv">
   <div class="fig-head"><span class="fig-title">Five members applying one log</span><span class="fig-note">live · a fixed leader; snapshot every 20 entries, keeping 6 (the real numbers are 5,000 and 1,000)</span></div>

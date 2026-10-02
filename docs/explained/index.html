@@ -8,30 +8,29 @@
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500;12..96,700;12..96,800&family=Literata:ital,opsz,wght@0,7..72,400;0,7..72,600;1,7..72,400&family=JetBrains+Mono:wght@400;600&display=swap">
 <link rel="stylesheet" href="assets/explained.css">
 
-<nav class="sitenav" aria-label="Pages"><a class="home" href="index.html">How RiftCluster works</a><a href="index.html" aria-current=page>Why a cluster, and its two planes</a><a href="consensus.html">Raft, and Raft under the hood</a><a href="requests.html">Writes, mock requests and routing</a><a href="flow-state.html">Flow ownership and stateful stubs</a><a href="logs.html">Write-ahead logs and convergence</a><a href="membership.html">Membership, and what survives</a></nav>
+<header class="sitenav"><a class="home" href="index.html">How RiftCluster works</a><nav aria-label="Pages"><ol><li><a href="index.html" aria-current=page><span>SECTIONS 1–3</span>What the cluster is, and its two planes</a></li><li><a href="consensus.html"><span>SECTIONS 4–5</span>Raft, and Raft under the hood</a></li><li><a href="requests.html"><span>SECTIONS 6–8</span>Writes, mock requests and routing</a></li><li><a href="flow-state.html"><span>SECTIONS 9–12</span>Flow ownership and stateful stubs</a></li><li><a href="logs.html"><span>SECTIONS 13–14</span>Write-ahead logs and convergence</a></li><li><a href="membership.html"><span>SECTIONS 15–16</span>Membership, and what survives</a></li></ol></nav></header>
 <header class="hero col">
-  <div class="eyebrow">rift-cluster · distributed edition · an interactive walkthrough</div>
+  <div class="eyebrow">rift-cluster · a reference guide to the internals</div>
   <h1>How RiftCluster works</h1>
-  <p class="lede">Three copies of one mock server, behind a load balancer, that behave like one. This page builds the design up from the obvious approach, shows where it breaks, and lets you drive each mechanism yourself: elect a leader, commit a write, move a flow between owners, crash the fleet mid-fsync.</p>
+  <p class="lede">Several copies of one mock server, behind a load balancer, that behave like one. This guide describes how the cluster is designed and how it operates: the two planes, consensus and what goes over the wire, the write and request paths, flow state, the logs, and membership. Most sections include a figure you can drive.</p>
   <div class="meta"><span>Sources: docs/architecture, DECISIONS.md through D-95</span><span>Code: crates/rift-cluster</span><span>Figures marked “live” run real logic</span></div>
   <nav class="toc" aria-label="Contents">
     <a href="index.html#one-node"><span>1</span>One node, and what it can't do</a>
     <a href="index.html#fleet"><span>2</span>The fleet and the load balancer</a>
-    <a href="index.html#breaks"><span>3</span>What breaks with the obvious design</a>
-    <a href="index.html#planes"><span>4</span>Two planes</a>
-    <a href="consensus.html#raft"><span>5</span>Raft: agreeing on the boring things</a>
-    <a href="consensus.html#wire"><span>6</span>Raft under the hood</a>
-    <a href="requests.html#write"><span>7</span>Life of an admin write</a>
-    <a href="requests.html#read"><span>8</span>Life of a mock request</a>
-    <a href="requests.html#route"><span>9</span>How a request finds its imposter</a>
-    <a href="flow-state.html#ring"><span>10</span>Who owns a flow</a>
-    <a href="flow-state.html#state"><span>11</span>The state behind a stateful stub</a>
-    <a href="flow-state.html#handoff"><span>12</span>Replicas, handoff and fencing</a>
-    <a href="flow-state.html#durable"><span>13</span>Flow state on disk</a>
-    <a href="logs.html#wal"><span>14</span>Two write-ahead logs</a>
-    <a href="logs.html#converge"><span>15</span>How the fleet converges</a>
-    <a href="membership.html#life"><span>16</span>Joining, leaving, retiring</a>
-    <a href="membership.html#survive"><span>17</span>What survives what</a>
+    <a href="index.html#planes"><span>3</span>Two planes</a>
+    <a href="consensus.html#raft"><span>4</span>Raft: agreeing on the boring things</a>
+    <a href="consensus.html#wire"><span>5</span>Raft under the hood</a>
+    <a href="requests.html#write"><span>6</span>Life of an admin write</a>
+    <a href="requests.html#read"><span>7</span>Life of a mock request</a>
+    <a href="requests.html#route"><span>8</span>How a request finds its imposter</a>
+    <a href="flow-state.html#ring"><span>9</span>Who owns a flow</a>
+    <a href="flow-state.html#state"><span>10</span>The state behind a stateful stub</a>
+    <a href="flow-state.html#handoff"><span>11</span>Replicas, handoff and fencing</a>
+    <a href="flow-state.html#durable"><span>12</span>Flow state on disk</a>
+    <a href="logs.html#wal"><span>13</span>Two write-ahead logs</a>
+    <a href="logs.html#converge"><span>14</span>How the fleet converges</a>
+    <a href="membership.html#life"><span>15</span>Joining, leaving, retiring</a>
+    <a href="membership.html#survive"><span>16</span>What survives what</a>
   </nav>
 </header>
 
@@ -41,16 +40,16 @@
   <h2>1 · One node, and what it can't do</h2>
   <p>Rift is a Mountebank-compatible mock server written in Rust. You <code>POST</code> an <strong>imposter</strong>: a fake service bound to a TCP port, carrying an ordered list of <strong>stubs</strong>. Each stub is a predicate (“<code>GET /orders/*</code>”) and a response. Your system under test calls the imposter as if it were the real service, and afterwards your test asks Rift what it received.</p>
   <p>Some stubs are <em>stateful</em>. A <strong>scenario</strong> stub only matches when a little state machine is in a given state (<code>requiredScenarioState: "AwaitingPayment"</code>) and may move it on (<code>willSetStateTo: "Shipped"</code>). That state belongs to a <strong>flow</strong>: one test run, one user session, named by a <code>flow_id</code> taken from a header such as <code>X-Flow-Id</code>. Stubs can also cycle through several responses, or proxy to a real upstream once and replay the recording forever (<code>proxyOnce</code>).</p>
-  <p>A single Rift process serves 20–40k requests per second, so one node usually has enough compute. What one node can't give you is an environment that survives that node dying. The distributed edition exists to meet four requirements. Each one rules out a simpler design:</p>
+  <p>A single Rift process serves 20–40k requests per second, so one node usually has enough compute. What one node can't give you is an environment that survives that node dying. The cluster meets four requirements, and each one maps to a specific mechanism:</p>
   <div class="tablewrap"><table>
-    <thead><tr><th>#</th><th>Requirement</th><th>What it rules out</th></tr></thead>
+    <thead><tr><th>#</th><th>Requirement</th><th>How it is met</th></tr></thead>
     <tbody>
-      <tr><td class="mono">R1</td><td>A config change acknowledged by <em>any</em> node is servable from <em>every</em> node by the time the client sees its 2xx.</td><td>Fire-and-forget replication; “poll until it converges”.</td></tr>
-      <tr><td class="mono">R2</td><td>A flow-state change made while serving one request is visible to the very next request, whichever node gets it.</td><td>Reading local replicas for state that decides which stub matches.</td></tr>
-      <tr><td class="mono">R3</td><td>Nothing is lost on a full-cluster restart: configs <em>and</em> flow state.</td><td>Memory-only state; “durable as long as one node survives”.</td></tr>
-      <tr><td class="mono">R4</td><td>An accepted admin request is never lost, even if the node handling it dies mid-flight.</td><td>Best-effort forwarding; relying on the client to retry.</td></tr>
+      <tr><td class="mono">R1</td><td>A config change acknowledged by <em>any</em> node is servable from <em>every</em> node by the time the client sees its 2xx.</td><td>Config is a Raft log every node applies; the write barrier holds the 2xx until every member has applied it (<a href='requests.html#write'>section 6</a>).</td></tr>
+      <tr><td class="mono">R2</td><td>A flow-state change made while serving one request is visible to the very next request, whichever node gets it.</td><td>Each flow has one owner, and state that decides which stub matches is read from it (sections 9 and 10).</td></tr>
+      <tr><td class="mono">R3</td><td>Nothing is lost on a full-cluster restart: configs <em>and</em> flow state.</td><td>The Raft log is fsynced on a majority before commit; flow state is written to disk on three nodes (sections 12 and 13).</td></tr>
+      <tr><td class="mono">R4</td><td>An accepted admin request is never lost, even if the node handling it dies mid-flight.</td><td>The receiving node parks the request on its own disk before forwarding it, and replays it until it commits (<a href='requests.html#write'>section 6</a>).</td></tr>
     </tbody></table></div>
-  <p>And one founding constraint: <strong>no mandatory external dependency</strong>. No etcd, no Redis, no ZooKeeper. Three Rift binaries behind a load balancer have to <em>be</em> the cluster.</p>
+  <p>One constraint shapes everything: <strong>no mandatory external dependency</strong>. There is no etcd, Redis or ZooKeeper; the Rift binaries behind the load balancer <em>are</em> the cluster.</p>
 </section>
 
 <!-- 2 -->
@@ -65,38 +64,14 @@
 </div>
 <section class="col">
   <p>Traffic reaches an imposter in one of three ways: on its own port (the Mountebank default), on one shared port with stubs separated by a <code>space</code> that matches the flow id, or through the <strong>gateway</strong>, where the port is carried in the path: <code>/__rift/8080/orders</code> is dispatched in-process to imposter 8080 as <code>/orders</code>. On Kubernetes, where Service ports are fixed, the gateway and the front-door route table are how runtime-minted ports stay reachable.</p>
-  <p>It is tempting to make the load balancer hash the flow-id header so a flow always lands on “its” node. The design records why this doesn't buy correctness (D-13): the balancer hashes onto <em>its own</em> ring over <em>its own</em> endpoint list. It never computes Rift's ownership function, so the sticky node is the state owner about 1/N of the time, by chance.</p>
+  <p>The load balancer needs no stickiness, and stickiness would not provide correctness (D-13). A balancer that hashes the flow-id header hashes onto <em>its own</em> ring over <em>its own</em> endpoint list. It never computes the cluster's ownership function, so the node it picks is the flow's owner about 1/N of the time, by chance. Correctness comes from the cluster routing each stateful operation to the owner, wherever the request landed.</p>
   <blockquote>Placement is a latency optimization. Ownership is a correctness mechanism. They are computed by different systems and must be assumed to disagree.</blockquote>
 </section>
 
 <!-- 3 -->
-<section class="col" id="breaks">
-  <h2>3 · What breaks with the obvious design</h2>
-  <p>Start naive: three independent Rift processes behind the balancer, each node copying changes to the others in the background. Step through each scenario to see where it goes wrong.</p>
-  <h3>Scenario 1: config that only one node has seen</h3>
-  <p>A CI job creates an imposter. The balancer sends that request to node B. B saves it, answers <code>201</code>, and starts copying it to A and C in the background. The test starts immediately.</p>
-</section>
-<div class="fig seq" id="seq-naive1"></div>
-<section class="col">
-  <p>The client was told “created”, and the very next request failed. That is an <strong>R1 violation</strong>. Whatever replaces background copying must not answer <code>201</code> until every serving node can serve the change.</p>
-  <h3>Scenario 2: state read from a local copy</h3>
-  <p>Now a scenario. Request 1 for flow <code>f</code> lands on node A, matches the <code>Started</code> stub and moves the flow to <code>AwaitingPayment</code>. Request 2 arrives 2 ms later on node B, whose copy of the flow is updated asynchronously.</p>
-</section>
-<div class="fig seq" id="seq-naive2"></div>
-<section class="col">
-  <p>Nothing errors. The test receives a <em>wrong mock response</em>, which is the one failure a verification tool must never produce. That is an <strong>R2 violation</strong>: state that decides which stub matches must come from one authoritative place.</p>
-  <h3>Scenario 3: nodes that disagree about who is in the cluster</h3>
-  <p>Suppose we fix scenario 2 by giving each flow one owner, chosen by hashing over the member list. An earlier draft of this design (RFC-001 v2) learned the member list by gossip. During a network blip, two nodes can hold different lists:</p>
-</section>
-<div class="fig seq" id="seq-naive3"></div>
-<section class="col">
-  <p>Two nodes each believe they own <code>f</code>, and both accept writes. The v2 draft piled up machinery to manage this: ring epochs, settle delays, per-key generations, version-vector merges on heal. The final design removes the disagreement instead of managing it.</p>
-</section>
-
-<!-- 4 -->
 <section class="col" id="planes">
-  <h2>4 · Two planes</h2>
-  <p>The fix is to sort state by <em>what goes wrong if two nodes disagree about it</em>, and give each class the cheapest mechanism that makes disagreement impossible.</p>
+  <h2>3 · Two planes</h2>
+  <p>State is divided by <em>what would go wrong if two nodes disagreed about it</em>, and each class gets the cheapest mechanism that makes disagreement impossible. Configuration and membership are rare, small and must be identical everywhere, so they go through consensus. Flow state changes on nearly every stateful request, so it goes to a single owner per key instead.</p>
 </section>
 <div class="fig">
   <div class="planes">
@@ -110,7 +85,7 @@
   <div class="feed">committed membership (control plane) ──feeds──▶ the ownership ring (data plane)</div>
 </div>
 <section class="col">
-  <p>The arrow between them is the trick. Membership lives <em>in</em> the Raft log, so at any log index every node computes byte-identical membership, and therefore byte-identical owners for every flow. Scenario 3 can't happen. The rule of thumb from chapter 4 of the guide:</p>
+  <p>The arrow between them is what ties the planes together. Membership lives <em>in</em> the Raft log, so at any log index every node computes byte-identical membership, and therefore byte-identical owners for every flow. Two nodes can never disagree about who owns a flow at the same index. The rule of thumb:</p>
   <blockquote>Raft carries what you'd expect to survive a restart. The ownership ring carries what a running test mutates.</blockquote>
 </section>
 

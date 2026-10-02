@@ -8,13 +8,13 @@
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500;12..96,700;12..96,800&family=Literata:ital,opsz,wght@0,7..72,400;0,7..72,600;1,7..72,400&family=JetBrains+Mono:wght@400;600&display=swap">
 <link rel="stylesheet" href="assets/explained.css">
 
-<nav class="sitenav" aria-label="Pages"><a class="home" href="index.html">How RiftCluster works</a><a href="index.html">Why a cluster, and its two planes</a><a href="consensus.html">Raft, and Raft under the hood</a><a href="requests.html">Writes, mock requests and routing</a><a href="flow-state.html" aria-current=page>Flow ownership and stateful stubs</a><a href="logs.html">Write-ahead logs and convergence</a><a href="membership.html">Membership, and what survives</a></nav>
-<header class="hero col page-title"><div class="eyebrow">How RiftCluster works · sections 10–13</div><h1 style="font-size:clamp(1.9rem,4.6vw,2.7rem)">Flow ownership and stateful stubs</h1></header>
+<header class="sitenav"><a class="home" href="index.html">How RiftCluster works</a><nav aria-label="Pages"><ol><li><a href="index.html"><span>SECTIONS 1–3</span>What the cluster is, and its two planes</a></li><li><a href="consensus.html"><span>SECTIONS 4–5</span>Raft, and Raft under the hood</a></li><li><a href="requests.html"><span>SECTIONS 6–8</span>Writes, mock requests and routing</a></li><li><a href="flow-state.html" aria-current=page><span>SECTIONS 9–12</span>Flow ownership and stateful stubs</a></li><li><a href="logs.html"><span>SECTIONS 13–14</span>Write-ahead logs and convergence</a></li><li><a href="membership.html"><span>SECTIONS 15–16</span>Membership, and what survives</a></li></ol></nav></header>
+<header class="hero col page-title"><div class="eyebrow">How RiftCluster works · sections 9–12</div><h1 style="font-size:clamp(1.9rem,4.6vw,2.7rem)">Flow ownership and stateful stubs</h1></header>
 
 <main>
-<!-- 10 -->
+<!-- 9 -->
 <section class="col" id="ring">
-  <h2>10 · Who owns a flow</h2>
+  <h2>9 · Who owns a flow</h2>
   <p>Every flow key has exactly one authoritative owner, <em>computed, not negotiated</em>, by rendezvous (highest-random-weight) hashing:</p>
   <p style="text-align:center"><code>owner(key) = argmax over voters n of xxh64(n.id ‖ class ‖ key)</code></p>
   <p>Each voter gets a score for the key; the highest score wins; the next two are the key's <strong>replica successors</strong>. The voter list comes from the committed membership, so every node at the same applied index computes the same answer. The key is the <em>scoped</em> flow id: the store prefixes it with the imposter's namespace, <code>i8080:</code> by default, so two imposters reading the same header value don't share state.</p>
@@ -30,13 +30,13 @@
 </div>
 <section class="col">
   <p>Removing a node moves only the flows it owned. Every other flow keeps its owner, because each voter's score is independent of the others. Adding a node moves only the flows it now wins. No coordination happens: <strong>ownership transfer is not a protocol</strong>. It is a deterministic consequence of a committed membership entry, effective at that entry's index (<code>m_idx</code>).</p>
-  <div class="callout warn"><b>When does membership change?</b> When a node joins or leaves (D-21), and when an operator <em>retires</em> a member that is gone (D-95). A <em>crashed</em> voter stays in the membership and keeps owning its flows (D-94): stateful requests for those flows fail fast (a <code>503</code> at the scenario gate) until it comes back and recovers them from its own disk. Nothing removes a voter because it stopped answering; a GC pause or a short partition must not move ownership. For a node that will never return (a lost volume, a retired host), the operator runs <code>rift-cluster-server cluster remove-node &lt;id&gt; --via &lt;live member&gt;</code>. The leader retires it only if nothing at its advertised address answers as that node, then commits the removal exactly like a graceful leave, and its successors adopt its flows from the replicas (<a href='logs.html#converge'>section 15</a> steps through it).</div>
+  <div class="callout warn"><b>When does membership change?</b> When a node joins or leaves (D-21), and when an operator <em>retires</em> a member that is gone (D-95). A <em>crashed</em> voter stays in the membership and keeps owning its flows (D-94): stateful requests for those flows fail fast (a <code>503</code> at the scenario gate) until it comes back and recovers them from its own disk. Nothing removes a voter because it stopped answering; a GC pause or a short partition must not move ownership. For a node that will never return (a lost volume, a retired host), the operator runs <code>rift-cluster-server cluster remove-node &lt;id&gt; --via &lt;live member&gt;</code>. The leader retires it only if nothing at its advertised address answers as that node, then commits the removal exactly like a graceful leave, and its successors adopt its flows from the replicas (<a href='logs.html#converge'>section 14</a> steps through it).</div>
 </section>
 
-<!-- 11 -->
+<!-- 10 -->
 <section class="col" id="state">
-  <h2>11 · The state behind a stateful stub</h2>
-  <p><a href='flow-state.html#ring'>Section 10</a> says who owns a flow. This section is about what a flow <em>holds</em>, and what each kind of stateful stub does to it.</p>
+  <h2>10 · The state behind a stateful stub</h2>
+  <p><a href='flow-state.html#ring'>Section 9</a> says who owns a flow. This section is about what a flow <em>holds</em>, and what each kind of stateful stub does to it.</p>
   <p><strong>A flow</strong> is a small key-value map, named by a flow id. The imposter decides where the id comes from (<code>_rift.flowState.flowIdSource</code>): <code>"imposter_port"</code>, the default, gives the whole imposter one flow, and <code>"header:X-Flow-Id"</code> gives every distinct header value its own, falling back to the port when the header is absent. The store then scopes the id, <code>i8080:</code> by default, so two imposters that see the same header value don't share state; <code>contextScope: "fleet"</code> opts into one shared <code>f:</code> namespace instead. The scoped id is the flow's key on the ring, so <em>one</em> owner holds every key of a flow, which is what lets a scenario read and update it atomically.</p>
   <div class="tablewrap"><table>
     <thead><tr><th>Stub feature</th><th>What it does to the store</th><th>Owner chosen by</th><th>If the owner can't answer</th></tr></thead>
@@ -45,7 +45,7 @@
       <tr><td>Scenario transition<br><code>willSetStateTo</code></td><td>Compare-and-set, expecting the state the gate just read (for <code>"Started"</code>, also absence). If another request moved the state first, this transition is <em>dropped</em>, not forced: the state advances once. A stub with no gate does a plain set.</td><td>the scoped flow id</td><td><code>503</code></td></tr>
       <tr><td>Flow KV in scripts and templates</td><td>Get, set, delete, increment, per-key TTL. An increment is a read-modify-write at the owner, so concurrent counters are exact.</td><td>the scoped flow id</td><td>a script fails with <code>500</code>; a template renders the value empty</td></tr>
       <tr><td>Cycling responses</td><td>Node-local cursor by default. With <code>sequencing.mode: "owner"</code> the cursor lives in the owner's memory: never replicated or persisted, reset on a handoff (D-8).</td><td>port + stub</td><td>falls back to the local cursor, never a <code>503</code> (D-10)</td></tr>
-      <tr><td><code>proxyOnce</code></td><td>Claim at the owner, then record through Raft (<a href='requests.html#route'>section 9</a>).</td><td>port + request signature</td><td><code>503</code>; upstream is never called (D-66)</td></tr>
+      <tr><td><code>proxyOnce</code></td><td>Claim at the owner, then record through Raft (<a href='requests.html#route'>section 8</a>).</td><td>port + request signature</td><td><code>503</code>; upstream is never called (D-66)</td></tr>
     </tbody></table></div>
   <h3>The path of one stateful operation</h3>
   <ol class="steps">
@@ -61,9 +61,9 @@
   <p>Everything else in the next three sections is how those copies survive: replicas and fencing when ownership moves, the shard on disk, and anti-entropy when a push is lost.</p>
 </section>
 
-<!-- 12 -->
+<!-- 11 -->
 <section class="col" id="handoff">
-  <h2>12 · Replicas, handoff and fencing</h2>
+  <h2>11 · Replicas, handoff and fencing</h2>
   <p>The owner serializes every write and every correctness-bearing read for its keys. Each accepted write is pushed asynchronously to the two HRW successors, fire-and-forget, with a 5 s anti-entropy pull as backstop. The replicas exist for handoff and durability, not for read scaling.</p>
   <p>Every stored value carries a <strong>fencing tuple</strong> <code>(m_idx, v, origin)</code>: the membership index under which the writer owned the key, the owner's per-key write counter, and the writer's node id to break exact ties. Whoever adopts a key takes the highest tuple. A deposed owner's writes carry a smaller <code>m_idx</code>, so they lose by arithmetic.</p>
 </section>
@@ -73,14 +73,14 @@
 </section>
 <div class="fig seq" id="seq-isolated"></div>
 <section class="col">
-  <p>The rule is strict. Any node whose current leader is unknown refuses, so an ordinary leader election pauses owner-side flow operations on nodes that lost sight of the leader. Measured, that pause is about 13–40 ms per election.</p>
+  <p>The rule is strict. Any node whose current leader is unknown refuses, so an ordinary leader election pauses owner-side flow operations on nodes that lost sight of the leader. In practice that pause is about 13–40 ms per election.</p>
   <h3>proxyOnce: one upstream call, cluster-wide</h3>
   <p><code>proxyOnce</code> must call the real upstream once per request signature, record the answer, and replay it forever. Three nodes taking the same first hit at the same moment need an arbiter, and the ring provides one: the claim is owned like a flow, keyed by <code>(port, signature)</code>. The owner runs a small state machine: <code>Unclaimed → Pending</code> (the winner gets a token and calls upstream) <code>→ Recorded</code>, only after the recorded stub's config write commits. Pending lives only in the owner's memory, so a crash makes the signature claimable again. If no owner can serialize the claim, the request is refused with <code>503</code> and upstream is never called (D-66).</p>
 </section>
 
-<!-- 13 -->
+<!-- 12 -->
 <section class="col" id="durable">
-  <h2>13 · Flow state on disk</h2>
+  <h2>12 · Flow state on disk</h2>
   <p>R3 says flow state survives a full restart, but a quorum round per scenario transition at 20–40k RPS would be an outage. Each node instead runs a <code>FlowShard</code>: an embedded <code>redb</code> file (<code>flow.redb</code>, separate from the Raft store so the two fsync policies never contend) holding every key the node owns <em>or replicates</em>. Each key already lives on three nodes, so it lands on three disks with no new replication machinery. A single writer task per node batches mutations. Each imposter picks how hard to push:</p>
 </section>
 <div class="fig" id="fig-dur">
