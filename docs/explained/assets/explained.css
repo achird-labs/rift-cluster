@@ -158,7 +158,7 @@ button:disabled{opacity:.45;cursor:default}
 .wire-req{font-family:var(--mono);font-size:.72rem;line-height:1.5;background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:10px 12px;margin:10px 0 0;white-space:pre-wrap;overflow-wrap:anywhere;min-height:9em}
 .wire-req .hl{color:var(--accent);font-weight:600}
 .wire-req .bad{color:var(--bad);font-weight:600}
-.wire-pipe{display:grid;grid-template-columns:repeat(7,minmax(0,1fr));gap:6px;margin-top:10px}
+.wire-pipe{display:grid;grid-template-columns:repeat(8,minmax(0,1fr));gap:6px;margin-top:10px}
 @media (max-width:760px){.wire-pipe{grid-template-columns:repeat(2,minmax(0,1fr))}}
 
 /* Route playground */

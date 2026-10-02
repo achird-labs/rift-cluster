@@ -308,7 +308,9 @@ still **not built**; it is kept as the design of what it would have to look like
   replicas. **Order:** retire first, then start the replacement. At the voter
   ceiling a replacement stays a learner until the dead voter is out. If the
   retired node ever returns on its old state dir, it rejoins as a learner by
-  itself (`docs/rift-cluster-server.md`, "Restarting a node").
+  itself (`docs/rift-cluster-server.md`, "Restarting a node"). Until the dead member is
+  retired, a new pod at its address refuses the traffic named for it (D-96), and the leader
+  logs once that `another node answers at this member's address`, naming the id that answered.
 - **Restore quorum after majority loss**: last-resort
   `cluster force-recover --from-state-dir` on the best surviving node (log
   end inspected via `cluster inspect`), then rejoin others empty. Documented

@@ -2157,40 +2157,111 @@ async fn retire_without_the_cluster_secret_changes_nothing() {
     cluster.shutdown_all().await;
 }
 
-/// #641 T6, pins D-95: a dead member's address answered by a *different* node — a pod
+/// #641 T6, pins D-95 and D-96: a dead member's address answered by a *different* node — a pod
 /// rescheduled without its volume and without a pinned name, back at the same stable address under
-/// a new id — does not block the retire. Who answered is the evidence, and it is reported.
+/// a new id — does not block the retire, and does not stand in for the dead member meanwhile.
 ///
-/// The newcomer is a stub that answers only the membership route, not a full node. A full node at
-/// a reused address also receives the leader's replication stream for the *dead* id, because Raft
-/// RPCs are addressed by socket only; the leader then sees that "member's" log revert to empty and
-/// openraft's `follower log reversion is not allowed` debug assertion panics its core. That is a
-/// separate defect from the probe this test pins, tracked on its own.
+/// The newcomer is a full node. Every Raft message and member call the fleet addresses to the dead
+/// id names it, so the newcomer refuses them all: the leader keeps leading and committing, the dead
+/// member's replication progress does not move, the newcomer's own Raft state stays empty, and a
+/// member call to the dead id reports who answered. Then the retire goes through, with the
+/// newcomer named as the evidence.
 #[tokio::test(flavor = "multi_thread")]
 async fn retire_proceeds_when_the_dead_members_address_answers_as_another_node() {
     let _lock = TEST_LOCK.lock().await;
     let mut cluster = TestCluster::start(3).await;
     let (via, dead) = followers(&cluster).await;
+    let leader_id = cluster
+        .wait_for_leader(LEADER_DEADLINE)
+        .await
+        .expect("leader");
     let dead_addr = cluster.member(dead).addr;
+    let matched_at_crash = |cluster: &TestCluster| {
+        cluster
+            .member(leader_id)
+            .node
+            .as_ref()
+            .expect("live")
+            .replication_matching()
+            .into_iter()
+            .find(|(id, _)| *id == dead)
+            .and_then(|(_, matched)| matched)
+    };
+    cluster.write_on_leader(19_001, "before-crash").await;
     cluster.kill(dead).await;
-
-    let newcomer = rift_cluster::rpc::Router::new().route(
-        "POST",
-        "/internal/v1/cluster/membership",
-        Arc::new(|_body: Vec<u8>| -> rift_cluster::rpc::HandlerFuture {
-            Box::pin(async { Ok(br#"{"node_id":77,"m_idx":0,"members":[]}"#.to_vec()) })
-        }),
+    let matched_before = matched_at_crash(&cluster);
+    assert!(
+        matched_before.is_some(),
+        "the leader must have replicated to node {dead} before it crashed, or the progress check below proves nothing"
     );
-    let server = rift_cluster::RpcServer::bind(
-        dead_addr,
-        rift_cluster::rpc::RpcServerConfig::new(
-            Some(Arc::new(rift_cluster::rpc::Verifier::new(SECRET))),
-            newcomer,
-        ),
-    )
-    .await
-    .expect("the newcomer binds the dead member's address");
-    let newcomer_task = tokio::spawn(server.serve());
+
+    let newcomer_dir = TempDir::new().expect("tempdir");
+    let newcomer = spawn(77, dead_addr, newcomer_dir.path()).await;
+
+    // Writes keep committing while the leader replicates toward the dead id's address.
+    for k in 0..5 {
+        cluster.write_on_leader(19_002 + k, "while-reused").await;
+    }
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert_eq!(
+        cluster.wait_for_leader(LEADER_DEADLINE).await,
+        Some(leader_id),
+        "the leader must keep leading while another node answers at a member's address"
+    );
+    assert_eq!(
+        matched_at_crash(&cluster),
+        matched_before,
+        "the dead member's replication progress must not move on another node's answers"
+    );
+    assert_eq!(
+        newcomer.raft_term(),
+        0,
+        "the newcomer must not adopt the fleet's term from traffic meant for node {dead}"
+    );
+    assert!(
+        !newcomer.is_initialized().await.expect("read"),
+        "the newcomer must not read as a node with Raft state"
+    );
+    let reached = cluster
+        .member(leader_id)
+        .node
+        .as_ref()
+        .expect("live")
+        .call_member(dead, "POST", "/internal/v1/applied", Vec::new())
+        .await;
+    assert!(
+        matches!(&reached, Err(message) if message.contains("77")),
+        "a member call to node {dead} must report that node 77 answered, got {reached:?}"
+    );
+
+    // The newcomer joins as itself and catches up, so it now holds every entry. The write barrier
+    // asks each member how far it has applied; asked on the dead member's behalf, the newcomer
+    // must refuse rather than confirm with its own, caught-up index.
+    newcomer
+        .join_via(&Authority::from(cluster.member(leader_id).addr))
+        .await
+        .expect("the newcomer joins as itself");
+    let revision = cluster.write_on_leader(19_010, "barrier").await;
+    let deadline = Instant::now() + CONVERGE_DEADLINE;
+    while newcomer.status().last_applied < Some(revision) {
+        assert!(
+            Instant::now() < deadline,
+            "the newcomer never caught up as itself"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let unconfirmed = cluster
+        .member(leader_id)
+        .node
+        .as_ref()
+        .expect("live")
+        .await_applied(revision, Duration::from_millis(800))
+        .await;
+    assert_eq!(
+        unconfirmed,
+        vec![dead],
+        "only the dead member is unconfirmed; the caught-up newcomer must not confirm on its behalf"
+    );
 
     let reply = rift_cluster::retire_via(
         &cluster.member(via).addr.to_string(),
@@ -2215,7 +2286,7 @@ async fn retire_proceeds_when_the_dead_members_address_answers_as_another_node()
         }],
         "the evidence must name the id that answered at the dead member's address"
     );
-    newcomer_task.abort();
+    newcomer.shutdown().await.ok();
     cluster.shutdown_all().await;
 }
 

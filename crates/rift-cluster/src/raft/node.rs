@@ -48,7 +48,7 @@ use super::{NodeId, TypeConfig};
 use crate::control::{ControlOp, ControlRequest, ControlResponse, SessionKey};
 use crate::rpc::{
     Authority, DnsResolver, PeerResolver, Router, RpcClient, RpcClientConfig, RpcError, RpcServer,
-    RpcServerConfig, Signer, TrackedPeerHealth, Verifier,
+    RpcServerConfig, Signer, TrackedPeerHealth, Verifier, addressed,
 };
 use crate::stores::flow::FlowNet;
 
@@ -424,7 +424,11 @@ where
     for &peer in addrs {
         match call(peer).await {
             Ok(reply) => return Ok(reply),
-            Err(error) if error.is_liveness_failure() => {
+            // An address answered by another node is not the member answering (D-96): its next
+            // address may be the member, so this is worth trying past, like silence.
+            Err(error)
+                if error.is_liveness_failure() || matches!(error, RpcError::WrongNode { .. }) =>
+            {
                 last = SweepFailure::Attempted { peer, error };
             }
             Err(error) => return Err(SweepFailure::Attempted { peer, error }),
@@ -749,9 +753,12 @@ impl RaftNode {
             Arc::clone(&resolver),
         );
 
-        let server = RpcServer::bind(config.bind, RpcServerConfig::new(verifier, router))
-            .await
-            .map_err(|e| NodeError::Bind(e.to_string()))?;
+        let server = RpcServer::bind(
+            config.bind,
+            RpcServerConfig::new(verifier, router).with_node_id(config.node_id),
+        )
+        .await
+        .map_err(|e| NodeError::Bind(e.to_string()))?;
         let local = server
             .local_addr()
             .map_err(|e| NodeError::Bind(e.to_string()))?;
@@ -1300,7 +1307,10 @@ impl RaftNode {
         let authority = self
             .member_authority(id)
             .ok_or_else(|| format!("node {id} is not in the applied membership"))?;
-        self.call_any(&authority, method, path, body).await
+        // Named for the member, so another node at its address refuses instead of answering for
+        // it, and the error says who did (D-96).
+        self.call_any(&authority, method, &addressed(path, id), body)
+            .await
     }
 
     /// [`call_member`](Self::call_member) with the member's own error preserved.
@@ -1331,7 +1341,8 @@ impl RaftNode {
                 detail: format!("node {id} is not in the applied membership"),
                 op_id: None,
             })?;
-        self.call_any_typed(&authority, method, path, body).await
+        self.call_any_typed(&authority, method, &addressed(path, id), body)
+            .await
     }
 
     /// The current leader's advertise authority, if metrics know one right now.
@@ -1672,11 +1683,11 @@ impl RaftNode {
                     // confirming: they are the same process. A dead address in
                     // the set costs one fast-failed call per round, not a
                     // falsely-unconfirmed member (#79).
+                    // Named for the member, so a node now holding its address cannot confirm on
+                    // its behalf (D-96).
+                    let path = addressed(CLUSTER_APPLIED_PATH, *id);
                     for peer in peers {
-                        if let Ok(reply) = self
-                            .client
-                            .call(*peer, "POST", CLUSTER_APPLIED_PATH, Vec::new())
-                            .await
+                        if let Ok(reply) = self.client.call(*peer, "POST", &path, Vec::new()).await
                             && let Ok(reply) =
                                 serde_json::from_slice::<network::AppliedReply>(&reply)
                             && reply.applied.is_some_and(|a| a >= revision)
@@ -1719,7 +1730,12 @@ impl RaftNode {
             return self.raft.metrics().borrow().last_applied.map(|l| l.index);
         }
         let reply = match self
-            .call_any(&addr, "POST", CLUSTER_APPLIED_PATH, Vec::new())
+            .call_any(
+                &addr,
+                "POST",
+                &addressed(CLUSTER_APPLIED_PATH, leader_id),
+                Vec::new(),
+            )
             .await
         {
             Ok(reply) => reply,
@@ -5045,6 +5061,27 @@ mod tests {
         .await
         .expect("the live address answers");
         assert_eq!(reply, b"pong".to_vec());
+    }
+
+    /// Pins D-96: an address now held by another node does not end the sweep. The member may be
+    /// at its next address, and a member call must reach it there rather than report the
+    /// stranger's refusal.
+    #[tokio::test]
+    async fn an_address_answered_by_another_node_is_tried_past() {
+        let (reused, live) = (addr(9403), addr(9404));
+        let reply = sweep_addresses(&[reused, live], |peer| async move {
+            if peer == reused {
+                Err(RpcError::WrongNode {
+                    expected: 3,
+                    actual: 77,
+                })
+            } else {
+                Ok(b"member".to_vec())
+            }
+        })
+        .await
+        .expect("the member answers at its second address");
+        assert_eq!(reply, b"member".to_vec());
     }
 
     /// The empty sweep, exercised through `sweep_addresses` itself rather than by hand-building

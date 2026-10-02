@@ -672,6 +672,9 @@ An operator-driven `change_membership` may race the soft gate — by design, the
 what the *fleet* does on its own, not what an operator chooses.
 
 ### D-28 — Dial every resolved address; do not prefer IPv4
+> **Refined by D-96** (2026-10-02, #646): an address says where to dial, never who answers. A
+> request addressed to a member names it, and a node refuses a request named for another.
+
 - **Status:** active
 - **Decided:** 2026-08 · #79
 - **Code:** crates/rift-cluster/src/rpc/client.rs
@@ -4301,3 +4304,66 @@ vote with a typed refusal (it arrives after the node has already bumped its term
 `a_retired_node_that_restarts_rejoins_as_a_learner_without_moving_the_term` and
 `a_stopped_member_that_restarts_resumes_without_a_membership_change`
 (`crates/rift-cluster-server/tests/clustered.rs`) pin it.
+
+### D-96 — An address says where to dial, never who answers: a request to a member names it
+
+- **Status:** active
+- **Decided:** 2026-10-02 · #646
+- **Refines:** D-28, D-95
+- **Implemented by:** #646
+- **Code:** crates/rift-cluster/src/rpc/server.rs, crates/rift-cluster/src/rpc/routes.rs, crates/rift-cluster/src/raft/network.rs, crates/rift-cluster/src/raft/node.rs
+
+**The rule.** Every request the fleet sends *to a member*, as opposed to an address, carries that
+member's id as a `to` query parameter: Raft's AppendEntries, RequestVote and InstallSnapshot, the
+liveness probe, every `call_member` (flow, sequencing, proxyOnce and fleet-view calls), and the
+write barrier's applied-index polls, including the read of the leader's own index. The
+parameter is inside the signed `path_and_query`, so it can't be rewritten in flight. A node's cluster
+server knows its own id and checks the recipient after the credential and before any handler runs:
+
+- no `to`: accepted. That is an older sender, or a call that dials an address on purpose;
+- `to` equal to this node's id: accepted;
+- `to` naming another node: refused with `409 wrong_node`, naming the id the sender expected and
+  the id that answered;
+- a malformed `to` (empty, non-decimal, out of range, repeated): refused as a bad request. A signed
+  request that names its recipient badly is a sender bug, and the gate fails closed.
+
+A refusal is an answer, not silence. Ordinary and Raft calls credit the address's health for it, and
+the liveness probe neither credits nor charges it. A member call that resolves to several addresses
+tries the next one, because another node at one address says nothing about the member's others.
+Raft senders surface it to openraft as an unreachable peer: no replication progress advances and no vote is counted on
+another node's word. A member call reports who answered (D-61). The flow store classifies it as
+the owner being unavailable (`503`, D-65), and a proxyOnce claim refuses (D-66). The leader's
+liveness ticker logs the transition once, naming the id that answered and the remedy (retire the
+member, D-95).
+
+**Why.** A member's address is a place, and after a pod is rescheduled without its volume and
+without a pinned name, a different node with a different id can hold it. Before this rule,
+whoever answered at that address was taken to be the member. The newcomer took the dead member's
+replication and votes as its own, with none of that member's log or vote. A debug build's leader
+panicked on the follower's log going backwards. A release build mis-tracks the member's progress.
+And a newcomer can grant a vote the real member would have refused, which is how a committed
+write could be lost.
+
+**Deliberately unaddressed.** A join through a seed, the CLI's `--via`, a write, leave or retire
+forwarded to the leader, D-95's retire probe and the restart removal check. These dial an address
+because they don't know who is there; the probe exists to find out.
+
+**Mixed versions.** A new sender to an old receiver: the query is signed and ignored by routing. An
+old sender to a new receiver: no `to`, accepted. Protection holds where both ends are new, and
+nothing breaks during a rolling upgrade.
+
+**Rejected.** A check in each Raft handler (handlers receive only the body, and it would leave
+`call_member` open). The recipient in the body (a wrapper breaks old receivers). Enabling openraft's
+`loosen-follower-log-revert` (it removes the crash by replicating to the wrong node on purpose).
+
+**Not covered.** A node that returns under the *same* id with a wiped state dir passes this check,
+because the id matches.
+
+`a_request_named_for_another_node_never_reaches_a_handler`,
+`a_malformed_recipient_is_refused_as_a_bad_request`,
+`an_unauthenticated_caller_is_refused_before_the_recipient_is_compared` and
+`re_addressing_a_signed_request_breaks_its_signature` (`crates/rift-cluster/src/rpc/server.rs`),
+`a_vote_to_a_reused_address_is_refused_and_does_not_mark_it_unhealthy`
+(`crates/rift-cluster/src/raft/network.rs`) and
+`retire_proceeds_when_the_dead_members_address_answers_as_another_node`
+(`crates/rift-cluster/tests/cluster.rs`) pin it.
