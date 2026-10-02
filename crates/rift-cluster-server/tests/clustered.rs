@@ -1229,3 +1229,356 @@ async fn a_joiner_bootstraps_its_imposters_into_the_founders_log() {
     joiner.shutdown().await;
     founder.shutdown().await;
 }
+
+/// A three-node clustered fleet whose third member sits on a fixed cluster address and state dir,
+/// so it can be stopped and brought back as "the same pod". Returns `(founder, keeper, victim)`.
+async fn fleet_with_a_restartable_member(
+    founder_state: &TempDir,
+    keeper_state: &TempDir,
+    victim_state: &TempDir,
+    founder_bind: &str,
+    victim_bind: &str,
+) -> (
+    compose::ComposedServer,
+    compose::ComposedServer,
+    compose::ComposedServer,
+) {
+    let founder = compose::start(cluster_on(
+        founder_state,
+        founder_bind,
+        "127.0.0.1:0",
+        &["--cluster-allow-solo"],
+    ))
+    .await
+    .expect("founder starts");
+    let keeper = compose::start(cluster_on(
+        keeper_state,
+        &reserve_port(),
+        "127.0.0.1:0",
+        &["--cluster-seeds", founder_bind],
+    ))
+    .await
+    .expect("keeper starts");
+    let victim = compose::start(cluster_on(
+        victim_state,
+        victim_bind,
+        "127.0.0.1:0",
+        &["--cluster-seeds", founder_bind],
+    ))
+    .await
+    .expect("victim starts");
+    wait_voter_count(
+        founder.node().expect("clustered"),
+        3,
+        "all three must be voters",
+    )
+    .await;
+    (founder, keeper, victim)
+}
+
+/// #641 T5, pins D-95 — D-26's new row. A voter that crashed and was then **retired** comes back on its old
+/// state dir. Its log still lists it, so before #641 it resumed as a voter, campaigned after the
+/// 3 s election hold, and climbed its term for a minute against survivors that refused it —
+/// measured (T0): term 1 → 65 over 61 s with the leader flat at 1, still not re-admitted. Now
+/// startup asks its peers, learns it is out at a newer membership index, and rejoins as a learner.
+///
+/// The 10 s bound is the point, not a margin: the #72 fallback re-offers a leaderless node after
+/// 60 s, so a test that only waited for membership would pass with the new check deleted.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_retired_node_that_restarts_rejoins_as_a_learner_without_moving_the_term() {
+    let (founder_state, keeper_state, victim_state) = (
+        TempDir::new().expect("tempdir"),
+        TempDir::new().expect("tempdir"),
+        TempDir::new().expect("tempdir"),
+    );
+    let founder_bind = reserve_port();
+    let victim_bind = reserve_port();
+    let (founder, keeper, victim) = fleet_with_a_restartable_member(
+        &founder_state,
+        &keeper_state,
+        &victim_state,
+        &founder_bind,
+        &victim_bind,
+    )
+    .await;
+    let founder_node = founder.node().expect("clustered").clone();
+    let keeper_node = keeper.node().expect("clustered").clone();
+    let victim_id = victim.node().expect("clustered").id();
+
+    victim.shutdown().await;
+    let reply = rift_cluster::retire_via(
+        &keeper_node.advertise().to_string(),
+        Some(SECRET),
+        victim_id,
+        Duration::from_secs(30),
+    )
+    .await
+    .expect("retire answers");
+    assert!(
+        matches!(reply, rift_cluster::RetireReply::Retired { .. }),
+        "the stopped voter must be retired, got {reply:?}"
+    );
+    wait_voter_count(&founder_node, 2, "the retirement must shrink the voter set").await;
+    let term = founder_node.raft_term();
+    assert_eq!(keeper_node.raft_term(), term, "survivors agree on the term");
+
+    let started = std::time::Instant::now();
+    let returned = compose::start(cluster_on(
+        &victim_state,
+        &victim_bind,
+        "127.0.0.1:0",
+        &["--cluster-seeds", &founder_bind],
+    ))
+    .await
+    .expect("a retired node must start on its old state dir");
+    let returned_node = returned.node().expect("clustered").clone();
+    assert_eq!(
+        returned_node.id(),
+        victim_id,
+        "same state dir, same identity"
+    );
+
+    let mut member_after = None;
+    while started.elapsed() < Duration::from_secs(15) {
+        let status = founder_node.status();
+        if member_after.is_none()
+            && (status.voters.contains(&victim_id) || status.learners.contains(&victim_id))
+        {
+            member_after = Some(started.elapsed());
+        }
+        assert_eq!(
+            founder_node.raft_term(),
+            term,
+            "the founder's term must not move"
+        );
+        assert_eq!(
+            keeper_node.raft_term(),
+            term,
+            "the keeper's term must not move"
+        );
+        assert!(
+            returned_node.raft_term() <= term,
+            "the returned node campaigned: its term is {} against the fleet's {term}",
+            returned_node.raft_term()
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let member_after = member_after.expect("the retired node must be a member again within 15 s");
+    assert!(
+        member_after < Duration::from_secs(10),
+        "rejoined after {member_after:?}; inside the election hold is the contract"
+    );
+    let probes = returned.probe_addr().expect("probes bound").to_string();
+    wait_ready(&probes, "the returned node").await;
+
+    returned.shutdown().await;
+    keeper.shutdown().await;
+    founder.shutdown().await;
+}
+
+/// #641, pins D-95's restart row from the other side: a member that merely **stopped** — never
+/// retired — and comes back while its peers are up must resume, not rejoin. Its peers answer the
+/// new check with a committed membership that still lists it, which is not evidence. A rejoin would
+/// commit a membership entry, so the fleet's `m_idx` must not move.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stopped_member_that_restarts_resumes_without_a_membership_change() {
+    let (founder_state, keeper_state, victim_state) = (
+        TempDir::new().expect("tempdir"),
+        TempDir::new().expect("tempdir"),
+        TempDir::new().expect("tempdir"),
+    );
+    let founder_bind = reserve_port();
+    let victim_bind = reserve_port();
+    let (founder, keeper, victim) = fleet_with_a_restartable_member(
+        &founder_state,
+        &keeper_state,
+        &victim_state,
+        &founder_bind,
+        &victim_bind,
+    )
+    .await;
+    let founder_node = founder.node().expect("clustered").clone();
+    let victim_id = victim.node().expect("clustered").id();
+    let m_idx = founder_node.ring().m_idx();
+    let term = founder_node.raft_term();
+
+    victim.shutdown().await;
+    let returned = compose::start(cluster_on(
+        &victim_state,
+        &victim_bind,
+        "127.0.0.1:0",
+        &["--cluster-seeds", &founder_bind],
+    ))
+    .await
+    .expect("a stopped member restarts");
+    let probes = returned.probe_addr().expect("probes bound").to_string();
+    wait_ready(&probes, "the restarted member").await;
+
+    assert!(
+        founder_node.status().voters.contains(&victim_id),
+        "the member must still be a voter"
+    );
+    assert_eq!(
+        founder_node.ring().m_idx(),
+        m_idx,
+        "a resume commits no membership entry; a rejoin would"
+    );
+    assert_eq!(founder_node.raft_term(), term, "the term must not move");
+
+    returned.shutdown().await;
+    keeper.shutdown().await;
+    founder.shutdown().await;
+}
+
+/// The binary, run to completion with a hard bound: a regression that sent `cluster` to the server
+/// parser could start serving instead of exiting, and `output()` would then hang the suite.
+fn run_cluster_command(args: &[&str]) -> (i32, String, String) {
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_rift-cluster-server"))
+        .args(args)
+        .env_remove("RIFT_CLUSTER_SECRET")
+        .env_remove("RIFT_CLUSTER_SECRET_FILE")
+        .env_remove("RIFT_CLUSTER_INSECURE")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn the binary");
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        if let Some(status) = child.try_wait().expect("poll the child") {
+            let mut out = String::new();
+            let mut err = String::new();
+            use std::io::Read as _;
+            child
+                .stdout
+                .take()
+                .expect("stdout")
+                .read_to_string(&mut out)
+                .ok();
+            child
+                .stderr
+                .take()
+                .expect("stderr")
+                .read_to_string(&mut err)
+                .ok();
+            return (status.code().unwrap_or(-1), out, err);
+        }
+        if std::time::Instant::now() >= deadline {
+            child.kill().ok();
+            panic!("`{}` did not exit within 60 s", args.join(" "));
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+async fn cluster_command(args: Vec<String>) -> (i32, String, String) {
+    tokio::task::spawn_blocking(move || {
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        run_cluster_command(&args)
+    })
+    .await
+    .expect("join the command")
+}
+
+/// #641 T7, pins D-95: `rift-cluster-server cluster remove-node` end to end — the subcommand is routed before
+/// the server's own parser, retires a stopped member through any live node, is idempotent on a
+/// re-run, and refuses a member that is still alive with the action to take instead.
+#[tokio::test(flavor = "multi_thread")]
+async fn cluster_remove_node_retires_a_stopped_member_end_to_end() {
+    let (founder_state, keeper_state, victim_state) = (
+        TempDir::new().expect("tempdir"),
+        TempDir::new().expect("tempdir"),
+        TempDir::new().expect("tempdir"),
+    );
+    let founder_bind = reserve_port();
+    let victim_bind = reserve_port();
+    let (founder, keeper, victim) = fleet_with_a_restartable_member(
+        &founder_state,
+        &keeper_state,
+        &victim_state,
+        &founder_bind,
+        &victim_bind,
+    )
+    .await;
+    let keeper_node = keeper.node().expect("clustered").clone();
+    let via = keeper_node.advertise().to_string();
+    let remove = |id: u64| {
+        vec![
+            "cluster".to_owned(),
+            "remove-node".to_owned(),
+            id.to_string(),
+            "--via".to_owned(),
+            via.clone(),
+            "--cluster-secret".to_owned(),
+            SECRET.to_owned(),
+        ]
+    };
+
+    // Still alive: refused, with the action to take.
+    let live_id = victim.node().expect("clustered").id();
+    let (code, _, err) = cluster_command(remove(live_id)).await;
+    assert_eq!(code, 1, "a live target must be refused: {err}");
+    assert!(
+        err.contains("answers") && err.contains("stop it"),
+        "the refusal must say it is alive and what to do: {err}"
+    );
+
+    victim.shutdown().await;
+    let (code, out, err) = cluster_command(remove(live_id)).await;
+    assert_eq!(code, 0, "retiring a stopped member must succeed: {err}");
+    assert!(
+        out.contains(&format!("retired node {live_id}")),
+        "the success line must name the node: {out}"
+    );
+    wait_voter_count(
+        founder.node().expect("clustered"),
+        2,
+        "the voter set shrinks",
+    )
+    .await;
+
+    let (code, out, err) = cluster_command(remove(live_id)).await;
+    assert_eq!(code, 0, "a re-run is idempotent: {err}");
+    assert!(out.contains("not a member"), "a re-run must say so: {out}");
+
+    keeper.shutdown().await;
+    founder.shutdown().await;
+}
+
+/// #641 T7: the operator-facing failures of the subcommand, without a fleet.
+#[tokio::test(flavor = "multi_thread")]
+async fn cluster_remove_node_refuses_without_a_secret_and_reports_an_unreachable_via() {
+    let closed = reserve_port();
+    let (code, _, err) = cluster_command(
+        ["cluster", "remove-node", "5", "--via", &closed]
+            .map(str::to_owned)
+            .to_vec(),
+    )
+    .await;
+    assert_ne!(code, 0, "no secret must not run: {err}");
+    assert!(
+        err.contains("--cluster-secret"),
+        "name the missing flag: {err}"
+    );
+
+    let (code, _, err) = cluster_command(
+        [
+            "cluster",
+            "remove-node",
+            "5",
+            "--via",
+            &closed,
+            "--cluster-secret",
+            SECRET,
+            "--timeout",
+            "3",
+        ]
+        .map(str::to_owned)
+        .to_vec(),
+    )
+    .await;
+    assert_eq!(code, 1, "an unreachable --via is an error: {err}");
+    assert!(
+        err.contains("unreachable"),
+        "say the via node was unreachable: {err}"
+    );
+}

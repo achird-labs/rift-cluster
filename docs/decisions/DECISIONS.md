@@ -534,7 +534,13 @@ fill it in; both were built on the wrong premise. An issue whose facts all check
 wrong at the intent level — this entry is what a triage checks it against.
 
 ### D-21 — Cluster membership changes only via a node joining or leaving
-- **Status:** active
+> **Amended by D-95** (2026-10-02, #641): one departure is performed on a member's behalf. A
+> member that cannot leave because it is gone is retired by an operator holding the cluster
+> secret, over the signed cluster port, through the leader. Nothing is added to the fleet this
+> way, the admin key cannot reach it, and the console still offers nothing. The leader refuses
+> unless the member's advertised address fails to answer *as that member*.
+
+- **Status:** amended
 - **Decided:** 2026-08-10 · #366 (rejected by design)
 - **Code:** crates/rift-cluster/src/raft/node.rs
 
@@ -633,6 +639,12 @@ rejected as orchestrator-specific — so the residual raciness of a fast roll is
 than papered over with a signal only one platform can send.
 
 ### D-26 — The `departed` marker and the join-or-bootstrap table; no state wiping
+> **Amended by D-95** (2026-10-02, #641): the table gains a row. A node with no marker whose own
+> log still lists it, but a live peer's committed membership at a *higher* log index does not, was
+> retired while it was down: it rejoins as a learner, state retained, instead of resuming. Asked
+> once at start, bounded inside the restart election hold; silence or an older build is not
+> evidence and resumes as before.
+
 - **Status:** amended
 - **Decided:** 2026-08 · #72
 - **Code:** crates/rift-cluster-server/src/compose.rs, crates/rift-cluster/src/raft/node.rs
@@ -4182,6 +4194,9 @@ shrinking the voter set on suspicion is how a minority comes to form a quorum. A
 for 1/N of flows while a pod restarts is the honest failure (Chapter 9's standing rule); a silent
 ownership move on a false positive is not. This is the same choice etcd makes.
 
+> **Amended by D-95** (2026-10-02, #641): the gap below is closed. `cluster remove-node` retires
+> a member that is gone; the rule above — nothing removes a voter *on its own* — is unchanged.
+
 **The gap it leaves, stated.** A voter that never comes back has no supported removal: D-21 rules
 out an admin route and the Chapter 10 `cluster remove-node` runbook is unbuilt. Until #641 lands,
 such a member keeps 1/N of keys at `503` and stays in the quorum denominator.
@@ -4196,3 +4211,93 @@ it: after a non-leader owner is stopped without leaving, the survivors' ring kee
 `m_idx` well past an election and a promotion sweep, and a write to its flow fails rather than
 being served by a successor. It bounds its own window (3 s): a failure detector slower than that
 would not turn it red.
+
+### D-95 — An operator retires a member that is gone, through the leader, and only when nothing answers as it
+
+- **Status:** active
+- **Decided:** 2026-10-02 · #641
+- **Amends:** D-21, D-26
+- **Refines:** D-94
+- **Implemented by:** #641
+- **Code:** crates/rift-cluster/src/raft/network.rs, crates/rift-cluster/src/raft/node.rs, crates/rift-cluster-server/src/compose.rs, crates/rift-cluster-server/src/cluster_cmd.rs
+
+**The rule.** `rift-cluster-server cluster remove-node <id> --via <live member>` sends a signed
+`POST /internal/v1/cluster/retire` with the cluster secret. Any member accepts it. A follower
+answers with a redirect, and the client chases it to the leader's advertised address. The leader
+then:
+
+1. confirms with a quorum that it still leads (`ensure_linearizable`, bounded 3 s). Without that
+   confirmation the answer is *unavailable*, never a refusal.
+2. answers `NotAMember` for an id absent from the committed membership. That is a distinct outcome
+   from a removal, so a mistyped 19-digit id cannot read as success.
+3. refuses its own id (`IsLeader`).
+4. probes the member's advertise authority outside the membership gate, for 3 rounds. Each round
+   re-resolves the authority and asks every address it yields (D-28)
+   `POST /internal/v1/cluster/membership`: who is there? Three outcomes count as gone:
+   - the probe fails and a plain TCP connect also fails;
+   - the authority resolved to no address in *any* round;
+   - a *different* node id answers.
+
+   The member's own id is `Reachable`. Every other outcome is `Unidentified`:
+   - a socket that accepts a connection but never answers (a paused or wedged process);
+   - an older build's unknown route;
+   - an auth refusal;
+   - a peer's 503 (`Shed`, although it counts as a liveness failure for health accounting);
+   - an undecodable body.
+
+   `Reachable` and `Unidentified` are both refusals.
+5. runs `evict` unchanged, so the gate, the D-25 floor and the one-step `RemoveVoters` (D-59) are
+   shared with a graceful leave. A learner leaves by `RemoveNodes`.
+
+A refusal is a normal reply on the `LeaveAccepted` precedent. A success returns the new `m_idx`,
+the surviving voters and the per-address evidence, and the leader logs it at `warn!`.
+
+**Why this is not the second entry point D-21 rejected.** D-21's concern was *admission*: operator
+input written into the membership log. Retirement adds nothing. It also grants no power the cluster
+secret did not already hold: `/internal/v1/cluster/leave` evicts whatever id its body names,
+because the MAC carries no sender identity. The new route is strictly more guarded than that. The
+admin key cannot reach it, and the console offers nothing.
+
+**Why no `--force` and no probe window.** A target that answers as itself is alive and can be
+stopped, and stopping it makes it leave. The only case `--force` would add is a node that answers
+and cannot be stopped, and that is the one case where nobody can vouch it has stopped serving the
+keys its successors are about to adopt. Fence the host, then retire. A longer window measures
+"down now", which a restarting pod also is. "Gone for good" is the operator's knowledge (D-94's own
+argument).
+
+**What the probe cannot see, accepted.** The resolver cannot tell a deleted DNS record from a
+failing lookup. Treating every lookup failure as "present" would make the main Kubernetes case,
+a gone pod whose headless record was deleted, impossible to retire. So a name that fails to
+resolve in every round counts as gone. A live node the leader cannot resolve for that long is
+also beyond the leader's replication, which resolves the same name, so it holds no lease and
+refuses owner-side writes (D-17). The same holds for a node partitioned from the leader. Both
+are reasons the operator, not the probe, asserts "gone for good". When such a node comes back,
+the restart check below sends it to rejoin as a learner.
+
+**Why no tombstone.** A banned-id set would block the D-26 "same name, wiped state dir" return of
+a node that *should* come back. It would also be a new replicated op, which an older build cannot
+decode (D-53's finding). Instead, D-26 gains a row. On start, a node with no `departed` marker and
+whose own log lists it asks its seeds and remembered peers for their committed membership. It
+asks once, within 2 s, which is inside the 3 s election hold. A membership at a *higher* log
+index that omits the node sends it down the existing rejoin path as a learner, with its
+elections held until the rejoin completes (`RaftNode::hold_elections`). Silence or an older build
+resumes as before.
+Measured on master before this change: a retired voter restarted on its old state dir campaigned
+from 3 s on, climbed to term 66 against survivors flat at term 1, and was re-admitted only by the
+60 s #72 fallback, at which point the whole fleet's term jumped to 68.
+
+**Rejected.** A `--cluster-retire <id>` server flag (a one-shot client behind a flag a pod spec can
+set by accident). Always re-joining on restart (openraft writes a membership entry even for a
+no-op change, so every restart would move `m_idx` and the ring). Survivors answering a non-member's
+vote with a typed refusal (it arrives after the node has already bumped its term once).
+
+`retire_removes_a_crashed_voter`,
+`retire_refuses_a_live_target_the_leader_and_reports_an_unknown_id`,
+`retire_refuses_while_the_members_address_answers_unidentifiably`,
+`retire_removes_a_crashed_learner_without_touching_the_voters`,
+`retire_proceeds_when_the_dead_members_address_answers_as_another_node` and
+`retire_without_the_cluster_secret_changes_nothing` (`crates/rift-cluster/tests/cluster.rs`),
+`a_retired_owners_flow_is_served_by_its_successor` (`crates/rift-cluster/tests/flow_store.rs`) and
+`a_retired_node_that_restarts_rejoins_as_a_learner_without_moving_the_term` and
+`a_stopped_member_that_restarts_resumes_without_a_membership_change`
+(`crates/rift-cluster-server/tests/clustered.rs`) pin it.

@@ -1299,6 +1299,119 @@ async fn a_crashed_voter_keeps_its_keys_until_it_leaves() {
     }
 }
 
+/// #641 T3, pins D-95 — the other half of D-94: once a crashed owner is **retired**, the departure commits and
+/// ownership moves to the HRW successor, which adopts the flow from the surviving replica. The
+/// old owner is stopped without leaving and removed by `retire_via` — not by test fiat — so this
+/// is the path an operator takes. Without the retire, the write at the end fails exactly as
+/// `a_crashed_voter_keeps_its_keys_until_it_leaves` pins.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_retired_owners_flow_is_served_by_its_successor() {
+    let _lock = TEST_LOCK.lock().await;
+    let members = flow_cluster_of(3, Duration::from_secs(60)).await;
+
+    let ring_before = members[0].node.ring();
+    let leader_id = members[0].node.id();
+    let (flow_id, owner_id) = (0..64)
+        .map(|i| format!("flow-retire-{i}"))
+        .find_map(|candidate| {
+            let owner = ring_before.owner(OwnedKey::new(KeyClass::FlowKv, &stored(&candidate)))?;
+            (owner != leader_id).then_some((candidate, owner))
+        })
+        .expect("some flow is owned by a non-leader");
+    let stored_id = stored(&flow_id);
+    let survivors: Vec<NodeId> = members
+        .iter()
+        .map(|m| m.node.id())
+        .filter(|&id| id != owner_id)
+        .collect();
+    let successor_id = rift_cluster::Ring::new(survivors.iter().copied(), 0)
+        .owner(OwnedKey::new(KeyClass::FlowKv, &stored_id))
+        .expect("two survivors");
+    let successor = members
+        .iter()
+        .find(|m| m.node.id() == successor_id)
+        .expect("successor member");
+
+    let store = store_on(&members[0], serde_json::json!({}));
+    {
+        let store = Arc::clone(&store);
+        let flow = flow_id.clone();
+        blocking(move || store.set(&flow, "k", serde_json::json!("before")))
+            .await
+            .expect("write while the owner is up");
+    }
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while successor.shard.get(&stored_id, "k").is_none() {
+        assert!(
+            Instant::now() < deadline,
+            "push never reached the successor"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    let owner = members
+        .iter()
+        .find(|m| m.node.id() == owner_id)
+        .expect("owner member");
+    owner
+        .node
+        .shutdown()
+        .await
+        .expect("stop the owner without leaving");
+
+    let reply = rift_cluster::retire_via(
+        &members[0].node.advertise().to_string(),
+        Some(SECRET),
+        owner_id,
+        Duration::from_secs(30),
+    )
+    .await
+    .expect("retire answers");
+    assert!(
+        matches!(reply, rift_cluster::RetireReply::Retired { .. }),
+        "the crashed owner must be retired, got {reply:?}"
+    );
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while members
+        .iter()
+        .filter(|m| m.node.id() != owner_id)
+        .any(|m| m.node.ring().members().len() != 2)
+    {
+        assert!(
+            Instant::now() < deadline,
+            "the retirement never reached every survivor's ring"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    let flow = flow_id.clone();
+    let reader = Arc::clone(&store);
+    let seen = tokio::time::timeout(
+        Duration::from_secs(15),
+        blocking(move || reader.get(&flow, "k")),
+    )
+    .await
+    .expect("the read must not hang")
+    .expect("the successor serves the retired owner's flow");
+    assert_eq!(
+        seen,
+        Some(serde_json::json!("before")),
+        "the successor must adopt the value from the replica"
+    );
+    let flow = flow_id.clone();
+    tokio::time::timeout(
+        Duration::from_secs(15),
+        blocking(move || store.set(&flow, "k", serde_json::json!("after"))),
+    )
+    .await
+    .expect("the write must not hang")
+    .expect("the successor accepts writes to the retired owner's flow");
+
+    for member in members.iter().filter(|m| m.node.id() != owner_id) {
+        member.node.shutdown().await.expect("shutdown");
+    }
+}
+
 /// #121: `durability: "none"` means none **fleet-wide**, not just at the owner.
 ///
 /// The replication push carries the write's own durability, so a replica holds

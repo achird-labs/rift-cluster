@@ -10,7 +10,7 @@
 //! the node through a shared [`OnceCell`] the node fills in once construction
 //! completes — before it accepts any peer traffic.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -52,6 +52,13 @@ pub(crate) const CLUSTER_WRITE_PATH: &str = "/internal/v1/cluster/write";
 /// Applied-index endpoint: reports how far this node's state machine has
 /// applied, for the write barrier (issue #9).
 pub(crate) const CLUSTER_APPLIED_PATH: &str = "/internal/v1/applied";
+/// Membership-view endpoint (#641): any node answers with its own id and its
+/// *committed* membership. Read-only; it is how the retire probe learns who
+/// answered at an address, and how a restarting node learns it was removed.
+pub(crate) const CLUSTER_MEMBERSHIP_PATH: &str = "/internal/v1/cluster/membership";
+/// Retire endpoint (#641, D-95): an operator holding the cluster secret asks the
+/// leader to remove a member that is gone and so cannot leave by itself.
+pub(crate) const CLUSTER_RETIRE_PATH: &str = "/internal/v1/cluster/retire";
 
 /// The maximum voter count the cluster auto-promotes a joining learner up to.
 /// Beyond this a larger quorum costs more than it buys, so extra members stay
@@ -116,6 +123,81 @@ pub(crate) struct JoinRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct LeaveRequest {
     pub node_id: NodeId,
+}
+
+/// An operator's request to retire a member that is gone (#641). Sent to any
+/// node; only the leader acts on it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct RetireRequest {
+    pub node_id: NodeId,
+}
+
+/// A node's answer on [`CLUSTER_MEMBERSHIP_PATH`]: who it is, and the committed
+/// membership it holds. `m_idx` is that membership's log index, 0 before any.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct MembershipView {
+    pub node_id: NodeId,
+    pub m_idx: u64,
+    pub members: BTreeSet<NodeId>,
+}
+
+/// The leader's answer to a retire request (#641, D-95). A refusal is a normal
+/// answer, not an error — the precedent is [`LeaveAccepted`]: the request was
+/// understood and judged, and the operator needs the judgement.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RetireReply {
+    /// The departure committed. `m_idx` is the new membership's log index and
+    /// `voters` the voters left; `evidence` is what each of the member's
+    /// addresses answered when the leader probed it.
+    Retired {
+        m_idx: u64,
+        voters: BTreeSet<NodeId>,
+        evidence: Vec<ProbeEvidence>,
+    },
+    /// The id is not in the committed membership. Distinct from `Retired` so a
+    /// mistyped 19-digit id never reads as a removal; a re-run after success
+    /// lands here too.
+    NotAMember,
+    /// The leader declined; nothing changed.
+    Refused(RetireRefusal),
+}
+
+/// Why the leader declined a retire.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RetireRefusal {
+    /// The target is the leader handling the request — alive by definition.
+    /// Stopping it makes it leave.
+    IsLeader,
+    /// The target's address answered as the target: it is alive, and stopping
+    /// it is how it leaves. There is no override (D-95).
+    Reachable { addr: String },
+    /// Something answered at the target's address but could not say who it is
+    /// (an older build without the membership route, an auth refusal, a shed).
+    /// A gate that cannot tell who answered treats it as the live member.
+    Unidentified { addr: String, detail: String },
+    /// The D-25 voter floor refused the removal.
+    HeldByFloor,
+}
+
+/// What one of a retired member's addresses showed when the leader probed it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProbeEvidence {
+    /// The resolved address, or the advertised authority when it never resolved.
+    pub addr: String,
+    pub seen: ProbeSeen,
+}
+
+/// The three ways an address can count as "not the member" (D-95).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ProbeSeen {
+    /// Nothing accepted a connection there.
+    NoAnswer,
+    /// The advertised authority resolved to no address in any round; `detail` is
+    /// the resolver's last error.
+    NoAddress { detail: String },
+    /// A *different* node answered: the address was reused, so it says nothing
+    /// about the retired member.
+    AnotherNode { node_id: NodeId },
 }
 
 /// A shared, late-filled handle to a node's [`Raft`]. The router captures a clone
@@ -857,6 +939,8 @@ pub(crate) fn control_routes(
     slot: RaftSlot,
     gate: MembershipGate,
     ceiling: AutoVoterCeiling,
+    client: RpcClient,
+    resolver: Arc<dyn PeerResolver>,
 ) -> Router {
     let admission_ceiling = ceiling;
     let append = slot.clone();
@@ -865,8 +949,11 @@ pub(crate) fn control_routes(
     let write = slot.clone();
     let applied = slot.clone();
     let leave = slot.clone();
+    let membership = slot.clone();
+    let retirement = slot.clone();
     let join = slot;
     let admission_gate = Arc::clone(&gate);
+    let retirement_gate = Arc::clone(&gate);
     let eviction_gate = gate;
     // Two names, one gate — each route closure needs its own handle, and the
     // names say which critical section each one serves. They must stay the same
@@ -971,6 +1058,32 @@ pub(crate) fn control_routes(
                         role: Some(admission.role),
                         catching_up: admission.catching_up,
                     })
+                })
+            }),
+        )
+        .route(
+            "POST",
+            CLUSTER_MEMBERSHIP_PATH,
+            Arc::new(move |_body: Vec<u8>| -> HandlerFuture {
+                let slot = membership.clone();
+                Box::pin(async move {
+                    let raft = raft_of(&slot)?;
+                    encode(&membership_view(raft).await?)
+                })
+            }),
+        )
+        .route(
+            "POST",
+            CLUSTER_RETIRE_PATH,
+            Arc::new(move |body: Vec<u8>| -> HandlerFuture {
+                let slot = retirement.clone();
+                let gate = Arc::clone(&retirement_gate);
+                let client = client.clone();
+                let resolver = Arc::clone(&resolver);
+                Box::pin(async move {
+                    let raft = raft_of(&slot)?;
+                    let req = decode::<RetireRequest>(&body)?;
+                    encode(&retire(raft, &gate, &client, &resolver, req.node_id).await?)
                 })
             }),
         )
@@ -1442,6 +1555,276 @@ pub(crate) async fn evict(
     Ok(EvictOutcome::Removed)
 }
 
+/// How long the leader may take to confirm it still leads before a retire is
+/// answered as unavailable. A quorum round trip normally takes milliseconds; a
+/// leader that cannot get one in this long cannot commit a removal either.
+const RETIRE_LEADERSHIP_DEADLINE: Duration = Duration::from_secs(3);
+/// Rounds the retire probe dials every address in. More than one so an address
+/// that drops a single connection is not taken for silent.
+const RETIRE_PROBE_ROUNDS: usize = 3;
+/// How long one probe of one address may take.
+const RETIRE_PROBE_DEADLINE: Duration = Duration::from_millis(500);
+/// The pause between probe rounds.
+const RETIRE_PROBE_INTERVAL: Duration = Duration::from_millis(500);
+
+/// This node's id and committed membership — the [`CLUSTER_MEMBERSHIP_PATH`] answer.
+pub(crate) async fn membership_view(raft: &Raft<TypeConfig>) -> Result<MembershipView, RpcError> {
+    let node_id = raft.metrics().borrow().id;
+    raft.with_raft_state(move |state| {
+        let committed = state.membership_state.committed();
+        MembershipView {
+            node_id,
+            m_idx: committed.log_id().map_or(0, |log_id| log_id.index),
+            members: committed.nodes().map(|(id, _)| *id).collect(),
+        }
+    })
+    .await
+    .map_err(|e| RpcError::Handler(format!("reading committed membership: {e}")))
+}
+
+/// Leader-side: retire `target`, a member that is gone (#641, D-95).
+///
+/// In order: confirm leadership first, so a stale follower never answers a
+/// refusal from an old read; then judge the target against the *committed*
+/// membership; then probe its advertised address, outside the membership gate so
+/// slow I/O never holds up an admission; then [`evict`], which owns the gate, the
+/// D-25 floor and the one-step `RemoveVoters` (D-59) exactly as a `leave` does.
+///
+/// The probe is the safety: a member is retired only when none of its addresses
+/// answers *as that member*. "Gone for good" is the operator's knowledge (D-94);
+/// what the leader checks is that nobody is still serving as the node whose keys
+/// its successors are about to adopt.
+pub(crate) async fn retire(
+    raft: &Raft<TypeConfig>,
+    gate: &Mutex<()>,
+    client: &RpcClient,
+    resolver: &Arc<dyn PeerResolver>,
+    target: NodeId,
+) -> Result<RetireReply, RpcError> {
+    confirm_leadership(raft).await?;
+
+    let leader = raft.metrics().borrow().id;
+    let found = raft
+        .with_raft_state(move |state| {
+            let committed = state.membership_state.committed();
+            let is_voter = committed.voter_ids().any(|id| id == target);
+            committed
+                .get_node(&target)
+                .map(|node| (node.addr.clone(), is_voter))
+        })
+        .await
+        .map_err(|e| {
+            RpcError::Handler(format!("reading committed membership for {target}: {e}"))
+        })?;
+    let Some((authority, is_voter)) = found else {
+        return Ok(RetireReply::NotAMember);
+    };
+    if target == leader {
+        return Ok(RetireReply::Refused(RetireRefusal::IsLeader));
+    }
+
+    let evidence = match probe_member(client, resolver, &authority, target).await {
+        Ok(evidence) => evidence,
+        Err(refusal) => {
+            tracing::info!(target_id = target, %authority, ?refusal, "refusing to retire a member that answered");
+            return Ok(RetireReply::Refused(refusal));
+        }
+    };
+
+    if evict(raft, gate, target).await? == EvictOutcome::HeldByFloor {
+        return Ok(RetireReply::Refused(RetireRefusal::HeldByFloor));
+    }
+    let (m_idx, voters) = raft
+        .with_raft_state(|state| {
+            let committed = state.membership_state.committed();
+            (
+                committed.log_id().map_or(0, |log_id| log_id.index),
+                committed.voter_ids().collect::<BTreeSet<_>>(),
+            )
+        })
+        .await
+        .map_err(|e| {
+            RpcError::Handler(format!("reading membership after retiring {target}: {e}"))
+        })?;
+    tracing::warn!(
+        target_id = target,
+        role = if is_voter { "voter" } else { "learner" },
+        %authority,
+        ?evidence,
+        m_idx,
+        ?voters,
+        "retired a member that is gone: it no longer owns keys or counts toward quorum"
+    );
+    Ok(RetireReply::Retired {
+        m_idx,
+        voters,
+        evidence,
+    })
+}
+
+/// Confirm, bounded, that this node leads right now. A follower answers with the
+/// typed redirect the client chases; a leader that cannot reach a quorum answers
+/// unavailable — there is nobody else to ask.
+async fn confirm_leadership(raft: &Raft<TypeConfig>) -> Result<(), RpcError> {
+    use openraft::error::CheckIsLeaderError;
+    match tokio::time::timeout(RETIRE_LEADERSHIP_DEADLINE, raft.ensure_linearizable()).await {
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(RaftError::APIError(CheckIsLeaderError::ForwardToLeader(forward)))) => {
+            Err(RpcError::NotLeader {
+                leader: forward.leader_node.map(|node| node.addr),
+            })
+        }
+        Ok(Err(e)) => Err(RpcError::Unavailable {
+            detail: format!("this node cannot confirm it leads: {e}"),
+            op_id: None,
+        }),
+        Err(_elapsed) => Err(RpcError::Unavailable {
+            detail: format!(
+                "leadership not confirmed by a quorum within {RETIRE_LEADERSHIP_DEADLINE:?}"
+            ),
+            op_id: None,
+        }),
+    }
+}
+
+/// What one probe of one address established.
+#[derive(Debug, PartialEq, Eq)]
+enum ProbeAnswer {
+    /// Nothing answered: the connection failed or timed out.
+    Silent,
+    /// The member itself answered.
+    Itself,
+    /// A different node answered: the address was reused.
+    Another(NodeId),
+    /// Something answered, but not in a way that says who it is.
+    Unidentified(String),
+}
+
+/// Classify one probe of a retire target's address.
+///
+/// Only `Timeout` and `Transport` are silence — and only provisionally:
+/// [`probe_member`] re-checks a silent address with a plain connect. `Shed` counts as a liveness
+/// failure for health accounting, but over the wire it is a peer's 503 —
+/// something is there — so here it is unidentified, like every other answer that
+/// does not name a node: the gate fails closed.
+fn classify_probe(result: Result<Vec<u8>, RpcError>, target: NodeId) -> ProbeAnswer {
+    match result {
+        Err(RpcError::Timeout | RpcError::Transport(_)) => ProbeAnswer::Silent,
+        Err(other) => ProbeAnswer::Unidentified(other.to_string()),
+        Ok(body) => match serde_json::from_slice::<MembershipView>(&body) {
+            Ok(view) if view.node_id == target => ProbeAnswer::Itself,
+            Ok(view) => ProbeAnswer::Another(view.node_id),
+            Err(e) => ProbeAnswer::Unidentified(format!("undecodable membership view: {e}")),
+        },
+    }
+}
+
+/// Probe the member's advertised authority for [`RETIRE_PROBE_ROUNDS`] rounds,
+/// re-resolving it each round and dialling every address it yields (D-28).
+/// Refuses on the first answer that is the target or cannot be identified;
+/// otherwise returns per-address evidence.
+///
+/// Two silences are weighed with care, because a wrong "gone" retires a live
+/// node:
+/// - **No address.** The resolver cannot tell a deleted record (a headless
+///   service drops a gone pod's name) from a failing lookup, so the authority
+///   counts as gone only when it resolves in *no* round. A live node whose name
+///   the leader cannot resolve for that long is equally beyond the leader's
+///   replication, which resolves the same name — it already holds no lease and
+///   refuses owner-side writes (D-17).
+/// - **No reply.** A probe that times out or fails in transport is silence only
+///   if a plain TCP connect to the address also fails. A process that is paused
+///   or wedged still has its socket accepted by the kernel, and that is a node
+///   which may resume — so it is unidentified, and the retire is refused.
+async fn probe_member(
+    client: &RpcClient,
+    resolver: &Arc<dyn PeerResolver>,
+    authority: &str,
+    target: NodeId,
+) -> Result<Vec<ProbeEvidence>, RetireRefusal> {
+    let mut probed: BTreeSet<SocketAddr> = BTreeSet::new();
+    let mut reused: BTreeMap<SocketAddr, NodeId> = BTreeMap::new();
+    let mut resolve_error = None;
+    for round in 0..RETIRE_PROBE_ROUNDS {
+        if round > 0 {
+            tokio::time::sleep(RETIRE_PROBE_INTERVAL).await;
+        }
+        let addrs = match resolve_authority(resolver, authority).await {
+            Ok(addrs) => addrs,
+            Err(e) => {
+                resolve_error = Some(e.to_string());
+                continue;
+            }
+        };
+        for addr in addrs {
+            probed.insert(addr);
+            if reused.contains_key(&addr) {
+                continue;
+            }
+            let result = client
+                .probe(
+                    addr,
+                    "POST",
+                    CLUSTER_MEMBERSHIP_PATH,
+                    Vec::new(),
+                    RETIRE_PROBE_DEADLINE,
+                )
+                .await;
+            match classify_probe(result, target) {
+                ProbeAnswer::Silent if accepts_connections(addr).await => {
+                    return Err(RetireRefusal::Unidentified {
+                        addr: addr.to_string(),
+                        detail: "accepts connections but did not answer the probe".to_owned(),
+                    });
+                }
+                ProbeAnswer::Silent => {}
+                ProbeAnswer::Another(id) => {
+                    reused.insert(addr, id);
+                }
+                ProbeAnswer::Itself => {
+                    return Err(RetireRefusal::Reachable {
+                        addr: addr.to_string(),
+                    });
+                }
+                ProbeAnswer::Unidentified(detail) => {
+                    return Err(RetireRefusal::Unidentified {
+                        addr: addr.to_string(),
+                        detail,
+                    });
+                }
+            }
+        }
+    }
+    if probed.is_empty() {
+        return Ok(vec![ProbeEvidence {
+            addr: authority.to_owned(),
+            seen: ProbeSeen::NoAddress {
+                // `resolve_authority` never answers an empty `Ok`, so an empty
+                // `probed` means every round recorded an error.
+                detail: resolve_error.unwrap_or_else(|| "resolved to no address".to_owned()),
+            },
+        }]);
+    }
+    Ok(probed
+        .into_iter()
+        .map(|addr| ProbeEvidence {
+            addr: addr.to_string(),
+            seen: reused.get(&addr).map_or(ProbeSeen::NoAnswer, |&node_id| {
+                ProbeSeen::AnotherNode { node_id }
+            }),
+        })
+        .collect())
+}
+
+/// Whether anything accepts a TCP connection at `addr` within the probe
+/// deadline — the tie-breaker that keeps a paused process from reading as gone.
+async fn accepts_connections(addr: SocketAddr) -> bool {
+    matches!(
+        tokio::time::timeout(RETIRE_PROBE_DEADLINE, tokio::net::TcpStream::connect(addr)).await,
+        Ok(Ok(_))
+    )
+}
+
 /// What [`evict`] did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum EvictOutcome {
@@ -1601,6 +1984,56 @@ fn encode<T: Serialize>(value: &T) -> Result<Vec<u8>, RpcError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn view_of(node_id: NodeId) -> Result<Vec<u8>, RpcError> {
+        Ok(serde_json::to_vec(&MembershipView {
+            node_id,
+            m_idx: 7,
+            members: BTreeSet::from([1, 2, 3]),
+        })
+        .expect("encode"))
+    }
+
+    /// Pins D-95: who answered at a retire target's address. Only a node naming itself as the target is
+    /// "alive"; only a different id is a reused address; only connect failure and timeout are
+    /// silence.
+    #[test]
+    fn a_retire_probe_counts_only_an_identified_other_node_or_silence_as_gone() {
+        assert_eq!(classify_probe(view_of(3), 3), ProbeAnswer::Itself);
+        assert_eq!(classify_probe(view_of(9), 3), ProbeAnswer::Another(9));
+        assert_eq!(
+            classify_probe(Err(RpcError::Timeout), 3),
+            ProbeAnswer::Silent
+        );
+        assert_eq!(
+            classify_probe(Err(RpcError::Transport("refused".into())), 3),
+            ProbeAnswer::Silent
+        );
+    }
+
+    /// Pins D-95: an answer that does not say who it is fails closed. An older build has no membership
+    /// route, a node on another secret refuses the MAC, and a peer's 503 is a server that is there —
+    /// even though `Shed` counts as a liveness failure for health accounting.
+    #[test]
+    fn a_retire_probe_treats_every_unidentifiable_answer_as_the_live_member() {
+        let unidentified = [
+            Err(RpcError::UnknownRoute {
+                method: "POST".into(),
+                path: CLUSTER_MEMBERSHIP_PATH.into(),
+            }),
+            Err(RpcError::Unauthorized(crate::rpc::AuthError::BadMac)),
+            Err(RpcError::Shed),
+            Err(RpcError::Handler("raft node not yet initialized".into())),
+            Ok(b"{}".to_vec()),
+        ];
+        for answer in unidentified {
+            let shown = format!("{answer:?}");
+            assert!(
+                matches!(classify_probe(answer, 3), ProbeAnswer::Unidentified(_)),
+                "{shown} must be unidentified"
+            );
+        }
+    }
     use openraft::error::{Fatal, ForwardToLeader, LearnerNotFound};
     use openraft::{CommittedLeaderId, LogId};
 

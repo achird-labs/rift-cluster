@@ -288,18 +288,27 @@ and nothing about what anyone may do. Node ids remain what every decision is mad
 
 ## Runbooks (sketches; full versions ship with the harness)
 
-The `cluster …` subcommands sketched below are **not built**: the binary has
-no membership or recovery subcommand today (membership changes only through a
-node joining or leaving — D-25, D-26; the cluster maintains its own log and
-snapshots — D-24). They are kept as the design of what a crash-retire and a
-majority-loss recovery would have to look like.
+Membership changes only through a node joining or leaving (D-21, D-26), with one
+exception built by D-95: an operator can retire a member that is gone. The cluster
+maintains its own log and snapshots (D-24). The majority-loss recovery below is
+still **not built**; it is kept as the design of what it would have to look like.
 
 - **Scale up**: start pod with seeds → auto learner → voter if < 9
   (`MAX_AUTO_VOTERS`, D-27). Nothing else.
 - **Scale down / retire**: SIGTERM, wait for exit (graceful leave does the
   rest; the leader refuses a leave that would drop the voter set below two —
-  D-25). Crash-retire: `rift-cluster-server cluster remove-node <id>` against
-  any live node *(sketch — not built)*.
+  D-25).
+- **Crash-retire** (a member that will never come back; D-95):
+  `rift-cluster-server cluster remove-node <id> --via <any live member's cluster
+  address>` with the cluster secret, run inside the fleet's network (a follower
+  redirects to the leader's advertised address). The leader probes the member's advertised
+  address and refuses while anything answers as that member. Silence, or a
+  different node id at a reused address, lets the retire go ahead. The departure
+  then commits like a graceful leave, and successors adopt its flows from
+  replicas. **Order:** retire first, then start the replacement. At the voter
+  ceiling a replacement stays a learner until the dead voter is out. If the
+  retired node ever returns on its old state dir, it rejoins as a learner by
+  itself (`docs/rift-cluster-server.md`, "Restarting a node").
 - **Restore quorum after majority loss**: last-resort
   `cluster force-recover --from-state-dir` on the best surviving node (log
   end inspected via `cluster inspect`), then rejoin others empty. Documented
