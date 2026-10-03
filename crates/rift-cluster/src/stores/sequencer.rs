@@ -135,10 +135,11 @@ impl SequencingMode {
 /// carries a port and no config — and unlike `FlowStoreProvider` the seam has no
 /// per-imposter hook to read one from. This registry is that missing lookup.
 ///
-/// Fed from the Raft apply loop's `EngineAction::Sync`, which is the single
-/// funnel every config passes through to become real on a node, and which
-/// carries the *complete* desired set — so the map is exact by construction and
-/// a port that disappears drops out. The two alternatives were rejected:
+/// Fed from the Raft apply loop's engine drive, which is the single funnel every
+/// config passes through to become real on a node: a whole-set `Sync` rebuilds
+/// the map, and a per-port `Put` or `Delete` (D-99) updates its one port. Every
+/// port change is an op, so the map is exact by construction and a port that
+/// disappears drops out. The two alternatives were rejected:
 /// `RaftNode::imposter_config` is a
 /// storage read on a 20–40k RPS path, and `FlowStoreProvider::provide` is not
 /// re-called when an existing imposter's config changes in place, so a mode
@@ -165,20 +166,37 @@ impl SequencingRegistry {
     pub fn apply(&self, desired: &[ImposterConfig]) {
         let next: HashMap<u16, SequencingMode> = desired
             .iter()
-            .filter_map(|config| {
-                let port = config.port?;
-                let mode = SequencingMode::from_imposter(config).unwrap_or_else(|reason| {
-                    tracing::error!(
-                        port,
-                        %reason,
-                        "sequencing carried a value this build cannot parse; using local"
-                    );
-                    SequencingMode::Local
-                });
-                Some((port, mode))
-            })
+            .filter_map(|config| Some((config.port?, Self::mode_of(config))))
             .collect();
         *self.modes.write() = next;
+    }
+
+    /// Record one port's config, leaving every other port as it is — the per-port drive of a
+    /// `PutImposter` (D-99). Exact because every port change reaches the apply loop as an op of
+    /// its own; [`Self::apply`] is the resync for the drives that carry the whole set.
+    pub fn set(&self, port: u16, config: &ImposterConfig) {
+        self.modes.write().insert(port, Self::mode_of(config));
+    }
+
+    /// Forget one port — the per-port drive of a `DeleteImposter` (D-99).
+    pub fn remove(&self, port: u16) {
+        self.modes.write().remove(&port);
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.modes.read().len()
+    }
+
+    fn mode_of(config: &ImposterConfig) -> SequencingMode {
+        SequencingMode::from_imposter(config).unwrap_or_else(|reason| {
+            tracing::error!(
+                port = config.port,
+                %reason,
+                "sequencing carried a value this build cannot parse; using local"
+            );
+            SequencingMode::Local
+        })
     }
 
     /// The mode for `port`. Unknown ports are [`SequencingMode::Local`]: an
@@ -732,7 +750,38 @@ mod tests {
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::time::Duration;
 
-    use super::{Delivery, RESET_MAX_ATTEMPTS, deliver_reset};
+    use super::{Delivery, RESET_MAX_ATTEMPTS, SequencingMode, SequencingRegistry, deliver_reset};
+
+    fn imposter(port: u16, mode: &str) -> rift_cluster_base::seams::ImposterConfig {
+        serde_json::from_value(serde_json::json!({
+            "port": port,
+            "protocol": "http",
+            "stubs": [],
+            "_rift": { "sequencing": { "mode": mode } },
+        }))
+        .expect("parses")
+    }
+
+    /// Pins D-99 (#651): `set` and `remove` touch one port and leave the rest of the map as the
+    /// last whole-set `apply` built it.
+    #[test]
+    fn set_and_remove_touch_only_their_port() {
+        let registry = SequencingRegistry::new();
+        registry.apply(&[imposter(1, "owner"), imposter(2, "owner")]);
+
+        registry.set(3, &imposter(3, "owner"));
+        registry.set(2, &imposter(2, "local"));
+        registry.remove(1);
+
+        assert_eq!(registry.mode(1), SequencingMode::Local, "removed");
+        assert_eq!(registry.mode(2), SequencingMode::Local, "re-set");
+        assert_eq!(registry.mode(3), SequencingMode::Owner, "added");
+        assert_eq!(
+            registry.len(),
+            2,
+            "1 left the map rather than turning local"
+        );
+    }
 
     /// Pins D-57 (#514): a peer that refuses the first attempts is asked again, and the reset is
     /// reported delivered once it lands. Before this, one `call_member` was made per peer and its

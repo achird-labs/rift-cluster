@@ -665,9 +665,19 @@ impl RaftLogStorage<TypeConfig> for RedbLogStore {
 /// against the engine with the same intermediate states the tables went
 /// through — computing the set after commit would make the later patch
 /// double-apply.
+///
+/// `Put` and `Delete` are the per-port drives of `PutImposter` / `DeleteImposter` on a node with no
+/// recorded failure (D-99); they carry the op's own config or port, which is the same "as of that
+/// op" state for the one port they touch.
 #[derive(Debug)]
 enum EngineAction {
     Sync(Vec<ImposterConfig>),
+    Put {
+        config: Box<ImposterConfig>,
+    },
+    Delete {
+        port: u16,
+    },
     Patch {
         port: u16,
         edit: StubEditScript,
@@ -699,6 +709,25 @@ enum EngineAction {
         id: String,
         error: String,
     },
+}
+
+/// What a drive's [`ApplyReport`] was measured against, for [`RedbStateMachine::record_report`].
+#[derive(Debug, Clone, Copy)]
+enum ReportScope<'a> {
+    /// A whole-set `Sync`: these are every port the fleet wants, so a recorded failure for any
+    /// other port is stale and is reaped.
+    WholeSet(&'a BTreeSet<u16>),
+    /// A per-port drive (D-99): only this port was looked at.
+    Port(u16),
+}
+
+impl ReportScope<'_> {
+    fn desires(self, port: u16) -> bool {
+        match self {
+            Self::WholeSet(desired) => desired.contains(&port),
+            Self::Port(only) => only == port,
+        }
+    }
 }
 
 /// An [`EngineAction`] paired with the principal whose committed op caused it
@@ -794,9 +823,11 @@ pub struct RedbStateMachine {
     /// against the *read that computed one* (#574).
     ///
     /// Two handles drive one engine. The apply loop owns openraft's clone;
-    /// `compose`'s reconciler owns the reader clone. Both build a whole desired
+    /// `compose`'s reconciler owns the reader clone. Both can build a whole desired
     /// config set and hand it to `apply_config` (U-6), which deletes every live
-    /// imposter the set omits.
+    /// imposter the set omits — the reconcile always, the apply loop for the ops
+    /// D-99 keeps whole-set. The lock serialises the apply loop's per-port drives
+    /// the same way.
     ///
     /// **Upstream takes no lock across `apply_config` at all**, and says so in
     /// its own bind path: "two `apply_config` calls can run against the same
@@ -824,6 +855,14 @@ pub struct RedbStateMachine {
     /// `GATE_RECONCILED` anyway, so the node is not serving yet. On the live apply
     /// path the delete side can also drain connections per port before returning.
     engine_drive: Arc<tokio::sync::Mutex<()>>,
+    /// Whole-set drives handed to the engine (`EngineAction::Sync`). Read by the tests that pin
+    /// D-99: a healthy node's puts and deletes must not add to it.
+    full_syncs: Arc<AtomicU64>,
+    /// Set when a toggle or stub patch clears a port's recorded failure (D-99). Those drives
+    /// touch one aspect of a port, so their success does not show the engine agrees with the
+    /// tables — a patch that failed half-way left stubs missing that a later toggle never
+    /// restores. The node stays degraded until a whole-set `Sync` has run.
+    needs_resync: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl std::fmt::Debug for RedbStateMachine {
@@ -850,6 +889,8 @@ impl RedbStateMachine {
             apply_failures: Arc::new(Mutex::new(BTreeMap::new())),
             bind_failures: Arc::new(Mutex::new(BTreeMap::new())),
             engine_drive: Arc::new(tokio::sync::Mutex::new(())),
+            full_syncs: Arc::new(AtomicU64::new(0)),
+            needs_resync: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -1288,6 +1329,32 @@ impl RedbStateMachine {
     #[must_use]
     pub fn apply_failures(&self) -> BTreeMap<u16, String> {
         self.apply_failures.lock().clone()
+    }
+
+    /// Whether any drive outcome or bind reason is recorded — the node is *degraded*, and its
+    /// puts and deletes drive the whole set rather than one port (D-99), so every config op
+    /// re-attempts what failed exactly as it did before per-port drives existed.
+    fn is_degraded(&self) -> bool {
+        // Two statements, so the two guards are never held together.
+        let failing = !self.apply_failures.lock().is_empty();
+        failing
+            || !self.bind_failures.lock().is_empty()
+            || self.needs_resync.load(Ordering::Acquire)
+    }
+
+    /// A toggle or stub patch succeeded: its port's last drive outcome is now this one. If that
+    /// erased a recorded failure, the failure may have been a different drive's — a half-applied
+    /// patch, a replace — that this one did not repair, so the node stays degraded until a
+    /// whole-set drive has reconciled everything (D-99).
+    fn clear_drive_outcome(&self, port: u16) {
+        if self.apply_failures.lock().remove(&port).is_some() {
+            self.needs_resync.store(true, Ordering::Release);
+        }
+    }
+
+    #[cfg(test)]
+    fn engine_full_syncs(&self) -> u64 {
+        self.full_syncs.load(Ordering::Relaxed)
     }
 
     /// Why `port`'s flow store is unusable, or `None` when it is fine (#576, D-76).
@@ -2083,6 +2150,7 @@ impl RedbStateMachine {
         proxy_recorded: &mut Table<'_, (u16, &'static str), &'static str>,
         op: &ControlOp,
         index: u64,
+        degraded: bool,
     ) -> StorageResult<Result<Vec<EngineAction>, String>> {
         let io =
             |e: redb::StorageError| StorageError::from(StorageIOError::write_state_machine(&e));
@@ -2111,7 +2179,15 @@ impl RedbStateMachine {
                 // exactly as they do on `DeleteImposter`.
                 proxy_recorded.retain(|(p, _), _| p != port).map_err(io)?;
                 crate::metrics::config_applied(port, index);
-                Ok(Ok(vec![Self::sync_action(configs)?]))
+                // D-99: one port's drive, unless something on this node is failing — then the
+                // whole set, so the drive re-attempts what failed (D-81's heal) as it always has.
+                if degraded {
+                    return Ok(Ok(vec![Self::sync_action(configs)?]));
+                }
+                // A clone: the op is borrowed from the committed entry.
+                Ok(Ok(vec![EngineAction::Put {
+                    config: config.clone(),
+                }]))
             }
             ControlOp::PatchStubs { port, edit } => {
                 // Block-scoped so the read guard's borrow of `configs` ends
@@ -2161,7 +2237,11 @@ impl RedbStateMachine {
                 // manager's own port-reclaim `clear`, and atomic with the delete here.
                 proxy_recorded.retain(|(p, _), _| p != *port).map_err(io)?;
                 crate::metrics::config_removed(*port);
-                Ok(Ok(vec![Self::sync_action(configs)?]))
+                // D-99, as for `PutImposter`.
+                if degraded {
+                    return Ok(Ok(vec![Self::sync_action(configs)?]));
+                }
+                Ok(Ok(vec![EngineAction::Delete { port: *port }]))
             }
             ControlOp::DeleteAll => {
                 let removed: Vec<u16> = {
@@ -2450,6 +2530,7 @@ impl RedbStateMachine {
                 // diffs on stable stub keys, so a replicated write never resets
                 // an untouched imposter's runtime state.
                 let Some(engine) = &self.engine else { return };
+                self.full_syncs.fetch_add(1, Ordering::Relaxed);
                 let desired_ports: std::collections::BTreeSet<u16> =
                     desired.iter().filter_map(|c| c.port).collect();
                 // Before the engine call, and from the same set: the sequencer
@@ -2464,7 +2545,10 @@ impl RedbStateMachine {
                         // ports this needs are exactly the ones it is about to
                         // drop (#573 review). See the clear below.
                         let previously_failed = self.previously_failed_ports();
-                        self.record_report(&report, &desired_ports);
+                        self.record_report(&report, ReportScope::WholeSet(&desired_ports));
+                        // The whole table has been reconciled; whatever failed again is in the
+                        // maps `record_report` just wrote, which keep the node degraded on their own.
+                        self.needs_resync.store(false, Ordering::Release);
                         // The delete-path half of D-5 (#565): the ports the
                         // engine actually removed — `deleted`, never
                         // `replaced`/`stub_patched`, which are config changes
@@ -2519,6 +2603,56 @@ impl RedbStateMachine {
                     }
                 }
             }
+            // D-99: `Sync`'s bookkeeping, scoped to the one port. Nothing else is in the report, and
+            // nothing else's recorded failure may be reaped — this node had none when the op was
+            // applied, or the arm would have emitted a `Sync`.
+            EngineAction::Put { config } => {
+                let Some(engine) = &self.engine else { return };
+                // The arm refused a port-less config before it committed, so this is unreachable;
+                // if it ever is reached, say so rather than drop a committed config quietly.
+                let Some(port) = config.port else {
+                    tracing::error!("a committed per-port drive carried no port; nothing applied");
+                    self.apply_failures
+                        .lock()
+                        .insert(0, "a committed config carried no port".to_owned());
+                    return;
+                };
+                if let Some(sequencing) = &self.sequencing {
+                    sequencing.set(port, &config);
+                }
+                match engine.apply_one(*config).await {
+                    // No flow-state clear: `apply_one` deletes nothing but a replace's own
+                    // teardown, and a port the tables still name keeps its state through a failed
+                    // re-create (#567) — the same filter `Sync` applies, with `{port}` desired.
+                    Ok(report) => self.record_report(&report, ReportScope::Port(port)),
+                    Err(e) => {
+                        tracing::error!(port, error = %e, "engine refused a committed config");
+                        self.apply_failures.lock().insert(port, e.to_string());
+                    }
+                }
+            }
+            EngineAction::Delete { port } => {
+                let Some(engine) = &self.engine else { return };
+                if let Some(sequencing) = &self.sequencing {
+                    sequencing.remove(port);
+                }
+                match engine.delete_imposter(port).await {
+                    // Not found is a delete too: the port was never staged here, or a failed
+                    // re-create already took it out of the engine's map (#573). Either way the
+                    // fleet no longer names it, so its state goes with it (#565).
+                    Ok(_) | Err(ImposterError::NotFound(_)) => {
+                        self.apply_failures.lock().remove(&port);
+                        self.bind_failures.lock().remove(&port);
+                        self.clear_imposter_state([port]).await;
+                    }
+                    // Still served here. Recorded, so the next op is a whole-set drive, which
+                    // retries the delete and clears the state when it lands.
+                    Err(e) => {
+                        tracing::error!(port, error = %e, "engine refused a committed delete");
+                        self.apply_failures.lock().insert(port, e.to_string());
+                    }
+                }
+            }
             EngineAction::RefuseSync { port, error } => {
                 if self.engine.is_none() {
                     return;
@@ -2534,9 +2668,7 @@ impl RedbStateMachine {
             EngineAction::SetEnabled { port, enabled } => {
                 let Some(engine) = &self.engine else { return };
                 match engine.set_imposter_enabled(port, enabled).await {
-                    Ok(()) => {
-                        self.apply_failures.lock().remove(&port);
-                    }
+                    Ok(()) => self.clear_drive_outcome(port),
                     Err(e) => {
                         tracing::error!(port, error = %e, "engine refused a committed toggle");
                         self.apply_failures.lock().insert(port, e.to_string());
@@ -2546,9 +2678,7 @@ impl RedbStateMachine {
             EngineAction::Patch { port, edit } => {
                 let Some(engine) = &self.engine else { return };
                 match Self::drive_patch(engine, port, &edit).await {
-                    Ok(()) => {
-                        self.apply_failures.lock().remove(&port);
-                    }
+                    Ok(()) => self.clear_drive_outcome(port),
                     Err(e) => {
                         tracing::error!(
                             port,
@@ -2764,7 +2894,10 @@ impl RedbStateMachine {
     /// failure. The **first** failure per port is
     /// kept: `apply_config` attempts a held port's bind before its toggle, stub patch and persist,
     /// so a later entry for the same port is one of those, not the reason it is unbound.
-    fn record_report(&self, report: &ApplyReport, desired_ports: &std::collections::BTreeSet<u16>) {
+    ///
+    /// A [`ReportScope::Port`] report (D-99) names one port, so nothing is reaped: every other
+    /// port's entry is outside what the drive looked at.
+    fn record_report(&self, report: &ApplyReport, scope: ReportScope<'_>) {
         let mut failures = self.apply_failures.lock();
         let mut bind_failures = self.bind_failures.lock();
         for port in report
@@ -2785,15 +2918,14 @@ impl RedbStateMachine {
         {
             bind_failures.remove(port);
         }
-        failures.retain(|port, _| desired_ports.contains(port));
-        bind_failures.retain(|port, _| desired_ports.contains(port));
+        if let ReportScope::WholeSet(desired_ports) = scope {
+            failures.retain(|port, _| desired_ports.contains(port));
+            bind_failures.retain(|port, _| desired_ports.contains(port));
+        }
         let mut bind_recorded = BTreeSet::new();
         for (port, error) in &report.failed {
             failures.insert(*port, error.to_string());
-            if desired_ports.contains(port)
-                && self.serving_unbound(*port)
-                && bind_recorded.insert(*port)
-            {
+            if scope.desires(*port) && self.serving_unbound(*port) && bind_recorded.insert(*port) {
                 bind_failures.insert(*port, error.to_string());
             }
         }
@@ -2990,6 +3122,9 @@ impl RaftStateMachine<TypeConfig> for RedbStateMachine {
         let entries_iter = entries.into_iter();
         let mut responses = Vec::with_capacity(entries_iter.size_hint().0);
         let mut engine_actions = Vec::new();
+        // Read once per batch: this batch's own drives run after its commit, so a failure one
+        // of its entries causes degrades the next batch, not a later entry of this one (D-99).
+        let degraded = self.is_degraded();
 
         let write_txn = self
             .db
@@ -3073,6 +3208,7 @@ impl RaftStateMachine<TypeConfig> for RedbStateMachine {
                                         &mut proxy_recorded,
                                         &request.op,
                                         log_id.index,
+                                        degraded,
                                     )?,
                                 },
                                 None => Self::mutate_tables(
@@ -3084,6 +3220,7 @@ impl RaftStateMachine<TypeConfig> for RedbStateMachine {
                                     &mut proxy_recorded,
                                     &request.op,
                                     log_id.index,
+                                    degraded,
                                 )?,
                             },
                         };
@@ -3999,7 +4136,9 @@ mod tests {
     }
 
     /// Pins D-98: an id-less, multi-key imposter is untouched by every config op that is not
-    /// about it. The state machine re-parses the whole committed set for each op, so before
+    /// about it. Every whole-set drive re-parses the committed set — a healthy node's puts are
+    /// per port since D-99, so the loop below runs the startup reconcile after each one to keep
+    /// that path under test — so before
     /// the engine keyed stubs on a canonical form each fresh parse keyed this stub differently
     /// from the live one and the level-2 reconcile (D-5) replaced or patched it — rebinding its
     /// listener and resetting its response cycle — on *any* write anywhere (#655).
@@ -4038,7 +4177,17 @@ mod tests {
                 Arc::ptr_eq(&live, &engine.get_imposter(A).expect("A is live")),
                 "an unrelated put to {port} replaced A"
             );
+            reconcile_bounded(&sm).await.expect("reconcile");
+            assert!(
+                Arc::ptr_eq(&live, &engine.get_imposter(A).expect("A is live")),
+                "a whole-set re-parse after the put to {port} replaced A"
+            );
         }
+        assert_eq!(
+            sm.engine_full_syncs(),
+            20,
+            "the loop drove A through 20 whole-set re-parses"
+        );
         let delete = ControlOp::DeleteImposter { port: DOOMED };
         apply_one(&mut sm, index, request(u128::from(index), delete)).await;
         index += 1;
@@ -5268,6 +5417,10 @@ mod tests {
 
     /// One unparseable stored record must refuse the whole engine sync — a
     /// partial desired set would read as "delete the missing imposters".
+    ///
+    /// A row only stops parsing across a restart (a different binary or engine reads it), so the
+    /// first whole-set drive to meet it is the startup reconcile, which records it. From then on
+    /// the node is degraded (D-99) and every config op is a whole-set drive that refuses again.
     #[tokio::test]
     async fn a_broken_stored_record_refuses_sync_instead_of_deleting() {
         let engine = Arc::new(ImposterManager::new());
@@ -5278,6 +5431,11 @@ mod tests {
         assert_eq!(engine.count(), 1);
 
         sm.inject_raw_config(18088, "not json");
+        reconcile_bounded(&sm)
+            .await
+            .expect("the reconcile records, never fails");
+        assert_eq!(engine.count(), 1, "the reconcile tore nothing down");
+        assert!(sm.apply_failures().contains_key(&18088));
 
         let responses = sm
             .apply(vec![entry(2, put(2, 18089, json!([])))])
@@ -5443,6 +5601,457 @@ mod tests {
 
         engine.shutdown().await;
     }
+
+    /// Pins D-99 (#651): on a node with nothing recorded as failing, a `PutImposter` or
+    /// `DeleteImposter` drives only its own port. Before, every one re-parsed every stored config
+    /// and reconciled the whole fleet, so a put cost O(fleet) on every node and a bulk import was
+    /// quadratic. The engine still ends up exactly where the tables say.
+    #[tokio::test]
+    async fn a_healthy_node_drives_puts_and_deletes_per_port() {
+        let engine = Arc::new(ImposterManager::new());
+        let (_td, mut sm) = fresh_sm(Some(engine.clone())).await;
+        let mut index = 0;
+        for port in 18400..18450u16 {
+            index += 1;
+            apply_one(&mut sm, index, put(u128::from(index), port, json!([]))).await;
+        }
+        for port in 18400..18410u16 {
+            index += 1;
+            apply_one(
+                &mut sm,
+                index,
+                request(u128::from(index), ControlOp::DeleteImposter { port }),
+            )
+            .await;
+        }
+        assert_eq!(
+            sm.engine_full_syncs(),
+            0,
+            "no put or delete on a healthy node reconciles the whole fleet"
+        );
+        assert_eq!(engine.count(), 40, "the engine serves what the tables name");
+        assert_eq!(sm.configured_ports().expect("ports").len(), 40);
+        assert!(sm.apply_failures().is_empty(), "{:?}", sm.apply_failures());
+
+        // `DeleteAll` keeps the whole-set drive: the table is empty afterwards, so it parses
+        // nothing, and one call tears the fleet down.
+        index += 1;
+        apply_one(
+            &mut sm,
+            index,
+            request(u128::from(index), ControlOp::DeleteAll),
+        )
+        .await;
+        assert_eq!(sm.engine_full_syncs(), 1);
+        assert_eq!(engine.count(), 0);
+
+        engine.shutdown().await;
+    }
+
+    /// Pins D-99 (#651): a put or delete leaves every other port's engine imposter alone — the
+    /// same `Imposter` instance, so its runtime state (cursors, scenario, recorded requests) is
+    /// untouched — and its flow state too.
+    #[tokio::test]
+    async fn a_per_port_drive_never_touches_another_ports_imposter() {
+        let engine = Arc::new(ImposterManager::new());
+        let (_td, mut sm, shard) = fresh_sm_with_flow_net(engine.clone()).await;
+        sm.apply(vec![
+            entry(1, put(1, 18460, json!([{ "id": "a" }]))),
+            entry(2, put(2, 18461, json!([{ "id": "a" }]))),
+            entry(3, put(3, 18462, json!([{ "id": "a" }]))),
+        ])
+        .await
+        .expect("apply puts");
+        seed_flow(&shard, "i18461:checkout").await;
+        let before = engine.get_imposter(18461).expect("served");
+
+        sm.apply(vec![
+            entry(4, put_recording(4, 18460, json!([{ "id": "b" }]))),
+            entry(5, request(5, ControlOp::DeleteImposter { port: 18462 })),
+        ])
+        .await
+        .expect("apply a replace and a delete of the neighbours");
+
+        let after = engine.get_imposter(18461).expect("still served");
+        assert!(
+            Arc::ptr_eq(&before, &after),
+            "an untouched port keeps its very imposter instance"
+        );
+        assert!(shard.get("i18461:checkout", "checkout").is_some());
+        assert!(
+            engine
+                .get_imposter(18460)
+                .expect("replaced")
+                .config
+                .record_requests,
+            "the put reached its own port"
+        );
+        assert!(
+            engine.get_imposter(18462).is_err(),
+            "the delete reached its own port"
+        );
+        assert_eq!(sm.engine_full_syncs(), 0);
+
+        engine.shutdown().await;
+    }
+
+    /// Pins D-99 (#651): a delete of a port the engine does not hold — never staged here, or
+    /// already gone — still drops that port's flow state and records no failure. It is the
+    /// per-port form of #565: the imposter is deleted fleet-wide, so its state goes too.
+    #[tokio::test]
+    async fn a_per_port_delete_of_a_port_the_engine_lacks_still_clears_its_state() {
+        let engine = Arc::new(ImposterManager::new());
+        let (_td, mut sm, shard) = fresh_sm_with_flow_net(engine.clone()).await;
+        seed_flow(&shard, "i18470:checkout").await;
+        seed_flow(&shard, "i18471:checkout").await;
+
+        let response = apply_one(
+            &mut sm,
+            1,
+            request(1, ControlOp::DeleteImposter { port: 18470 }),
+        )
+        .await;
+        assert_eq!(response, ControlResponse::applied(1));
+        assert!(shard.get("i18470:checkout", "checkout").is_none());
+        assert!(
+            shard.get("i18471:checkout", "checkout").is_some(),
+            "another port's state is not the deleted one's"
+        );
+        assert!(sm.apply_failures().is_empty(), "{:?}", sm.apply_failures());
+        assert_eq!(sm.engine_full_syncs(), 0);
+
+        engine.shutdown().await;
+    }
+
+    /// Pins D-99 (#651): a recorded failure puts the node in degraded mode — every put or delete
+    /// drives the whole set again, as before this change — until a drive clears it, after which
+    /// puts go back to per port. The failure is recorded against its own port, not the set-level
+    /// slot `0`, and a failed edit of a still-desired port keeps its flow state (#567).
+    #[tokio::test]
+    async fn a_recorded_failure_degrades_puts_to_whole_set_until_it_clears() {
+        let engine = Arc::new(ImposterManager::new());
+        let (_td, mut sm, shard) = fresh_sm_with_flow_net(engine.clone()).await;
+        apply_one(&mut sm, 1, put(1, 18480, json!([]))).await;
+        seed_flow(&shard, "i18480:checkout").await;
+
+        // A per-port drive that fails: the replace's teardown succeeds, its re-create is refused.
+        apply_one(&mut sm, 2, put_unstageable(2, 18480)).await;
+        assert_eq!(
+            sm.engine_full_syncs(),
+            0,
+            "the failing put itself was per port"
+        );
+        assert_eq!(
+            sm.apply_failures().keys().copied().collect::<Vec<_>>(),
+            vec![18480],
+            "recorded against its own port: {:?}",
+            sm.apply_failures()
+        );
+        assert!(
+            shard.get("i18480:checkout", "checkout").is_some(),
+            "a failed edit of a still-desired port keeps its state"
+        );
+
+        // Degraded: an unrelated put drives the whole set, and so does a delete.
+        apply_one(&mut sm, 3, put(3, 18481, json!([]))).await;
+        assert_eq!(sm.engine_full_syncs(), 1);
+        apply_one(
+            &mut sm,
+            4,
+            request(4, ControlOp::DeleteImposter { port: 18483 }),
+        )
+        .await;
+        assert_eq!(sm.engine_full_syncs(), 2);
+
+        // The repair is a whole-set drive too, and it clears the failure.
+        apply_one(&mut sm, 5, put(5, 18480, json!([]))).await;
+        assert_eq!(sm.engine_full_syncs(), 3);
+        assert!(sm.apply_failures().is_empty(), "{:?}", sm.apply_failures());
+        assert_eq!(engine.count(), 2);
+
+        // Healthy again: back to per port.
+        apply_one(&mut sm, 6, put(6, 18482, json!([]))).await;
+        apply_one(
+            &mut sm,
+            7,
+            request(7, ControlOp::DeleteImposter { port: 18481 }),
+        )
+        .await;
+        assert_eq!(sm.engine_full_syncs(), 3);
+        assert_eq!(engine.count(), 2);
+
+        engine.shutdown().await;
+    }
+
+    /// Pins D-99 (#651) against D-81: a bind-failed port is healed by the next config op anywhere
+    /// in the fleet, exactly as before. Degraded mode is what keeps that: while the bind failure is
+    /// recorded, a put to another port is a whole-set drive, and `apply_config` re-attempts every
+    /// held-but-unbound port's bind.
+    #[tokio::test]
+    async fn a_put_elsewhere_still_heals_a_bind_failed_port() {
+        let blocker = std::net::TcpListener::bind("127.0.0.1:0").expect("bind blocker");
+        let port = blocker.local_addr().expect("addr").port();
+        let other = std::net::TcpListener::bind("127.0.0.1:0")
+            .and_then(|free| free.local_addr())
+            .expect("a free port")
+            .port();
+        let engine = Arc::new(ImposterManager::new().with_serve_unbound(true));
+        let (_td, mut sm) = fresh_sm(Some(engine.clone())).await;
+
+        apply_one(&mut sm, 1, put(1, port, json!([]))).await;
+        assert!(
+            sm.bind_failure(port).is_some(),
+            "precondition: served unbound"
+        );
+        assert_eq!(sm.engine_full_syncs(), 0, "the failing put was per port");
+
+        // A pause succeeds and clears the port's drive outcome but keeps its bind reason (D-81),
+        // so the bind reason alone has to keep the node degraded.
+        apply_one(
+            &mut sm,
+            2,
+            request(
+                2,
+                ControlOp::SetEnabled {
+                    port,
+                    enabled: false,
+                },
+            ),
+        )
+        .await;
+        assert!(sm.apply_failures().is_empty(), "{:?}", sm.apply_failures());
+        assert!(sm.bind_failure(port).is_some());
+
+        drop(blocker);
+        apply_one(&mut sm, 3, put(3, other, json!([]))).await;
+        assert_eq!(sm.engine_full_syncs(), 1, "degraded: a whole-set drive");
+        assert!(
+            sm.is_locally_bound(port),
+            "the freed port was rebound by a put elsewhere"
+        );
+        assert_eq!(sm.bind_failure(port), None);
+
+        engine.shutdown().await;
+    }
+
+    /// Pins D-99 (#651): a per-port drive the engine refuses outright — `apply_one`'s `Err`, which
+    /// means nothing was mutated — is recorded against that port, not the set-level slot `0`,
+    /// so the node degrades and the port's own status names it. `validate` stops such a config
+    /// before it commits, so this drives the action directly.
+    #[tokio::test]
+    async fn a_refused_per_port_put_is_recorded_against_its_port() {
+        let engine = Arc::new(ImposterManager::new());
+        let (_td, sm) = fresh_sm(Some(engine.clone())).await;
+        let duplicate_ids = config(18493, json!([{ "id": "a" }, { "id": "a" }]));
+
+        sm.drive_engine(vec![super::AttributedAction {
+            principal: None,
+            action: super::EngineAction::Put {
+                config: Box::new(duplicate_ids),
+            },
+        }])
+        .await;
+
+        assert_eq!(
+            sm.apply_failures().keys().copied().collect::<Vec<_>>(),
+            vec![18493],
+            "{:?}",
+            sm.apply_failures()
+        );
+        assert_eq!(engine.count(), 0, "nothing was mutated");
+        assert!(sm.is_degraded());
+
+        engine.shutdown().await;
+    }
+
+    /// Pins D-99 (#651): a delete the engine refuses — here its datadir file cannot be unlinked,
+    /// so upstream keeps the imposter registered and serving — is recorded, and the port keeps its
+    /// flow state while it is still served. The next op is a whole-set drive that retries the
+    /// delete, and when that lands the state goes with it (#565).
+    #[tokio::test]
+    async fn a_refused_per_port_delete_is_recorded_and_retried_whole_set() {
+        let data = TempDir::new().expect("tempdir");
+        let datadir = data.path().join("datadir");
+        std::fs::create_dir(&datadir).expect("mk datadir");
+        let engine = Arc::new(ImposterManager::with_datadir(Some(datadir.clone())));
+        let (_td, mut sm, shard) = fresh_sm_with_flow_net(engine.clone()).await;
+        apply_one(&mut sm, 1, put(1, 18494, json!([]))).await;
+        seed_flow(&shard, "i18494:checkout").await;
+
+        // A file where the directory was: every unlink under it fails with ENOTDIR.
+        std::fs::remove_dir_all(&datadir).expect("remove datadir");
+        std::fs::write(&datadir, b"not a directory").expect("squat the datadir");
+        apply_one(
+            &mut sm,
+            2,
+            request(2, ControlOp::DeleteImposter { port: 18494 }),
+        )
+        .await;
+        assert_eq!(sm.engine_full_syncs(), 0, "the delete was per port");
+        assert!(
+            sm.apply_failures().contains_key(&18494),
+            "the refused delete is node status: {:?}",
+            sm.apply_failures()
+        );
+        assert_eq!(engine.count(), 1, "upstream kept serving it");
+        assert!(
+            shard.get("i18494:checkout", "checkout").is_some(),
+            "a port still served keeps its state"
+        );
+
+        // Repair the datadir; the next op anywhere is a whole-set drive that finishes the delete.
+        std::fs::remove_file(&datadir).expect("unsquat");
+        std::fs::create_dir(&datadir).expect("mk datadir");
+        apply_one(&mut sm, 3, put(3, 18495, json!([]))).await;
+        assert_eq!(sm.engine_full_syncs(), 1);
+        assert!(
+            engine.get_imposter(18494).is_err(),
+            "the retried delete landed"
+        );
+        assert!(shard.get("i18494:checkout", "checkout").is_none());
+        assert!(sm.apply_failures().is_empty(), "{:?}", sm.apply_failures());
+
+        engine.shutdown().await;
+    }
+
+    /// Pins D-99 (#651): a toggle that succeeds after a patch failed half-way does not end degraded
+    /// mode. The toggle clears the port's drive outcome, but it did not restore the stubs the
+    /// patch never installed, so the next op must still be a whole-set drive — which does.
+    #[tokio::test]
+    async fn a_toggle_after_a_half_applied_patch_keeps_the_node_degraded() {
+        const P: u16 = 18496;
+        let data = TempDir::new().expect("tempdir");
+        let datadir = data.path().join("datadir");
+        std::fs::create_dir(&datadir).expect("mk datadir");
+        let engine = Arc::new(ImposterManager::with_datadir(Some(datadir.clone())));
+        let (_td, mut sm) = fresh_sm(Some(engine.clone())).await;
+        apply_one(&mut sm, 1, put(1, P, json!([{ "id": "a" }]))).await;
+
+        // Every persist fails while a file squats the datadir, so the patch stops at its first step.
+        std::fs::remove_dir_all(&datadir).expect("remove datadir");
+        std::fs::write(&datadir, b"not a directory").expect("squat the datadir");
+        let add = |id: &str| StubEdit::Add {
+            stub: serde_json::from_value(json!({ "id": id })).expect("parses"),
+            index: None,
+        };
+        apply_one(
+            &mut sm,
+            2,
+            request(
+                2,
+                ControlOp::PatchStubs {
+                    port: P,
+                    edit: StubEditScript(vec![add("b"), add("c")]),
+                },
+            ),
+        )
+        .await;
+        assert!(
+            sm.apply_failures().contains_key(&P),
+            "precondition: the patch failed"
+        );
+        assert!(
+            !engine_stub_ids(&engine, P).contains(&"c".to_owned()),
+            "precondition: the engine is missing a stub the tables hold"
+        );
+        assert_eq!(stored_stub_ids(&sm, P), vec!["a", "b", "c"]);
+
+        std::fs::remove_file(&datadir).expect("unsquat");
+        std::fs::create_dir(&datadir).expect("mk datadir");
+        apply_one(
+            &mut sm,
+            3,
+            request(
+                3,
+                ControlOp::SetEnabled {
+                    port: P,
+                    enabled: false,
+                },
+            ),
+        )
+        .await;
+        assert!(
+            sm.apply_failures().is_empty(),
+            "the toggle itself succeeded"
+        );
+
+        apply_one(&mut sm, 4, put(4, 18497, json!([]))).await;
+        assert_eq!(
+            sm.engine_full_syncs(),
+            1,
+            "still degraded: a whole-set drive"
+        );
+        assert_eq!(
+            engine_stub_ids(&engine, P),
+            vec!["a", "b", "c"],
+            "and it repaired P"
+        );
+
+        apply_one(&mut sm, 5, put(5, 18498, json!([]))).await;
+        assert_eq!(
+            sm.engine_full_syncs(),
+            1,
+            "healthy again after the whole-set drive"
+        );
+
+        engine.shutdown().await;
+    }
+
+    /// Pins D-99 (#651): the sequencing registry follows per-port drives exactly — a put sets
+    /// only its port's mode, a delete drops only its port — so a neighbour's put cannot erase an
+    /// owner-mode port, which a "replace the map" update would.
+    #[tokio::test]
+    async fn per_port_drives_keep_the_sequencing_registry_exact() {
+        use crate::stores::sequencer::{SequencingMode, SequencingRegistry};
+        let owner = |port: u16| -> ControlRequest {
+            let config: ImposterConfig = serde_json::from_value(json!({
+                "port": port,
+                "protocol": "http",
+                "host": "127.0.0.1",
+                "stubs": [],
+                "_rift": { "sequencing": { "mode": "owner" } },
+            }))
+            .expect("parses");
+            request(
+                u128::from(port),
+                ControlOp::PutImposter {
+                    config: Box::new(config),
+                },
+            )
+        };
+        let engine = Arc::new(ImposterManager::new());
+        let registry = SequencingRegistry::new();
+        let (_td, sm) = fresh_sm(Some(engine.clone())).await;
+        let mut sm = sm.with_sequencing_registry(Arc::clone(&registry));
+
+        apply_one(&mut sm, 1, owner(18490)).await;
+        apply_one(&mut sm, 2, owner(18491)).await;
+        apply_one(&mut sm, 3, put(3, 18492, json!([]))).await;
+        assert_eq!(registry.mode(18490), SequencingMode::Owner);
+        assert_eq!(registry.mode(18491), SequencingMode::Owner);
+
+        apply_one(&mut sm, 4, put(4, 18491, json!([]))).await;
+        apply_one(
+            &mut sm,
+            5,
+            request(5, ControlOp::DeleteImposter { port: 18490 }),
+        )
+        .await;
+        assert_eq!(
+            registry.mode(18491),
+            SequencingMode::Local,
+            "the put changed its mode"
+        );
+        assert_eq!(
+            registry.mode(18490),
+            SequencingMode::Local,
+            "the delete dropped it"
+        );
+        assert_eq!(sm.engine_full_syncs(), 0);
+
+        engine.shutdown().await;
+    }
+
     /// #46 gate: the expected-revision precondition is checked inside apply,
     /// so every replica computes the identical refusal from the same entry.
     #[tokio::test]

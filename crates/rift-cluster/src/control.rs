@@ -508,7 +508,9 @@ fn hex_decode(s: &str) -> Option<Vec<u8>> {
 /// [`ControlOp::PutImposter`], a compiled OpenAPI import, or a `--imposters`
 /// bootstrap, all of which reach the log through that one op (D-72).
 fn validate_replicable_config(config: &ImposterConfig) -> Result<(), String> {
-    if config.port.is_none() {
+    // Port 0 is upstream's "assign one for me" as surely as an absent port is (`explicit_port`),
+    // so it cannot replicate either: every node would bind a different port.
+    if config.port.is_none_or(|port| port == 0) {
         return Err(
             "config must carry an explicit port: an auto-assigned port cannot replicate".to_owned(),
         );
@@ -924,6 +926,19 @@ mod tests {
         };
         let err = validate(&op).expect_err("auto-assign cannot replicate");
         assert!(err.contains("port"), "{err}");
+    }
+
+    /// Port 0 asks upstream to auto-assign, exactly like an absent port: a committed one would be
+    /// created on a fresh port by every whole-set sync, and refused outright by a per-port drive
+    /// (`apply_one`'s `ExplicitPortRequired`, D-99).
+    #[test]
+    fn validate_rejects_a_config_on_port_zero() {
+        let op = ControlOp::PutImposter {
+            config: serde_json::from_value(json!({ "port": 0, "protocol": "http" }))
+                .expect("parses"),
+        };
+        let err = validate(&op).expect_err("port 0 is auto-assign");
+        assert!(err.contains("explicit port"), "{err}");
     }
 
     #[test]
