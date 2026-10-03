@@ -16,7 +16,10 @@
 //!   (RFC-001 §8.3). The documented consequence: editing a *keyless* stub
 //!   changes its `stub_key` and so restarts its cluster cursor, where a
 //!   single-node `LocalSequencer` would preserve it. A stub that needs
-//!   cross-node sequencing should carry an explicit `id`.
+//!   cross-node sequencing should carry an explicit `id`. An *unedited* keyless
+//!   stub keys identically on every node, because each node derives the key
+//!   from its own parse of the committed config and the engine hashes a
+//!   canonical form (D-98); before rift #1259 a multi-key one did not.
 //! - **Not replicated, not persisted.** D-8: replicating every advance would put
 //!   a network write on the hottest stateful path. Cursors are test-run-scoped;
 //!   a membership change hands the key to a new owner that starts at zero, and
