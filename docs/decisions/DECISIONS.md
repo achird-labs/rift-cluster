@@ -131,6 +131,9 @@ The entry stays `amended` rather than `superseded` because its surviving claim i
 built the system: config travels as a body on the log, not as a gossip digest.
 
 ### D-5 — Two-level, order-aware reconcile (LCS edit script) on top of by-id/positional stub CRUD
+> **Amended by D-98** (2026-10-03, #655): until rift #1259 (first pinned at `fa205d4`) a keyless
+> stub with a multi-entry map could key differently on each parse, and the cluster re-parses the
+> committed set on every config op — so such a stub was replaced or patched, not kept, on any write.
 - **Status:** amended
 - **Decided:** 2026-07-01 · RFC-001 v2
 - **Implemented by:** #565 (the delete-path amendment)
@@ -976,6 +979,9 @@ silent-fallback rule surviving its own decision.
 > **Amended by D-57** (2026-08-28, #514): a cursor **reset** is delivered per-peer, retried, and
 > reported when it does not land. "Degrades rather than fails" governs a *decision* on the hot
 > path; it never licensed losing a config-time reset.
+> **Amended by D-98** (2026-10-03, #655): a keyless *multi-key* stub shares one fleet cursor only
+> from rift #1259 (first pinned at `fa205d4`); before it each node keyed that stub from its own parse and cycled its own copy.
+> The "editing a keyless stub restarts its cursor" divergence below is unchanged.
 - **Status:** active
 - **Decided:** 2026-08-26 · #466
 - **Supersedes:** D-12
@@ -4448,3 +4454,60 @@ and the gate opening is not covered for that node.
 `a_dead_follower_is_named_unreachable_in_the_warnings_header` and
 `a_node_reports_its_own_readiness_on_the_applied_route`
 (`crates/rift-cluster-server/tests/write_path.rs`) pin it.
+
+### D-98 — An engine bump that changes matching, key derivation or admission is a whole-fleet upgrade; a keyless stub's key is canonical from rift #1259
+
+- **Status:** active
+- **Decided:** 2026-10-03 · #655
+- **Refines:** D-5, D-47, D-73
+- **Amends:** docs/architecture/10-operations.md
+- **Implemented by:** #655
+- **Code:** crates/rift-cluster/src/raft/store.rs, crates/rift-cluster/src/stores/sequencer.rs, tests/cluster-chaos/tests/scenarios.rs
+
+**What the bump fixed.** Before rift #1259 (first pinned here at `fa205d4`; the previous pin was
+`453191f`), the content key of a stub with no `id` was a hash of its serialization, and `Stub`
+holds `HashMap`s — predicate operations and response headers — that serialize in per-instance
+iteration order. Two parses of the same JSON could therefore key a stub with any multi-entry map
+differently (a stub whose every map has one entry could not vary). The state machine re-parses the whole committed set
+on every config op (`desired_configs`), so on every node:
+
+- **D-5's level-2 reconcile degenerated.** The freshly parsed stub never matched the live one, so
+  `reconcile_stub_states` saw a delete plus an insert and replaced or patched the imposter —
+  listener rebound, response cycle reset — on *any* config op anywhere in the fleet. Measured on
+  1000 production-derived imposters: each re-parsed apply replaced 112 and patched 285.
+- **D-47's cursor sharing did not hold for these stubs.** A cursor's owner is HRW over membership
+  and the stub's key, and each node keyed the stub from its own parse, so each node routed to its
+  own cursor and the fleet answered a per-node cycle. D-47's acceptance scenario (C33) used a
+  single-key, header-less stub — a shape whose serialization order cannot vary.
+
+From #1259 the key hashes a canonical form (`serde_json::to_value`, whose objects are sorted — which
+holds only while serde_json's `preserve_order` feature is off in this workspace's build), so a stub
+keys identically on every parse, node and process. `an_unrelated_put_leaves_a_multi_key_sibling_untouched`,
+`a_committed_stub_keys_the_same_on_every_parse` (which pins the key's literal value: a future
+change to the engine's content hash restarts every keyless cursor once and must be recorded, not
+slip in with a bump) and chaos scenario C34 pin it; each was run at `453191f` and failed there.
+
+**The rule.** An engine pin bump whose upstream range changes *matching* (which request a
+predicate accepts), a *key* the cluster derives ownership or reconcile identity from, or what the
+engine *admits* at deserialize is a **whole-fleet upgrade**: every node runs the new binary before
+the fleet takes config writes again. The rolling upgrade in `docs/architecture/10-operations.md`
+holds only for a delta that is additive in all three. The pin-bump PR says which it is, from
+`git log OLD..NEW` read commit by commit. This bump (`453191f`→`fa205d4`) is whole-fleet on all
+three counts: #1259 changes keys (#1265 only caches the same hash), #1261/#1263 change JSONPath and
+XPath matching, #1262 changes admission.
+
+**Why documentation, not a mechanism.** Cluster cursors live in memory on their owner (D-8), so
+the restart an upgrade needs resets them whatever their keys are; there is nothing to migrate. In a
+mixed-version window, old and new nodes key a keyless stub differently, so an owner-mode stub can
+be served from two cursors and repeat an index. That is unannotated, because neither node took a
+fallback, but it is the degradation D-10 and D-47 already accept, and no cursor mechanism would
+reach the other two divergences: the nodes match requests differently and admit different configs.
+D-73 recorded "every node upgrades at once" for one format break; this generalises it to the class.
+
+**Hazard, stated.** A config the old engine admitted and the new one refuses (here: a `copy` or
+`lookup` behavior whose selector does not compile, #1262) is re-validated when the new binary reads
+it back. Depending on where it sits in the log, the node does not start, serves no imposter, or
+takes down the leader's Raft core when a node joins (#657). Until #657 lands, a fleet that keeps
+its state directory is upgraded only after its imposters are exported and loaded into the new
+engine, and anything refused is fixed or deleted first. `rift-lint` is not a substitute: it checks
+regex selectors (E051) but carries no JSONPath or XPath parser.

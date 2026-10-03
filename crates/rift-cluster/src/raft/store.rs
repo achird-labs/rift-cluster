@@ -3515,6 +3515,7 @@ impl RedbStateMachine {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -3529,7 +3530,8 @@ mod tests {
 
     use super::{SESSION_KEY_ROW, SM_SESSION_KEY_TABLE};
     use rift_cluster_base::seams::{
-        CompiledRoutes, ImposterConfig, ImposterManager, Route, RouteMatch, RouteTable, RouteTarget,
+        CompiledRoutes, EventContext, ImposterConfig, ImposterEvent, ImposterEventListener,
+        ImposterManager, Route, RouteMatch, RouteTable, RouteTarget, stub_key,
     };
     use serde_json::json;
     use tempfile::TempDir;
@@ -3909,13 +3911,19 @@ mod tests {
         .await
         .expect("apply");
         assert_eq!(engine.count(), 2, "both imposters live in the engine");
+        let before = engine.get_imposter(18081).expect("18081 is live");
 
         // A sibling-port change must leave 18081 untouched (the #316 contract:
-        // identical config → not recreated).
+        // identical config → not recreated). Identity, not stub ids: a wholesale
+        // replace re-creates the imposter with the same ids (#655).
         sm.apply(vec![entry(3, put(3, 18082, json!([{ "id": "b" }])))])
             .await
             .expect("apply");
         assert_eq!(engine.count(), 2);
+        assert!(
+            Arc::ptr_eq(&before, &engine.get_imposter(18081).expect("18081 is live")),
+            "a sibling-port put must not replace 18081"
+        );
         assert_eq!(engine_stub_ids(&engine, 18081), vec!["a"]);
         assert_eq!(engine_stub_ids(&engine, 18082), vec!["b"]);
         assert!(
@@ -3925,6 +3933,164 @@ mod tests {
         );
 
         engine.shutdown().await;
+    }
+
+    /// A stub shaped like most real Mountebank stubs: no `id`, a multi-key `equals` (one value a
+    /// nested object) and several response headers — every one a `HashMap` upstream.
+    fn multi_key_stub(body: &str) -> serde_json::Value {
+        json!({
+            "predicates": [{ "equals": {
+                "method": "POST",
+                "path": "/pay",
+                "query": { "a": "1", "b": "2", "c": "3" },
+                "headers": { "X-A": "1", "X-B": "2" },
+                "body": "x",
+            } }],
+            "responses": [{ "is": {
+                "statusCode": 200,
+                "headers": {
+                    "Content-Type": "application/json",
+                    "X-One": "1",
+                    "X-Two": "2",
+                    "X-Three": "3",
+                    "X-Four": "4",
+                },
+                "body": body,
+            } }],
+        })
+    }
+
+    /// `multi_key_stub("A")` on `port`, written with every object's keys in a different order
+    /// from `json!`'s sorted output — the same config as a client might send it.
+    fn multi_key_config_reordered(port: u16) -> ImposterConfig {
+        let doc = format!(
+            r#"{{"stubs": [{{
+                "responses": [{{ "is": {{ "body": "A", "headers": {{
+                    "X-Four": "4", "X-Three": "3", "X-Two": "2", "X-One": "1",
+                    "Content-Type": "application/json" }}, "statusCode": 200 }} }}],
+                "predicates": [{{ "equals": {{ "body": "x", "headers": {{ "X-B": "2", "X-A": "1" }},
+                    "query": {{ "c": "3", "b": "2", "a": "1" }}, "path": "/pay", "method": "POST" }} }}]
+            }}], "host": "127.0.0.1", "protocol": "http", "port": {port}}}"#
+        );
+        serde_json::from_str(&doc).expect("reordered config parses")
+    }
+
+    /// Records every engine event that names one port. A wholesale replace re-creates an
+    /// imposter with the same stub ids, so ids alone cannot tell "untouched" from "replaced".
+    struct PortEvents {
+        port: u16,
+        seen: Mutex<Vec<String>>,
+    }
+
+    impl ImposterEventListener for PortEvents {
+        fn on_event(&self, event: &ImposterEvent, _ctx: &EventContext) {
+            let port = match event {
+                ImposterEvent::Created(p)
+                | ImposterEvent::Replaced(p)
+                | ImposterEvent::StubsChanged(p)
+                | ImposterEvent::Deleted(p)
+                | ImposterEvent::EnabledChanged { port: p, .. } => Some(*p),
+                ImposterEvent::AllDeleted => None,
+            };
+            if port.is_none_or(|p| p == self.port) {
+                self.seen.lock().push(format!("{event:?}"));
+            }
+        }
+    }
+
+    /// Pins D-98: an id-less, multi-key imposter is untouched by every config op that is not
+    /// about it. The state machine re-parses the whole committed set for each op, so before
+    /// the engine keyed stubs on a canonical form each fresh parse keyed this stub differently
+    /// from the live one and the level-2 reconcile (D-5) replaced or patched it — rebinding its
+    /// listener and resetting its response cycle — on *any* write anywhere (#655).
+    #[tokio::test]
+    async fn an_unrelated_put_leaves_a_multi_key_sibling_untouched() {
+        const A: u16 = 18655;
+        const DOOMED: u16 = 18656;
+        let events = Arc::new(PortEvents {
+            port: A,
+            seen: Mutex::new(Vec::new()),
+        });
+        let engine = Arc::new(ImposterManager::new().with_event_listener(events.clone()));
+        let (_td, mut sm) = fresh_sm(Some(engine.clone())).await;
+
+        apply_one(&mut sm, 1, put(1, A, json!([multi_key_stub("A")]))).await;
+        let live = engine.get_imposter(A).expect("A is live");
+        assert_eq!(
+            *events.seen.lock(),
+            vec![format!("Created({A})")],
+            "the listener must see A's creation, or the empty log asserted below proves nothing"
+        );
+        events.seen.lock().clear();
+        apply_one(&mut sm, 2, put(2, DOOMED, json!([{ "id": "doomed" }]))).await;
+        assert!(
+            Arc::ptr_eq(&live, &engine.get_imposter(A).expect("A is live")),
+            "an unrelated put to {DOOMED} replaced A"
+        );
+
+        let mut index = 3;
+        for k in 0..20u16 {
+            let port = 18660 + k;
+            let stub = json!([{ "id": format!("s{k}") }]);
+            apply_one(&mut sm, index, put(u128::from(index), port, stub)).await;
+            index += 1;
+            assert!(
+                Arc::ptr_eq(&live, &engine.get_imposter(A).expect("A is live")),
+                "an unrelated put to {port} replaced A"
+            );
+        }
+        let delete = ControlOp::DeleteImposter { port: DOOMED };
+        apply_one(&mut sm, index, request(u128::from(index), delete)).await;
+        index += 1;
+        // A again, as a client might resend it: D-5's "identical config → untouched", through a
+        // fresh parse of a document that lists every key in a different order.
+        let again = ControlOp::PutImposter {
+            config: Box::new(multi_key_config_reordered(A)),
+        };
+        apply_one(&mut sm, index, request(u128::from(index), again)).await;
+
+        assert!(
+            Arc::ptr_eq(&live, &engine.get_imposter(A).expect("A is live")),
+            "an unrelated delete or an identical re-put replaced A"
+        );
+        assert!(
+            events.seen.lock().is_empty(),
+            "no engine event may name A — it was neither replaced, patched, toggled nor deleted: \
+             {:?}",
+            events.seen.lock()
+        );
+        assert!(sm.apply_failures().is_empty(), "{:?}", sm.apply_failures());
+        engine.shutdown().await;
+    }
+
+    /// Pins D-98 (and D-47's premise that a cursor's owner is a pure function of membership and
+    /// the stub's key): a committed id-less stub keys the same however often it is read back,
+    /// and whatever order its JSON keys arrived in. The expected key is literal on purpose — a
+    /// future change to the engine's content hash restarts every keyless cluster cursor once,
+    /// so it must fail here and be recorded, not slip in with a pin bump (#655).
+    #[tokio::test]
+    async fn a_committed_stub_keys_the_same_on_every_parse() {
+        const KEY: &str = "~d29d8fa0b36e0ffc#0";
+        let (_td, mut sm) = fresh_sm(None).await;
+        apply_one(&mut sm, 1, put(1, 18690, json!([multi_key_stub("A")]))).await;
+        let row = sm.read_config(18690).expect("read").expect("committed");
+
+        let keys: BTreeSet<String> = (0..20)
+            .map(|_| {
+                let config: ImposterConfig = serde_json::from_str(&row).expect("row parses");
+                stub_key(&config.stubs[0], 0)
+            })
+            .collect();
+        assert_eq!(
+            keys,
+            BTreeSet::from([KEY.to_owned()]),
+            "twenty parses of one committed row must key one way"
+        );
+        assert_eq!(
+            stub_key(&multi_key_config_reordered(18691).stubs[0], 0),
+            KEY,
+            "the key must not depend on the order the document listed its keys in"
+        );
     }
 
     /// The core infallibility clause: a port that cannot bind fails the *engine

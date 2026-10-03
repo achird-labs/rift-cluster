@@ -332,6 +332,10 @@ still **not built**; it is kept as the design of what it would have to look like
 
 ## Rolling upgrades
 
+> **Amended by D-98** (2026-10-03, #655): a rolling upgrade is for a release whose engine delta is
+> additive. A release that changes the engine's *matching*, a stub *key*, or what it *admits* is a
+> whole-fleet upgrade — see "Whole-fleet upgrades" below.
+
 One node at a time, SIGTERM-driven; the invariants that make it boring:
 protocol majors must match to join (clean refusal otherwise), gossip/RPC
 fields are additive within a major, config bodies tolerate unknown fields
@@ -340,6 +344,33 @@ crashes on genuinely new required semantics), and graceful leave means no
 election and no ownership guess per step. Sequence cursors still reset on
 ownership moves (D-8) — schedule upgrades between test runs, stated in the
 docs rather than discovered in one.
+
+### Whole-fleet upgrades (D-98)
+
+"An old node can apply a new node's config" holds for *new fields*. It does not hold when the
+engine underneath changes what a config *means*. A release whose engine pin moves any of these is
+upgraded on every node before the fleet takes config writes again:
+
+- **Matching** — which requests a predicate accepts. In a mixed fleet the same request matches on
+  one node and not on another.
+- **A stub key** — the identity the reconcile keeps stubs by and sequencing routes cursors by. In a
+  mixed fleet a keyless owner-mode stub is served from two cursors and can repeat an index, with no
+  fallback recorded.
+- **Admission** — what the engine refuses to load. A config admitted by the old engine and refused
+  by the new one is refused again when the new binary reads it back from its own state.
+
+The release notes of a pin bump say which kind it is. The bump to rift `fa205d4` (#655) is all
+three: stub keys became canonical (which fixes cross-node cursor sharing and stops unrelated writes
+from replacing keyless multi-key imposters), JSONPath reads Mountebank's selector shorthands and a
+JSONPath or XPath predicate matches when any selected value satisfies it, and a `copy`/`lookup`
+behavior whose selector does not compile is refused at load.
+
+**Before a whole-fleet upgrade of a fleet that keeps its state directory**, export the imposters and
+load them into the new engine, and fix or delete anything it refuses. `rift-lint` is not a
+substitute: it checks regex selectors (E051) but carries no JSONPath or XPath parser.
+Until #657 lands, a stored config the new engine refuses can stop a node from starting, leave it
+serving nothing, or take down the leader when a node joins. A fleet started from a fresh state
+directory is unaffected. Response cursors restart at the upgrade as they do on any restart (D-8).
 
 ## Sizing rules of thumb
 

@@ -4746,3 +4746,75 @@ async fn c33_owner_mode_sequencing_cycles_fleet_wide_and_degrades_on_owner_kill(
          a repeat)"
     );
 }
+
+/// C33's imposter in the shape real Mountebank stubs have: no `id`, a two-key
+/// `equals`, and several response headers. Each of those is a `HashMap` in the
+/// engine, so before the engine keyed a stub on a canonical form (#655) every
+/// node parsing this config computed its own `stub_key` — and with it its own
+/// owner on the ring. C33's single-key, header-less stub could not show that.
+fn multi_key_sequencing_imposter(port: u16) -> serde_json::Value {
+    let response = |body: &str| {
+        serde_json::json!({ "is": {
+            "statusCode": 200,
+            "headers": {
+                "Content-Type": "text/plain",
+                "X-One": "1",
+                "X-Two": "2",
+                "X-Three": "3",
+                "X-Four": "4",
+            },
+            "body": body,
+        } })
+    };
+    serde_json::json!({
+        "port": port,
+        "protocol": "http",
+        "_rift": { "sequencing": { "mode": "owner" } },
+        "stubs": [{
+            "predicates": [{ "equals": { "method": "GET", "path": "/cycle" } }],
+            "responses": [response("A"), response("B"), response("C")],
+        }],
+    })
+}
+
+/// C34 (#655, D-98): an owner-mode imposter whose stub carries no `id` and is
+/// multi-key cycles once **fleet-wide**. The cursor's owner is HRW over
+/// membership and the stub's key, so this holds only if all three nodes derive
+/// the same key from their own parse of the committed config. The healthy half
+/// of C33, on the stub shape that half was blind to.
+#[tokio::test]
+#[ignore = "needs a container runtime"]
+async fn c34_a_keyless_multi_key_stub_cycles_once_fleet_wide() {
+    let _cluster = Cluster::up_with_overlays(&["sequencing.overlay.yml"])
+        .await
+        .expect("fleet comes up");
+    let port = SEQUENCING_IMPOSTER_PORT;
+    let all: Vec<usize> = (0..NODES.len()).collect();
+
+    let (status, body) = put_imposter_config(NODES[0].admin, &multi_key_sequencing_imposter(port))
+        .await
+        .expect("admin write");
+    assert_eq!(
+        status, 201,
+        "the keyless owner-mode imposter was refused: {body}"
+    );
+    wait_converged(u64::from(port), CONVERGE_TIMEOUT)
+        .await
+        .expect("the imposter binds on every node before any request is sprayed");
+
+    let before = c33_fallbacks(&all).await;
+    let bodies = c33_spray(&all, 3).await.expect("healthy spray");
+    let want: Vec<String> = "ABCABCABC".chars().map(|c| c.to_string()).collect();
+    assert_eq!(
+        bodies, want,
+        "three nodes must agree on one cursor for a keyless multi-key stub. A \
+         per-node cycle here means the nodes keyed the same committed stub \
+         differently, so each routed to its own owner (the pre-#655 engine)"
+    );
+    let fallbacks = c33_fallbacks(&all).await - before;
+    assert_eq!(
+        fallbacks, 0.0,
+        "{fallbacks} fallback(s) on a healthy fleet: the cycle above was not \
+         answered by the ring"
+    );
+}
