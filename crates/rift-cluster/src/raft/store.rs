@@ -75,6 +75,7 @@ use rift_cluster_base::seams::{
     with_annotation_scope,
 };
 use serde::{Deserialize, Serialize};
+use serde_json::value::{RawValue, to_raw_value};
 
 use super::TypeConfig;
 use crate::control::{
@@ -216,6 +217,13 @@ fn place_recorded_stub(
     }
 }
 
+/// The state directory's format (D-100), one row. Written when a directory is created, checked on
+/// every open: a directory of another format is refused rather than read with the wrong row shapes.
+const SM_FORMAT_TABLE: TableDefinition<(), u32> = TableDefinition::new("sm_format");
+/// The format this binary reads and writes. `1` is D-100's: configs nested in `sm_configs` rows and
+/// every row nested in the snapshot. A directory with no `sm_format` row and some state is format
+/// `0` — written before the row existed, with string-escaped rows.
+const STATE_FORMAT: u32 = 1;
 const SM_DEDUP_TABLE: TableDefinition<&str, &str> = TableDefinition::new("sm_op_dedup");
 const SM_APPLIED_TABLE: TableDefinition<(), &[u8]> = TableDefinition::new("sm_applied");
 /// Node-local durable intents (issue #9 R4): ops this node accepted but has
@@ -249,11 +257,15 @@ struct AppliedState {
 }
 
 /// What `sm_configs` stores per port: the canonical config JSON,
-/// whether the imposter is enabled (always `true` until the `SetEnabled` slice
-/// lands with #15), and the log index that last wrote this record.
+/// whether the imposter is enabled, and the log index that last wrote this record.
+///
+/// The config is **nested** JSON, not a string holding JSON (D-100): an escaped string cost
+/// 1.15× the config's bytes in the row and 1.46× once the snapshot escaped it again. `RawValue`
+/// keeps the committed bytes as written and lets a reader parse the config once, from
+/// [`RawValue::get`], with the envelope parse a skip over its span.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct StoredImposter {
-    config_json: String,
+    config: Box<RawValue>,
     enabled: bool,
     revision: u64,
 }
@@ -288,16 +300,26 @@ struct DedupEntry {
 /// doc), so a fleet upgrading across this commit starts from a fresh
 /// `cluster-state-dir`.
 ///
+/// **Since D-100 the payload is versioned** (`format`): a payload of any other format is refused at
+/// install, so the per-field `#[serde(default)]`s below keep a payload of *this* format decodable
+/// when a field is absent; they no longer make an older format's payload installable.
+///
 /// No `Debug`: `session_key` is the raw `sm_session_key` row, key included (D-86).
 #[derive(Clone, Default, Serialize, Deserialize)]
 struct SnapshotPayload {
-    /// `(port, stored-imposter JSON)` rows of `sm_configs`.
-    configs: Vec<(u16, String)>,
-    /// `(route id, route JSON)` rows of `sm_routes`. Defaulted so a snapshot
-    /// built before issue #131 still installs cleanly on an upgraded node — it
-    /// just carries no routes, the same as a fleet that never wrote any.
+    /// The state format this payload was built in (D-100). Absent — `0` — on a payload a
+    /// pre-#653 binary built; [`RedbStateMachine::parse_snapshot`] refuses any but
+    /// [`STATE_FORMAT`], because the rows below change shape between formats.
     #[serde(default)]
-    routes: Vec<(String, String)>,
+    format: u32,
+    /// `(port, stored-imposter row)` rows of `sm_configs`, nested (D-100): each row is embedded
+    /// as the JSON it is, so the snapshot does not escape it a second time.
+    configs: Vec<(u16, Box<RawValue>)>,
+    /// `(route id, route JSON)` rows of `sm_routes`, nested. Defaulted so a payload
+    /// without the key decodes as no routes, the same as a fleet that never wrote any
+    /// (since D-100 only a payload of the current format installs at all).
+    #[serde(default)]
+    routes: Vec<(String, Box<RawValue>)>,
     /// The `sm_routes_revision` row (issue #210), absent when no route table has
     /// ever been written.
     ///
@@ -319,23 +341,23 @@ struct SnapshotPayload {
     #[serde(default)]
     session_key: Option<String>,
     /// The `sm_fleet_name` row, if an operator has ever set one (issue #373). `#[serde(default)]`
-    /// for the #134/#137 reason every table above carries it: a snapshot built before this field
-    /// existed must still install, and a table omitted from this payload is a table that
+    /// for the #134/#137 reason every table above carries it: a payload without the key decodes,
+    /// and a table omitted from this payload is a table that
     /// vanishes on the next follower catch-up. The failure if it were forgotten here is quieter
     /// than most of its siblings but still real: a node that joins by snapshot would silently
     /// forget the fleet's name and every surface reading it through that node would show
     /// "unnamed" until the next rename.
     #[serde(default)]
     fleet_name: Option<String>,
-    /// `(port, sig-hash, recorded-response JSON)` rows of `sm_proxy_recorded` (#226).
+    /// `(port, sig-hash, recorded-response JSON)` rows of `sm_proxy_recorded` (#226), nested.
     /// `#[serde(default)]` for the #134/#137 reason every table above carries it. The failure
     /// if it were forgotten: a node that joins by snapshot answers `Claimed` for signatures
     /// the fleet already recorded, and the engine calls the real upstream a second time — the
     /// exact duplicate `proxyOnce` exists to prevent.
     #[serde(default)]
-    proxy_recorded: Vec<(u16, String, String)>,
+    proxy_recorded: Vec<(u16, String, Box<RawValue>)>,
     /// `(op_id, dedup-entry JSON)` rows of `sm_op_dedup`.
-    dedup: Vec<(String, String)>,
+    dedup: Vec<(String, Box<RawValue>)>,
     last_applied_log: Option<LogId<u64>>,
     last_membership: StoredMembership<u64, BasicNode>,
     #[serde(default)]
@@ -352,18 +374,6 @@ struct StoredSnapshot {
     /// Invariant: by the time this row commits, that file is fully written, fsynced and renamed
     /// into place — the row never names a payload that is not already durable.
     file: String,
-}
-
-/// The pre-#436 row: the payload inlined as a JSON integer array (~3.7x its own size).
-///
-/// Read-only, and read exactly once — [`RedbStateMachine::migrate_legacy_snapshot_row`] converts it
-/// to a file on first open. Distinguishable from [`StoredSnapshot`] by serde without a version tag:
-/// a legacy row has no `file`, so the current shape fails with *missing field `file`*, and the
-/// legacy shape's extra `data` is simply ignored when the current one is what is present.
-#[derive(Debug, Deserialize)]
-struct LegacyStoredSnapshot {
-    meta: SnapshotMeta<u64, BasicNode>,
-    data: Vec<u8>,
 }
 
 /// Create a fresh (or reopen an existing) `redb` database at `path` and return the
@@ -410,6 +420,7 @@ pub async fn new<P: AsRef<Path>>(path: P) -> StorageResult<(RedbLogStore, RedbSt
         write_txn.open_table(SM_DEDUP_TABLE).map_err(io)?;
         write_txn.open_table(SM_APPLIED_TABLE).map_err(io)?;
         write_txn.open_table(PENDING_INTENTS_TABLE).map_err(io)?;
+        check_state_format(&write_txn)?;
         write_txn
             .commit()
             .map_err(|e| StorageError::from(StorageIOError::write(&e)))?;
@@ -418,8 +429,62 @@ pub async fn new<P: AsRef<Path>>(path: P) -> StorageResult<(RedbLogStore, RedbSt
     std::fs::create_dir_all(&snapshot_dir)
         .map_err(|e| StorageError::from(StorageIOError::write(&e)))?;
     let sm = RedbStateMachine::new(db.clone(), snapshot_dir);
-    sm.migrate_legacy_snapshot_row()?;
     Ok((RedbLogStore { db }, sm))
+}
+
+/// Stamp a new state directory with [`STATE_FORMAT`], or refuse one of another format (D-100).
+///
+/// A directory with no format row is new only if it holds nothing at all — no log entry, no
+/// vote, no applied state, no snapshot, no config. One that holds any of those and no row was
+/// written before the row existed (format `0`), and its rows are shaped for that format: opened,
+/// every engine sync would refuse on a "corrupt" record for the life of the process. The refusal
+/// names the remedy D-73 documents, rather than leaving an operator to infer it from that log.
+#[allow(clippy::result_large_err)]
+fn check_state_format(write_txn: &redb::WriteTransaction) -> StorageResult<()> {
+    let read = |e: redb::StorageError| StorageError::from(StorageIOError::read(&e));
+    let open = |e: redb::TableError| StorageError::from(StorageIOError::read(&e));
+    let mut format_table = write_txn.open_table(SM_FORMAT_TABLE).map_err(open)?;
+    let stored = format_table.get(()).map_err(read)?.map(|row| row.value());
+    let found = match stored {
+        Some(format) => format,
+        None => {
+            let holds_state = !table_is_empty(write_txn, LOG_TABLE)?
+                || !table_is_empty(write_txn, VOTE_TABLE)?
+                || !table_is_empty(write_txn, SM_APPLIED_TABLE)?
+                || !table_is_empty(write_txn, SNAPSHOT_TABLE)?
+                || !table_is_empty(write_txn, SM_CONFIGS_TABLE)?;
+            if !holds_state {
+                format_table
+                    .insert((), STATE_FORMAT)
+                    .map_err(|e| StorageError::from(StorageIOError::write(&e)))?;
+                return Ok(());
+            }
+            0
+        }
+    };
+    if found == STATE_FORMAT {
+        return Ok(());
+    }
+    Err(StorageError::from(StorageIOError::read(
+        &std::io::Error::other(format!(
+            "cluster state directory format {found}, but this binary needs format {STATE_FORMAT}: \
+         a release that changes the format is a whole-fleet upgrade — start every node from a \
+         fresh --cluster-state-dir and load the imposters back from an export taken with the \
+         previous release, which is the one that can read this directory (D-73, D-100)"
+        )),
+    )))
+}
+
+#[allow(clippy::result_large_err)]
+fn table_is_empty<K: redb::Key + 'static, V: redb::Value + 'static>(
+    write_txn: &redb::WriteTransaction,
+    table: TableDefinition<K, V>,
+) -> StorageResult<bool> {
+    write_txn
+        .open_table(table)
+        .map_err(|e| StorageError::from(StorageIOError::read(&e)))?
+        .is_empty()
+        .map_err(|e| StorageError::from(StorageIOError::read(&e)))
 }
 
 // ---------------------------------------------------------------------------
@@ -1125,51 +1190,6 @@ impl RedbStateMachine {
         Ok(tokio::fs::File::from_std(file))
     }
 
-    /// Convert a pre-#436 snapshot row (payload inlined as a JSON integer array) into a payload
-    /// file plus a `{meta, file}` row, once, at open.
-    ///
-    /// Migrated rather than discarded: a node restarted onto a new binary part-way through catching
-    /// a peer up must not lose the snapshot it already holds. A row already in the current shape,
-    /// or no row at all, is left untouched.
-    #[allow(clippy::result_large_err)]
-    fn migrate_legacy_snapshot_row(&self) -> StorageResult<()> {
-        let read_txn = self
-            .db
-            .begin_read()
-            .map_err(|e| StorageIOError::read_snapshot(None, &e))?;
-        let table = read_txn
-            .open_table(SNAPSHOT_TABLE)
-            .map_err(|e| StorageIOError::read_snapshot(None, &e))?;
-        let Some(guard) = table
-            .get(())
-            .map_err(|e| StorageIOError::read_snapshot(None, &e))?
-        else {
-            return Ok(());
-        };
-        let bytes = guard.value().to_vec();
-        drop(read_txn);
-
-        if serde_json::from_slice::<StoredSnapshot>(&bytes).is_ok() {
-            return Ok(());
-        }
-        // Not the current shape — the only other thing it can legitimately be is the pre-#436 one.
-        // A parse failure here is propagated, not swallowed: silently dropping a snapshot would
-        // look identical to a fleet that never had one.
-        let legacy: LegacyStoredSnapshot =
-            serde_json::from_slice(&bytes).map_err(|e| StorageIOError::read_snapshot(None, &e))?;
-
-        self.write_snapshot_file(&legacy.meta, |file| {
-            std::io::Write::write_all(file, &legacy.data)
-        })?;
-        self.commit_snapshot_row(&legacy.meta)?;
-        tracing::info!(
-            snapshot_id = %legacy.meta.snapshot_id,
-            bytes = legacy.data.len(),
-            "migrated a pre-#436 inlined snapshot row to a payload file"
-        );
-        Ok(())
-    }
-
     /// Read the applied config JSON for `port`, or `None` if no config has been
     /// applied for it.
     ///
@@ -1192,7 +1212,7 @@ impl RedbStateMachine {
             .map_err(|e| StorageIOError::read_state_machine(&e))?
             .map(|g| {
                 serde_json::from_str::<StoredImposter>(g.value())
-                    .map(|stored| stored.config_json)
+                    .map(|stored| stored.config.get().to_owned())
                     .map_err(|e| StorageError::from(StorageIOError::read_state_machine(&e)))
             })
             .transpose()
@@ -1997,7 +2017,7 @@ impl RedbStateMachine {
             // Disabled configs stay in the desired set: upstream keeps a
             // paused imposter bound (serving 503) — dropping it here would
             // read as "delete it" to apply_config (#817).
-            match serde_json::from_str::<ImposterConfig>(&stored.config_json) {
+            match serde_json::from_str::<ImposterConfig>(stored.config.get()) {
                 Ok(config) => desired.push(config),
                 Err(e) => {
                     return Ok(Err((port, format!("stored config will not parse: {e}"))));
@@ -2162,10 +2182,9 @@ impl RedbStateMachine {
                 let Some(port) = config.port else {
                     return Ok(Err("config must carry an explicit port".to_owned()));
                 };
-                let config_json = serde_json::to_string(config)
-                    .map_err(|e| StorageIOError::write_state_machine(&e))?;
                 let stored = StoredImposter {
-                    config_json,
+                    config: to_raw_value(config)
+                        .map_err(|e| StorageIOError::write_state_machine(&e))?,
                     enabled: config.enabled,
                     revision: index,
                 };
@@ -2206,7 +2225,7 @@ impl RedbStateMachine {
                         },
                     }
                 };
-                let mut config: ImposterConfig = match serde_json::from_str(&record.config_json) {
+                let mut config: ImposterConfig = match serde_json::from_str(record.config.get()) {
                     Ok(config) => config,
                     Err(e) => {
                         tracing::error!(port = *port, error = %e, "corrupt stored config");
@@ -2216,8 +2235,8 @@ impl RedbStateMachine {
                 if let Err(reason) = control::apply_edit(&mut config.stubs, edit) {
                     return Ok(Err(reason));
                 }
-                record.config_json = serde_json::to_string(&config)
-                    .map_err(|e| StorageIOError::write_state_machine(&e))?;
+                record.config =
+                    to_raw_value(&config).map_err(|e| StorageIOError::write_state_machine(&e))?;
                 record.revision = index;
                 let value = serde_json::to_string(&record)
                     .map_err(|e| StorageIOError::write_state_machine(&e))?;
@@ -2278,7 +2297,7 @@ impl RedbStateMachine {
                 // is what the engine, snapshots and the desired-set builder
                 // consume; the record field is a redundant projection kept in
                 // sync so later slices can read it without a config parse.
-                let mut config: ImposterConfig = match serde_json::from_str(&record.config_json) {
+                let mut config: ImposterConfig = match serde_json::from_str(record.config.get()) {
                     Ok(config) => config,
                     Err(e) => {
                         tracing::error!(port = *port, error = %e, "corrupt stored config");
@@ -2287,8 +2306,8 @@ impl RedbStateMachine {
                 };
                 record.enabled = *enabled;
                 config.enabled = *enabled;
-                record.config_json = serde_json::to_string(&config)
-                    .map_err(|e| StorageIOError::write_state_machine(&e))?;
+                record.config =
+                    to_raw_value(&config).map_err(|e| StorageIOError::write_state_machine(&e))?;
                 record.revision = index;
                 let value = serde_json::to_string(&record)
                     .map_err(|e| StorageIOError::write_state_machine(&e))?;
@@ -2418,7 +2437,7 @@ impl RedbStateMachine {
                         },
                     }
                 };
-                let mut config: ImposterConfig = match serde_json::from_str(&record.config_json) {
+                let mut config: ImposterConfig = match serde_json::from_str(record.config.get()) {
                     Ok(config) => config,
                     Err(e) => {
                         tracing::error!(port = *port, error = %e, "corrupt stored config");
@@ -2438,8 +2457,8 @@ impl RedbStateMachine {
                     recorded.placement,
                     &recorded.proxy_to,
                 );
-                record.config_json = serde_json::to_string(&config)
-                    .map_err(|e| StorageIOError::write_state_machine(&e))?;
+                record.config =
+                    to_raw_value(&config).map_err(|e| StorageIOError::write_state_machine(&e))?;
                 record.revision = index;
                 let value = serde_json::to_string(&record)
                     .map_err(|e| StorageIOError::write_state_machine(&e))?;
@@ -2973,7 +2992,8 @@ impl RedbStateMachine {
             .map_err(|e| StorageIOError::read_state_machine(&e))?
         {
             let (key, value) = item.map_err(|e| StorageIOError::read_state_machine(&e))?;
-            configs.push((key.value(), value.value().to_owned()));
+            let port = key.value();
+            configs.push((port, Self::nested_row("sm_configs", port, value.value())?));
         }
         let routes_table = read_txn
             .open_table(SM_ROUTES_TABLE)
@@ -2984,7 +3004,11 @@ impl RedbStateMachine {
             .map_err(|e| StorageIOError::read_state_machine(&e))?
         {
             let (key, value) = item.map_err(|e| StorageIOError::read_state_machine(&e))?;
-            routes.push((key.value().to_owned(), value.value().to_owned()));
+            let id = key.value();
+            routes.push((
+                id.to_owned(),
+                Self::nested_row("sm_routes", id, value.value())?,
+            ));
         }
         // Travels with the routes themselves (issue #210). Omitting it
         // would not lose data, but it would silently reset the table to
@@ -3029,7 +3053,15 @@ impl RedbStateMachine {
         {
             let (key, value) = item.map_err(|e| StorageIOError::read_state_machine(&e))?;
             let (port, sig_hash) = key.value();
-            proxy_recorded.push((port, sig_hash.to_owned(), value.value().to_owned()));
+            proxy_recorded.push((
+                port,
+                sig_hash.to_owned(),
+                Self::nested_row(
+                    "sm_proxy_recorded",
+                    format_args!("{port}/{sig_hash}"),
+                    value.value(),
+                )?,
+            ));
         }
         let dedup_table = read_txn
             .open_table(SM_DEDUP_TABLE)
@@ -3040,9 +3072,14 @@ impl RedbStateMachine {
             .map_err(|e| StorageIOError::read_state_machine(&e))?
         {
             let (key, value) = item.map_err(|e| StorageIOError::read_state_machine(&e))?;
-            dedup.push((key.value().to_owned(), value.value().to_owned()));
+            let op_id = key.value();
+            dedup.push((
+                op_id.to_owned(),
+                Self::nested_row("sm_op_dedup", op_id, value.value())?,
+            ));
         }
         Ok(SnapshotPayload {
+            format: STATE_FORMAT,
             configs,
             routes,
             routes_revision,
@@ -3054,6 +3091,49 @@ impl RedbStateMachine {
             last_membership: applied.last_membership,
             logical_clock_secs: applied.logical_clock_secs,
         })
+    }
+
+    /// A stored row, embedded in the snapshot as the JSON it is (D-100).
+    ///
+    /// Every row this crate writes is a JSON object. One that is not JSON at all is corruption,
+    /// and it travels as a JSON **string** holding the row unchanged — what the snapshot did with
+    /// every row before D-100 — so [`Self::stored_row`] restores it byte for byte and the
+    /// receiving node reports it exactly as this one does (a refused sync, a corrupt-record
+    /// error). Failing the build instead would fail every build until the row is removed, and
+    /// openraft ends the Raft core on a snapshot-build error: one bad row would stop the node.
+    #[allow(clippy::result_large_err)]
+    fn nested_row(
+        table: &str,
+        key: impl std::fmt::Display,
+        row: &str,
+    ) -> StorageResult<Box<RawValue>> {
+        // Owned: `RawValue::from_string` takes the `String` it validates.
+        match RawValue::from_string(row.to_owned()) {
+            Ok(nested) => Ok(nested),
+            Err(e) => {
+                tracing::error!(
+                    table,
+                    key = %key,
+                    error = %e,
+                    "a stored row is not JSON; the snapshot carries it unchanged, as a string"
+                );
+                to_raw_value(row)
+                    .map_err(|e| StorageError::from(StorageIOError::read_state_machine(&e)))
+            }
+        }
+    }
+
+    /// The row text a snapshot entry stands for: the nested JSON as written, or — for a row
+    /// [`Self::nested_row`] had to carry as a string — the string's contents.
+    #[allow(clippy::result_large_err)]
+    fn stored_row(nested: &RawValue) -> StorageResult<std::borrow::Cow<'_, str>> {
+        let raw = nested.get();
+        if raw.starts_with('"') {
+            return serde_json::from_str::<String>(raw)
+                .map(std::borrow::Cow::Owned)
+                .map_err(|e| StorageError::from(StorageIOError::read_state_machine(&e)));
+        }
+        Ok(std::borrow::Cow::Borrowed(raw))
     }
 
     /// [`RaftSnapshotBuilder::build_snapshot`]'s body, off the runtime.
@@ -3410,6 +3490,24 @@ impl RedbStateMachine {
             serde_json::from_reader(std::io::BufReader::new(received_for_parse)).map_err(|e| {
                 StorageError::from(StorageIOError::read_snapshot(Some(meta.signature()), &e))
             })?;
+        // Before any table is touched (D-100). Rows change shape between formats, so a payload of
+        // another one would install rows this binary then misreads as corrupt.
+        if payload.format != STATE_FORMAT {
+            tracing::error!(
+                found = payload.format,
+                needed = STATE_FORMAT,
+                "refusing a snapshot of another state format; every member must run the same \
+                 release (D-100)"
+            );
+            return Err(StorageError::from(StorageIOError::read_snapshot(
+                Some(meta.signature()),
+                &std::io::Error::other(format!(
+                    "snapshot format {} cannot be installed by a binary that needs format \
+                     {STATE_FORMAT}: every member of a fleet runs the same build (D-73, D-100)",
+                    payload.format
+                )),
+            )));
+        }
         Ok((payload, received))
     }
 
@@ -3464,7 +3562,7 @@ impl RedbStateMachine {
                 .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
             for (port, value) in &payload.configs {
                 configs_table
-                    .insert(*port, value.as_str())
+                    .insert(*port, Self::stored_row(value)?.as_ref())
                     .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
             }
             let mut routes_table = write_txn
@@ -3475,7 +3573,7 @@ impl RedbStateMachine {
                 .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
             for (id, value) in &payload.routes {
                 routes_table
-                    .insert(id.as_str(), value.as_str())
+                    .insert(id.as_str(), Self::stored_row(value)?.as_ref())
                     .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
             }
             let routes_action = match Self::desired_routes(&routes_table)
@@ -3551,7 +3649,7 @@ impl RedbStateMachine {
                 .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
             for (port, sig_hash, resp) in &payload.proxy_recorded {
                 proxy_recorded_table
-                    .insert((*port, sig_hash.as_str()), resp.as_str())
+                    .insert((*port, sig_hash.as_str()), Self::stored_row(resp)?.as_ref())
                     .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
             }
 
@@ -3563,7 +3661,7 @@ impl RedbStateMachine {
                 .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
             for (op_id, value) in &payload.dedup {
                 dedup_table
-                    .insert(op_id.as_str(), value.as_str())
+                    .insert(op_id.as_str(), Self::stored_row(value)?.as_ref())
                     .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
             }
 
@@ -5087,7 +5185,7 @@ mod tests {
             "_rift": { "flowState": { "contextScope": "tenant" } },
         });
         let stored = json!({
-            "config_json": config.to_string(),
+            "config": config,
             "enabled": true,
             "revision": 1,
         });
@@ -6276,24 +6374,6 @@ mod tests {
         sm.proxy_recorded_resp(port, sig_hash).expect("read marker")
     }
 
-    /// The failure the snapshot field's own doc names: a snapshot built before #226 must
-    /// still install, and the empty table it decodes to must answer "never recorded" —
-    /// not fail — so a rolling upgrade cannot turn joins into duplicate upstream calls.
-    #[tokio::test]
-    async fn a_pre_proxy_recorded_snapshot_still_installs() {
-        let (_td, sm) = fresh_sm(None).await;
-        let legacy = json!({
-            "configs": [],
-            "dedup": [],
-            "last_applied_log": null,
-            "last_membership": { "log_id": null, "membership": { "configs": [], "nodes": {} } },
-        });
-        let payload: super::SnapshotPayload =
-            serde_json::from_value(legacy).expect("a pre-#226 snapshot payload still decodes");
-        assert!(payload.proxy_recorded.is_empty());
-        assert!(marker(&sm, 8080, "aa11").is_none());
-    }
-
     /// Recordings die with their imposter — the purge `ClusterProxyStore::clear`'s doc
     /// leans on. A regression here makes a deleted-and-recreated imposter answer
     /// `AlreadyRecorded` with the dead imposter's response, forever.
@@ -6667,7 +6747,8 @@ mod tests {
             serde_json::from_slice(row.value()).expect("the row is the current shape");
         assert_eq!(parsed.file, meta.snapshot_id);
         assert!(
-            serde_json::from_slice::<super::LegacyStoredSnapshot>(row.value()).is_err(),
+            serde_json::from_slice::<serde_json::Value>(row.value()).expect("json")["data"]
+                .is_null(),
             "the row must not carry an inlined payload"
         );
         assert!(
@@ -6834,6 +6915,358 @@ mod tests {
         );
     }
 
+    /// A config whose JSON is mostly structure — many stubs, each with predicates and headers —
+    /// which is what production imposters look like, and the shape in which a string-escaped
+    /// config costs the most: every `"` becomes `\"`, and `\\\"` once nested again (#653).
+    fn quote_heavy_config(port: u16) -> ImposterConfig {
+        let stubs: Vec<serde_json::Value> = (0..200)
+            .map(|i| {
+                json!({
+                    "id": format!("stub-{i}"),
+                    "predicates": [
+                        { "equals": { "method": "GET", "path": format!("/api/v1/items/{i}") } },
+                        { "equals": { "headers": { "x-tenant": "acme", "accept": "application/json" } } },
+                    ],
+                    "responses": [{ "is": {
+                        "statusCode": 200,
+                        "headers": { "content-type": "application/json", "x-trace": "abc" },
+                        "body": { "id": i, "name": format!("item {i}"), "tags": ["a", "b", "c"] },
+                    } }],
+                })
+            })
+            .collect();
+        config(port, serde_json::Value::Array(stubs))
+    }
+
+    /// Pins D-100 (#653): a config is stored nested inside its `sm_configs` row and inside the
+    /// snapshot, never as an escaped string. Before, the row was 1.15× the config's compact
+    /// bytes and the snapshot 1.46×, measured on production imposters; nested, both are the
+    /// config plus a few bytes of envelope.
+    #[tokio::test]
+    async fn configs_are_stored_and_snapshotted_as_nested_json() {
+        let (td, mut sm) = fresh_sm(None).await;
+        let heavy = quote_heavy_config(19_300);
+        let raw = serde_json::to_string(&heavy).expect("encode config");
+        apply_one(
+            &mut sm,
+            1,
+            request(
+                1,
+                ControlOp::PutImposter {
+                    config: Box::new(heavy),
+                },
+            ),
+        )
+        .await;
+
+        let row = {
+            let read = sm.db.begin_read().expect("read txn");
+            let table = read.open_table(super::SM_CONFIGS_TABLE).expect("table");
+            table
+                .get(19_300)
+                .expect("get")
+                .expect("row present")
+                .value()
+                .to_owned()
+        };
+        assert!(
+            row.starts_with(r#"{"config":{"#),
+            "the config is nested in the row, not a string: {}",
+            &row[..row.len().min(60)]
+        );
+        assert!(
+            row.len() * 100 <= raw.len() * 105,
+            "row {} must be <= 1.05x the config's {} bytes",
+            row.len(),
+            raw.len()
+        );
+
+        let mut builder = sm.clone();
+        let Snapshot { meta, .. } = builder.build_snapshot().await.expect("build snapshot");
+        let stored = std::fs::metadata(td.path().join("snapshot").join(&meta.snapshot_id))
+            .expect("snapshot file")
+            .len() as usize;
+        assert!(
+            stored * 100 <= raw.len() * 105,
+            "snapshot {stored} must be <= 1.05x the config's {} bytes",
+            raw.len()
+        );
+    }
+
+    /// Pins D-100 (#653): the stored config reads back as the exact compact bytes that were
+    /// committed, and a stub patch and a toggle rewrite a nested row without disturbing it.
+    #[tokio::test]
+    async fn a_nested_row_reads_back_byte_identical_and_survives_a_patch_and_a_toggle() {
+        let (_td, mut sm) = fresh_sm(None).await;
+        let committed = config(19_301, json!([{ "id": "a" }]));
+        let committed_bytes = serde_json::to_string(&committed).expect("encode");
+        apply_one(
+            &mut sm,
+            1,
+            request(
+                1,
+                ControlOp::PutImposter {
+                    config: Box::new(committed),
+                },
+            ),
+        )
+        .await;
+        assert_eq!(
+            sm.read_config(19_301).expect("read").expect("present"),
+            committed_bytes
+        );
+        apply_one(
+            &mut sm,
+            2,
+            request(
+                2,
+                ControlOp::PatchStubs {
+                    port: 19_301,
+                    edit: StubEditScript(vec![StubEdit::Add {
+                        stub: serde_json::from_value(json!({ "id": "b" })).expect("parses"),
+                        index: None,
+                    }]),
+                },
+            ),
+        )
+        .await;
+        apply_one(
+            &mut sm,
+            3,
+            request(
+                3,
+                ControlOp::SetEnabled {
+                    port: 19_301,
+                    enabled: false,
+                },
+            ),
+        )
+        .await;
+        assert_eq!(stored_stub_ids(&sm, 19_301), vec!["a", "b"]);
+        assert_eq!(sm.imposter_revision(19_301).expect("revision"), Some(3));
+        let row = {
+            let read = sm.db.begin_read().expect("read txn");
+            let table = read.open_table(super::SM_CONFIGS_TABLE).expect("table");
+            table
+                .get(19_301)
+                .expect("get")
+                .expect("row")
+                .value()
+                .to_owned()
+        };
+        assert!(
+            row.starts_with(r#"{"config":{"#) && row.ends_with(r#""enabled":false,"revision":3}"#),
+            "the patch and the toggle rewrote a nested row: {row}"
+        );
+        let config: serde_json::Value =
+            serde_json::from_str(&sm.read_config(19_301).expect("read").expect("present"))
+                .expect("json");
+        assert_eq!(config["enabled"], json!(false));
+    }
+
+    /// Pins D-100 (#653): a proxy recording, a dedup entry and a route travel nested through a
+    /// snapshot and read back on the node that installs it.
+    #[tokio::test]
+    async fn every_nested_table_round_trips_through_a_snapshot_install() {
+        let (td, mut sm) = fresh_sm(None).await;
+        apply_one(
+            &mut sm,
+            1,
+            request(
+                1,
+                ControlOp::PutImposter {
+                    config: Box::new(proxy_imposter_config(8080)),
+                },
+            ),
+        )
+        .await;
+        apply_one(&mut sm, 2, proxy_recorded(2, 8080, "aa11", "kept", None)).await;
+        apply_one(&mut sm, 3, put_routes(3, vec![test_route("r1", 8080)])).await;
+        let recorded = marker(&sm, 8080, "aa11").expect("recorded");
+
+        let mut builder = sm.clone();
+        let Snapshot { meta, snapshot } = builder.build_snapshot().await.expect("build snapshot");
+        let bytes = read_snapshot_bytes(snapshot).await;
+        let text = String::from_utf8(bytes.clone()).expect("utf-8");
+        let escaped = text.find(r#"\""#);
+        assert!(
+            escaped.is_none(),
+            "no row is escaped inside the snapshot: …{}…",
+            escaped.map_or("", |at| &text
+                [at.saturating_sub(120)..(at + 60).min(text.len())])
+        );
+
+        let (_td2, mut follower) = fresh_sm(None).await;
+        follower
+            .install_snapshot(&meta, snapshot_handle_from(td.path(), &bytes).await)
+            .await
+            .expect("install");
+        assert_eq!(marker(&follower, 8080, "aa11"), Some(recorded));
+        assert_eq!(route_ids(&follower), vec!["r1"]);
+        let replay = apply_one(
+            &mut follower,
+            4,
+            proxy_recorded(2, 8080, "aa11", "kept", None),
+        )
+        .await;
+        assert_eq!(
+            replay.revision, 2,
+            "the dedup row came across: a replay answers the original"
+        );
+        assert!(follower.read_config(8080).expect("read").is_some());
+    }
+
+    /// Pins D-100 (#653): a row that is not JSON does not fail the snapshot build — that would
+    /// fail every build and stop the node's Raft core. It travels as a string and is installed
+    /// byte for byte, so the receiving node meets the same corruption the sending one has.
+    #[tokio::test]
+    async fn a_row_that_is_not_json_travels_unchanged_through_a_snapshot() {
+        let (td, mut sm) = fresh_sm(None).await;
+        apply_one(&mut sm, 1, put(1, 8080, json!([]))).await;
+        sm.inject_raw_config(8081, "not json");
+
+        let mut builder = sm.clone();
+        let Snapshot { meta, snapshot } =
+            builder.build_snapshot().await.expect("the build succeeds");
+        let bytes = read_snapshot_bytes(snapshot).await;
+        let (_td2, mut follower) = fresh_sm(None).await;
+        follower
+            .install_snapshot(&meta, snapshot_handle_from(td.path(), &bytes).await)
+            .await
+            .expect("install");
+        let row = {
+            let read = follower.db.begin_read().expect("read txn");
+            let table = read.open_table(super::SM_CONFIGS_TABLE).expect("table");
+            table
+                .get(8081)
+                .expect("get")
+                .expect("row")
+                .value()
+                .to_owned()
+        };
+        assert_eq!(row, "not json");
+        assert!(follower.read_config(8080).expect("read").is_some());
+    }
+
+    /// Pins D-100 (#653): a state directory that carries no format row but does carry state —
+    /// one a pre-#653 binary wrote, whose `sm_configs` rows hold escaped strings — is refused at
+    /// open, with the remedy in the message. Opening it would otherwise refuse every engine sync
+    /// on a "corrupt record" for the life of the process.
+    #[tokio::test]
+    async fn a_state_dir_without_a_format_row_is_refused_at_open() {
+        let td = TempDir::new().expect("tempdir");
+        let path = td.path().join("raft.redb");
+        {
+            let (_, mut sm) = new(&path).await.expect("a fresh directory opens");
+            apply_one(&mut sm, 1, put(1, 8080, json!([]))).await;
+        }
+        {
+            let (_, sm) = new(&path).await.expect("a current directory reopens");
+            assert!(sm.read_config(8080).expect("read").is_some());
+        }
+        {
+            let db = super::Database::create(&path).expect("reopen");
+            let write = db.begin_write().expect("write txn");
+            write
+                .open_table(super::SM_FORMAT_TABLE)
+                .expect("format table")
+                .remove(())
+                .expect("drop the format row");
+            write.commit().expect("commit");
+        }
+        let err = new(&path)
+            .await
+            .expect_err("a pre-#653 directory must be refused")
+            .to_string();
+        assert!(
+            err.contains("state directory format 0") && err.contains("needs format 1"),
+            "names both formats: {err}"
+        );
+        assert!(err.contains("fresh"), "names the remedy: {err}");
+    }
+
+    /// Pins D-100 (#653): a directory a *newer* binary wrote is refused too, rather than read
+    /// with this binary's idea of the row shapes.
+    #[tokio::test]
+    async fn a_state_dir_of_a_newer_format_is_refused_at_open() {
+        let td = TempDir::new().expect("tempdir");
+        let path = td.path().join("raft.redb");
+        drop(new(&path).await.expect("a fresh directory opens"));
+        {
+            let db = super::Database::create(&path).expect("reopen");
+            let write = db.begin_write().expect("write txn");
+            write
+                .open_table(super::SM_FORMAT_TABLE)
+                .expect("format table")
+                .insert((), 2)
+                .expect("stamp a newer format");
+            write.commit().expect("commit");
+        }
+        let err = new(&path)
+            .await
+            .expect_err("a newer directory must be refused")
+            .to_string();
+        assert!(err.contains("state directory format 2"), "{err}");
+    }
+
+    /// Pins D-100 (#653): a snapshot of another format is refused at install, before any table
+    /// is touched — a pre-#653 payload (no `format`, string rows) and a newer one alike.
+    #[tokio::test]
+    async fn a_snapshot_of_another_format_is_refused_at_install() {
+        let (td, mut sm) = fresh_sm(None).await;
+        apply_one(&mut sm, 1, put(1, 8080, json!([{ "id": "a" }]))).await;
+        let mut builder = sm.clone();
+        let Snapshot { meta, snapshot } = builder.build_snapshot().await.expect("build snapshot");
+        let current: serde_json::Value =
+            serde_json::from_slice(&read_snapshot_bytes(snapshot).await).expect("json");
+        assert_eq!(current["format"], json!(1), "a built snapshot is stamped");
+
+        // A payload exactly as a pre-#653 binary wrote it: no `format`, rows as escaped strings.
+        let legacy = json!({
+            "configs": [[8080, r#"{"config_json":"{\"port\":8080,\"protocol\":\"http\",\"stubs\":[]}","enabled":true,"revision":1}"#]],
+            "dedup": [],
+            "last_applied_log": current["last_applied_log"],
+            "last_membership": current["last_membership"],
+        });
+        let handle =
+            snapshot_handle_from(td.path(), &serde_json::to_vec(&legacy).expect("encode")).await;
+        let (_td_legacy, mut legacy_follower) = fresh_sm(None).await;
+        let err = legacy_follower
+            .install_snapshot(&meta, handle)
+            .await
+            .expect_err("a pre-#653 payload must be refused")
+            .to_string();
+        assert!(err.contains("snapshot format 0"), "{err}");
+        assert!(legacy_follower.read_config(8080).expect("read").is_none());
+
+        for format in [None, Some(2)] {
+            let mut payload = current.clone();
+            let object = payload.as_object_mut().expect("object");
+            match format {
+                None => {
+                    object.remove("format");
+                }
+                Some(f) => {
+                    object.insert("format".to_owned(), json!(f));
+                }
+            }
+            let handle =
+                snapshot_handle_from(td.path(), &serde_json::to_vec(&payload).expect("encode"))
+                    .await;
+            let (_td2, mut follower) = fresh_sm(None).await;
+            let err = follower
+                .install_snapshot(&meta, handle)
+                .await
+                .expect_err("another format must be refused")
+                .to_string();
+            assert!(err.contains("snapshot format"), "{format:?}: {err}");
+            assert!(
+                follower.read_config(8080).expect("read").is_none(),
+                "nothing was installed"
+            );
+        }
+    }
+
     /// An installed snapshot must be readable back as the current one.
     ///
     /// This pins the regression that openraft's conformance suite caught and none of my own tests
@@ -6966,64 +7399,6 @@ mod tests {
         }
     }
 
-    /// #436 AC3: a row written in the pre-#436 format is migrated to a file on first open.
-    ///
-    /// Migration rather than rebuild: a node part-way through catching a peer up must not lose the
-    /// snapshot it already holds just because it restarted onto a new binary.
-    #[tokio::test]
-    async fn a_legacy_json_snapshot_row_is_migrated_on_open() {
-        let (td, mut sm) = fresh_sm(None).await;
-        sm.apply(vec![entry(1, set_fleet_name(1, "legacy-fleet"))])
-            .await
-            .expect("apply");
-        let mut builder = sm.clone();
-        let Snapshot { meta, snapshot } = builder.build_snapshot().await.expect("build snapshot");
-        let payload_bytes = read_snapshot_bytes(snapshot).await;
-        drop(sm);
-        drop(builder);
-
-        // Rewrite the row in the OLD shape and delete the file, so the only way to answer is to
-        // migrate what the row carries.
-        let legacy = serde_json::json!({ "meta": meta, "data": payload_bytes });
-        let path = td.path().join("raft.redb");
-        {
-            let db = super::Database::create(&path).expect("reopen");
-            let write = db.begin_write().expect("write txn");
-            {
-                let mut table = write
-                    .open_table(super::SNAPSHOT_TABLE)
-                    .expect("snapshot table");
-                table
-                    .insert(
-                        (),
-                        serde_json::to_vec(&legacy)
-                            .expect("encode legacy")
-                            .as_slice(),
-                    )
-                    .expect("insert legacy row");
-            }
-            write.commit().expect("commit");
-        }
-        std::fs::remove_dir_all(td.path().join("snapshot")).ok();
-
-        let (_, mut reopened) = new(&path).await.expect("reopen store");
-        let current = reopened
-            .get_current_snapshot()
-            .await
-            .expect("read current snapshot")
-            .expect("the migrated snapshot must still be there");
-        assert_eq!(current.meta.snapshot_id, meta.snapshot_id);
-        let migrated = read_snapshot_bytes(current.snapshot).await;
-        assert_eq!(
-            migrated, payload_bytes,
-            "migration must preserve the payload byte-for-byte"
-        );
-        assert!(
-            td.path().join("snapshot").join(&meta.snapshot_id).exists(),
-            "the migrated payload must now live in a file"
-        );
-    }
-
     /// A row naming a file that is gone reads as "no snapshot" so openraft rebuilds, rather than
     /// erroring the node out of service. The one deliberate fallback in #436 — it must be a
     /// *correct* answer, not a silenced failure.
@@ -7141,10 +7516,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_snapshot_without_a_fleet_name_installs_and_reads_absent() {
-        // The #134/#137 lesson, applied before it can bite again: a snapshot built before this
-        // field existed must still install. Simulated faithfully by stripping the key from a
-        // real snapshot's JSON rather than by trusting `#[serde(default)]` in the abstract.
+    async fn a_current_format_snapshot_without_a_fleet_name_installs_and_reads_absent() {
+        // The field's `#[serde(default)]`, exercised on a real current-format snapshot with the key
+        // stripped rather than trusted in the abstract. Since D-100 a payload of an older format
+        // is refused at install, so this is what the default still serves.
         let (td, mut sm) = fresh_sm(None).await;
         sm.apply(vec![entry(1, set_fleet_name(1, "rift-prod-eu"))])
             .await
@@ -7170,7 +7545,7 @@ mod tests {
         follower
             .install_snapshot(&meta, older)
             .await
-            .expect("a snapshot predating the fleet name must still install");
+            .expect("a current-format payload without a fleet name installs");
         assert_eq!(
             follower.fleet_name().expect("read fleet name"),
             None,
@@ -7356,34 +7731,6 @@ mod tests {
         );
     }
 
-    /// A snapshot built before #210 carries no revision at all. It must still
-    /// install, and the table must read as revision 0 — which *fails* a
-    /// stale precondition rather than passing one. The dangerous alternative
-    /// (inheriting the last applied index) would let a token minted before the
-    /// join silently pass.
-    #[tokio::test]
-    async fn a_pre_route_revision_snapshot_installs_and_reads_zero() {
-        let (_td, sm, _routes) = fresh_sm_with_routes().await;
-        let legacy = json!({
-            "configs": [],
-            "routes": [["a", "{}"]],
-            "dedup": [],
-            "last_applied_log": null,
-            "last_membership": { "log_id": null, "membership": { "configs": [], "nodes": {} } },
-        });
-        let payload: super::SnapshotPayload =
-            serde_json::from_value(legacy).expect("a pre-#210 snapshot payload still decodes");
-        assert!(
-            payload.routes_revision.is_none(),
-            "the missing field defaults to absent, not a parse failure"
-        );
-        assert_eq!(
-            routes_revision(&sm),
-            0,
-            "a table with no stored revision reads 0"
-        );
-    }
-
     /// A restart, unlike a join: the routes `ArcSwap` is process-local and
     /// starts empty every time, even though `sm_routes` already has committed
     /// rows on disk from the previous run. `reconcile_engine` is what
@@ -7423,17 +7770,17 @@ mod tests {
         <super::SnapshotPayload as AmbiguousIfDebug<_>>::check();
     }
 
-    /// An older snapshot, written before #185 existed, must still install —
-    /// same `#[serde(default)]` contract every table added since #134 carries.
+    /// A payload of the current format that lacks `session_key` installs and reads the key as
+    /// absent: the field's `#[serde(default)]`, which since D-100 serves a payload of this format
+    /// rather than an older one (an older format is refused at install).
     #[tokio::test]
-    async fn a_pre_session_key_snapshot_still_installs() {
+    async fn a_current_format_snapshot_without_a_session_key_installs() {
         let (td, mut sm) = fresh_sm(None).await;
         apply_one(&mut sm, 1, put(1, 8080, json!([{ "id": "a" }]))).await;
         let mut builder = sm.clone();
         let Snapshot { meta, snapshot } = builder.build_snapshot().await.expect("build snapshot");
 
-        // Strip #185's `session_key`, standing in for a payload serialized by a binary that
-        // predates it.
+        // Strip `session_key` from a current-format payload.
         let mut payload: serde_json::Value =
             serde_json::from_slice(&read_snapshot_bytes(snapshot).await)
                 .expect("snapshot payload is JSON");
@@ -7449,7 +7796,7 @@ mod tests {
         follower
             .install_snapshot(&meta, stripped)
             .await
-            .expect("a pre-#185 snapshot must still install");
+            .expect("a current-format payload without a session key installs");
         assert_eq!(follower.session_key().expect("read session key"), None);
     }
 

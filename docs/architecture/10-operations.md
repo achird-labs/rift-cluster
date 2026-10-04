@@ -372,6 +372,25 @@ Until #657 lands, a stored config the new engine refuses can stop a node from st
 serving nothing, or take down the leader when a node joins. A fleet started from a fresh state
 directory is unaffected. Response cursors restart at the upgrade as they do on any restart (D-8).
 
+### State-directory format changes (D-100)
+
+> **Amended by D-100** (2026-10-03, #653): this section is new; it is the upgrade rule for a
+> change of the state directory's format.
+
+A release can also change the **state directory's format** — the shape of the rows the state
+machine keeps and of the snapshot it ships to joiners. The directory records its format in a
+one-row `sm_format` table. A binary refuses to open a directory of any other format, naming both
+formats and the remedy, and refuses to install a snapshot of any other format. A directory a
+pre-format binary wrote has no row and reads as format `0`.
+
+A format change is a whole-fleet upgrade, and a stricter one than D-98's: no node of the new
+release can catch up from a node of the old one, because the old leader's snapshot is refused.
+**Before upgrading**, export the imposters with the release you are running — the new one cannot
+read the old directory. Then start **every** node of the new release from a fresh
+`--cluster-state-dir`, and load the imposters back. Downgrading across a format change is not
+supported: the older binary does not know the format row and reads every row as corrupt. Format `1` (#653: configs stored as nested JSON rather than escaped
+strings) is the first change.
+
 ## Sizing rules of thumb
 
 3 voters for HA (survives 1), 5 for comfort (survives 2); learners beyond 9
