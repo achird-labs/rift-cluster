@@ -382,6 +382,9 @@ zero-dependency premise (revisit only as an *optional* integration, the D-12 pat
 replayed on heal); elections (~1–3 s) pause admin writes invisibly; every voter needs a real disk.
 
 ### D-16 — `redb` for all cluster durability
+> **Amended by D-100** (2026-10-03, #653): `sm_configs` rows nest their config as JSON rather
+> than an escaped string, the snapshot nests every row, and the state directory and the snapshot
+> carry a format that is refused on mismatch.
 - **Status:** amended
 - **Decided:** 2026-07-21 · ADR-001
 - **Implemented by:** #436
@@ -4597,3 +4600,59 @@ Pinned by `a_healthy_node_drives_puts_and_deletes_per_port`,
 `a_put_elsewhere_still_heals_a_bind_failed_port`,
 `per_port_drives_keep_the_sequencing_registry_exact` (`raft/store.rs`) and
 `set_and_remove_touch_only_their_port` (`stores/sequencer.rs`).
+
+### D-100 — Stored configs are nested JSON, and the state directory and the snapshot carry a format that is refused on mismatch
+
+- **Status:** active
+- **Decided:** 2026-10-03 · #653
+- **Amends:** D-16, docs/architecture/10-operations.md
+- **Implemented by:** #653
+- **Code:** crates/rift-cluster/src/raft/store.rs
+
+An `sm_configs` row held its config as a JSON **string** (`config_json`), so every `"` was stored
+as `\"`, and the snapshot embedded each row as a string again. Measured on production-derived
+imposters, that made the row 1.15× and the snapshot file 1.46× the config's compact bytes, and
+serde_json's escape handling was the top on-CPU frame of every whole-set re-parse.
+
+**Nested, not escaped.** A row is `{"config":{…},"enabled":…,"revision":…}`, the config held as a
+`serde_json::value::RawValue`: written once with `to_raw_value`, read back as the committed bytes
+(`RawValue::get`), and parsed once by any reader that needs the typed config. The snapshot payload
+embeds every row the same way — `sm_configs`, `sm_routes`, `sm_proxy_recorded`, `sm_op_dedup` —
+so nothing is escaped twice. On 67 production-derived imposters (3.65 MB of config): row 1.001×,
+snapshot 1.003×. The redb value type stays `&str`, so no table definition changes, and the Raft
+log is untouched: `PutImposter` already carried the config as nested JSON.
+
+**Versioned, and refused on mismatch.** Because the value type is unchanged, redb's
+`TableTypeMismatch` would not notice a directory written in the old shape, and an old row would
+fail to parse on every engine sync: a node serving its last-known state forever and reporting a
+corrupt record. So the directory now carries its format in a one-row `sm_format` table
+(`STATE_FORMAT` = `1`), written when a directory is created. A directory with no row but some
+state — a log entry, a vote, applied state, a snapshot or a config — was written before the row
+existed and reads as format `0`. Any format but this binary's is refused at open, with a message
+naming both formats and the remedy. The snapshot payload carries the same number (`format`,
+absent = `0`) and a payload of another format is refused at install before any table is touched.
+
+**No dual-read path.** This is D-73's pre-release stance — the upgrade across a format change is a
+fresh state directory — made loud instead of discovered. A format change is a whole-fleet upgrade
+in the strict sense: an upgraded node cannot catch up from an old leader, whose snapshot it
+refuses (`docs/architecture/10-operations.md`, "State-directory format changes").
+
+**A row that is not JSON still travels**, as a JSON string holding it unchanged — how every row
+travelled before — and is installed byte for byte, so the receiving node reports the same
+corruption the sending one does (a refused sync). It is logged at build. Failing the build instead
+was the first shape of this change and was rejected in review: openraft ends the Raft core on a
+snapshot-build error, so one corrupt row would have stopped the node on every compaction.
+
+**Removed with it: #436's migration of an inlined snapshot row.** A directory holding such a row
+predates the format row, so it is refused at open before the migration could run; the migration,
+its legacy row type and its test went with this change.
+
+**Downgrade is unsupported.** A binary from before this change does not read `sm_format`, so it
+would open a format-1 directory and refuse every row as corrupt. The export that a format change
+needs is taken with the release that can read the directory — the previous one — before upgrading.
+
+Pinned by `configs_are_stored_and_snapshotted_as_nested_json`,
+`a_nested_row_reads_back_byte_identical_and_survives_a_patch_and_a_toggle`,
+`a_state_dir_without_a_format_row_is_refused_at_open`,
+`a_state_dir_of_a_newer_format_is_refused_at_open` and
+`a_snapshot_of_another_format_is_refused_at_install` (`raft/store.rs`).
