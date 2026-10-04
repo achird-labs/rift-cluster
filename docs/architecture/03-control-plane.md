@@ -47,7 +47,7 @@ flowchart TB
     RN -- "append entries (fsync'd)" --> DB
     RN -- "committed entries" --> SM
     SM -- "sm_* updates" --> DB
-    SM -- "apply_config / set_enabled" --> IM
+    SM -- "apply_one / delete / set_enabled" --> IM
     RN <-- "to peers" --> RPC
 ```
 
@@ -62,8 +62,10 @@ flowchart TB
   exactly-once *effect*.
 - **Apply is deterministic and cannot fail.** All validation happens on the
   leader *before* the entry is appended; apply only writes `sm_*` tables and
-  calls the local engine (`ImposterManager::apply_config` — the incremental
-  reconciler from upstream #316, which touches only what changed). A node
+  calls the local engine for the port the op names (`ImposterManager::apply_one`,
+  the per-port arm of upstream #316's incremental reconciler, which touches only
+  what changed; a node with an engine failure on record reconciles the whole set
+  with `apply_config` instead, D-99). A node
   where the local side-effect fails (say, a port bind conflict) still advances
   its applied index — the config exists; that node reports the bind failure as
   status (Chapter 2), preserving "one node's local problem never stalls the

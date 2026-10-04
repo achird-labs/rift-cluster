@@ -26,7 +26,7 @@ sequenceDiagram
     F-->>L: fsync'd ✓
     B-->>L: fsync'd ✓
     Note over L: entry N COMMITTED (majority, on disk)
-    L->>L: apply N — sm_configs + ImposterManager::apply_config<br/>revision := N · record sm_op_dedup[k1] = N
+    L->>L: apply N — sm_configs + ImposterManager::apply_one<br/>revision := N · record sm_op_dedup[k1] = N
     L-->>B: ok {revision: N}
     B->>B: mark intent applied
     par barrier (D-97): B polls every member that reports itself Ready
@@ -49,9 +49,13 @@ The steps that make the guarantees:
   restart (R3).
 - **Step 8 — validation precedes append; apply cannot fail.** A config the
   fleet would reject never enters the log; a config in the log lands on every
-  node deterministically. Apply uses upstream `apply_config` (#316) — the
-  order-aware, incremental reconciler — so applying config for port 8080 never
-  disturbs port 8081's scenario state, cursors, or recorded requests.
+  node deterministically. Apply drives only the port the op names — upstream's
+  `apply_one`, the per-port arm of the order-aware incremental reconciler (#316),
+  or `delete_imposter` — so applying config for port 8080 never disturbs port
+  8081's scenario state, cursors, or recorded requests, and costs the same at
+  1000 imposters as at 10. A node with an engine failure on record drives the
+  whole committed set instead (`apply_config`), so every write re-attempts what
+  failed (D-99).
 - **The read-after-write barrier (D-97).** Raft's commit guarantees
   durability, not that follower state machines have *applied*. The barrier
   closes exactly that gap. Once the leader has answered, the accepting node

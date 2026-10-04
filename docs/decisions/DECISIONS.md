@@ -131,6 +131,9 @@ The entry stays `amended` rather than `superseded` because its surviving claim i
 built the system: config travels as a body on the log, not as a gossip digest.
 
 ### D-5 — Two-level, order-aware reconcile (LCS edit script) on top of by-id/positional stub CRUD
+> **Amended by D-99** (2026-10-03, #651): a `PutImposter` or `DeleteImposter` drives only its own
+> port on a node with no recorded failure; the whole-set level-2 reconcile is kept for startup,
+> snapshot install, `DeleteAll`, the anonymous-merge recording and a degraded node.
 > **Amended by D-98** (2026-10-03, #655): until rift #1259 (first pinned at `fa205d4`) a keyless
 > stub with a multi-entry map could key differently on each parse, and the cluster re-parses the
 > committed set on every config op — so such a stub was replaced or patched, not kept, on any write.
@@ -3190,8 +3193,10 @@ says decisions live, and finds nothing — the same "decided in a thread, never 
 register exists to prevent.
 
 ### D-76 — An engine-side refusal an operator cannot see is a defect; a refused flow store is **derived** per read, not recorded
+> **Amended by D-99** (2026-10-03, #651): a per-port drive is a fourth writer of `apply_failures`;
+> it records and clears only its own port and never reaps another.
 
-- **Status:** active
+- **Status:** amended
 - **Decided:** 2026-09-09 · #576
 - **Amends:** RFC-001 §7.4.6
 - **Implemented by:** #576
@@ -3570,8 +3575,11 @@ is the honest limit of what one sample on a shared runner can prove, and the rea
 recorded rather than discarded.
 
 ### D-81 — A bind failure's reason has the bind's lifetime: recorded and cleared only by drives that attempt the bind
+> **Amended by D-99** (2026-10-03, #651): a per-port drive records and clears its own port's bind
+> reason through `record_report`; the heal-on-every-op cadence is kept by driving the whole set
+> while any failure is recorded.
 
-- **Status:** active
+- **Status:** amended
 - **Decided:** 2026-09-16 · #586
 - **Amends:** RFC-001 §7.4.6
 - **Refines:** D-76
@@ -4511,3 +4519,81 @@ takes down the leader's Raft core when a node joins (#657). Until #657 lands, a 
 its state directory is upgraded only after its imposters are exported and loaded into the new
 engine, and anything refused is fixed or deleted first. `rift-lint` is not a substitute: it checks
 regex selectors (E051) but carries no JSONPath or XPath parser.
+
+### D-99 — A put or delete drives only its own port; a node with a recorded failure drives the whole set
+
+- **Status:** active
+- **Decided:** 2026-10-03 · #651
+- **Amends:** D-5, D-76, D-81
+- **Implemented by:** #651
+- **Code:** crates/rift-cluster/src/raft/store.rs, crates/rift-cluster/src/stores/sequencer.rs
+
+Every committed `PutImposter` and `DeleteImposter` used to re-read and re-parse every row of
+`sm_configs` and hand the whole set to upstream's `apply_config`, on every node. The cost was
+O(fleet) per write and quadratic per import: at 1000 production-derived imposters a put took
+~258 ms per node (~150 ms of it the cluster's re-parse) and a 1000-imposter import 150 s.
+`PatchStubs`, `SetEnabled` and `ProxyRecorded` already drove one port; these two were the outliers.
+
+**The rule.** On a node with nothing recorded in `apply_failures` or `bind_failures`, a
+`PutImposter` drives upstream's `apply_one` with the op's own config (the per-port arm of
+`apply_config`: create, replace, heal-rebind, toggle, stub reconcile, the same `ApplyReport`), and a
+`DeleteImposter` drives `delete_imposter`. The whole-set drive stays for the startup reconcile, a
+snapshot install, `DeleteAll` (the table is empty after it, so it parses nothing) and the
+anonymous-merge recording — and for **every** put and delete on a node that has a failure on record.
+
+**Why the degraded fallback, rather than per-port bookkeeping alone.** Three behaviours were
+attached to the whole-set drive and a per-port drive cannot reproduce them:
+
+- *D-81's heal.* `apply_config` re-attempts the bind of every held-but-unbound port, so a put to Q
+  healed a bind-failed P. `apply_one` touches only Q.
+- *The reap.* `record_report` dropped failure entries for ports the desired set no longer names; a
+  per-port report names one port and must reap nothing (a fourth writer of `apply_failures`, D-76:
+  it records and clears only its own port).
+- *The retry.* A failed drive used to be re-attempted by the next op anywhere in the fleet.
+
+So the choice is made per node, inside apply, from whether anything is failing. While something
+is, the node pays today's cost and every one of those behaviours is unchanged; when nothing is, a
+put costs one port.
+
+**"Nothing is failing" is not "the maps are empty".** A successful toggle or stub patch clears its
+port's drive outcome, and the outcome it clears may be another drive's — a patch that failed
+half-way, leaving stubs the tables hold and the engine does not. The toggle repaired none of that;
+before this decision the next write anywhere was a whole-set drive and did. So a toggle or patch
+that erases a recorded failure marks the node as needing a resync, and it stays degraded until a
+whole-set drive completes. The converse cost, accepted: an outcome no whole-set drive names (a
+toggle whose persist failed, reported `Unchanged` by the next sync) keeps the node degraded until
+that port is driven again — today's write cost, never a wrong engine. The flag is read once per apply batch: a batch's drives run after its commit,
+so a failure one entry causes degrades the *next* batch, not a later entry of the same one.
+
+**A per-port drive's bookkeeping** is `Sync`'s, scoped: the sequencing registry is updated for
+the one port before the engine call (`set`/`remove`; `apply` stays the whole-set resync), the
+report is folded with no reap, and a delete clears its port's flow state (#565) on success *or*
+when the engine does not hold the port — never staged here, or already removed by a failed
+re-create (#573). A put clears no flow state: `apply_one` deletes nothing but a replace's own
+teardown, and a port the tables still name keeps its state through a failed re-create (#567).
+A delete the engine refuses for any other reason is recorded, so the next op is a whole-set drive
+that retries it.
+
+**Dropped, and named.** #574's note that a config lost to the apply/reconcile race "returns only on
+the next committed config op (each carries the whole set)" no longer holds on a healthy node. The
+guarantee was always the `engine_drive` lock held across the reconcile's read and drive; the
+whole-set replay was a belt over it. Likewise a stored row that stops parsing is no longer met by
+a healthy node's puts — only by a whole-set drive. A row this binary wrote parses; the reachable
+way for one to stop is a different binary or engine reading it (#657), which means a restart, and
+the first whole-set drive after a restart is the startup reconcile, which records the refusal and
+so degrades the node. A row corrupted *in place* while the process runs is not met until the next
+whole-set drive.
+
+**Port 0 is refused at validation**, with an absent port: it is upstream's auto-assign request
+(`explicit_port`), so it could never replicate, and `apply_one` refuses it outright.
+
+**Not on the wire.** `EngineAction` is derived locally from the committed `ControlOp`; nothing in
+the log, the snapshot or any RPC changes.
+
+Pinned by `a_healthy_node_drives_puts_and_deletes_per_port`,
+`a_per_port_drive_never_touches_another_ports_imposter`,
+`a_per_port_delete_of_a_port_the_engine_lacks_still_clears_its_state`,
+`a_recorded_failure_degrades_puts_to_whole_set_until_it_clears`,
+`a_put_elsewhere_still_heals_a_bind_failed_port`,
+`per_port_drives_keep_the_sequencing_registry_exact` (`raft/store.rs`) and
+`set_and_remove_touch_only_their_port` (`stores/sequencer.rs`).
