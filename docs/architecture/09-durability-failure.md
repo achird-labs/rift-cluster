@@ -28,7 +28,7 @@ What state lives where, and what it survives:
 | Sequence cursors | memory | ❌ reset (D-8) | ❌ | Deliberate: hottest stateful path, test-run-scoped |
 | Request journal + counters | memory (upstream's own per-node journal) | ❌ that node's | ❌ | In-run assertion data, bounded buffers |
 | proxyOnce `Pending` claims | owner memory | ❌ re-claimable | ❌ | By design — Chapter 6 |
-| proxyOnce `Recorded` + recorded stubs | via config (Raft SM) | ✅ | ✅ | Recordings are config |
+| proxyOnce `Recorded` + recorded stubs | Raft SM (`sm_proxy_recorded` markers; recorded stubs ride the config) | ✅ | ✅ | Replicated like config |
 
 The volatile rows are decisions, not gaps: each would cost hot-path writes to
 preserve state whose value ends with the test run.
@@ -49,8 +49,11 @@ the row above declines to buy.
 > `rift_cluster_proxy_claims_total{outcome="refused"}`.
 
 Behavior per operation class when the relevant authority is unreachable.
-Defaults shown; `local` overrides exist per feature and stamp
-`Rift-Cluster-Degraded: <feature>` on every response they taint:
+Defaults shown; `local` overrides exist per feature. A `local` flow read is not
+annotated: the engine reaches the flow store through `spawn_blocking`, and the
+task-local scope that becomes response headers does not cross it
+(`stores/flow.rs`), so what tells a degraded answer apart is the override the
+imposter chose, not a header:
 
 One class the word *unreachable* does not cover: an authority that is perfectly
 reachable and **refuses itself**. A flow owner that cannot see a quorum reports
@@ -58,8 +61,7 @@ reachable and **refuses itself**. A flow owner that cannot see a quorum reports
 the isolated-owner rule, Chapter 6). The outcomes in the table are unchanged —
 the caller still gets a fast failure rather than a stale answer — but the cause
 is the owner's own quorum state, not the network between caller and owner, and
-`Rift-Cluster-Degraded` does **not** fire for it: nothing degraded, the write was
-refused.
+nothing marks it degraded: nothing degraded, the write was refused.
 
 What is observable differs by operation, and it is worth stating exactly:
 a refused **write** increments `rift_cluster_cas_conflicts_total{reason="isolated"}`;
@@ -118,7 +120,7 @@ read it are asserting.
 | Scenario match-gate read | flow owner | fast-fail `503` | A stale read here = silently wrong stub |
 | Scenario CAS / flow-KV write | flow owner | fast-fail `503` | Single-writer or nothing |
 | Script flow-KV read (`strong`, default) | flow owner | `503` | Scripts drive responses off this |
-| Script flow-KV read (`local`, opt-in) | — | local replica, flagged when owner down | Imposter chose speed |
+| Script flow-KV read (`local`, opt-in) | — | local replica, unannotated | Imposter chose speed |
 | Sequence advance | cursor owner (opt-in, D-47) | **falls back to the node-local cursor, annotated and counted** (`rift_cluster_sequence_fallbacks_total`) | Blocking all cyclic responses during a blip is worse than a possible duplicate index — the one place availability wins (D-10). Never a `503`; the counter, not the returned index, is what distinguishes a degraded answer from a healthy one |
 | proxyOnce claim | signature owner | `503`, **never forwarded**; counted `rift_cluster_proxy_claims_total{outcome="refused"}` (D-66) | Duplicate upstream side-effects are worse than a failed mock call — and with the owner unreachable the duplicate is bounded by the *outage*, not by "1 + ownership changes" |
 | Journal append / count | — (always local) | unaffected | Recording never leaves the node |
@@ -136,7 +138,8 @@ out-of-band transport that once carried them. What follows describes the log's
 own large-entry path (#411): it still exists and still bounds any entry the
 transport cap admits, but nothing routine takes it any more.
 
-What bounds a log entry's size is the transport's own body cap (32 MiB). What
+What bounds a log entry's size is the log's own payload cap
+(`MAX_LOG_PAYLOAD_BYTES`, 10 MiB), under the transport's 32 MiB body cap. What
 bounds its *latency* is the link:
 
 - A large entry commits in **`O(size / link speed)`**, not in one heartbeat.
@@ -252,38 +255,50 @@ survive only as `--datadir` exports/backups (Chapter 10's backup runbook);
 this is stated rather than hedged.
 
 That catch-up moves the *whole* state machine — imposter configs, the route
-table, dedup — and it costs roughly 4× its size on the wire, because snapshot
-chunks ride the JSON cluster port as byte
-arrays. The transfer is bounded **per chunk**, not per snapshot: a chunk that
-misses its deadline abandons the entire transfer back to offset 0, so the bounds
-are deliberately generous rather than tight (#428). Two apply, and the smaller
-governs — the RPC's own size-aware deadline (~6 s for a 1 MiB chunk: a flat
-budget plus a 1 MiB/s floor on the link) inside openraft's per-chunk
-`install_snapshot_timeout` of 10 s. The join itself never rides that install:
+table, dedup — as its snapshot payload file, zstd-compressed, which the joiner
+pulls from the leader (D-101): the leader offers the snapshot's size and sha256,
+the joiner fetches the file over a signed stream, resuming from whatever it
+already holds, checks the digest and installs. A deadline bounds the offer —
+the RPC's size-aware deadline (a flat budget plus a 1 MiB/s floor on the link)
+plus a 30 s allowance for the install it waits on — and a fetch that stalls for
+10 s without a byte is abandoned. Either costs only the bytes still missing,
+never a restart from offset 0 (#428). A
+receiver that predates the offer route is sent the chunked `install_snapshot` transfer
+instead, bounded per chunk by `install_snapshot_timeout` (10 s) with each chunk
+retried. The join itself never rides that install:
 admission is two-phase (#433) — the join RPC returns once the membership
 entry commits, the node starts up as a learner, and the leader promotes it to
 voter when its replication is current. However long the catch-up above takes,
 it delays *promotion*, never startup; a refused, unreachable, or mis-secreted
 join still fails the deployment exactly as before.
 
-**What a snapshot costs to store, measured (#436).** The payload is written as a plain file beside
-redb rather than inlined into a `redb` row as a JSON integer array, which is what made the stored
-artifact ~3.7× the bytes it carried. Measured after the change, on loopback: a fleet holding 4 MiB
-of state stores **1.00×** its raw bytes, and one holding 16 MiB likewise **1.00×**.
+**What a snapshot costs to store, measured (#436, D-100, D-101).** The payload is written as a file
+beside redb rather than inlined into a `redb` row as a JSON integer array, which is what made the
+stored artifact ~3.7× the bytes it carried (#436). Its rows nest each config as JSON rather than
+escaping it into a string (D-100), and the file is zstd at rest (D-101): 969 production-derived
+imposters holding 57.6 MB of config store a **2.23 MB** payload, about 1/26 of it.
 
-**Fresh-joiner catch-up, before and after (#436),** same probe on both sides, 1 voter → 2:
+**Fresh-joiner catch-up, measured.** The probe is the same shape on both rows — one voter, the
+log snapshotted and purged to the tip, then a fresh joiner caught up by snapshot, loopback, release
+build (Apple Silicon) — the shape `a_joiner_is_caught_up_by_a_multi_mebibyte_snapshot` asserts on.
+Each row says what it measured and on which code, so a stale figure cannot pass for a current one:
 
-| fleet state | before (#436) | after file-backed (#436) |
+| fleet state | #436, 2026-08-24 — blob-era state machine, chunked JSON transfer | `master` @ `ea33bce`, 2026-10-03 — production-derived configs, D-101 pull |
 |---|---|---|
-| 4 MiB | 3.1 s | **2.2 s** |
-| 16 MiB | 12.3 s | **8.8 s** |
+| 4 MiB of state | 2.2 s | — |
+| 16 MiB of state | 8.8 s | — |
+| 64 imposters — 3.9 MB of config, 0.16 MB snapshot | — | **0.18 s** |
+| 290 imposters — 18.7 MB of config, 0.70 MB snapshot | — | **0.39 s** |
+| 969 imposters — 57.6 MB of config, 2.23 MB snapshot | — | **0.91 s** |
 
-Those figures were measured against a state machine that could reach tens of MiB. It no longer can:
-the state machine holds imposter configs, the route table and dedup — small JSON, all of it — so a snapshot
-is bounded by how many imposters a fleet runs, not by an upload quota (D-71, #549). The
-`InstallSnapshotRequest` path is still openraft's own, still chunked as a JSON integer array, and
-still the reason a snapshot is measured rather than assumed; what changed is that nothing puts MiB
-of payload into it any more.
+The current rows are two runs each, agreeing within 1%, from `~/Projects/solo-test/imposters` (67
+production Mountebank imposters, cycled); the transfer counters confirm each went by offer. The
+#436 rows were measured against a state machine that still carried uploaded payloads and could
+reach tens of MiB; it no longer can — it holds imposter configs, the route table and dedup, so a
+snapshot is bounded by how many imposters a fleet runs (D-71, #549). On loopback the remaining time
+is the install itself — decompress, parse, the redb write — not the wire: the 969-imposter payload
+crosses as its 2.23 MB file, where the chunked transfer carried ~3.4× the uncompressed
+payload as a JSON integer array (D-101).
 
 **Producing a snapshot costs the leader CPU, but never its runtime (#444).** The chapter above
 describes what a catch-up costs the *joiner*; the other half is what building one costs the node
@@ -327,10 +342,11 @@ admin plane.
 ## The client-visible contract
 
 Everything above surfaces through five headers — `Rift-Cluster-Revision`,
-`Rift-Cluster-Op-Id`, `Rift-Cluster-Warnings`, `Rift-Cluster-Degraded`,
-`Rift-Cluster-Partial` — plus `rift_cluster_degraded_ops_total{feature}` and
-friends in metrics. A strict test harness asserts the absence of the last
-three; a lenient one ignores them. Both get the truth.
+`Rift-Cluster-Op-Id`, `Rift-Cluster-Warnings`, `Rift-Cluster-Bind-Failures`,
+`Rift-Cluster-Partial` (`decorate.rs`) — plus correctness counters such as
+`rift_cluster_sequence_fallbacks_total` in metrics. A strict test harness can
+assert their absence and a lenient one can ignore them — both get the truth;
+Chapter 12 says which of these its strict gate checks today.
 
 `Rift-Cluster-Partial` is the narrowest of the five, and deliberately so since D-74 (#552): it is
 stamped on exactly two reads — `/_fleet/members` and `/_fleet/health` — where "I could not reach

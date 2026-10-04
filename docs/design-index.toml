@@ -124,8 +124,8 @@ note = "Retired by D-71/D-73 (#550). Its two non-tenancy sections were moved out
 
 ["docs/architecture/09-durability-failure.md"]
 status = "amended"
-verified_sha = "7f6a3bbbd"
-verified_on = "2026-09-17"
+verified_sha = "ea33bceca"
+verified_on = "2026-10-03"
 code = ["crates/rift-cluster/src/raft/store.rs", "crates/rift-cluster/src/stores/flow.rs"]
 note = "Amended in place by D-74 (#552): the journal row, the failure-matrix row and the Rift-Cluster-Partial paragraph now describe a per-node journal. `status` is prose for a reader — check_index reads only verified_sha and code — and the standing doc-stale warning is NOT about that edit, which moved doc and code together: it is raft/store.rs and stores/flow.rs changing in #565/#567 and #563 since e0df0c376. #554 removed tenancy and bindings from the write row, the cold-start list and the snapshot description, and pointed the isolation condition at /_cluster/health rather than a /_cluster/status that is not served. That is a targeted correction, not a whole-chapter reading: re-verify the rest, then --mark-verified."
 
