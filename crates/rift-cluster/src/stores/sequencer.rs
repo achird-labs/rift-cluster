@@ -32,7 +32,7 @@
 //! - **An isolated owner refuses** (D-17), and the caller falls back. Placed
 //!   after the ownership check so a misroute is still a misroute (#465).
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, OnceLock, Weak};
 use std::time::Duration;
 
@@ -164,11 +164,26 @@ impl SequencingRegistry {
     /// changes nothing beats both a panic on the apply path and inheriting a
     /// stale mode.
     pub fn apply(&self, desired: &[ImposterConfig]) {
-        let next: HashMap<u16, SequencingMode> = desired
-            .iter()
-            .filter_map(|config| Some((config.port?, Self::mode_of(config))))
+        let held = desired.iter().filter_map(|config| config.port).collect();
+        self.apply_holding(desired, &held);
+    }
+
+    /// [`Self::apply`] when some ports the tables name are not in `desired`: `held` is every port
+    /// the tables name, and a port in it but not in `desired` is one whose config this engine
+    /// refuses (D-102). It keeps its entry — the engine keeps serving its last-known config there,
+    /// and this map describes that config.
+    pub fn apply_holding(&self, desired: &[ImposterConfig], held: &BTreeSet<u16>) {
+        let mut modes = self.modes.write();
+        let mut next: HashMap<u16, SequencingMode> = modes
+            .drain()
+            .filter(|(port, _)| held.contains(port))
             .collect();
-        *self.modes.write() = next;
+        for config in desired {
+            if let Some(port) = config.port {
+                next.insert(port, Self::mode_of(config));
+            }
+        }
+        *modes = next;
     }
 
     /// Record one port's config, leaving every other port as it is — the per-port drive of a
@@ -747,6 +762,7 @@ pub fn seq_routes(seq: Arc<ClusteredSequencer>) -> Router {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::time::Duration;
 
@@ -760,6 +776,25 @@ mod tests {
             "_rift": { "sequencing": { "mode": mode } },
         }))
         .expect("parses")
+    }
+
+    /// Pins D-102 (#657): a whole-set `apply_holding` keeps the entry of a port the tables still name but
+    /// whose config this engine refuses — the engine still serves its last config there — and drops
+    /// a port the tables no longer name.
+    #[test]
+    fn apply_holding_keeps_a_refused_port_and_drops_a_gone_one() {
+        let registry = SequencingRegistry::new();
+        registry.apply(&[
+            imposter(1, "owner"),
+            imposter(2, "owner"),
+            imposter(3, "owner"),
+        ]);
+        // Port 2 refused (held, not desired); port 3 deleted (not held).
+        registry.apply_holding(&[imposter(1, "local")], &BTreeSet::from([1, 2]));
+        assert_eq!(registry.mode(1), SequencingMode::Local, "re-applied");
+        assert_eq!(registry.mode(2), SequencingMode::Owner, "refused: kept");
+        assert_eq!(registry.mode(3), SequencingMode::Local, "gone: dropped");
+        assert_eq!(registry.len(), 2);
     }
 
     /// Pins D-99 (#651): `set` and `remove` touch one port and leave the rest of the map as the

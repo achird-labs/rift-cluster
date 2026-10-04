@@ -3200,6 +3200,10 @@ register exists to prevent.
 ### D-76 — An engine-side refusal an operator cannot see is a defect; a refused flow store is **derived** per read, not recorded
 > **Amended by D-99** (2026-10-03, #651): a per-port drive is a fourth writer of `apply_failures`;
 > it records and clears only its own port and never reaps another.
+>
+> **Amended by D-102** (2026-10-04, #657): the per-port rule now covers every stored config this
+> engine will not run — a row that will not parse, or a config its admission checks refuse.
+> `RefuseSync` is retired for configs; the refusal is derived per read (`config_refusal`).
 
 - **Status:** amended
 - **Decided:** 2026-09-09 · #576
@@ -4730,3 +4734,80 @@ Pinned by `a_built_snapshot_file_is_zstd_and_installs`, `a_plain_json_snapshot_f
 `a_digest_mismatch_discards_the_file`, `a_fetch_that_dies_mid_stream_keeps_what_arrived`,
 `a_receiver_without_the_offer_route_gets_the_snapshot_in_chunks_decompressed`
 (`raft/network.rs`); and `a_joiner_is_caught_up_by_a_multi_mebibyte_snapshot` (`tests/cluster.rs`).
+
+### D-102 — Replay is not admission: a committed config decodes without the engine's admission checks, and the engine refuses it per port at the drive
+
+- **Status:** active
+- **Decided:** 2026-10-04 · #657
+- **Amends:** D-76
+- **Implemented by:** #657
+- **Code:** crates/rift-cluster/src/control.rs, crates/rift-cluster/src/raft/store.rs, crates/rift-cluster/src/stores/sequencer.rs, crates/rift-cluster/src/raft/node.rs, crates/rift-cluster-server/src/admin_front.rs, crates/rift-cluster-base/src/lib.rs
+
+Upstream runs its admission checks — predicate and `matches` patterns, `copy`/`lookup` selectors,
+behaviors blocks that must parse — inside `Deserialize`, so one check covers every config door.
+rift-cluster used the same `Deserialize` to **replay**: the Raft log, the `sm_configs` rows and the
+stored-config reads. So the engine version decided what the fleet had committed. A config an
+earlier engine admitted and a later one refuses (upstream #1262 tightened `copy` selectors) made:
+a node whose last log entry held it unable to start (`when Read Logs`); a leader whose log a joiner
+asked for lose its Raft core; and, mid-log, `RefuseSync` refuse every whole-set drive — on a
+restarted node, whose engine starts empty, that served nothing on any port, while later writes
+answered `Applied` and were never realized.
+
+**Decoding never admits.** Every engine-typed field of `ControlOp` — `PutImposter.config`,
+`PatchStubs.edit`, `ProxyRecorded.stub` — decodes through upstream's `deserialize_replayed`
+(rift #1267) by `#[serde(deserialize_with)]` on the field, so no decode path (log read, Raft RPC,
+forwarded write) can forget it. Every stored-config read uses `control::decode_committed_config`.
+`ProxyRecorded.resp` and `PutRoutes.table` are structural (nothing in them admits) and carry no
+attribute. The replay floor's refusals (behaviors key shape, header case duplicates,
+`_rift.fault.tcp` bounds) still apply on replay, by upstream's contract; they are the same in every
+engine at or after the floor.
+
+**Admission stays at the door.** The HTTP door parses a client's body with the validating
+`Deserialize`; a config this engine refuses is still a `400` with the engine's message.
+
+**The engine admits per port, at the drive.** `admit_row` — decode the row, replay-decode its
+config, run `admission_check` — is the one rule. A whole-set drive builds a `DesiredSet` of admitted
+configs, every port the tables name (`held`), and the refused rows. With none refused it is
+`apply_config` as before (D-99); with any, it deletes the engine ports outside `held` and
+`apply_one`s each admitted config, so a refused port is **neither created nor deleted** — a live
+imposter keeps its last-known config, the invariant `RefuseSync` existed for — and every other port
+is realized. Bookkeeping, the flow-state clear and the sequencer (`apply_holding`) are scoped to
+`held`, so a refused port keeps them. The per-port `Put` drive skips a refused config; the
+toggle, stub-patch and recording arms skip the drive when the config they leave is refused. The
+row is written from the replay-decoded config either way, so every node, whatever its engine,
+holds the leader's exact bytes. A row that is not JSON at all gets the same per-port treatment.
+
+**The refusal is derived per read, not recorded** — D-76's rule, for D-76's reason: the toggle and
+patch arms reap a port's `apply_failures`, so a recorded refusal would vanish the first time someone
+paused the imposter. `config_refusal(port)` runs `admit_row` on the stored row, and both
+`local-engine=` surfaces consult it first, then `apply_failures`, then the flow-store refusal:
+`local-engine=config refused by this engine version: <reason> - PUT a corrected config`, spelled in
+visible ASCII because the reason echoes the operator's config. One `error!` per refused port per
+whole-set drive. Recovery is an ordinary corrected `PUT`.
+
+**An upstream validation change is not a format break** (D-73): the state dir stays readable, and
+what changes is which committed configs this engine serves.
+
+**Not solved, stated:** binaries before this decision cannot decode a config a newer engine admits
+(upstream *loosening* a check). That window is the whole-fleet upgrade rule's (D-98); from this
+decision on, decoding is engine-independent.
+
+**Rejected:** carrying configs as raw JSON in the log and editing them as `Value`s (re-implements
+stub edits and recorded-stub placement untyped); running refused configs unchecked (re-opens the
+silently-wrong matching upstream closed in #1220/#1221); a preflight tool (operator surface for
+something the node can survive); and `apply_config` with the admitted subset (it deletes every
+port the set omits, a refused live one included).
+
+Pinned by `every_config_bearing_op_decodes_without_admission`,
+`a_committed_config_decodes_where_the_door_refuses_it` (`control.rs`);
+`a_log_entry_holding_a_refused_config_reads_back`,
+`a_refused_config_is_not_served_and_does_not_stop_the_rest`,
+`a_refused_config_for_a_live_port_keeps_its_last_config`,
+`edits_on_a_refused_port_change_the_row_and_keep_the_refusal`, `a_corrected_put_clears_a_refusal`,
+`a_reconcile_serves_the_admissible_rows_and_tears_down_no_refused_one`,
+`a_broken_stored_record_refuses_only_its_own_port` (`raft/store.rs`);
+`apply_holding_keeps_a_refused_port_and_drops_a_gone_one` (`stores/sequencer.rs`);
+`a_refusal_reason_is_spelled_for_a_header` (`admin_front.rs`);
+`a_node_whose_last_entry_is_a_refused_config_restarts`,
+`a_joiner_replays_a_refused_config_and_the_leader_survives` (`tests/cluster.rs`);
+`a_refused_committed_config_is_named_and_the_door_still_refuses_it` (`tests/write_path.rs`).

@@ -357,7 +357,8 @@ upgraded on every node before the fleet takes config writes again:
   mixed fleet a keyless owner-mode stub is served from two cursors and can repeat an index, with no
   fallback recorded.
 - **Admission** — what the engine refuses to load. A config admitted by the old engine and refused
-  by the new one is refused again when the new binary reads it back from its own state.
+  by the new one is not served by the new engine on its port (D-102): see "Configs the engine
+  refuses" below.
 
 The release notes of a pin bump say which kind it is. The bump to rift `fa205d4` (#655) is all
 three: stub keys became canonical (which fixes cross-node cursor sharing and stops unrelated writes
@@ -367,10 +368,28 @@ behavior whose selector does not compile is refused at load.
 
 **Before a whole-fleet upgrade of a fleet that keeps its state directory**, export the imposters and
 load them into the new engine, and fix or delete anything it refuses. `rift-lint` is not a
-substitute: it checks regex selectors (E051) but carries no JSONPath or XPath parser.
-Until #657 lands, a stored config the new engine refuses can stop a node from starting, leave it
-serving nothing, or take down the leader when a node joins. A fleet started from a fresh state
-directory is unaffected. Response cursors restart at the upgrade as they do on any restart (D-8).
+substitute: it checks regex selectors (E051) but carries no JSONPath or XPath parser. A fleet
+started from a fresh state directory is unaffected. Response cursors restart at the upgrade as they
+do on any restart (D-8).
+
+### Configs the engine refuses (D-102)
+
+> **Amended by D-102** (2026-10-04, #657): this section is new.
+
+What the fleet committed is read back without the engine's admission checks, so an upgrade never
+makes the state directory unreadable: a node whose log holds a config its engine refuses still
+starts, still replicates it to a joiner, and holds the same rows as every other node. The engine
+then declines to **serve** that one config, on that one port:
+
+- a port it was already serving keeps serving its last config, and one it was not is not created;
+- every other port is served as committed;
+- `GET /imposters/{port}`, and any write to that port, carry
+  `Rift-Cluster-Warnings: local-engine=config refused by this engine version: <reason> - PUT a
+  corrected config`, and the node logs one `error!` per refused port at each whole-set drive.
+
+To recover, `PUT` a corrected config for the port; the warning clears because the row changed.
+Pausing or patching the port still commits and still changes the row, but the engine keeps
+declining it until the config itself is admitted.
 
 ### State-directory format changes (D-100)
 
