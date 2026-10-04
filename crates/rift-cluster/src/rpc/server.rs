@@ -4,8 +4,9 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use http_body_util::{BodyExt, Full, Limited};
-use hyper::body::{Bytes, Incoming};
+use http_body_util::combinators::UnsyncBoxBody;
+use http_body_util::{BodyExt, Full, Limited, StreamBody};
+use hyper::body::{Bytes, Frame, Incoming};
 use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
@@ -13,7 +14,7 @@ use tokio::net::TcpListener;
 
 use super::RpcError;
 use super::auth::{AUTH_HEADER, SignedRequest, Verifier};
-use super::routes::{PROTO_HEADER, Router, negotiate, recipient};
+use super::routes::{PROTO_HEADER, Router, StreamReply, negotiate, recipient};
 
 /// Default cap on an accepted request body. Cluster payloads are small control
 /// messages; an unbounded reader is a memory bomb, and the *reader* is capped
@@ -147,18 +148,41 @@ impl RpcServer {
     }
 }
 
-async fn handle(config: Arc<RpcServerConfig>, req: Request<Incoming>) -> Response<Full<Bytes>> {
+/// Every response body the port sends: one buffered document, or a stream (D-101).
+type ResponseBody = UnsyncBoxBody<Bytes, std::io::Error>;
+
+/// What a dispatched request answers with.
+enum Reply {
+    Json(Vec<u8>),
+    Stream(StreamReply),
+}
+
+fn buffered(bytes: Bytes) -> ResponseBody {
+    Full::new(bytes)
+        .map_err(|never| match never {})
+        .boxed_unsync()
+}
+
+async fn handle(config: Arc<RpcServerConfig>, req: Request<Incoming>) -> Response<ResponseBody> {
     match dispatch(&config, req).await {
-        Ok(body) => Response::builder()
+        Ok(Reply::Json(body)) => Response::builder()
             .status(StatusCode::OK)
             .header("content-type", "application/json")
-            .body(Full::new(Bytes::from(body)))
+            .body(buffered(Bytes::from(body)))
             .unwrap_or_else(|_| error_response(&RpcError::Handler("malformed response".into()))),
+        Ok(Reply::Stream(StreamReply { content_type, body })) => {
+            let frames = futures_util::StreamExt::map(body, |chunk| chunk.map(Frame::data));
+            Response::builder()
+                .status(StatusCode::OK)
+                .header("content-type", content_type)
+                .body(StreamBody::new(frames).boxed_unsync())
+                .unwrap_or_else(|_| error_response(&RpcError::Handler("malformed response".into())))
+        }
         Err(e) => error_response(&e),
     }
 }
 
-fn error_response(err: &RpcError) -> Response<Full<Bytes>> {
+fn error_response(err: &RpcError) -> Response<ResponseBody> {
     let mut body = serde_json::json!({
         "error": err.reason(),
         "message": err.to_string(),
@@ -195,17 +219,17 @@ fn error_response(err: &RpcError) -> Response<Full<Bytes>> {
             .header("retry-after", "1");
     }
     builder
-        .body(Full::new(Bytes::from(body.to_string())))
+        .body(buffered(Bytes::from(body.to_string())))
         // Infallible in practice: the status is validated above and the body is
         // owned. Falling back to a bare 500 keeps the signature total.
         .unwrap_or_else(|_| {
-            let mut resp = Response::new(Full::new(Bytes::from_static(b"{}")));
+            let mut resp = Response::new(buffered(Bytes::from_static(b"{}")));
             *resp.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
             resp
         })
 }
 
-async fn dispatch(config: &RpcServerConfig, req: Request<Incoming>) -> Result<Vec<u8>, RpcError> {
+async fn dispatch(config: &RpcServerConfig, req: Request<Incoming>) -> Result<Reply, RpcError> {
     let method = req.method().as_str().to_owned();
     // Sign the query too: a handler that later reads one would otherwise have
     // an unauthenticated input, and the client signs whatever it puts on the
@@ -263,10 +287,13 @@ async fn dispatch(config: &RpcServerConfig, req: Request<Incoming>) -> Result<Ve
     }
 
     if let Some(handler) = config.router.lookup(&method, &path) {
-        return handler.call(body.to_vec()).await;
+        return handler.call(body.to_vec()).await.map(Reply::Json);
     }
     if let Some((handler, suffix)) = config.router.lookup_prefix(&method, &path) {
-        return handler.call(suffix, body.to_vec()).await;
+        return handler.call(suffix, body.to_vec()).await.map(Reply::Json);
+    }
+    if let Some((handler, suffix)) = config.router.lookup_stream_prefix(&method, &path) {
+        return handler.call(suffix).await.map(Reply::Stream);
     }
     Err(RpcError::UnknownRoute { method, path })
 }
@@ -401,6 +428,68 @@ mod tests {
             },
         );
         assert_eq!(replayed, Err(crate::rpc::AuthError::BadMac));
+    }
+
+    /// Pins D-101 (#652): a streamed route answers a signed GET with its body as it is produced —
+    /// the first response on the cluster port that is not one buffered JSON document. The route is
+    /// behind the same credential, recipient and route checks as every other.
+    #[tokio::test]
+    async fn a_stream_route_streams_its_body_to_a_signed_get() {
+        use crate::rpc::{StreamFuture, StreamReply};
+        let router = Router::new().route_stream_prefix(
+            "GET",
+            "/stream/",
+            Arc::new(|suffix: String| -> StreamFuture {
+                Box::pin(async move {
+                    let chunks: Vec<std::io::Result<Bytes>> = vec![
+                        Ok(Bytes::from(format!("{suffix}:"))),
+                        Ok(Bytes::from_static(b"abc")),
+                        Ok(Bytes::from_static(b"def")),
+                    ];
+                    Ok(StreamReply {
+                        content_type: "application/zstd",
+                        body: Box::pin(futures_util::stream::iter(chunks)),
+                    })
+                })
+            }),
+        );
+        let server = RpcServer::bind(
+            "127.0.0.1:0".parse().expect("addr"),
+            RpcServerConfig::new(Some(Arc::new(Verifier::new(SECRET))), router).with_node_id(77),
+        )
+        .await
+        .expect("bind");
+        let addr = server.local_addr().expect("addr");
+        let _server = tokio::spawn(server.serve());
+
+        let body = client(SECRET)
+            .fetch_stream(addr, "/stream/x/3?to=77", Duration::from_secs(2))
+            .await
+            .expect("a signed GET streams");
+        let bytes = body.collect().await.expect("read the stream").to_bytes();
+        assert_eq!(&bytes[..], b"x/3?to=77:abcdef");
+
+        let refused = client("not-the-secret")
+            .fetch_stream(addr, "/stream/x/3", Duration::from_secs(2))
+            .await;
+        assert!(
+            matches!(refused, Err(RpcError::Unauthorized(_))),
+            "got {refused:?}"
+        );
+        let elsewhere = client(SECRET)
+            .fetch_stream(addr, "/stream/x/3?to=3", Duration::from_secs(2))
+            .await;
+        assert!(
+            matches!(elsewhere, Err(RpcError::WrongNode { .. })),
+            "got {elsewhere:?}"
+        );
+        let unknown = client(SECRET)
+            .fetch_stream(addr, "/nope", Duration::from_secs(2))
+            .await;
+        assert!(
+            matches!(unknown, Err(RpcError::UnknownRoute { .. })),
+            "got {unknown:?}"
+        );
     }
 
     /// Pins D-96: a server that has not been told its id cannot compare, and accepts the request.

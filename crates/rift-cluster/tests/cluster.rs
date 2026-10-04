@@ -1292,6 +1292,61 @@ async fn test_rejoin_after_leave_with_retained_state_dir() {
     cluster.shutdown_all().await;
 }
 
+/// A counter's value in this process's metrics registry (the one every in-process node shares),
+/// or 0 when the series has not been touched yet. Read as a before/after difference.
+fn counter(name: &str, label: Option<(&str, &str)>) -> f64 {
+    prometheus::gather()
+        .into_iter()
+        .find(|family| family.get_name() == name)
+        .and_then(|family| {
+            family
+                .get_metric()
+                .iter()
+                .find(|metric| match label {
+                    None => true,
+                    Some((key, value)) => metric
+                        .get_label()
+                        .iter()
+                        .any(|l| l.get_name() == key && l.get_value() == value),
+                })
+                .map(|metric| metric.get_counter().get_value())
+        })
+        .unwrap_or(0.0)
+}
+
+/// `target_bytes` of seeded pseudo-random text, starting with `tag` (see [`bulky_request`]).
+fn incompressible_body(tag: &str, target_bytes: usize) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let mut x = tag.bytes().fold(0x9E37_79B9_7F4A_7C15_u64, |h, b| {
+        (h ^ u64::from(b)).wrapping_mul(0x100_0000_01B3)
+    }) | 1;
+    let mut body = String::with_capacity(target_bytes);
+    body.push_str(tag);
+    while body.len() < target_bytes {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        body.push(char::from(ALPHABET[(x & 63) as usize]));
+    }
+    body.truncate(target_bytes);
+    body
+}
+
+/// Pins #652's fixture premise: the bulk these tests write does not compress, so a snapshot built
+/// from it still has to cross the wire at close to its size.
+#[test]
+fn bulky_bodies_do_not_compress() {
+    let body = incompressible_body("d0", 1024 * 1024);
+    let compressed = zstd::encode_all(body.as_bytes(), 3).expect("compress");
+    assert!(
+        compressed.len() * 10 >= body.len() * 7,
+        "the fixture compressed to {} of {} bytes — it no longer exercises the transfer",
+        compressed.len(),
+        body.len()
+    );
+    assert_ne!(incompressible_body("d1", 64), incompressible_body("d0", 64));
+}
+
 /// A `PutImposter` whose serialized entry is at least `target_bytes` — the bulk payload the
 /// large-entry tests (#411, #430, #431, #428) need in order to exercise openraft and redb at
 /// size.
@@ -1304,13 +1359,15 @@ async fn test_rejoin_after_leave_with_retained_state_dir() {
 ///
 /// `tag` makes two calls at the same size produce *different* bytes, so a test that writes N of
 /// these writes N distinct entries rather than N copies of one.
+///
+/// **The body is incompressible (#652).** Snapshots are zstd at rest and on the wire (D-101), and
+/// a body of one repeated character compresses about 1000×: every snapshot built from it would
+/// shrink to nothing and the transfer these tests measure would vanish with it. So the body is a
+/// seeded pseudo-random stream over a 64-character alphabet — six bits of entropy per byte, which
+/// zstd cannot squeeze below ~3/4 of its size. `bulky_bodies_do_not_compress` checks that rather
+/// than assuming it.
 fn bulky_request(port: u16, tag: &str, target_bytes: usize) -> ControlRequest {
-    let mut body = String::with_capacity(target_bytes);
-    body.push_str(tag);
-    while body.len() < target_bytes {
-        body.push('x');
-    }
-    body.truncate(target_bytes);
+    let body = incompressible_body(tag, target_bytes);
     let config: rift_cluster_base::seams::ImposterConfig =
         serde_json::from_value(serde_json::json!({
             "port": port,
@@ -1764,6 +1821,15 @@ async fn a_joiner_is_caught_up_by_a_multi_mebibyte_snapshot() {
     let seed = Authority::from(addr1);
     // Timed from *before* the call: the install races the admission window from here, so this is
     // the same quantity `ADMIT_CURRENCY_WAIT` is compared against inside `admit`.
+    let offers_before = counter(
+        "rift_cluster_snapshot_transfers_total",
+        Some(("path", "offer")),
+    );
+    let chunked_before = counter(
+        "rift_cluster_snapshot_transfers_total",
+        Some(("path", "chunked")),
+    );
+    let fetched_before = counter("rift_cluster_snapshot_fetch_bytes_total", None);
     let join_started = Instant::now();
     // Admission commits the membership entry and returns (#433); the install it used to have to
     // outlast is no longer on this call's path, so the first attempt succeeds.
@@ -1832,6 +1898,40 @@ async fn a_joiner_is_caught_up_by_a_multi_mebibyte_snapshot() {
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
     let install_took = join_started.elapsed();
+
+    // D-101: the snapshot crossed as an offer the joiner pulled — never the chunked fallback — and
+    // what it pulled was the payload file at about its size. The fixture does not compress, so
+    // the file is close to the state it holds; the chunked path would have cost ~4× that, as a
+    // JSON array of integers.
+    let state_bytes = (ENTRIES * PER_ENTRY_BYTES) as f64;
+    // The leader counts the offer when the reply arrives, which is after the install the poll
+    // above saw: wait for it rather than race it.
+    let offer_count = || {
+        counter(
+            "rift_cluster_snapshot_transfers_total",
+            Some(("path", "offer")),
+        )
+    };
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while offer_count() - offers_before < 1.0 && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let offers = offer_count() - offers_before;
+    let chunked = counter(
+        "rift_cluster_snapshot_transfers_total",
+        Some(("path", "chunked")),
+    ) - chunked_before;
+    let fetched = counter("rift_cluster_snapshot_fetch_bytes_total", None) - fetched_before;
+    assert!(
+        offers >= 1.0,
+        "the joiner was not sent an offer. {}",
+        state("offer")
+    );
+    assert_eq!(chunked, 0.0, "the snapshot went by the chunked fallback");
+    assert!(
+        fetched >= 0.5 * state_bytes && fetched <= 1.1 * state_bytes,
+        "the fetch served {fetched} bytes for {state_bytes} bytes of incompressible state"
+    );
     assert!(
         install_took >= MIN_INSTALL_MARGIN * ADMIT_CURRENCY_WAIT,
         "the install took {install_took:?} against a {ADMIT_CURRENCY_WAIT:?} admission window — \

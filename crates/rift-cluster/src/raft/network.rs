@@ -25,14 +25,19 @@ use openraft::raft::{
     AppendEntriesRequest, AppendEntriesResponse, ClientWriteResponse, InstallSnapshotRequest,
     InstallSnapshotResponse, VoteRequest, VoteResponse,
 };
-use openraft::{BasicNode, ChangeMembers, LogId, Raft, RaftNetwork, RaftNetworkFactory, Vote};
+use openraft::{
+    BasicNode, ChangeMembers, LogId, Raft, RaftNetwork, RaftNetworkFactory, SnapshotMeta, Vote,
+};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, OnceCell};
 
 use super::{NodeId, TypeConfig};
 use crate::control::{ControlRequest, ControlResponse};
-use crate::rpc::{Authority, HandlerFuture, PeerResolver, Router, RpcClient, RpcError, addressed};
+use crate::rpc::{
+    Authority, ByteStream, HandlerFuture, PeerResolver, Router, RpcClient, RpcError, StreamFuture,
+    StreamReply, addressed,
+};
 
 /// AppendEntries receiving endpoint.
 pub(crate) const RAFT_APPEND_PATH: &str = "/internal/v1/raft/append";
@@ -40,6 +45,11 @@ pub(crate) const RAFT_APPEND_PATH: &str = "/internal/v1/raft/append";
 pub(crate) const RAFT_VOTE_PATH: &str = "/internal/v1/raft/vote";
 /// InstallSnapshot receiving endpoint.
 pub(crate) const RAFT_SNAPSHOT_PATH: &str = "/internal/v1/raft/snapshot";
+/// A leader's snapshot offer (D-101): the follower fetches the payload from the leader, checks
+/// it and installs it, and the reply is the install's result.
+pub(crate) const RAFT_SNAPSHOT_OFFER_PATH: &str = "/internal/v1/raft/snapshot/offer";
+/// Streams a payload file from an offset: `{prefix}{snapshot_id}/{offset}` (D-101).
+pub(crate) const RAFT_SNAPSHOT_FETCH_PREFIX: &str = "/internal/v1/raft/snapshot/fetch/";
 /// Seed-join endpoint: a starting node asks an existing member to admit it.
 pub(crate) const CLUSTER_JOIN_PATH: &str = "/internal/v1/cluster/join";
 /// Leave endpoint (issue #6): a leaving node (or whoever is completing its
@@ -224,6 +234,8 @@ pub(crate) struct RpcNetwork {
     /// Every [`PeerClient`] ticker consults it before probing; see the field
     /// on [`PeerClient`] for why.
     leading: LeadingProbe,
+    /// This node, as the snapshots it offers name it (D-101).
+    local: LocalNode,
 }
 
 impl RpcNetwork {
@@ -231,11 +243,13 @@ impl RpcNetwork {
         client: RpcClient,
         resolver: Arc<dyn PeerResolver>,
         leading: LeadingProbe,
+        local: LocalNode,
     ) -> Self {
         Self {
             client,
             resolver,
             leading,
+            local,
         }
     }
 }
@@ -253,6 +267,7 @@ impl RaftNetworkFactory<TypeConfig> for RpcNetwork {
             liveness: Arc::new(std::sync::Mutex::new(PeerLiveness::default())),
             leading: Arc::clone(&self.leading),
             ticker: None,
+            local: self.local.clone(),
         };
         peer.ticker = Some(peer.spawn_liveness_ticker());
         peer
@@ -285,6 +300,8 @@ pub(crate) struct PeerClient {
     /// precisely when openraft is silent and the ticker would speak.
     leading: LeadingProbe,
     ticker: Option<tokio::task::JoinHandle<()>>,
+    /// This node, for the snapshots it offers this peer (D-101).
+    local: LocalNode,
 }
 
 #[derive(Default)]
@@ -397,6 +414,43 @@ struct InflightAppend {
     handle: tokio::task::JoinHandle<AppendOutcome>,
 }
 
+/// Why a [`PeerClient::post`] did not get an answer.
+enum SendFailure {
+    /// The member's advertised authority resolved to no address.
+    Unresolved(String),
+    /// Every address was tried, or the budget ran out first. `last` is the error that decides how
+    /// openraft is told; `context` names the peer.
+    Failed {
+        last: Option<RpcError>,
+        context: String,
+    },
+}
+
+impl SendFailure {
+    /// Classify on the last failure rather than flattening everything to `Unreachable`: a peer
+    /// that is up but still booting answers `Handler`, which openraft retries promptly, and
+    /// reporting that as unreachable would make it back off from a node that is seconds from ready.
+    fn into_rpc_error<E: std::error::Error>(
+        self,
+    ) -> RPCError<NodeId, BasicNode, RaftError<NodeId, E>> {
+        match self {
+            Self::Unresolved(detail) => {
+                RPCError::Unreachable(Unreachable::new(&std::io::Error::other(detail)))
+            }
+            Self::Failed {
+                last: Some(e),
+                context,
+            } => map_rpc_err(&e, &context),
+            Self::Failed {
+                last: None,
+                context,
+            } => RPCError::Unreachable(Unreachable::new(&std::io::Error::other(format!(
+                "{context}: no addresses to try"
+            )))),
+        }
+    }
+}
+
 impl PeerClient {
     // `RPCError` is openraft's, and every caller hands the result straight back to an
     // openraft `RaftNetwork` method, so this signature is fixed by that trait.
@@ -412,13 +466,37 @@ impl PeerClient {
         Resp: DeserializeOwned,
         E: std::error::Error,
     {
+        let body = serde_json::to_vec(req).map_err(|e| RPCError::Network(NetworkError::new(&e)))?;
+        let budget = match delivery {
+            Delivery::Retried => None,
+            Delivery::BulkSingleAttempt => Some(replication_deadline(
+                self.client.request_timeout(),
+                body.len(),
+            )),
+        };
+        match self.post(path, body, budget).await {
+            Ok(response) => serde_json::from_slice(&response)
+                .map_err(|e| RPCError::Network(NetworkError::new(&e))),
+            Err(failure) => Err(failure.into_rpc_error()),
+        }
+    }
+
+    /// POST `body` to the member this client serves, trying each address it resolves to.
+    ///
+    /// `budget` is `None` for a small retried RPC and `Some` for a single-attempt bulk transfer,
+    /// whose deadline is a budget for this whole send, not for each address in turn.
+    async fn post(
+        &self,
+        path: &str,
+        body: Vec<u8>,
+        budget: Option<Duration>,
+    ) -> Result<Vec<u8>, SendFailure> {
         // Resolved fresh on every send (never cached), so a peer's advertise
         // address that is a hostname (a StatefulSet's headless DNS entry) picks
         // up a changed pod IP on the very next attempt.
         let addrs = resolve_peer(&self.resolver, self.target, &self.addr)
             .await
-            .map_err(|e| RPCError::Unreachable(Unreachable::new(&e)))?;
-        let body = serde_json::to_vec(req).map_err(|e| RPCError::Network(NetworkError::new(&e)))?;
+            .map_err(|e| SendFailure::Unresolved(e.to_string()))?;
         // Named for the member this client serves, so another node holding its address refuses
         // the message rather than taking it as its own (D-96).
         let member_path = addressed(path, self.target);
@@ -440,13 +518,6 @@ impl PeerClient {
         // deadline would let a peer advertising N addresses spend N x the budget and blow
         // openraft's bound whenever the first address is reachable-but-hung — restarting the
         // snapshot from offset 0, which is the very failure #428 exists to remove.
-        let budget = match delivery {
-            Delivery::Retried => None,
-            Delivery::BulkSingleAttempt => Some(replication_deadline(
-                self.client.request_timeout(),
-                body.len(),
-            )),
-        };
         let started = Instant::now();
 
         // The body is handed to the last address rather than cloned for it: for a snapshot chunk
@@ -473,24 +544,13 @@ impl PeerClient {
                 }
             };
             match attempt {
-                Ok(response) => {
-                    return serde_json::from_slice(&response)
-                        .map_err(|e| RPCError::Network(NetworkError::new(&e)));
-                }
+                Ok(response) => return Ok(response),
                 Err(e) => last = Some(keep_wrong_node(last, e)),
             }
         }
-
-        // Classify on the last failure rather than flattening everything to
-        // `Unreachable`: a peer that is up but still booting answers `Handler`,
-        // which openraft retries promptly, and reporting that as unreachable
-        // would make it back off from a node that is seconds from ready.
-        let context = format!("{} ({} address(es) tried)", self.addr, addrs.len());
-        Err(match last {
-            Some(e) => map_rpc_err(&e, &context),
-            None => RPCError::Unreachable(Unreachable::new(&std::io::Error::other(format!(
-                "{context}: no addresses to try"
-            )))),
+        Err(SendFailure::Failed {
+            last,
+            context: format!("{} ({} address(es) tried)", self.addr, addrs.len()),
         })
     }
 
@@ -932,6 +992,268 @@ impl RaftNetwork<TypeConfig> for PeerClient {
         self.send(RAFT_SNAPSHOT_PATH, &rpc, Delivery::BulkSingleAttempt)
             .await
     }
+
+    /// Offer the snapshot; the follower pulls it (D-101).
+    ///
+    /// openraft's default sends the snapshot itself, in 1 MiB `install_snapshot` chunks, each a
+    /// JSON array of integers — ~3.4× the payload on the wire — and restarts from byte 0 when one
+    /// misses its deadline (#428). Here the leader sends a few hundred bytes naming the payload, its
+    /// size and its sha256, and the follower fetches the file — raw, zstd at rest — resuming from
+    /// whatever it already holds, checks the digest, and installs; the offer's reply is that
+    /// install's response. A receiver without the offer route predates this and is sent the
+    /// snapshot the old way, decompressed, since it cannot read zstd.
+    ///
+    /// openraft sends this peer nothing else while the snapshot is outstanding; this shortens that
+    /// window, it does not close it (D-83's ticker is still the mitigation).
+    async fn full_snapshot(
+        &mut self,
+        vote: Vote<NodeId>,
+        snapshot: openraft::Snapshot<TypeConfig>,
+        cancel: impl Future<Output = openraft::error::ReplicationClosed>
+        + openraft::OptionalSend
+        + 'static,
+        option: RPCOption,
+    ) -> Result<
+        openraft::raft::SnapshotResponse<NodeId>,
+        openraft::error::StreamingError<TypeConfig, openraft::error::Fatal<NodeId>>,
+    > {
+        use futures_util::FutureExt as _;
+        use openraft::error::StreamingError;
+        self.note_sent(vote);
+        let cancel = Box::pin(cancel).shared();
+        let openraft::Snapshot { meta, snapshot } = snapshot;
+        // Hashed through the handle openraft opened, never reopened by path: a newer snapshot's GC
+        // may unlink this file while the offer is outstanding, and an open handle still reads it.
+        let payload = snapshot.into_std().await;
+        let (payload, digest, size) = tokio::task::spawn_blocking(move || hash_payload(payload))
+            .await
+            .map_err(std::io::Error::other)
+            .and_then(|hashed| hashed)
+            .map_err(|e| local_failure(&meta, &e))?;
+        let offer = SnapshotOffer {
+            vote,
+            meta: meta.clone(),
+            digest,
+            size,
+            from: self.local.advertise.clone(),
+            leader: self.local.id,
+        };
+        let body = serde_json::to_vec(&offer)
+            .map_err(|e| StreamingError::Network(NetworkError::new(&e)))?;
+        let budget = replication_deadline(
+            self.client.request_timeout(),
+            usize::try_from(size).unwrap_or(usize::MAX),
+        ) + OFFER_INSTALL_ALLOWANCE;
+        let sent = tokio::select! {
+            sent = self.post(RAFT_SNAPSHOT_OFFER_PATH, body, Some(budget)) => sent,
+            closed = cancel.clone() => return Err(StreamingError::Closed(closed)),
+        };
+        match sent {
+            Ok(response) => {
+                crate::metrics::snapshot_transfer("offer");
+                serde_json::from_slice(&response)
+                    .map_err(|e| StreamingError::Network(NetworkError::new(&e)))
+            }
+            // Only the receiver's own "no such route" reaches here as `UnknownRoute`: a follower
+            // reports a failure of its fetch from this node as a `Handler` error (`accept_offer`).
+            Err(SendFailure::Failed {
+                last: Some(RpcError::UnknownRoute { .. }),
+                ..
+            }) => {
+                tracing::info!(
+                    target = self.target,
+                    "peer has no snapshot offer route; sending the snapshot in chunks"
+                );
+                self.send_snapshot_in_chunks(vote, meta, payload, cancel, option)
+                    .await
+            }
+            Err(failure) => Err(
+                match failure.into_rpc_error::<openraft::error::Infallible>() {
+                    RPCError::Unreachable(e) => StreamingError::Unreachable(e),
+                    RPCError::Network(e) => StreamingError::Network(e),
+                    other => StreamingError::Network(NetworkError::new(&other)),
+                },
+            ),
+        }
+    }
+}
+
+/// A local failure while this leader reads its own payload to send it.
+///
+/// Reported as a `Network` error, not a storage error, deliberately: openraft treats a storage
+/// error from a replication stream as fatal to the node's whole Raft (it stops the core), and a
+/// leader that could not read a snapshot file this once — a full disk, an fd limit, a file a newer
+/// build has replaced — should retry the transfer, not stop leading.
+fn local_failure(
+    meta: &SnapshotMeta<NodeId, BasicNode>,
+    e: &std::io::Error,
+) -> openraft::error::StreamingError<TypeConfig, openraft::error::Fatal<NodeId>> {
+    openraft::error::StreamingError::Network(NetworkError::new(&std::io::Error::other(format!(
+        "reading snapshot {} to send it: {e}",
+        meta.snapshot_id
+    ))))
+}
+
+/// sha256 (hex) and length of a payload handle, read from the start; the handle comes back for a
+/// fallback send.
+fn hash_payload(mut file: std::fs::File) -> std::io::Result<(std::fs::File, String, u64)> {
+    use sha2::Digest as _;
+    use std::io::{Read as _, Seek as _};
+    file.seek(std::io::SeekFrom::Start(0))?;
+    let mut hasher = sha2::Sha256::new();
+    let mut buf = vec![0u8; FETCH_CHUNK_BYTES];
+    let mut len = 0u64;
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+        len += u64::try_from(n).unwrap_or(u64::MAX);
+    }
+    Ok((file, hex(&hasher.finalize()), len))
+}
+
+/// Lowercase hex of `bytes`.
+fn hex(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        let _ = write!(out, "{b:02x}");
+    }
+    out
+}
+
+/// How often one fallback chunk is attempted before the transfer is given up to openraft — the
+/// bound openraft's own chunked sender uses.
+const CHUNK_ATTEMPTS: u32 = 5;
+
+/// Chunk size for the fallback when openraft did not set one — the size the node configures
+/// (`node.rs`, `snapshot_max_chunk_size`).
+const FALLBACK_CHUNK_BYTES: usize = 1024 * 1024;
+
+impl PeerClient {
+    /// The pre-D-101 transfer, for a receiver without the offer route: `install_snapshot` chunks
+    /// of the payload **decompressed** — such a receiver reads only plain JSON — read through the
+    /// handle openraft opened, a chunk at a time, so nothing is written to disk.
+    ///
+    /// Shaped like openraft's `Chunked` sender: each chunk is retried, up to [`CHUNK_ATTEMPTS`]
+    /// with a growing pause, on a timeout or a network failure, so one dropped connection costs one
+    /// chunk rather than the transfer; the receiver answering a higher vote ends it. It is written
+    /// out because `Chunked` takes its chunk size from an `RPCOption` field only openraft can set,
+    /// which no test can drive. One difference: a payload that is an exact multiple of the chunk
+    /// size ends with an empty `done` chunk, which the receiver treats as the end it is.
+    // `StreamingError` is openraft's: this is `full_snapshot`'s fallback and returns its type.
+    #[allow(clippy::result_large_err)]
+    async fn send_snapshot_in_chunks(
+        &mut self,
+        vote: Vote<NodeId>,
+        meta: SnapshotMeta<NodeId, BasicNode>,
+        payload: std::fs::File,
+        cancel: impl Future<Output = openraft::error::ReplicationClosed> + Clone,
+        option: RPCOption,
+    ) -> Result<
+        openraft::raft::SnapshotResponse<NodeId>,
+        openraft::error::StreamingError<TypeConfig, openraft::error::Fatal<NodeId>>,
+    > {
+        let chunk_size = option
+            .snapshot_chunk_size()
+            .filter(|n| *n > 0)
+            .unwrap_or(FALLBACK_CHUNK_BYTES);
+        let mut reader = tokio::task::spawn_blocking(move || plain_reader(payload))
+            .await
+            .map_err(std::io::Error::other)
+            .and_then(|r| r)
+            .map_err(|e| local_failure(&meta, &e))?;
+        let mut offset = 0u64;
+        loop {
+            let (back, data) = tokio::task::spawn_blocking(move || {
+                use std::io::Read as _;
+                let mut data = Vec::with_capacity(chunk_size);
+                std::io::Read::by_ref(&mut reader)
+                    .take(chunk_size as u64)
+                    .read_to_end(&mut data)
+                    .map(|_| (reader, data))
+            })
+            .await
+            .map_err(std::io::Error::other)
+            .and_then(|r| r)
+            .map_err(|e| local_failure(&meta, &e))?;
+            reader = back;
+            let done = data.len() < chunk_size;
+            let len = data.len() as u64;
+            let request = InstallSnapshotRequest {
+                vote,
+                meta: meta.clone(),
+                offset,
+                data,
+                done,
+            };
+            let response = self
+                .send_chunk_with_retry(request, cancel.clone(), &option)
+                .await?;
+            if response.vote > vote || done {
+                crate::metrics::snapshot_transfer("chunked");
+                return Ok(openraft::raft::SnapshotResponse {
+                    vote: response.vote,
+                });
+            }
+            offset += len;
+        }
+    }
+
+    /// One fallback chunk, retried on a timeout or a network failure.
+    #[allow(clippy::result_large_err)]
+    async fn send_chunk_with_retry(
+        &mut self,
+        request: InstallSnapshotRequest<TypeConfig>,
+        cancel: impl Future<Output = openraft::error::ReplicationClosed>,
+        option: &RPCOption,
+    ) -> Result<
+        InstallSnapshotResponse<NodeId>,
+        openraft::error::StreamingError<TypeConfig, openraft::error::Fatal<NodeId>>,
+    > {
+        use openraft::error::StreamingError;
+        tokio::pin!(cancel);
+        let mut attempt = 1;
+        loop {
+            let sent = tokio::select! {
+                sent = tokio::time::timeout(option.hard_ttl(), self.install_snapshot(request.clone(), option.clone())) => sent,
+                closed = &mut cancel => return Err(StreamingError::Closed(closed)),
+            };
+            let failure = match sent {
+                Ok(Ok(response)) => return Ok(response),
+                Err(_elapsed) => StreamingError::Timeout(openraft::error::Timeout {
+                    action: openraft::RPCTypes::InstallSnapshot,
+                    id: self.local.id,
+                    target: self.target,
+                    timeout: option.hard_ttl(),
+                }),
+                Ok(Err(RPCError::Unreachable(e))) => StreamingError::Unreachable(e),
+                Ok(Err(other)) => StreamingError::Network(NetworkError::new(&other)),
+            };
+            if attempt >= CHUNK_ATTEMPTS {
+                return Err(failure);
+            }
+            tracing::debug!(attempt, offset = request.offset, error = %failure, "retrying a snapshot chunk");
+            tokio::time::sleep(Duration::from_millis(100) * attempt).await;
+            attempt += 1;
+        }
+    }
+}
+
+/// The payload as plain JSON: through a zstd decoder when it is zstd (D-101), as is when it
+/// predates that. Read from the start of the handle.
+fn plain_reader(file: std::fs::File) -> std::io::Result<Box<dyn std::io::Read + Send>> {
+    use std::io::{BufRead as _, Seek as _};
+    let mut file = file;
+    file.seek(std::io::SeekFrom::Start(0))?;
+    let mut reader = std::io::BufReader::new(file);
+    if reader.fill_buf()?.starts_with(&super::store::ZSTD_MAGIC) {
+        Ok(Box::new(zstd::stream::read::Decoder::with_buffer(reader)?))
+    } else {
+        Ok(Box::new(reader))
+    }
 }
 
 /// Error carrying which peer's address failed to resolve.
@@ -998,6 +1320,8 @@ pub(crate) type AutoVoterCeiling = Arc<std::sync::atomic::AtomicUsize>;
 /// that path has to share this serialization to keep the floor exact.
 /// `ceiling` likewise: both admission phases must read the one value.
 #[must_use]
+// Each argument is one subsystem's handle the routes close over; a struct would only move the arity.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn control_routes(
     router: Router,
     slot: RaftSlot,
@@ -1006,6 +1330,7 @@ pub(crate) fn control_routes(
     client: RpcClient,
     resolver: Arc<dyn PeerResolver>,
     ready: ReadyProbe,
+    files: SnapshotFiles,
 ) -> Router {
     let admission_ceiling = ceiling;
     let append = slot.clone();
@@ -1026,7 +1351,36 @@ pub(crate) fn control_routes(
     // on it, so splitting them would let a join and a leave each see a count the
     // other was about to change.
 
+    let offer_slot = join.clone();
+    let offer_files = files.clone();
+    let offer_client = client.clone();
+    let offer_resolver = Arc::clone(&resolver);
+    let served_files = files;
+
     router
+        .route(
+            "POST",
+            RAFT_SNAPSHOT_OFFER_PATH,
+            Arc::new(move |body: Vec<u8>| -> HandlerFuture {
+                let slot = offer_slot.clone();
+                let files = offer_files.clone();
+                let client = offer_client.clone();
+                let resolver = Arc::clone(&offer_resolver);
+                Box::pin(async move {
+                    let raft = raft_of(&slot)?;
+                    let offer = decode::<SnapshotOffer>(&body)?;
+                    accept_offer(raft, &files, &client, &resolver, offer).await
+                })
+            }),
+        )
+        .route_stream_prefix(
+            "GET",
+            RAFT_SNAPSHOT_FETCH_PREFIX,
+            Arc::new(move |suffix: String| -> StreamFuture {
+                let files = served_files.clone();
+                Box::pin(async move { serve_snapshot(&files, &suffix).await })
+            }),
+        )
         .route(
             "POST",
             CLUSTER_WRITE_PATH,
@@ -2095,9 +2449,944 @@ fn encode<T: Serialize>(value: &T) -> Result<Vec<u8>, RpcError> {
     serde_json::to_vec(value).map_err(|e| RpcError::Handler(format!("encode: {e}")))
 }
 
+/// The snapshot transfer's local side (D-101): the directory payload files live in, and the lock
+/// that keeps two receives of one node from writing the same file at once.
+#[derive(Debug, Clone)]
+pub(crate) struct SnapshotFiles {
+    dir: std::path::PathBuf,
+    receiving: Arc<Mutex<()>>,
+}
+
+impl SnapshotFiles {
+    pub(crate) fn new(dir: std::path::PathBuf) -> Self {
+        Self {
+            dir,
+            receiving: Arc::new(Mutex::new(())),
+        }
+    }
+}
+
+/// Who this node is, for the snapshots it offers (D-101): a follower fetches from the address and
+/// names the member in the request, like every other cluster RPC (D-96).
+#[derive(Debug, Clone)]
+pub(crate) struct LocalNode {
+    pub(crate) id: NodeId,
+    pub(crate) advertise: String,
+}
+
+/// A leader's offer of a snapshot: everything a follower needs to fetch it from the leader, check
+/// it, and install it. The reply is the install's own [`SnapshotResponse`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct SnapshotOffer {
+    pub vote: Vote<NodeId>,
+    pub meta: SnapshotMeta<NodeId, BasicNode>,
+    /// sha256 of the payload file, lowercase hex.
+    pub digest: String,
+    /// The payload file's length in bytes.
+    pub size: u64,
+    /// The leader's advertised authority, to fetch from.
+    pub from: String,
+    /// The leader's id, which the fetch is addressed to (D-96).
+    pub leader: NodeId,
+}
+
+/// How long a follower is given, on top of the transfer itself, to install the snapshot before the
+/// leader's offer gives up. The offer's reply waits for the install — decompress, parse, the redb
+/// write and the engine drive — which is seconds for a large fleet. Giving up early costs a repeat
+/// offer: one that arrives while the file is still there installs without fetching, and one that
+/// arrives after a finished install has removed it fetches again.
+const OFFER_INSTALL_ALLOWANCE: Duration = Duration::from_secs(30);
+
+/// How long a snapshot fetch may go without a byte before it is abandoned. A stalled fetch keeps
+/// what arrived; the next offer resumes from it.
+const FETCH_IDLE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The name prefix of a transfer's working file in the snapshot directory — shared with openraft's
+/// own receive (`begin_receiving_snapshot`) — which the fetch route never serves.
+const RECEIVING_PREFIX: &str = super::store::RECEIVING_PREFIX;
+
+/// How much of a payload file one streamed chunk carries.
+const FETCH_CHUNK_BYTES: usize = 64 * 1024;
+
+/// sha256 (hex) and length of a whole file, off the runtime.
+async fn digest_file(path: std::path::PathBuf) -> std::io::Result<(String, u64)> {
+    tokio::task::spawn_blocking(move || {
+        use sha2::Digest as _;
+        use std::io::Read as _;
+        let mut file = std::fs::File::open(&path)?;
+        let mut hasher = sha2::Sha256::new();
+        let mut buf = vec![0u8; FETCH_CHUNK_BYTES];
+        let mut len = 0u64;
+        loop {
+            let n = file.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            hasher.update(&buf[..n]);
+            len += n as u64;
+        }
+        Ok((hex(&hasher.finalize()), len))
+    })
+    .await
+    .map_err(std::io::Error::other)?
+}
+
+/// Serve a payload file from an offset — the leader's half of the transfer (D-101). `suffix` is
+/// `{snapshot_id}/{offset}`, optionally followed by a query.
+pub(crate) async fn serve_snapshot(
+    files: &SnapshotFiles,
+    suffix: &str,
+) -> Result<StreamReply, RpcError> {
+    use tokio::io::{AsyncReadExt as _, AsyncSeekExt as _};
+    let target = suffix.split_once('?').map_or(suffix, |(before, _)| before);
+    let (id, offset) = target.split_once('/').ok_or_else(|| {
+        RpcError::BadRequest(format!("snapshot fetch {target:?} names no offset"))
+    })?;
+    // A payload id, never a transfer's working file: those share the directory.
+    if !super::store::snapshot_id_is_safe(id)
+        || id.starts_with(RECEIVING_PREFIX)
+        || id.starts_with(super::store::TMP_PREFIX)
+    {
+        return Err(RpcError::BadRequest(format!("unusable snapshot id {id:?}")));
+    }
+    let offset: u64 = offset
+        .parse()
+        .map_err(|_| RpcError::BadRequest(format!("snapshot offset {offset:?} is not a number")))?;
+    let mut file = match tokio::fs::File::open(files.dir.join(id)).await {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(RpcError::NotFound {
+                what: format!("snapshot {id}"),
+            });
+        }
+        Err(e) => return Err(RpcError::Handler(format!("opening snapshot {id}: {e}"))),
+    };
+    let len = file
+        .metadata()
+        .await
+        .map_err(|e| RpcError::Handler(format!("reading snapshot {id}: {e}")))?
+        .len();
+    if offset > len {
+        return Err(RpcError::BadRequest(format!(
+            "offset {offset} is past the end of snapshot {id} ({len} bytes)"
+        )));
+    }
+    file.seek(std::io::SeekFrom::Start(offset))
+        .await
+        .map_err(|e| RpcError::Handler(format!("seeking snapshot {id}: {e}")))?;
+    let body = futures_util::stream::unfold(Some(file), |state| async move {
+        let mut file = state?;
+        let mut buf = vec![0u8; FETCH_CHUNK_BYTES];
+        match file.read(&mut buf).await {
+            Ok(0) => None,
+            Ok(n) => {
+                buf.truncate(n);
+                crate::metrics::snapshot_fetch_bytes(n);
+                Some((Ok(hyper::body::Bytes::from(buf)), Some(file)))
+            }
+            // One error ends the stream: the reader has the bytes that arrived and resumes.
+            Err(e) => Some((Err(e), None)),
+        }
+    });
+    Ok(StreamReply {
+        content_type: "application/zstd",
+        body: Box::pin(body),
+    })
+}
+
+/// Bring `receiving-{id}` to the snapshot the leader offered — the follower's half (D-101) — and
+/// return its path once its sha256 matches `digest`.
+///
+/// Resumes, never restarts: a file holding fewer than `size` bytes fetches only the remainder,
+/// one already complete fetches nothing, and one longer than `size` (another transfer's leftover)
+/// is discarded. A fetch that fails keeps what arrived. A file that does not hash to `digest` is
+/// removed, so the next attempt starts clean rather than resuming corruption.
+pub(crate) async fn receive_snapshot<F, Fut>(
+    files: &SnapshotFiles,
+    id: &str,
+    size: u64,
+    digest: &str,
+    fetch: F,
+) -> Result<std::path::PathBuf, RpcError>
+where
+    F: FnOnce(u64) -> Fut,
+    Fut: Future<Output = Result<ByteStream, RpcError>>,
+{
+    use futures_util::StreamExt as _;
+    use tokio::io::{AsyncSeekExt as _, AsyncWriteExt as _};
+    if !super::store::snapshot_id_is_safe(id) {
+        return Err(RpcError::BadRequest(format!("unusable snapshot id {id:?}")));
+    }
+    let io = |e: std::io::Error| RpcError::Handler(format!("receiving snapshot {id}: {e}"));
+    let _receiving = files.receiving.lock().await;
+    tokio::fs::create_dir_all(&files.dir).await.map_err(io)?;
+    let path = files.dir.join(format!("{RECEIVING_PREFIX}{id}"));
+    let mut file = tokio::fs::File::options()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&path)
+        .await
+        .map_err(io)?;
+    let mut held = file.metadata().await.map_err(io)?.len();
+    if held > size {
+        tracing::info!(
+            snapshot = id,
+            held,
+            size,
+            "discarding a received file longer than the offered snapshot"
+        );
+        file.set_len(0).await.map_err(io)?;
+        held = 0;
+    }
+    if held < size {
+        file.seek(std::io::SeekFrom::Start(held))
+            .await
+            .map_err(io)?;
+        let fetched = async {
+            let mut body = fetch(held).await?;
+            loop {
+                let next = tokio::time::timeout(FETCH_IDLE_TIMEOUT, body.next())
+                    .await
+                    .map_err(|_| RpcError::Timeout)?;
+                let Some(chunk) = next else { break };
+                let chunk = chunk.map_err(|e| {
+                    RpcError::Transport(format!("snapshot {id} fetch broke off: {e}"))
+                })?;
+                file.write_all(&chunk).await.map_err(io)?;
+            }
+            Ok::<(), RpcError>(())
+        }
+        .await;
+        // Flushed whether or not the fetch finished: tokio's `File` holds writes back, and what
+        // arrived before a failure is exactly what the next attempt resumes from.
+        file.flush().await.map_err(io)?;
+        file.sync_all().await.map_err(io)?;
+        fetched?;
+    } else {
+        file.sync_all().await.map_err(io)?;
+    }
+    drop(file);
+
+    let (actual, len) = digest_file(path.clone()).await.map_err(io)?;
+    // Short but cleanly ended — the leader's response stopped early: keep the bytes, and the next
+    // offer resumes from them. Only a complete-length file that hashes wrong, or a longer one, is
+    // corrupt.
+    if len < size {
+        return Err(RpcError::Transport(format!(
+            "snapshot {id} ended at {len} of {size} bytes"
+        )));
+    }
+    if len != size || actual != digest {
+        tracing::error!(
+            snapshot = id,
+            len,
+            size,
+            %actual,
+            expected = %digest,
+            "a received snapshot does not match the leader's offer; discarding it"
+        );
+        discard(&path).await;
+        return Err(RpcError::Handler(format!(
+            "snapshot {id} arrived as {len} bytes with sha256 {actual}; the leader offered {size} \
+             bytes with sha256 {digest}"
+        )));
+    }
+    Ok(path)
+}
+
+/// Remove a corrupt transfer file. If it cannot be removed it is emptied instead — a corrupt file
+/// left at full length would be taken as complete by every later offer and fail the same way.
+async fn discard(path: &std::path::Path) {
+    let Err(e) = tokio::fs::remove_file(path).await else {
+        return;
+    };
+    tracing::warn!(error = %e, file = %path.display(), "could not remove a corrupt snapshot transfer; emptying it");
+    let emptied = tokio::fs::OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .open(path)
+        .await;
+    if let Err(e) = emptied {
+        tracing::error!(error = %e, file = %path.display(), "could not empty a corrupt snapshot transfer either");
+    }
+}
+
+/// Fetch the offered snapshot from the leader, from `offset` (D-101). Tries each address the
+/// leader's authority resolves to.
+async fn fetch_offered(
+    client: &RpcClient,
+    resolver: &Arc<dyn PeerResolver>,
+    offer: &SnapshotOffer,
+    offset: u64,
+) -> Result<ByteStream, RpcError> {
+    use futures_util::StreamExt as _;
+    let addrs = resolve_peer(resolver, offer.leader, &offer.from)
+        .await
+        .map_err(|e| RpcError::Transport(e.to_string()))?;
+    let path = addressed(
+        &format!(
+            "{RAFT_SNAPSHOT_FETCH_PREFIX}{}/{offset}",
+            offer.meta.snapshot_id
+        ),
+        offer.leader,
+    );
+    let mut last = None;
+    for addr in addrs {
+        match client
+            .fetch_stream(addr, &path, client.request_timeout())
+            .await
+        {
+            Ok(body) => {
+                let stream = http_body_util::BodyDataStream::new(body)
+                    .map(|chunk| chunk.map_err(std::io::Error::other));
+                return Ok(Box::pin(stream));
+            }
+            Err(e) => last = Some(keep_wrong_node(last, e)),
+        }
+    }
+    Err(last.unwrap_or_else(|| RpcError::Transport(format!("{}: no addresses to try", offer.from))))
+}
+
+/// The follower's offer handler: fetch, check, install, answer with the install's response.
+async fn accept_offer(
+    raft: &Raft<TypeConfig>,
+    files: &SnapshotFiles,
+    client: &RpcClient,
+    resolver: &Arc<dyn PeerResolver>,
+    offer: SnapshotOffer,
+) -> Result<Vec<u8>, RpcError> {
+    let id = offer.meta.snapshot_id.clone();
+    // A failure of *this node's* fetch from the leader is reported to the leader as a handler
+    // error naming the hop, never under its own class: passed through, a fetch that met an old
+    // build at the leader's address would come back `UnknownRoute` and read to the leader as "this
+    // follower has no offer route", and a credential or reachability failure on the fetch would be
+    // blamed on this follower's address.
+    let path = receive_snapshot(
+        files,
+        &id,
+        offer.size,
+        &offer.digest,
+        |offset| fetch_offered(client, resolver, &offer, offset),
+    )
+    .await
+    .map_err(|e| {
+        tracing::error!(snapshot = %id, leader = offer.leader, from = %offer.from, error = %e, "receiving an offered snapshot failed");
+        match e {
+            RpcError::BadRequest(_) => e,
+            other => RpcError::Handler(format!(
+                "fetching snapshot {id} from node {} at {}: {other}",
+                offer.leader, offer.from
+            )),
+        }
+    })?;
+    let file = tokio::fs::File::open(&path)
+        .await
+        .map_err(|e| RpcError::Handler(format!("opening the received snapshot: {e}")))?;
+    let response = raft
+        .install_full_snapshot(
+            offer.vote,
+            openraft::Snapshot {
+                meta: offer.meta,
+                snapshot: Box::new(file),
+            },
+        )
+        .await
+        .map_err(|e| {
+            tracing::error!(snapshot = %id, error = %e, "installing an offered snapshot failed");
+            RpcError::Handler(e.to_string())
+        })?;
+    // The install copied the file into place; this copy is spent.
+    if let Err(e) = tokio::fs::remove_file(&path).await {
+        tracing::warn!(error = %e, file = %path.display(), "could not remove a spent snapshot transfer");
+    }
+    encode(&response)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A node identity for tests that never offer a snapshot.
+    fn test_local() -> LocalNode {
+        LocalNode {
+            id: 0,
+            advertise: "127.0.0.1:0".to_owned(),
+        }
+    }
+
+    mod snapshot_transfer {
+        use std::sync::Mutex as StdMutex;
+
+        use futures_util::StreamExt as _;
+        use hyper::body::Bytes;
+        use sha2::Digest as _;
+
+        use super::super::{SnapshotFiles, receive_snapshot, serve_snapshot};
+        use crate::rpc::RpcError;
+
+        fn files() -> (tempfile::TempDir, SnapshotFiles) {
+            let dir = tempfile::TempDir::new().expect("tempdir");
+            let files = SnapshotFiles::new(dir.path().to_path_buf());
+            (dir, files)
+        }
+
+        /// Deterministic bytes that do not repeat, so an offset mistake shows as wrong content.
+        fn content(len: usize) -> Vec<u8> {
+            let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+            (0..len)
+                .map(|_| {
+                    x ^= x << 13;
+                    x ^= x >> 7;
+                    x ^= x << 17;
+                    x.to_le_bytes()[0]
+                })
+                .collect()
+        }
+
+        fn sha256_hex(bytes: &[u8]) -> String {
+            sha2::Sha256::digest(bytes)
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect()
+        }
+
+        async fn served(files: &SnapshotFiles, suffix: &str) -> Result<Vec<u8>, RpcError> {
+            let reply = serve_snapshot(files, suffix).await?;
+            assert_eq!(reply.content_type, "application/zstd");
+            let mut body = reply.body;
+            let mut out = Vec::new();
+            while let Some(chunk) = body.next().await {
+                out.extend_from_slice(&chunk.expect("chunk"));
+            }
+            Ok(out)
+        }
+
+        /// Pins D-101 (#652): the fetch route serves the payload file from the offset asked for —
+        /// the half of resume that lives on the leader.
+        #[tokio::test]
+        async fn the_fetch_route_serves_the_file_from_the_offset() {
+            let (dir, files) = files();
+            std::fs::write(dir.path().join("1-5-3"), b"0123456789").expect("write");
+            assert_eq!(
+                served(&files, "1-5-3/0?to=2").await.expect("from 0"),
+                b"0123456789"
+            );
+            assert_eq!(
+                served(&files, "1-5-3/4?to=2").await.expect("from 4"),
+                b"456789"
+            );
+            assert_eq!(served(&files, "1-5-3/10").await.expect("at the end"), b"");
+            assert!(matches!(
+                served(&files, "1-5-3/11").await,
+                Err(RpcError::BadRequest(_))
+            ));
+        }
+
+        /// Pins D-101 (#652): the snapshot id is a path component, so one that could leave the
+        /// snapshot directory is refused before any file is opened; one it does not hold is
+        /// `NotFound`, not a transport failure.
+        #[tokio::test]
+        async fn the_fetch_route_refuses_an_unsafe_id_and_names_a_missing_one() {
+            let (dir, files) = files();
+            std::fs::write(dir.path().join("secret"), b"x").expect("write");
+            // Working files a fetch must never serve, present so a refusal is not a `NotFound`.
+            std::fs::write(dir.path().join("receiving-1-1-1"), b"partial").expect("write");
+            std::fs::write(dir.path().join("tmp-1-1-1"), b"unrenamed").expect("write");
+            for suffix in [
+                "../secret/0",
+                "a/b/0",
+                "/0",
+                "x/notanumber",
+                "x",
+                "receiving-1-1-1/0",
+                "tmp-1-1-1/0",
+            ] {
+                assert!(
+                    matches!(served(&files, suffix).await, Err(RpcError::BadRequest(_))),
+                    "{suffix}"
+                );
+            }
+            assert!(matches!(
+                served(&files, "1-1-1/0").await,
+                Err(RpcError::NotFound { .. })
+            ));
+        }
+
+        /// Send `payload_file` (the bytes of the leader's payload file) to a receiver with no
+        /// offer route, through `full_snapshot`, and return what the receiver assembled.
+        async fn sent_by_fallback(payload_file: Vec<u8>, fail_second_chunk_once: bool) -> Vec<u8> {
+            use openraft::network::{RPCOption, RaftNetwork as _, RaftNetworkFactory as _};
+            use openraft::raft::{InstallSnapshotRequest, InstallSnapshotResponse};
+            use openraft::{BasicNode, Snapshot, SnapshotMeta, Vote};
+
+            use super::super::{
+                HandlerFuture, LocalNode, PeerResolver, RAFT_SNAPSHOT_PATH, RpcNetwork, TypeConfig,
+                decode, encode,
+            };
+            use crate::rpc::{
+                AlwaysHealthy, Router, RpcClient, RpcClientConfig, RpcServer, RpcServerConfig,
+            };
+
+            let received = std::sync::Arc::new(StdMutex::new((Vec::<u8>::new(), 0usize, false)));
+            let sink = std::sync::Arc::clone(&received);
+            let router = Router::new().route(
+                "POST",
+                RAFT_SNAPSHOT_PATH,
+                std::sync::Arc::new(move |body: Vec<u8>| -> HandlerFuture {
+                    let sink = std::sync::Arc::clone(&sink);
+                    Box::pin(async move {
+                        let req = decode::<InstallSnapshotRequest<TypeConfig>>(&body)?;
+                        {
+                            let mut held = sink.lock().expect("lock");
+                            if fail_second_chunk_once && req.offset > 0 && !held.2 {
+                                held.2 = true;
+                                return Err(RpcError::Handler("injected chunk failure".to_owned()));
+                            }
+                            held.0
+                                .truncate(usize::try_from(req.offset).expect("offset"));
+                            held.0.extend_from_slice(&req.data);
+                            held.1 += 1;
+                        }
+                        encode(&InstallSnapshotResponse { vote: req.vote })
+                    })
+                }),
+            );
+            let server = RpcServer::bind(
+                "127.0.0.1:0".parse().expect("addr"),
+                RpcServerConfig::new(None, router),
+            )
+            .await
+            .expect("bind");
+            let addr = server.local_addr().expect("addr");
+            let _server = tokio::spawn(server.serve());
+
+            let (dir, _files) = files();
+            std::fs::write(dir.path().join("1-1-1"), &payload_file).expect("payload");
+
+            let resolver: std::sync::Arc<dyn PeerResolver> =
+                std::sync::Arc::new(super::ListResolver {
+                    addrs: vec![addr],
+                    calls: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                });
+            let client = RpcClient::new(
+                None,
+                std::sync::Arc::new(AlwaysHealthy),
+                RpcClientConfig {
+                    connect_timeout: std::time::Duration::from_millis(200),
+                    request_timeout: std::time::Duration::from_secs(2),
+                    max_retries: 0,
+                },
+            );
+            let local = LocalNode {
+                id: 1,
+                advertise: "127.0.0.1:1".to_owned(),
+            };
+            let mut network =
+                RpcNetwork::new(client, resolver, std::sync::Arc::new(|| true), local);
+            let mut peer = network
+                .new_client(2, &BasicNode::new(addr.to_string()))
+                .await;
+
+            let vote = Vote::new(3, 1);
+            let meta = SnapshotMeta {
+                last_log_id: None,
+                last_membership: openraft::StoredMembership::default(),
+                snapshot_id: "1-1-1".to_owned(),
+            };
+            let file = tokio::fs::File::open(dir.path().join("1-1-1"))
+                .await
+                .expect("open payload");
+            let response = peer
+                .full_snapshot(
+                    vote,
+                    Snapshot {
+                        meta,
+                        snapshot: Box::new(file),
+                    },
+                    std::future::pending(),
+                    RPCOption::new(std::time::Duration::from_secs(5)),
+                )
+                .await
+                .expect("sent by the fallback");
+            assert_eq!(response.vote, vote);
+            let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+                .expect("dir")
+                .flatten()
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .filter(|name| name != "1-1-1")
+                .collect();
+            assert!(
+                leftovers.is_empty(),
+                "the fallback wrote nothing beside the payload: {leftovers:?}"
+            );
+            let held = received.lock().expect("lock");
+            assert!(held.1 >= 1);
+            held.0.clone()
+        }
+
+        /// Pins D-101 (#652): a receiver that predates the offer route is still caught up — by
+        /// `install_snapshot` chunks carrying the payload **decompressed**, because such a
+        /// receiver reads only plain JSON.
+        #[tokio::test]
+        async fn a_receiver_without_the_offer_route_gets_the_snapshot_in_chunks_decompressed() {
+            let plain = br#"{"format":1,"configs":[],"dedup":[]}"#.to_vec();
+            let sent = sent_by_fallback(
+                zstd::encode_all(plain.as_slice(), 3).expect("compress"),
+                false,
+            )
+            .await;
+            assert_eq!(sent, plain);
+        }
+
+        /// Pins D-101 (#652): the fallback walks a payload larger than one chunk — offsets and the
+        /// final `done` — and passes a pre-D-101 plain payload through unchanged.
+        #[tokio::test]
+        async fn the_fallback_sends_a_multi_chunk_payload_and_a_plain_one() {
+            let big = content(2_500_000);
+            let sent = sent_by_fallback(
+                zstd::encode_all(big.as_slice(), 3).expect("compress"),
+                false,
+            )
+            .await;
+            assert_eq!(sent.len(), big.len(), "three 1 MiB chunks, reassembled");
+            assert_eq!(sent, big);
+
+            let plain = content(1_500_000);
+            assert_eq!(sent_by_fallback(plain.clone(), false).await, plain);
+        }
+
+        /// Pins D-101 (#652): a chunk that fails is retried, not the transfer — one dropped request
+        /// costs one chunk, not a restart from byte 0 (#428).
+        #[tokio::test]
+        async fn the_fallback_retries_a_failed_chunk() {
+            let big = content(2_500_000);
+            let sent =
+                sent_by_fallback(zstd::encode_all(big.as_slice(), 3).expect("compress"), true)
+                    .await;
+            assert_eq!(sent, big);
+        }
+
+        fn stream_of(chunks: Vec<std::io::Result<Bytes>>) -> super::super::ByteStream {
+            Box::pin(futures_util::stream::iter(chunks))
+        }
+
+        /// Pins D-101 (#652): a body that ends cleanly but short keeps what arrived — the next
+        /// offer resumes — and a fetch the leader refuses (its snapshot was superseded) keeps the
+        /// partial too, rather than either reading as corruption.
+        #[tokio::test]
+        async fn a_short_body_or_a_refused_fetch_keeps_the_partial() {
+            let (dir, files) = files();
+            let full = content(40_000);
+            let head = full[..10_000].to_vec();
+            let short = receive_snapshot(
+                &files,
+                "e",
+                full.len() as u64,
+                &sha256_hex(&full),
+                move |_| async move { Ok::<_, RpcError>(stream_of(vec![Ok(Bytes::from(head))])) },
+            )
+            .await;
+            assert!(
+                matches!(short, Err(RpcError::Transport(_))),
+                "got {short:?}"
+            );
+            assert_eq!(
+                std::fs::metadata(dir.path().join("receiving-e"))
+                    .expect("kept")
+                    .len(),
+                10_000
+            );
+
+            let refused = receive_snapshot(
+                &files,
+                "e",
+                full.len() as u64,
+                &sha256_hex(&full),
+                |_| async {
+                    Err::<super::super::ByteStream, _>(RpcError::NotFound {
+                        what: "snapshot e".to_owned(),
+                    })
+                },
+            )
+            .await;
+            assert!(
+                matches!(refused, Err(RpcError::NotFound { .. })),
+                "got {refused:?}"
+            );
+            assert_eq!(
+                std::fs::metadata(dir.path().join("receiving-e"))
+                    .expect("kept")
+                    .len(),
+                10_000
+            );
+        }
+
+        /// Pins D-101 (#652): two receives on one node run one at a time. The second waits for the
+        /// first and resumes from what it left, instead of both writing the same file at once.
+        #[tokio::test]
+        async fn concurrent_receives_take_turns() {
+            let (_dir, files) = files();
+            let full = content(60_000);
+            let digest = sha256_hex(&full);
+            let (release, gate) = tokio::sync::oneshot::channel::<()>();
+            let head = full[..30_000].to_vec();
+            let first = {
+                let files = files.clone();
+                let digest = digest.clone();
+                tokio::spawn(async move {
+                    receive_snapshot(&files, "f", 60_000, &digest, move |_| async move {
+                        let stalled = futures_util::stream::once(async move {
+                            let _ = gate.await;
+                            Err::<Bytes, _>(std::io::Error::other("connection reset"))
+                        });
+                        let body =
+                            futures_util::stream::iter(vec![Ok(Bytes::from(head))]).chain(stalled);
+                        Ok::<_, RpcError>(Box::pin(body) as super::super::ByteStream)
+                    })
+                    .await
+                })
+            };
+            // Let the first take the lock and write its head.
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            let asked = std::sync::Arc::new(StdMutex::new(Vec::new()));
+            let second = {
+                let files = files.clone();
+                let fetch = fetcher(full.clone(), asked.clone());
+                tokio::spawn(
+                    async move { receive_snapshot(&files, "f", 60_000, &digest, fetch).await },
+                )
+            };
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            assert!(
+                asked.lock().expect("lock").is_empty(),
+                "the second waits for the first"
+            );
+            release.send(()).expect("release");
+            assert!(first.await.expect("join").is_err());
+            second.await.expect("join").expect("the second completes");
+            assert_eq!(*asked.lock().expect("lock"), vec![30_000]);
+        }
+
+        /// Pins D-101 (#652): the follower's fetch and the leader's route agree on the offset over a
+        /// real signed request — a resume asks for, and is served, exactly the remainder.
+        #[tokio::test]
+        async fn a_resumed_fetch_over_the_wire_completes_the_file() {
+            use crate::rpc::{
+                AlwaysHealthy, PeerResolver, Router, RpcClient, RpcClientConfig, RpcServer,
+                RpcServerConfig, Signer, StreamFuture, Verifier,
+            };
+
+            let full = content(200_000);
+            let (leader_dir, leader_files) = files();
+            std::fs::write(leader_dir.path().join("9-9-1"), &full).expect("payload");
+            let served = leader_files.clone();
+            let router = Router::new().route_stream_prefix(
+                "GET",
+                super::super::RAFT_SNAPSHOT_FETCH_PREFIX,
+                std::sync::Arc::new(move |suffix: String| -> StreamFuture {
+                    let files = served.clone();
+                    Box::pin(async move { serve_snapshot(&files, &suffix).await })
+                }),
+            );
+            let server = RpcServer::bind(
+                "127.0.0.1:0".parse().expect("addr"),
+                RpcServerConfig::new(Some(std::sync::Arc::new(Verifier::new("s"))), router)
+                    .with_node_id(1),
+            )
+            .await
+            .expect("bind");
+            let addr = server.local_addr().expect("addr");
+            let _server = tokio::spawn(server.serve());
+
+            let (dir, files) = files();
+            std::fs::write(dir.path().join("receiving-9-9-1"), &full[..70_000]).expect("partial");
+            let client = RpcClient::new(
+                Some(Signer::new("s")),
+                std::sync::Arc::new(AlwaysHealthy),
+                RpcClientConfig {
+                    connect_timeout: std::time::Duration::from_millis(200),
+                    request_timeout: std::time::Duration::from_secs(2),
+                    max_retries: 0,
+                },
+            );
+            let resolver: std::sync::Arc<dyn PeerResolver> =
+                std::sync::Arc::new(super::ListResolver {
+                    addrs: vec![addr],
+                    calls: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                });
+            let offer = super::super::SnapshotOffer {
+                vote: openraft::Vote::new(1, 1),
+                meta: openraft::SnapshotMeta {
+                    last_log_id: None,
+                    last_membership: openraft::StoredMembership::default(),
+                    snapshot_id: "9-9-1".to_owned(),
+                },
+                digest: sha256_hex(&full),
+                size: full.len() as u64,
+                from: addr.to_string(),
+                leader: 1,
+            };
+            let path = receive_snapshot(&files, "9-9-1", offer.size, &offer.digest, |offset| {
+                super::super::fetch_offered(&client, &resolver, &offer, offset)
+            })
+            .await
+            .expect("received over the wire");
+            assert_eq!(std::fs::read(path).expect("read"), full);
+        }
+
+        /// What a fetch was asked for, and a canned answer from that offset.
+        fn fetcher(
+            full: Vec<u8>,
+            asked: std::sync::Arc<StdMutex<Vec<u64>>>,
+        ) -> impl FnOnce(
+            u64,
+        ) -> futures_util::future::BoxFuture<
+            'static,
+            Result<super::super::ByteStream, RpcError>,
+        > {
+            move |offset| {
+                asked.lock().expect("lock").push(offset);
+                let rest = full[usize::try_from(offset).expect("offset")..].to_vec();
+                Box::pin(async move {
+                    let chunks: Vec<std::io::Result<Bytes>> = rest
+                        .chunks(7_000)
+                        .map(|c| Ok(Bytes::copy_from_slice(c)))
+                        .collect();
+                    Ok::<_, RpcError>(
+                        Box::pin(futures_util::stream::iter(chunks)) as super::super::ByteStream
+                    )
+                })
+            }
+        }
+
+        /// Pins D-101 (#652): a transfer resumes from what the follower already holds — the
+        /// retry asks for the remainder, not the whole file — and the result is the whole file.
+        #[tokio::test]
+        async fn a_receive_resumes_from_the_length_already_held() {
+            let (dir, files) = files();
+            let full = content(100_000);
+            std::fs::write(dir.path().join("receiving-7-9-1"), &full[..40_000]).expect("partial");
+            let asked = std::sync::Arc::new(StdMutex::new(Vec::new()));
+            let path = receive_snapshot(
+                &files,
+                "7-9-1",
+                full.len() as u64,
+                &sha256_hex(&full),
+                fetcher(full.clone(), asked.clone()),
+            )
+            .await
+            .expect("received");
+            assert_eq!(*asked.lock().expect("lock"), vec![40_000]);
+            assert_eq!(std::fs::read(path).expect("read"), full);
+        }
+
+        /// Pins D-101 (#652): a file already complete is not fetched again, and a partial longer
+        /// than the snapshot (left by some other transfer) is discarded and fetched from 0.
+        #[tokio::test]
+        async fn a_complete_file_is_not_refetched_and_an_overlong_one_restarts() {
+            let (dir, files) = files();
+            let full = content(20_000);
+            std::fs::write(dir.path().join("receiving-a"), &full).expect("complete");
+            let asked = std::sync::Arc::new(StdMutex::new(Vec::new()));
+            receive_snapshot(
+                &files,
+                "a",
+                full.len() as u64,
+                &sha256_hex(&full),
+                fetcher(full.clone(), asked.clone()),
+            )
+            .await
+            .expect("received");
+            assert!(asked.lock().expect("lock").is_empty(), "nothing to fetch");
+
+            let mut longer = full.clone();
+            longer.extend_from_slice(b"stale tail");
+            std::fs::write(dir.path().join("receiving-b"), &longer).expect("overlong");
+            let path = receive_snapshot(
+                &files,
+                "b",
+                full.len() as u64,
+                &sha256_hex(&full),
+                fetcher(full.clone(), asked.clone()),
+            )
+            .await
+            .expect("received");
+            assert_eq!(*asked.lock().expect("lock"), vec![0]);
+            assert_eq!(std::fs::read(path).expect("read"), full);
+        }
+
+        /// Pins D-101 (#652): bytes that do not hash to the leader's digest are never installed —
+        /// the file is discarded, so the next attempt starts clean rather than resuming corruption.
+        #[tokio::test]
+        async fn a_digest_mismatch_discards_the_file() {
+            let (dir, files) = files();
+            let full = content(30_000);
+            let mut corrupt = full.clone();
+            corrupt[12_345] ^= 0xFF;
+            let asked = std::sync::Arc::new(StdMutex::new(Vec::new()));
+            let result = receive_snapshot(
+                &files,
+                "c",
+                full.len() as u64,
+                &sha256_hex(&full),
+                fetcher(corrupt, asked),
+            )
+            .await;
+            assert!(result.is_err(), "a corrupt transfer must not be accepted");
+            assert!(
+                !dir.path().join("receiving-c").exists(),
+                "and must not be resumed"
+            );
+        }
+
+        /// Pins D-101 (#652): a fetch that dies mid-stream fails the attempt but keeps what
+        /// arrived, so the retry resumes there.
+        #[tokio::test]
+        async fn a_fetch_that_dies_mid_stream_keeps_what_arrived() {
+            let (dir, files) = files();
+            let full = content(50_000);
+            let head = full[..21_000].to_vec();
+            let dying = move |offset: u64| -> futures_util::future::BoxFuture<
+                'static,
+                Result<super::super::ByteStream, RpcError>,
+            > {
+                assert_eq!(offset, 0);
+                Box::pin(async move {
+                    let chunks: Vec<std::io::Result<Bytes>> = vec![
+                        Ok(Bytes::from(head)),
+                        Err(std::io::Error::other("connection reset")),
+                    ];
+                    Ok::<_, RpcError>(
+                        Box::pin(futures_util::stream::iter(chunks)) as super::super::ByteStream
+                    )
+                })
+            };
+            let result =
+                receive_snapshot(&files, "d", full.len() as u64, &sha256_hex(&full), dying).await;
+            assert!(result.is_err());
+            assert_eq!(
+                std::fs::metadata(dir.path().join("receiving-d"))
+                    .expect("kept")
+                    .len(),
+                21_000
+            );
+
+            let asked = std::sync::Arc::new(StdMutex::new(Vec::new()));
+            let path = receive_snapshot(
+                &files,
+                "d",
+                full.len() as u64,
+                &sha256_hex(&full),
+                fetcher(full.clone(), asked.clone()),
+            )
+            .await
+            .expect("the retry completes");
+            assert_eq!(*asked.lock().expect("lock"), vec![21_000]);
+            assert_eq!(std::fs::read(path).expect("read"), full);
+        }
+    }
 
     /// Pins D-97: a node whose Raft has not started yet answers the barrier's poll `ready: false`,
     /// whatever its probe says, so the barrier leaves it out instead of naming it `unreachable` on
@@ -2116,6 +3405,7 @@ mod tests {
             ),
             Arc::new(crate::rpc::DnsResolver),
             ReadyProbe::new(|| true),
+            SnapshotFiles::new(std::env::temp_dir()),
         );
         let handler = routes
             .lookup("POST", CLUSTER_APPLIED_PATH)
@@ -2499,7 +3789,7 @@ mod tests {
                 max_retries: 0,
             },
         );
-        let mut network = RpcNetwork::new(client, resolver, Arc::new(|| true));
+        let mut network = RpcNetwork::new(client, resolver, Arc::new(|| true), test_local());
         let mut peer = network
             .new_client(2, &BasicNode::new("dual-stack-peer:4790".to_owned()))
             .await;
@@ -2557,7 +3847,7 @@ mod tests {
             },
         );
         let resolver: Arc<dyn PeerResolver> = Arc::new(crate::rpc::DnsResolver);
-        let mut network = RpcNetwork::new(client, resolver, Arc::new(|| true));
+        let mut network = RpcNetwork::new(client, resolver, Arc::new(|| true), test_local());
         let mut peer = network
             .new_client(3, &BasicNode::new(addr.to_string()))
             .await;
@@ -2666,7 +3956,7 @@ mod tests {
                 max_retries: 0,
             },
         );
-        let mut network = RpcNetwork::new(client, resolver, Arc::new(|| true));
+        let mut network = RpcNetwork::new(client, resolver, Arc::new(|| true), test_local());
         let mut peer = network
             .new_client(2, &BasicNode::new("all-dead:4790".to_owned()))
             .await;
@@ -2733,7 +4023,7 @@ mod tests {
                 max_retries: 0,
             },
         );
-        let mut network = RpcNetwork::new(client, resolver, Arc::new(|| true));
+        let mut network = RpcNetwork::new(client, resolver, Arc::new(|| true), test_local());
 
         // Driven through one `PeerClient` from `new_client`, which is the whole
         // point: calling the free `resolve_peer` twice would pass even if
@@ -2999,7 +4289,7 @@ mod tests {
                 max_retries: 0,
             },
         );
-        let mut network = RpcNetwork::new(client, resolver, leading);
+        let mut network = RpcNetwork::new(client, resolver, leading, test_local());
         network
             .new_client(2, &BasicNode::new(addr.to_string()))
             .await

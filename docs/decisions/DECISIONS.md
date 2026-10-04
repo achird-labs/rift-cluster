@@ -11,6 +11,8 @@ rest is discipline, described in [`docs/process/design-code-sync.md`](../process
 ```
 
 ### D-16 — `redb` for all cluster durability
+> **Amended by D-101** (2026-10-03, #652): the snapshot payload file is zstd at rest, and a
+> follower pulls it from the leader rather than being pushed chunks of it.
 - **Status:** amended            active | amended | superseded | pending
 - **Decided:** 2026-07-21 · ADR-001 · #14
 - **Supersedes:** D-1, D-2       decisions this one retires (they get Superseded by: D-16)
@@ -4656,3 +4658,75 @@ Pinned by `configs_are_stored_and_snapshotted_as_nested_json`,
 `a_state_dir_without_a_format_row_is_refused_at_open`,
 `a_state_dir_of_a_newer_format_is_refused_at_open` and
 `a_snapshot_of_another_format_is_refused_at_install` (`raft/store.rs`).
+
+### D-101 — A snapshot is an offer the follower pulls: zstd at rest, fetched raw, resumable, and checked against a digest
+
+- **Status:** active
+- **Decided:** 2026-10-03 · #652
+- **Amends:** RFC-001 §7.3, D-16
+- **Implemented by:** #652
+- **Code:** crates/rift-cluster/src/raft/network.rs, crates/rift-cluster/src/raft/store.rs, crates/rift-cluster/src/rpc/server.rs, crates/rift-cluster/src/rpc/client.rs, crates/rift-cluster/src/rpc/routes.rs
+
+Catch-up by snapshot crossed the wire as openraft's chunked `install_snapshot`: 1 MiB chunks,
+each serialized as a JSON array of integers — measured 3.39× the payload — parsed one integer at a
+time on the joiner (514 ms for 60 MB), with no compression, no checksum, and a restart from byte 0
+whenever one chunk missed its deadline (#428). At the realistic fleet ceiling (969 imposters, a
+76 MB payload) that is 257 MB per join: ~21 s at 100 Mbit/s.
+
+**Pull, not push.** `PeerClient::full_snapshot` (openraft's application-owned transport) sends the
+follower a small JSON **offer** — vote, snapshot meta, the payload file's size and sha256, and the
+leader's address and id. The follower fetches the file from the leader with a signed
+`GET /internal/v1/raft/snapshot/fetch/{id}/{offset}`, streamed as `application/zstd`, checks the
+digest, installs with `Raft::install_full_snapshot`, and answers the offer with the install's
+response. Push was rejected because the cluster port buffers a request body and checks its HMAC
+before dispatch, so a streamed request body would need a second, header-bound credential; a GET
+with an empty body is signed exactly like every other request, path and offset included.
+
+**zstd at rest.** The payload file is written through a zstd level-3 encoder (measured 24.8× on
+production configs at 1.5 ms per 4 MB), so the leader compresses once and every joiner fetches the
+same bytes under the same digest; an installed node keeps the file it received as is. The
+container is sniffed by the frame magic, so a plain-JSON payload written before this decision
+still installs. The payload's own format (D-100) is unchanged.
+
+**Resume, not restart.** A follower writes into `receiving-{id}` and fetches only what it lacks:
+a retry of the same snapshot resumes at the length already held, a complete file is not fetched
+again, and a file longer than the snapshot is discarded. A fetch that fails keeps what arrived. A
+file that does not hash to the offered digest is removed, so the next attempt starts clean rather
+than resuming corruption. One receive runs at a time per node.
+
+**A receiver without the offer route** — a build from before this decision — answers it as an
+unknown route, and the leader falls back to `install_snapshot` chunks of the payload
+**decompressed** (such a receiver reads only plain JSON), read through the handle openraft opened
+a chunk at a time, with nothing written to disk. Each chunk is retried, like openraft's own
+`Chunked` sender, so one dropped request costs one chunk rather than a restart. The loop is written
+out rather than delegated to `Chunked`, which takes its chunk size from an `RPCOption` field only
+openraft can set and so cannot be driven by a test. The old receiving route stays, so an older
+leader can still push to a newer follower. A follower reports a failure of its own fetch from the
+leader as a handler error naming that hop, never under its own class: passed through, a fetch that
+met an old build at the leader's address would read to the leader as "no offer route here".
+
+**A leader's own read failure never stops it.** openraft treats a storage error from a replication
+stream as fatal to the node's Raft, so every local failure on the send path — reading or
+decompressing the payload — is reported as a network error, which openraft retries. The payload is
+hashed through the handle openraft opened, not reopened by path, so a newer snapshot's GC cannot
+pull it away mid-offer.
+
+**What this does not fix.** openraft schedules no heartbeat and no AppendEntries to a peer while
+its snapshot is outstanding; this shortens that window — by ~80× at 100 Mbit/s for the realistic
+ceiling — but does not close it. D-22/D-83's liveness ticker remains the mitigation.
+
+**Instrumented**, because a regression that quietly fell back to chunks would only be slower:
+`rift_cluster_snapshot_transfers_total{path}` and `rift_cluster_snapshot_fetch_bytes_total`, read by
+`a_joiner_is_caught_up_by_a_multi_mebibyte_snapshot`, which asserts the offer path ran and served
+about the payload's size. That test's fixture is incompressible now (#652): a body of one repeated
+character compresses ~1000×, and the install it measures would vanish.
+
+Pinned by `a_built_snapshot_file_is_zstd_and_installs`, `a_plain_json_snapshot_file_still_installs`
+(`raft/store.rs`); `a_stream_route_streams_its_body_to_a_signed_get` (`rpc/server.rs`);
+`the_fetch_route_serves_the_file_from_the_offset`,
+`the_fetch_route_refuses_an_unsafe_id_and_names_a_missing_one`,
+`a_receive_resumes_from_the_length_already_held`,
+`a_complete_file_is_not_refetched_and_an_overlong_one_restarts`,
+`a_digest_mismatch_discards_the_file`, `a_fetch_that_dies_mid_stream_keeps_what_arrived`,
+`a_receiver_without_the_offer_route_gets_the_snapshot_in_chunks_decompressed`
+(`raft/network.rs`); and `a_joiner_is_caught_up_by_a_multi_mebibyte_snapshot` (`tests/cluster.rs`).

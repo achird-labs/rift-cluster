@@ -376,6 +376,28 @@ struct StoredSnapshot {
     file: String,
 }
 
+/// The zstd level a snapshot payload is written at (D-101): measured on production imposters, 24.8×
+/// at 1.5 ms per 4 MB; level 9 gains ~30% more and costs over 5× the time.
+const SNAPSHOT_ZSTD_LEVEL: i32 = 3;
+
+/// The first four bytes of a zstd frame — how an installer tells a compressed payload from one
+/// written before D-101.
+pub(crate) const ZSTD_MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
+
+/// Name prefixes of the snapshot directory's working files: an in-flight receive, and a build or
+/// install not yet renamed into place. Neither is a payload, and neither is ever served (D-101).
+pub(crate) const RECEIVING_PREFIX: &str = "receiving-";
+pub(crate) const TMP_PREFIX: &str = "tmp-";
+
+/// Whether `id` can name a file in the snapshot directory. A snapshot id arrives from a peer and
+/// becomes a path component, so anything that could leave the directory — or be empty — is refused.
+pub(crate) fn snapshot_id_is_safe(id: &str) -> bool {
+    !id.is_empty()
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
 /// Create a fresh (or reopen an existing) `redb` database at `path` and return the
 /// log store and state machine that share it.
 ///
@@ -1069,7 +1091,9 @@ impl RedbStateMachine {
         // otherwise share this directory with no coordination at all.
         let _guard = self.snapshot_guard.lock();
         std::fs::create_dir_all(&self.snapshot_dir).map_err(io)?;
-        let tmp = self.snapshot_dir.join(format!("tmp-{}", meta.snapshot_id));
+        let tmp = self
+            .snapshot_dir
+            .join(format!("{TMP_PREFIX}{}", meta.snapshot_id));
         {
             // 0o600: a snapshot payload carries `session_key` and every `principals` row, so it
             // is the most sensitive file this node writes.
@@ -1179,6 +1203,12 @@ impl RedbStateMachine {
                 tracing::warn!(file = %name, error = %e, "could not remove a superseded snapshot payload");
             }
         }
+    }
+
+    /// The directory holding snapshot payload files (#436), for the snapshot transfer's
+    /// routes (D-101), which serve and receive files there.
+    pub(crate) fn snapshot_dir(&self) -> &Path {
+        &self.snapshot_dir
     }
 
     /// Open the payload file for `snapshot_id` as the handle openraft streams from.
@@ -3165,12 +3195,16 @@ impl RedbStateMachine {
         // Streamed, never collected: `to_vec` here would rebuild the entire snapshot as one
         // `Vec<u8>` purely to hand it to the writer (#436 AC2).
         self.write_snapshot_file(&meta, |file| {
-            // `to_writer` serialises and returns; it never flushes. Dropping the `BufWriter` here
-            // would discard the flush error by design, so an ENOSPC in the last 8 KiB would look
-            // like success and this node would commit a row naming a truncated snapshot — which
-            // every joiner then fails to parse, for ever, with nothing on this side to say why.
-            let mut writer = std::io::BufWriter::new(file);
-            serde_json::to_writer(&mut writer, &payload).map_err(std::io::Error::other)?;
+            // zstd at rest (D-101): the leader compresses once, and every joiner fetches the same
+            // bytes under the same digest. `finish` writes the frame's end and returns the writer;
+            // the flush after it is what surfaces an ENOSPC in the last buffered bytes — dropping
+            // either would let a truncated payload pass for a complete one, and this node would
+            // commit a row naming a snapshot every joiner then fails to read, with nothing here to
+            // say why.
+            let mut encoder =
+                zstd::stream::Encoder::new(std::io::BufWriter::new(file), SNAPSHOT_ZSTD_LEVEL)?;
+            serde_json::to_writer(&mut encoder, &payload).map_err(std::io::Error::other)?;
+            let mut writer = encoder.finish()?;
             std::io::Write::flush(&mut writer)
         })?;
         self.commit_snapshot_row(&meta)?;
@@ -3370,7 +3404,7 @@ impl RaftStateMachine<TypeConfig> for RedbStateMachine {
         // A fresh temp file per receive: openraft writes chunks into it and hands the same handle
         // back to `install_snapshot`, so it must be writable, seekable and private to this transfer.
         let path = self.snapshot_dir.join(format!(
-            "receiving-{}",
+            "{RECEIVING_PREFIX}{}",
             self.snapshot_idx.fetch_add(1, Ordering::Relaxed)
         ));
         let file = tokio::fs::File::options()
@@ -3398,12 +3432,7 @@ impl RaftStateMachine<TypeConfig> for RedbStateMachine {
         // `meta.snapshot_id` arrives from a peer and becomes a path component below. Nothing else
         // validates it, and the traversal that a `../` id would otherwise attempt is blocked today
         // only by the incidental `tmp-` prefix on the temp name. Make the defence deliberate.
-        if meta.snapshot_id.is_empty()
-            || !meta
-                .snapshot_id
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-        {
+        if !snapshot_id_is_safe(&meta.snapshot_id) {
             return Err(StorageIOError::read_snapshot(
                 Some(meta.signature()),
                 &std::io::Error::other(format!(
@@ -3486,10 +3515,23 @@ impl RedbStateMachine {
         let received_for_parse = received
             .try_clone()
             .map_err(|e| StorageIOError::read_snapshot(Some(meta.signature()), &e))?;
-        let payload: SnapshotPayload =
-            serde_json::from_reader(std::io::BufReader::new(received_for_parse)).map_err(|e| {
-                StorageError::from(StorageIOError::read_snapshot(Some(meta.signature()), &e))
-            })?;
+        let read_err = |e: std::io::Error| {
+            StorageError::from(StorageIOError::read_snapshot(Some(meta.signature()), &e))
+        };
+        let mut reader = std::io::BufReader::new(received_for_parse);
+        // Sniffed, not assumed (D-101): a payload built before the change is plain JSON, and a node
+        // that holds one — or a leader that predates the change — must still be installable.
+        let zstd = std::io::BufRead::fill_buf(&mut reader)
+            .map_err(read_err)?
+            .starts_with(&ZSTD_MAGIC);
+        let payload: SnapshotPayload = if zstd {
+            serde_json::from_reader(zstd::stream::Decoder::with_buffer(reader).map_err(read_err)?)
+        } else {
+            serde_json::from_reader(reader)
+        }
+        .map_err(|e| {
+            StorageError::from(StorageIOError::read_snapshot(Some(meta.signature()), &e))
+        })?;
         // Before any table is touched (D-100). Rows change shape between formats, so a payload of
         // another one would install rows this binary then misreads as corrupt.
         if payload.format != STATE_FORMAT {
@@ -3825,6 +3867,16 @@ mod tests {
             .await
             .expect("read snapshot");
         bytes
+    }
+
+    /// A snapshot's payload JSON: the file decompressed when it is zstd (D-101), as is when not.
+    async fn read_snapshot_json(snapshot: Box<tokio::fs::File>) -> Vec<u8> {
+        let bytes = read_snapshot_bytes(snapshot).await;
+        if bytes.starts_with(&[0x28, 0xB5, 0x2F, 0xFD]) {
+            zstd::decode_all(bytes.as_slice()).expect("decompress snapshot")
+        } else {
+            bytes
+        }
     }
 
     /// Wrap `bytes` in a snapshot handle, for the tests that install a deliberately older-shaped
@@ -6727,8 +6779,11 @@ mod tests {
         let file = td.path().join("snapshot").join(&meta.snapshot_id);
         let on_disk = std::fs::read(&file)
             .unwrap_or_else(|e| panic!("the snapshot must exist at {file:?}: {e}"));
-        let payload: super::SnapshotPayload =
-            serde_json::from_slice(&on_disk).expect("the file is the payload verbatim");
+        // zstd since D-101: the file is the payload, compressed.
+        let payload: super::SnapshotPayload = serde_json::from_slice(
+            &zstd::decode_all(on_disk.as_slice()).expect("the file is a zstd frame"),
+        )
+        .expect("the file is the payload");
         assert_eq!(payload.fleet_name.as_deref(), Some("rift-prod-eu"));
 
         // redb allows one open handle per file, and `sm`/`builder` still hold this one.
@@ -7086,7 +7141,7 @@ mod tests {
 
         let mut builder = sm.clone();
         let Snapshot { meta, snapshot } = builder.build_snapshot().await.expect("build snapshot");
-        let bytes = read_snapshot_bytes(snapshot).await;
+        let bytes = read_snapshot_json(snapshot).await;
         let text = String::from_utf8(bytes.clone()).expect("utf-8");
         let escaped = text.find(r#"\""#);
         assert!(
@@ -7218,7 +7273,7 @@ mod tests {
         let mut builder = sm.clone();
         let Snapshot { meta, snapshot } = builder.build_snapshot().await.expect("build snapshot");
         let current: serde_json::Value =
-            serde_json::from_slice(&read_snapshot_bytes(snapshot).await).expect("json");
+            serde_json::from_slice(&read_snapshot_json(snapshot).await).expect("json");
         assert_eq!(current["format"], json!(1), "a built snapshot is stamped");
 
         // A payload exactly as a pre-#653 binary wrote it: no `format`, rows as escaped strings.
@@ -7265,6 +7320,102 @@ mod tests {
                 "nothing was installed"
             );
         }
+    }
+
+    /// Pins D-101 (#652): the payload file is zstd at rest, so the leader compresses once and
+    /// serves the same bytes to every joiner. A config's JSON compresses well — this fixture's
+    /// bulk is one repeated body — and the file must show it, not merely carry a zstd header.
+    #[tokio::test]
+    async fn a_built_snapshot_file_is_zstd_and_installs() {
+        let (td, mut sm) = fresh_sm(None).await;
+        apply_one(&mut sm, 1, put(1, 8080, json!([{ "id": "a" }]))).await;
+        let big = bulky_config(19_210, "zstd", 1024 * 1024);
+        apply_one(
+            &mut sm,
+            2,
+            request(
+                2,
+                ControlOp::PutImposter {
+                    config: Box::new(big),
+                },
+            ),
+        )
+        .await;
+        let mut builder = sm.clone();
+        let Snapshot { meta, snapshot } = builder.build_snapshot().await.expect("build snapshot");
+        let bytes = read_snapshot_bytes(snapshot).await;
+        assert_eq!(
+            &bytes[..4],
+            &[0x28, 0xB5, 0x2F, 0xFD],
+            "the payload file starts with the zstd frame magic"
+        );
+        assert!(
+            bytes.len() < 100 * 1024,
+            "a 1 MiB repetitive config compresses far below its size: {} bytes",
+            bytes.len()
+        );
+
+        let (_td2, mut follower) = fresh_sm(None).await;
+        follower
+            .install_snapshot(&meta, snapshot_handle_from(td.path(), &bytes).await)
+            .await
+            .expect("a zstd payload installs");
+        assert!(follower.read_config(8080).expect("read").is_some());
+        assert!(follower.read_config(19_210).expect("read").is_some());
+    }
+
+    /// Pins D-101 (#652): a zstd frame cut short fails the install before any table is touched —
+    /// the chunked path carries no digest, so this is the check that applies there.
+    #[tokio::test]
+    async fn a_truncated_zstd_payload_is_refused_at_install() {
+        let (td, mut sm) = fresh_sm(None).await;
+        apply_one(&mut sm, 1, put(1, 8080, json!([{ "id": "a" }]))).await;
+        let big = bulky_config(19_211, "cut", 256 * 1024);
+        apply_one(
+            &mut sm,
+            2,
+            request(
+                2,
+                ControlOp::PutImposter {
+                    config: Box::new(big),
+                },
+            ),
+        )
+        .await;
+        let mut builder = sm.clone();
+        let Snapshot { meta, snapshot } = builder.build_snapshot().await.expect("build snapshot");
+        let bytes = read_snapshot_bytes(snapshot).await;
+        let cut = &bytes[..bytes.len() / 2];
+
+        let (_td2, mut follower) = fresh_sm(None).await;
+        follower
+            .install_snapshot(&meta, snapshot_handle_from(td.path(), cut).await)
+            .await
+            .expect_err("a truncated frame must not install");
+        assert!(follower.read_config(8080).expect("read").is_none());
+    }
+
+    /// Pins D-101 (#652): a payload file written before the change — plain JSON, no zstd frame —
+    /// still installs, so a node holding one, or a leader that predates the change, is not cut off.
+    #[tokio::test]
+    async fn a_plain_json_snapshot_file_still_installs() {
+        let (td, mut sm) = fresh_sm(None).await;
+        apply_one(&mut sm, 1, put(1, 8080, json!([{ "id": "a" }]))).await;
+        let mut builder = sm.clone();
+        let Snapshot { meta, snapshot } = builder.build_snapshot().await.expect("build snapshot");
+        let plain = read_snapshot_json(snapshot).await;
+        assert_eq!(
+            plain.first(),
+            Some(&b'{'),
+            "the decompressed payload is JSON"
+        );
+
+        let (_td2, mut follower) = fresh_sm(None).await;
+        follower
+            .install_snapshot(&meta, snapshot_handle_from(td.path(), &plain).await)
+            .await
+            .expect("a plain JSON payload installs");
+        assert!(follower.read_config(8080).expect("read").is_some());
     }
 
     /// An installed snapshot must be readable back as the current one.
@@ -7528,7 +7679,7 @@ mod tests {
         let Snapshot { meta, snapshot } = builder.build_snapshot().await.expect("build snapshot");
 
         let mut payload: serde_json::Value =
-            serde_json::from_slice(&read_snapshot_bytes(snapshot).await).expect("snapshot is json");
+            serde_json::from_slice(&read_snapshot_json(snapshot).await).expect("snapshot is json");
         let removed = payload
             .as_object_mut()
             .expect("snapshot payload is an object")
@@ -7782,7 +7933,7 @@ mod tests {
 
         // Strip `session_key` from a current-format payload.
         let mut payload: serde_json::Value =
-            serde_json::from_slice(&read_snapshot_bytes(snapshot).await)
+            serde_json::from_slice(&read_snapshot_json(snapshot).await)
                 .expect("snapshot payload is JSON");
         payload
             .as_object_mut()

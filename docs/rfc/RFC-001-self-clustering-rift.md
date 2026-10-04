@@ -779,6 +779,12 @@ becomes the §7.6 503, never a silent wrong match. OSS behavior is unchanged in 
 
 ### 7.3 Internal RPC
 
+> **Amended by D-101** (2026-10-03, #652): all bodies are JSON **except one response**. A snapshot
+> reaches a follower as an offer (`POST /internal/v1/raft/snapshot/offer`, JSON), and the follower
+> pulls the payload from the leader with `GET /internal/v1/raft/snapshot/fetch/{id}/{offset}`,
+> whose response is the payload file streamed as `application/zstd`. The request is signed like
+> every other — the path, id and offset included — and its body is empty.
+
 > **Config endpoints superseded by ADR-001 (v3.1).** The transport, auth and epoch/proto
 > framing below are current (merged as #8). The two **config** rows are not: config writes
 > go to the **Raft leader** as a `ControlOp` (§7.6, #9), not to a per-port config owner

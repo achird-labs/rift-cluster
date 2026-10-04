@@ -610,6 +610,11 @@ impl RaftNode {
             election_timeout_min: ELECTION_TIMEOUT_MIN_MS,
             election_timeout_max: ELECTION_TIMEOUT_MAX_MS,
             heartbeat_interval: 50,
+            // Since D-101 a snapshot is an *offer* the follower pulls (raw zstd, resumable,
+            // digest-checked), on a deadline sized to the payload in `PeerClient::full_snapshot`;
+            // these two knobs govern only the chunked fallback for a receiver without the offer
+            // route, and the reasoning below is that path's.
+            //
             // Snapshot transport (#428). openraft bounds each *chunk* by `install_snapshot_timeout`
             // and abandons the whole transfer — back to offset 0 — when one misses, so this is a
             // deadline that must never be tight. Its defaults (3 MiB chunks, 200 ms) cannot be met
@@ -854,6 +859,8 @@ impl RaftNode {
         let auto_voter_ceiling: network::AutoVoterCeiling = Arc::new(
             std::sync::atomic::AtomicUsize::new(network::MAX_AUTO_VOTERS),
         );
+        // The snapshot directory, for the routes that receive and serve payload files (D-101).
+        let snapshot_files = network::SnapshotFiles::new(sm_reader.snapshot_dir().to_path_buf());
         let router = network::control_routes(
             config.routes.clone(),
             slot.clone(),
@@ -862,6 +869,7 @@ impl RaftNode {
             client.clone(),
             Arc::clone(&resolver),
             config.ready.clone(),
+            snapshot_files,
         );
 
         let server = RpcServer::bind(
@@ -896,7 +904,15 @@ impl RaftNode {
                     .is_some_and(|raft| raft.metrics().borrow().state == ServerState::Leader)
             })
         };
-        let network = RpcNetwork::new(client.clone(), Arc::clone(&resolver), leading);
+        let network = RpcNetwork::new(
+            client.clone(),
+            Arc::clone(&resolver),
+            leading,
+            network::LocalNode {
+                id: config.node_id,
+                advertise: advertise.to_string(),
+            },
+        );
 
         let raft = Raft::new(
             config.node_id,
