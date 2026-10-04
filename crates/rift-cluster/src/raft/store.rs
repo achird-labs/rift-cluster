@@ -5167,6 +5167,81 @@ mod tests {
         );
     }
 
+    /// One forward-dated entry must not expire the dedup entries of ops minted seconds ago.
+    ///
+    /// The logical clock is an unbounded max over `issued_at_secs`, so a single entry minted by a
+    /// node whose wall clock runs a day ahead drags every replica's clock a day forward, and the
+    /// next sweep drops every live dedup row. A client retrying its `Idempotency-Key` five seconds
+    /// after the first attempt then re-applies instead of collapsing. Here that retry is a
+    /// `DELETE`, so it removes the imposter another client created in between.
+    ///
+    /// The skewed `issued_at_secs` is reachable with a cluster secret, not only with
+    /// `--cluster-insecure`: a write accepted on the skewed node is parked whole (its
+    /// `issued_at_secs` included) when the forward fails the ±30 s credential window, and the
+    /// replay loop resubmits that stored request once the node's clock is corrected.
+    #[tokio::test]
+    async fn a_forward_dated_entry_does_not_expire_live_dedup_entries() {
+        const T: u64 = 1_700_000_000;
+        let (_td, mut sm) = fresh_sm(None).await;
+        let put_at = |op_id: u128, issued: u64, stubs: serde_json::Value| {
+            request_at(
+                op_id,
+                issued,
+                ControlOp::PutImposter {
+                    config: Box::new(config(8080, stubs)),
+                },
+            )
+        };
+        let delete_8080 =
+            |issued: u64| request_at(1, issued, ControlOp::DeleteImposter { port: 8080 });
+
+        sm.apply(vec![entry(1, put_at(10, T, json!([])))])
+            .await
+            .expect("apply");
+        // Client A deletes 8080 under an Idempotency-Key (op 1); its answer is lost in transit.
+        let first = sm
+            .apply(vec![entry(2, delete_8080(T))])
+            .await
+            .expect("apply");
+        // Client B re-creates 8080 a second later.
+        sm.apply(vec![entry(
+            3,
+            put_at(
+                11,
+                T + 1,
+                json!([{ "responses": [{ "is": { "statusCode": 418 } }] }]),
+            ),
+        )])
+        .await
+        .expect("apply");
+        // One unrelated write minted by a node whose clock is a day ahead.
+        sm.apply(vec![entry(
+            4,
+            request_at(
+                12,
+                T + DEDUP_TTL_SECS + 60,
+                ControlOp::DeleteImposter { port: 9999 },
+            ),
+        )])
+        .await
+        .expect("apply");
+
+        // Client A retries op 1, five seconds after the first attempt.
+        let retry = sm
+            .apply(vec![entry(5, delete_8080(T + 5))])
+            .await
+            .expect("apply");
+
+        assert_eq!(
+            retry, first,
+            "a retry seconds after the original must replay its stored response"
+        );
+        assert!(
+            sm.read_config(8080).expect("read").is_some(),
+            "client A's retry must not delete the imposter client B created"
+        );
+    }
+
     /// A `sm_configs` row whose `flowState` this build refuses, as a raw insert —
     /// which is the only way to make one, and that is the point.
     ///
