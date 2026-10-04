@@ -45,6 +45,10 @@ xxhash-rust.workspace = true
 prometheus.workspace = true
 lazy_static.workspace = true
 
+# Snapshot payloads are zstd at rest and on the wire (D-101): ~25x smaller on real configs, and
+# the leader compresses once for every joiner.
+zstd = "0.13"
+
 [dev-dependencies]
 # Scratch directories for the redb-backed store tests.
 tempfile = "3"

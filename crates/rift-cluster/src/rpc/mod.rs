@@ -16,7 +16,10 @@ pub use client::{
     RpcClient, RpcClientConfig, TrackedPeerHealth,
 };
 pub(crate) use routes::addressed;
-pub use routes::{Handler, HandlerFuture, PROTO_VERSION, PrefixHandler, ProtocolVersion, Router};
+pub use routes::{
+    ByteStream, Handler, HandlerFuture, PROTO_VERSION, PrefixHandler, ProtocolVersion, Router,
+    StreamFuture, StreamHandler, StreamReply,
+};
 pub use server::{DEFAULT_MAX_BODY_BYTES, RpcServer, RpcServerConfig};
 
 /// Connect timeout for a peer RPC.

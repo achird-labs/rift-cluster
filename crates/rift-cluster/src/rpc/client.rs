@@ -669,6 +669,77 @@ impl RpcClient {
         }
     }
 
+    /// A signed `GET path` on `peer` whose response body is handed back as it arrives (D-101),
+    /// rather than collected — the snapshot fetch, which can be tens of MiB.
+    ///
+    /// `deadline` bounds the wait for the response *head*; reading the body is the caller's to
+    /// bound, because only the caller knows how large it expects it to be. One attempt, with
+    /// [`Self::call_once`]'s health accounting: the caller is a transfer that keeps its own
+    /// progress and its own retry.
+    ///
+    /// # Errors
+    ///
+    /// The peer's error envelope mapped as for [`Self::call`], or a transport failure or timeout
+    /// before the head arrived.
+    pub async fn fetch_stream(
+        &self,
+        peer: SocketAddr,
+        path: &str,
+        deadline: Duration,
+    ) -> Result<hyper::body::Incoming, RpcError> {
+        let admission = self.health.admit(peer);
+        if admission == Admission::Refused {
+            return Err(RpcError::Transport(format!("peer {peer} is not healthy")));
+        }
+        let result = self.fetch_stream_head(peer, path, deadline).await;
+        match &result {
+            Ok(_) => self.health.record_success(peer, admission),
+            Err(e) => self.settle_single_attempt(peer, e, admission),
+        }
+        result
+    }
+
+    async fn fetch_stream_head(
+        &self,
+        peer: SocketAddr,
+        path: &str,
+        deadline: Duration,
+    ) -> Result<hyper::body::Incoming, RpcError> {
+        let mut builder = Request::builder()
+            .method("GET")
+            .uri(format!("http://{peer}{path}"))
+            .header(PROTO_HEADER, PROTO_VERSION.to_string());
+        if let Some(signer) = &self.signer {
+            builder = builder.header(
+                AUTH_HEADER,
+                signer.header(SignedRequest {
+                    method: "GET",
+                    path,
+                    body: b"",
+                }),
+            );
+        }
+        let request = builder
+            .body(Full::new(Bytes::new()))
+            .map_err(|e| RpcError::Transport(e.to_string()))?;
+        let response = tokio::time::timeout(deadline, self.http.request(request))
+            .await
+            .map_err(|_| RpcError::Timeout)?
+            .map_err(|e| RpcError::Transport(e.to_string()))?;
+        let status = response.status();
+        if status.is_success() {
+            return Ok(response.into_body());
+        }
+        // An error answers with the ordinary envelope, which is small: read it whole, inside the
+        // same deadline, and map it as every other call does.
+        let bytes = tokio::time::timeout(deadline, response.into_body().collect())
+            .await
+            .map_err(|_| RpcError::Timeout)?
+            .map_err(|e| RpcError::Transport(e.to_string()))?
+            .to_bytes();
+        Err(status_to_error(status.as_u16(), &bytes, "GET", path))
+    }
+
     /// Settle a failed single-attempt call against `peer`'s health: charge a
     /// liveness failure, credit an answer, and **release** a deadline expiry.
     ///

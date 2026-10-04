@@ -18,6 +18,8 @@
 //! | `rift_cluster_intents_pending` | C4, C6 — the R4 ledger drains after a heal |
 //! | `rift_cluster_dedup_hits_total` | C4 — the replayed duplicate was collapsed, not re-applied |
 //! | `rift_cluster_snapshots_installed_total` | C26 — the snapshot wire path ran (otherwise unobservable, #183) |
+//! | `rift_cluster_snapshot_transfers_total{path}` | `cluster.rs` multi-MiB catch-up — the offer path ran, not the chunked fallback (D-101) |
+//! | `rift_cluster_snapshot_fetch_bytes_total` | `cluster.rs` multi-MiB catch-up — a snapshot costs its file size on the wire, not ~4× (D-101) |
 //! | `rift_cluster_pull_on_miss_retries_total` | C16 — the lagging-follower net re-matched |
 //! | `rift_cluster_flow_wal_lag_ops` | flow-shard tests — the `async` loss window, measured |
 //! | `rift_cluster_flow_replay_entries_total` | C15 — flow state came back from disk |
@@ -77,6 +79,25 @@ lazy_static! {
         "Snapshots received from a peer and applied to this node's state machine"
     )
     .expect("rift_cluster_snapshots_installed_total registers once");
+
+    /// `rift_cluster_snapshot_transfers_total{path}` — snapshots this node sent as leader, by how:
+    /// `offer` (the follower pulled the zstd payload, D-101) or `chunked` (openraft's
+    /// `install_snapshot` stream, for a receiver without the offer route). The multi-MiB catch-up
+    /// test reads it: a regression that quietly fell back to chunks would otherwise pass, slower.
+    static ref SNAPSHOT_TRANSFERS: IntCounterVec = register_int_counter_vec!(
+        "rift_cluster_snapshot_transfers_total",
+        "Snapshots sent to a peer, by transfer path (offer or chunked)",
+        &["path"]
+    )
+    .expect("rift_cluster_snapshot_transfers_total registers once");
+
+    /// `rift_cluster_snapshot_fetch_bytes_total` — payload bytes this node's fetch route served
+    /// (D-101). Read beside the payload file's size: the bytes a snapshot costs on the wire.
+    static ref SNAPSHOT_FETCH_BYTES: IntCounter = register_int_counter!(
+        "rift_cluster_snapshot_fetch_bytes_total",
+        "Snapshot payload bytes served by the snapshot fetch route"
+    )
+    .expect("rift_cluster_snapshot_fetch_bytes_total registers once");
 
     /// `rift_cluster_pull_on_miss_retries_total` — requests sent back through
     /// the matcher once by the lagging-follower net (#49). C16 reads it to prove
@@ -235,6 +256,16 @@ pub(crate) fn snapshot_installed() {
     SNAPSHOTS_INSTALLED.inc();
 }
 
+/// A snapshot was sent to a peer by `path` (`offer` or `chunked`), D-101.
+pub(crate) fn snapshot_transfer(path: &str) {
+    SNAPSHOT_TRANSFERS.with_label_values(&[path]).inc();
+}
+
+/// The snapshot fetch route served `bytes` of a payload file (D-101).
+pub(crate) fn snapshot_fetch_bytes(bytes: usize) {
+    SNAPSHOT_FETCH_BYTES.inc_by(bytes as u64);
+}
+
 pub(crate) fn flow_wal_lag(depth: usize) {
     #[expect(
         clippy::cast_precision_loss,
@@ -340,6 +371,8 @@ mod tests {
         intents_pending_sampled(3);
         dedup_hit();
         snapshot_installed();
+        snapshot_transfer("offer");
+        snapshot_fetch_bytes(10);
         pull_on_miss_retry();
         flow_wal_lag(4);
         flow_replayed(10);
@@ -360,6 +393,8 @@ mod tests {
             "rift_cluster_intents_pending",
             "rift_cluster_dedup_hits_total",
             "rift_cluster_snapshots_installed_total",
+            "rift_cluster_snapshot_transfers_total",
+            "rift_cluster_snapshot_fetch_bytes_total",
             "rift_cluster_pull_on_miss_retries_total",
             "rift_cluster_flow_wal_lag_ops",
             "rift_cluster_flow_replay_entries_total",

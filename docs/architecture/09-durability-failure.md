@@ -162,6 +162,18 @@ so a 512 KiB entry took 23–548 s and anything ≥ 1 MiB never committed at all
 the effective ceiling was "whatever replicates in one heartbeat", far below the
 entry sizes the write path admits.
 
+**Snapshot catch-up is a pull (D-101, #652).** A snapshot used to cross as openraft's chunked
+`install_snapshot`: 1 MiB chunks of a JSON array of integers, ~3.4× the payload on the wire,
+parsed one integer at a time, and restarted from byte 0 whenever one chunk missed its deadline
+(#428). Now the leader *offers* the snapshot — its id, size and sha256 — and the follower fetches
+the payload file from the leader as raw bytes, resuming from whatever it already holds, checks the
+digest, installs, and answers the offer with the install's result. The file is zstd at rest (level
+3), so the leader compresses once for every joiner: on production-derived configs that is ~25×
+smaller than the JSON it holds, and the wire carries the file at its own size. A receiver without
+the offer route is sent the old chunked stream, decompressed. What this does not change: openraft
+sends a peer nothing else while its snapshot is outstanding, so the transfer is shorter but the
+silent window below still exists while it runs.
+
 **The silent window, and why it is closed.** A follower's election timer is
 refreshed only by an AppendEntries that reaches its engine, and openraft 0.9
 sends a follower nothing else while a large entry is in flight nor anything at

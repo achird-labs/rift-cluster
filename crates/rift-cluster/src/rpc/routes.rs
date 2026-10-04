@@ -107,6 +107,37 @@ where
     }
 }
 
+/// A response body produced as it is sent — the snapshot fetch (D-101), which serves a file
+/// that may be tens of MiB and is never worth holding in memory as one buffer.
+pub type ByteStream =
+    Pin<Box<dyn futures_util::Stream<Item = std::io::Result<hyper::body::Bytes>> + Send>>;
+
+/// What a streamed route answers with.
+pub struct StreamReply {
+    /// The response's `content-type`.
+    pub content_type: &'static str,
+    pub body: ByteStream,
+}
+
+/// A streamed route's response, or the error that answers instead of it.
+pub type StreamFuture = Pin<Box<dyn Future<Output = Result<StreamReply, RpcError>> + Send>>;
+
+/// A prefix-registered endpoint whose response is streamed (D-101). Called with the path remainder
+/// after its prefix (query included, as for [`PrefixHandler`]); the request body is not handed on —
+/// it is still read, capped and covered by the credential before dispatch, like every request.
+pub trait StreamHandler: Send + Sync {
+    fn call(&self, suffix: String) -> StreamFuture;
+}
+
+impl<F> StreamHandler for F
+where
+    F: Fn(String) -> StreamFuture + Send + Sync,
+{
+    fn call(&self, suffix: String) -> StreamFuture {
+        self(suffix)
+    }
+}
+
 /// The part of a request target that names a route: everything before the first
 /// `?`.
 ///
@@ -176,6 +207,7 @@ pub(crate) fn recipient(path_and_query: &str) -> Result<Option<u64>, RpcError> {
 pub struct Router {
     routes: HashMap<(String, String), Arc<dyn Handler>>,
     prefix_routes: Vec<(String, String, Arc<dyn PrefixHandler>)>,
+    stream_routes: Vec<(String, String, Arc<dyn StreamHandler>)>,
 }
 
 impl Router {
@@ -231,15 +263,43 @@ impl Router {
             .map(|(_, prefix, handler)| (handler, path[prefix.len()..].to_owned()))
     }
 
+    /// Register a prefix endpoint whose response is streamed (D-101). Consulted after the exact
+    /// and the buffered prefix tables; the longest matching prefix wins, as there.
+    #[must_use]
+    pub fn route_stream_prefix(
+        mut self,
+        method: &str,
+        prefix: &str,
+        handler: Arc<dyn StreamHandler>,
+    ) -> Self {
+        self.stream_routes
+            .push((method.to_ascii_uppercase(), prefix.to_owned(), handler));
+        self
+    }
+
+    pub(crate) fn lookup_stream_prefix(
+        &self,
+        method: &str,
+        path: &str,
+    ) -> Option<(&Arc<dyn StreamHandler>, String)> {
+        let method = method.to_ascii_uppercase();
+        let route_path = route_path(path);
+        self.stream_routes
+            .iter()
+            .filter(|(m, prefix, _)| *m == method && route_path.starts_with(prefix.as_str()))
+            .max_by_key(|(_, prefix, _)| prefix.len())
+            .map(|(_, prefix, handler)| (handler, path[prefix.len()..].to_owned()))
+    }
+
     /// Number of registered endpoints.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.routes.len() + self.prefix_routes.len()
+        self.routes.len() + self.prefix_routes.len() + self.stream_routes.len()
     }
 
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.routes.is_empty() && self.prefix_routes.is_empty()
+        self.routes.is_empty() && self.prefix_routes.is_empty() && self.stream_routes.is_empty()
     }
 
     /// Fold `other`'s routes into `self`.
@@ -259,6 +319,7 @@ impl Router {
     pub fn merge(mut self, other: Router) -> Self {
         self.routes.extend(other.routes);
         self.prefix_routes.extend(other.prefix_routes);
+        self.stream_routes.extend(other.stream_routes);
         self
     }
 }
