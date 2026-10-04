@@ -1975,8 +1975,9 @@ fn local_bind_failure(state: &FrontState, params: &[(&'static str, String)]) -> 
 ///
 /// The **companion** to [`local_bind_failure`], not a replacement, and the split is the point.
 /// That one reports only a port the engine holds but never bound — "serving in-process only". This
-/// one reports the rest of `apply_failures`: a stored record that will not parse, a refused
-/// `SetEnabled`, a rejected stub patch, and since #576 a refused flow store. For those the port may
+/// one reports the rest of `apply_failures` — a refused `SetEnabled`, a rejected stub patch — and
+/// the derived refusals: a committed config this engine refuses or cannot parse (D-102), and a
+/// refused flow store (#576, D-76). For those the port may
 /// be perfectly bound and serving, which is exactly why `rift-cluster-bind-failures` is the wrong home for
 /// them — it asserts a bind outcome, and asserting one here would point an operator at the socket
 /// when the socket is fine.
@@ -2032,13 +2033,17 @@ fn header_safe(text: &str) -> String {
 /// explains: a config it refuses (D-102), then a recorded drive failure, then a refused flow
 /// store (D-76). `None` when the port is served as committed.
 fn engine_refusal(node: &RaftNode, port: u16) -> Option<String> {
-    let refused = node
-        .config_refusal(port)
-        .inspect_err(|e| {
-            tracing::warn!(port, error = %e, "could not read whether this port's config is refused");
-        })
-        .ok()
-        .flatten();
+    // Fail closed: a read that could not tell must not answer "served as committed".
+    let refused = match node.config_refusal(port) {
+        Ok(refused) => refused,
+        Err(e) => {
+            tracing::error!(port, error = %e, "could not read whether this port's config is refused");
+            return Some(format!(
+                "config state unreadable on this node: {}",
+                header_safe(&e.to_string())
+            ));
+        }
+    };
     if let Some(reason) = refused {
         return Some(format!(
             "config refused by this engine version: {} - PUT a corrected config",
@@ -3162,7 +3167,8 @@ async fn run_mutation(
     // to realize it (a bind, a refused toggle): §7.4.6 — success with a named
     // warning, never a silent divergence the client cannot see.
     //
-    // The derived flow-store refusal joins it (D-76), and this is the case that made recording
+    // The derived refusals join it — a config this engine refuses (D-102), a refused flow store
+    // (D-76) — and the flow store is the case that made recording
     // the verdict unworkable: the mutations that can touch a refused imposter — `disable`, a stub
     // patch — are exactly the ones whose engine arms `remove` the port's `apply_failures` entry on
     // success. So the operator pausing a refused imposter is the *most* likely person to need this

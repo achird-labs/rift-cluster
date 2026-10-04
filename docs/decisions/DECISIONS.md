@@ -3203,7 +3203,8 @@ register exists to prevent.
 >
 > **Amended by D-102** (2026-10-04, #657): the per-port rule now covers every stored config this
 > engine will not run — a row that will not parse, or a config its admission checks refuse.
-> `RefuseSync` is retired for configs; the refusal is derived per read (`config_refusal`).
+> `RefuseSync` is removed (route tables keep `RefuseRoutesSync`); the refusal is derived per read
+> (`config_refusal`).
 
 - **Status:** amended
 - **Decided:** 2026-09-09 · #576
@@ -4773,17 +4774,25 @@ configs, every port the tables name (`held`), and the refused rows. With none re
 imposter keeps its last-known config, the invariant `RefuseSync` existed for — and every other port
 is realized. Bookkeeping, the flow-state clear and the sequencer (`apply_holding`) are scoped to
 `held`, so a refused port keeps them. The per-port `Put` drive skips a refused config; the
-toggle, stub-patch and recording arms skip the drive when the config they leave is refused. The
+toggle, stub-patch and recording arms skip the drive when the config they leave is refused, and
+drive the **whole** config as a `Put` when they *repair* a refused one — the engine never ran the
+row the edit started from, so an incremental patch would fail as not found or land on an older
+config. A recording that falls back to a whole-set drive is never gated: that drive judges every
+row itself. The
 row is written from the replay-decoded config either way, so every node, whatever its engine,
 holds the leader's exact bytes. A row that is not JSON at all gets the same per-port treatment.
 
 **The refusal is derived per read, not recorded** — D-76's rule, for D-76's reason: the toggle and
 patch arms reap a port's `apply_failures`, so a recorded refusal would vanish the first time someone
 paused the imposter. `config_refusal(port)` runs `admit_row` on the stored row, and both
-`local-engine=` surfaces consult it first, then `apply_failures`, then the flow-store refusal:
+`local-engine=` surfaces — the port's read and any single-imposter write — consult it first, then
+`apply_failures`, then the flow-store refusal, and a read that fails says so rather than answering
+healthy:
 `local-engine=config refused by this engine version: <reason> - PUT a corrected config`, spelled in
-visible ASCII because the reason echoes the operator's config. One `error!` per refused port per
-whole-set drive. Recovery is an ordinary corrected `PUT`.
+visible ASCII because the reason echoes the operator's config. Every drive that skips a refused
+config logs an `error!` naming the port: one per refused port per whole-set drive, and one per
+skipped `Put` or edit. Recovery is an ordinary corrected `PUT`, or an edit that leaves an admitted
+config.
 
 **An upstream validation change is not a format break** (D-73): the state dir stays readable, and
 what changes is which committed configs this engine serves.
@@ -4805,7 +4814,10 @@ Pinned by `every_config_bearing_op_decodes_without_admission`,
 `a_refused_config_for_a_live_port_keeps_its_last_config`,
 `edits_on_a_refused_port_change_the_row_and_keep_the_refusal`, `a_corrected_put_clears_a_refusal`,
 `a_reconcile_serves_the_admissible_rows_and_tears_down_no_refused_one`,
-`a_broken_stored_record_refuses_only_its_own_port` (`raft/store.rs`);
+`a_broken_stored_record_refuses_only_its_own_port`,
+`a_patch_that_repairs_a_refused_config_serves_the_whole_config`,
+`a_whole_set_drive_with_a_refused_row_still_deletes_a_port_the_tables_dropped`,
+`a_whole_set_drive_keeps_a_refused_ports_sequencing_mode` (`raft/store.rs`);
 `apply_holding_keeps_a_refused_port_and_drops_a_gone_one` (`stores/sequencer.rs`);
 `a_refusal_reason_is_spelled_for_a_header` (`admin_front.rs`);
 `a_node_whose_last_entry_is_a_refused_config_restarts`,

@@ -3151,8 +3151,9 @@ components:
         Present when the answering node has something to say that did not change the
         outcome. A comma-separated list of `key=value` items. `local-engine=<reason>`
         means THIS node failed to realize the addressed imposter's committed config —
-        a stored record that will not parse, a refused enable/disable or stub patch, an
-        unreadable TLS cert, or a `flowState` this build will not honour (D-76). The
+        a committed config this engine version refuses or cannot parse (D-102), a refused
+        enable/disable or stub patch, an unreadable TLS cert, or a `flowState` this build
+        will not honour (D-76). The
         record is committed fleet-wide either way, and other nodes may be serving it
         normally; this is a per-node observation.
 

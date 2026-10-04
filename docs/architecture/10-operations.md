@@ -383,13 +383,16 @@ then declines to **serve** that one config, on that one port:
 
 - a port it was already serving keeps serving its last config, and one it was not is not created;
 - every other port is served as committed;
-- `GET /imposters/{port}`, and any write to that port, carry
-  `Rift-Cluster-Warnings: local-engine=config refused by this engine version: <reason> - PUT a
-  corrected config`, and the node logs one `error!` per refused port at each whole-set drive.
+- `GET /imposters/{port}`, and any single-imposter write to that port (not the bulk
+  `PUT /imposters`), carry `Rift-Cluster-Warnings: local-engine=config refused by this engine
+  version: <reason> - PUT a corrected config`, and the node logs an `error!` naming the port each
+  time a drive skips it.
 
-To recover, `PUT` a corrected config for the port; the warning clears because the row changed.
-Pausing or patching the port still commits and still changes the row, but the engine keeps
-declining it until the config itself is admitted.
+To recover, `PUT` a corrected config for the port; the warning clears because the row changed. A
+stub patch that replaces the refused stub works too: the node then realizes the whole corrected
+config. Pausing the port, or a patch that leaves the config refused, still commits and still
+changes the row, but the engine keeps declining it — and keeps serving whatever it last admitted
+there, unpaused — until the config itself is admitted.
 
 ### State-directory format changes (D-100)
 

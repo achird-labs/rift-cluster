@@ -1030,8 +1030,8 @@ binds can fail on some nodes (port taken by an unrelated process). Built (#143):
 
   > **Amended by D-76** (2026-09-09): "no header at all for a healthy port" still holds, but a
   > *failed* port now carries a second, disjoint marker. Not every engine failure is a bind failure:
-  > a stored record that will not parse, a refused `SetEnabled` or stub patch, and a `flowState` this
-  > build will not honour are none of them bind divergence. The read carries
+  > a committed config this engine version refuses or cannot parse (D-102), a refused `SetEnabled`
+  > or stub patch, and a `flowState` this build will not honour are none of them bind divergence. The read carries
   > `rift-cluster-warnings: local-engine=<reason>` for those, leaving `rift-cluster-bind-failures`
   > its exact meaning. The two can both name one port; that is intended, not an overlap bug.
   >
