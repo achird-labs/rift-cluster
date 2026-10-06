@@ -26,10 +26,22 @@ jobs:
       - name: Bump vendor/rift to upstream master
         id: bump
         run: |
+          set -euo pipefail
+          # The pin as committed, read from the superproject's tree rather than
+          # the submodule's HEAD so it does not depend on checkout state.
+          before="$(git rev-parse HEAD:vendor/rift)"
           git submodule update --remote --recursive vendor/rift
           cd vendor/rift
+          after="$(git rev-parse HEAD)"
           echo "rev=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
           echo "subject=$(git log -1 --pretty=%s)" >> "$GITHUB_OUTPUT"
+          if [ "$before" = "$after" ]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "vendor/rift is already at upstream's tip ($after); nothing to verify"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "vendor/rift moves $before -> $after"
+          fi
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -44,7 +56,16 @@ jobs:
       # perfectly type-correct and still break behaviour. The real gate is the
       # chaos tier on the resulting PR (#93); this one just fails faster and
       # keeps a broken bump from opening a PR at all.
+      #
+      # Only when the pin moved. With upstream already at the pin there is no
+      # bump to verify — the tree is master, which CI's `build` job gated on
+      # every PR that reached it — yet this ran anyway, and on 2026-10-05 a
+      # first-party test that flakes about once in a hundred runs (D-17's pin)
+      # was reported as "the scheduled vendor bump is failing" (#422) on a
+      # morning with no bump to fail. A red run here must mean the bump broke
+      # something; a red master test on a day without a bump is CI's finding.
       - name: Verify cluster workspace against new upstream
+        if: steps.bump.outputs.changed == 'true'
         run: |
           set -euo pipefail
           cargo clippy --workspace --all-targets -- -D warnings
@@ -106,7 +127,7 @@ jobs:
           Until this is fixed the pin does not move, and no PR is opened. Common causes:
 
           - **\`GitHub Actions is not permitted to create or approve pull requests\`** at the *Open sync PR* step — a repo/org setting (Settings -> Actions -> General -> Workflow permissions). This is what caused the 2026-07-12..07-21 run of failures.
-          - The verify step failing on first-party code that did not change: \`dtolnay/rust-toolchain@stable\` floats, so a new stable's clippy lints can fail \`-D warnings\` on their own.
+          - The verify step failing on first-party code that did not change: \`dtolnay/rust-toolchain@stable\` floats, so a new stable's clippy lints can fail \`-D warnings\` on their own. (The verify step runs only when the pin actually moved, so a first-party test flaking on a day without a bump cannot land here.)
           - A genuinely broken upstream bump — the case this workflow exists to catch.
 
           This issue is reused for every consecutive failure; it closes itself on the next green run."
