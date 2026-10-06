@@ -166,7 +166,10 @@ leader (openraft campaigns only after `leader_lease + rand(election_timeout_min.
 campaigning at once do not split the vote — votes are ordered by term and then node id — but a
 survivor that was still processing the dead leader's last AppendEntries refuses a campaign on its
 lease, and each such refusal costs the candidate another election timeout, 150–375 ms (#606); a
-survivor with a longer log refuses too, and then the candidate waits a further 600 ms.
+survivor with a longer log refuses too, and then the candidate waits a further 600 ms. A round can
+also simply be lost to time: a candidate whose vote is not committed within its election timeout
+re-elects at the next term whatever delayed the exchange, which on a loaded runner has cost a
+quiesced fleet two extra rounds (#422). D-17 pins the pause per round for that reason.
 
 That is stricter than this rule's own wording — "has not heard a leader heartbeat within
 `3 × election_timeout`" would ride out a routine election, whereas the primitive fails closed the
