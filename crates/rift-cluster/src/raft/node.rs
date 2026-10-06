@@ -84,6 +84,12 @@ pub(super) const ELECTION_TIMEOUT_MIN_MS: u64 = 150;
 /// spacing pin (D-83).
 pub(super) const ELECTION_TIMEOUT_MAX_MS: u64 = 300;
 
+/// The heartbeat interval the Raft config uses. openraft's election tick is 1.5× this
+/// (`Tick::spawn` in its `raft/mod.rs`), which is what rounds an extra election round's cost up
+/// from the election timeout to the 150–375 ms D-17 records; D-17's pin derives its per-round
+/// bound from it.
+pub(super) const HEARTBEAT_INTERVAL_MS: u64 = 50;
+
 /// A leader that a quorum has not acknowledged within this window is treated as
 /// isolated (the isolated-owner rule, RFC-001 §7.2): 3× the election timeout.
 const ISOLATION_WINDOW_MS: u64 = 3 * ELECTION_TIMEOUT_MAX_MS;
@@ -609,7 +615,7 @@ impl RaftNode {
             // the rejected alternative. #411 pins them below.
             election_timeout_min: ELECTION_TIMEOUT_MIN_MS,
             election_timeout_max: ELECTION_TIMEOUT_MAX_MS,
-            heartbeat_interval: 50,
+            heartbeat_interval: HEARTBEAT_INTERVAL_MS,
             // Since D-101 a snapshot is an *offer* the follower pulls (raw zstd, resumable,
             // digest-checked), on a deadline sized to the payload in `PeerClient::full_snapshot`;
             // these two knobs govern only the chunked fallback for a receiver without the offer
@@ -3483,8 +3489,21 @@ mod tests {
     /// (5–145 ms). The voter-set clause is the one that matters there; the applied-index clause
     /// survives that mutation and is kept so a test that writes before the kill stays quiesced;
     /// the uniform-config clause closes promotion's joint window, whose voter set already reads
-    /// {1, 2, 3}. The failure message carries the term delta and the survivors' views at the
-    /// kill, so a refused round under this start reads as the D-17 finding it would be.
+    /// {1, 2, 3}.
+    ///
+    /// **The bound is per round.** A quiesced start rules out the *refused* round, not a round
+    /// *lost* to time: openraft re-elects at term + 1 whenever a candidate's vote has not been
+    /// committed within its election timeout (`handle_tick_election`), and a voter that granted
+    /// an uncommitted vote does the same — whatever kept the request, the grant or the winner's
+    /// first AppendEntries from landing in time. The sync workflow saw exactly that on 2026-10-05
+    /// (#422): three rounds and 716 ms from a start whose recorded views were quiesced, once in
+    /// ~110 runs since #614, with no change to the tree or the toolchain. The sampler-gap
+    /// heuristic cannot see it, because the cores and the sampler are different tasks. So the
+    /// pin asserts what D-17 actually records: tens of milliseconds for the round trip, plus at
+    /// most one election timeout rounded up to openraft's tick for every extra round — 400 ms +
+    /// 375 ms × (rounds − 1). The failure message carries each survivor's vote timeline since
+    /// the kill, so a refusal (a vote that never moved while the candidate cycled terms) and a
+    /// lost round (a vote that moved at once, with no committed vote following) read differently.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_routine_election_isolates_a_node_for_the_round_trip_not_the_timeout() {
         use std::time::{Duration, Instant};
@@ -3540,9 +3559,9 @@ mod tests {
             n3.status()
         );
 
-        // A routine election advances the term by exactly one. Recorded so a failure says
-        // whether it was one slow round or extra rounds (#606), with the survivors' own views at
-        // the moment of the kill.
+        // A routine election advances the term by exactly one; every further round is allowed an
+        // election timeout below (#422). Recorded so a failure says how many rounds it took (#606),
+        // with the survivors' own views at the moment of the kill.
         let pre_kill = (n2.status(), n3.status());
         let term_before = n2.raft_term().max(n3.raft_term());
         n1.shutdown().await.ok();
@@ -3552,7 +3571,11 @@ mod tests {
         let mut longest = [Duration::ZERO; 2];
         let mut run_start: [Option<Instant>; 2] = [None, None];
         let mut widest_gap = Duration::ZERO;
-        let mut last_sample = Instant::now();
+        let killed_at = Instant::now();
+        let mut last_sample = killed_at;
+        // Each survivor's vote, every time it changed, with the time since the kill: the
+        // account of how the election went that the failure message prints.
+        let mut votes: [Vec<(Duration, String)>; 2] = [Vec::new(), Vec::new()];
 
         let deadline = Instant::now() + Duration::from_secs(10);
         let mut settled_at: Option<Instant> = None;
@@ -3567,6 +3590,10 @@ mod tests {
                     run_start[i].get_or_insert(now);
                 } else if let Some(started) = run_start[i].take() {
                     longest[i] = longest[i].max(now - started);
+                }
+                let vote = node.raft.metrics().borrow().vote.to_string();
+                if votes[i].last().map(|(_, v)| v) != Some(&vote) {
+                    votes[i].push((now - killed_at, vote));
                 }
             }
 
@@ -3589,18 +3616,28 @@ mod tests {
         }
 
         let term_after = n2.raft_term().max(n3.raft_term());
+        // Rounds the election took. Every one past the first cost the candidate its election
+        // timeout, reached on openraft's next tick: the 150–375 ms D-17 records per extra round.
+        let rounds = term_after.saturating_sub(term_before).max(1);
+        let extra_round =
+            Duration::from_millis(ELECTION_TIMEOUT_MAX_MS + HEARTBEAT_INTERVAL_MS * 3 / 2);
+        let bound = Duration::from_millis(400) + extra_round * u32::try_from(rounds - 1).unwrap();
         for (i, (id, _)) in survivors.iter().enumerate() {
             assert!(
-                longest[i] < Duration::from_millis(400),
-                "node {id} was isolated for {:?} across one routine election; D-17 records ~13–40 ms \
-                 and this bound is 400 ms. Largest gap between consecutive samples was {:?} — if \
-                 that approaches the reported isolation the sampler was starved and this is a CI \
-                 load artefact, not a regression. The term went {term_before} → {term_after}: a \
-                 delta above 1 means extra campaigns — refused, or unable to reach a quorum — \
-                 which the quiesced start exists to rule out, so it is a finding about D-17, not a \
-                 flake. Survivors at the kill: {:?} / {:?}",
+                longest[i] < bound,
+                "node {id} was isolated for {:?} across an election of {rounds} round(s), term \
+                 {term_before} → {term_after}; D-17 records ~13–40 ms for the round trip plus \
+                 150–375 ms per extra round, so the bound is {bound:?}. Largest gap between \
+                 consecutive samples was {:?} — if that approaches the reported isolation the \
+                 sampler was starved and this is a CI load artefact, not a regression. Vote \
+                 timelines since the kill — a vote that never moved while the candidate cycled \
+                 terms refused it (a live lease on the dead leader, or a longer log); one that \
+                 moved at once with no committed vote following lost the round to time: \
+                 n2 {:?} / n3 {:?}. Survivors at the kill: {:?} / {:?}",
                 longest[i],
                 widest_gap,
+                votes[0],
+                votes[1],
                 pre_kill.0,
                 pre_kill.1
             );

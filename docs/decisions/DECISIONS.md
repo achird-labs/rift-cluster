@@ -405,7 +405,7 @@ the snapshot's metadata; only where the payload bytes are written changed.
 ### D-17 — Flow state stays off consensus
 - **Status:** active
 - **Decided:** 2026-07-21 · ADR-001
-- **Implemented by:** #465 (the isolated-owner rule, for flow KV), #472 (the measured cost), #606 (the cost of an extra election round)
+- **Implemented by:** #465 (the isolated-owner rule, for flow KV), #472 (the measured cost), #606 (the cost of an extra election round), #422 (the pin bounds the pause per round)
 - **Code:** crates/rift-cluster/src/stores/flow.rs, crates/rift-cluster/src/raft/ring.rs
 
 **Paid, honestly — measured (2026-08-28, #472; supersedes the #465 estimate).** Enforcing the
@@ -435,6 +435,15 @@ at ~1 ms, 10 rounds / 20 observations):
   longer log also refuses, and then the candidate additionally waits `smaller_log_timeout`
   (600 ms). A leader dying under write load with a follower backlogged can therefore cost one or
   more such rounds; D-17's pin starts from a quiesced fleet so that it measures the routine case.
+  A quiesced start rules out the *refused* round, not a round **lost to time**: openraft re-elects
+  at term + 1 whenever a candidate's vote is not committed within its election timeout, and a
+  voter that granted an uncommitted vote does the same — whatever delayed the request, the grant
+  or the winner's first AppendEntries. Observed 2026-10-05 (#422): three rounds and 716 ms from a
+  start whose recorded views were quiesced, on a loaded runner, once in ~110 runs since #614, with
+  no change to the tree or the toolchain. The pin therefore bounds the pause **per round** — 400 ms
+  plus 375 ms for each extra round — and prints each survivor's vote timeline so a refusal and a
+  lost round read differently. The per-election figure stays as recorded; the number of rounds is
+  the load's, not the design's.
   The #472 probe measured **13–31 ms**; re-measuring while writing this entry's guard test, on
   different hardware and with a coarser ~8 ms sampler, gave **32–40 ms**. Both are the same
   quantity and both are two orders of magnitude below the figure this entry used to state; take
