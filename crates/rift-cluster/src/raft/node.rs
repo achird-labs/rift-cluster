@@ -2134,6 +2134,19 @@ impl RaftNode {
         self.sm_reader.flow_store_refusal(port)
     }
 
+    /// Why this node's engine will not run the config stored for `port` — an earlier engine
+    /// admitted it, this one refuses it — or `None` (D-102). Derived on each call; see
+    /// [`RedbStateMachine::config_refusal`].
+    ///
+    /// # Errors
+    ///
+    /// The state-machine read failed.
+    pub fn config_refusal(&self, port: u16) -> Result<Option<String>, NodeError> {
+        self.sm_reader
+            .config_refusal(port)
+            .map_err(|e| NodeError::Storage(e.to_string()))
+    }
+
     /// Every port this node's engine holds, split by bound vs. failed (issue #369, blocker B4). See
     /// [`RedbStateMachine::local_bind_report`] — a single in-memory pass over the engine's own
     /// imposter set, not a redb transaction, which is what makes it safe to call on every 5-second

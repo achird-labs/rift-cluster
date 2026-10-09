@@ -72,6 +72,7 @@ use hyper_util::rt::{TokioExecutor, TokioIo};
 use rand::RngCore;
 use rift_cluster::control::{
     self, ControlOp, ControlRequest, PreconditionTarget, SessionKeyHex, StubEdit, StubEditScript,
+    decode_committed_config,
 };
 use rift_cluster::decorate::{
     HEADER_BIND_FAILURES, HEADER_OP_ID, HEADER_PARTIAL, HEADER_REVISION, HEADER_WARNINGS,
@@ -1659,7 +1660,7 @@ fn imposter_scope(node: &RaftNode, port: u16) -> Option<ContextScope> {
         })
         .ok()
         .flatten()
-        .and_then(|json| serde_json::from_str::<ImposterConfig>(&json).ok())
+        .and_then(|json| decode_committed_config(&json).ok())
         .and_then(|config| FlowConfig::from_imposter(&config).ok())
         .map(|flow| flow.scope)
 }
@@ -1914,7 +1915,7 @@ fn flow_state_resolved(state: &FrontState, port: u16) -> Option<ResolvedKnobs> {
     // either one failing means an applied record that should not exist — an integrity signal worth
     // alerting on, not just something to find by grepping afterwards. The `warn` above is the
     // different, benign case of a read that simply could not be served.
-    let config: ImposterConfig = serde_json::from_str(&config)
+    let config = decode_committed_config(&config)
         .inspect_err(|e| {
             tracing::error!(port, error = %e, "the stored imposter config did not parse; serving without resolved flow-state knobs");
         })
@@ -1974,8 +1975,9 @@ fn local_bind_failure(state: &FrontState, params: &[(&'static str, String)]) -> 
 ///
 /// The **companion** to [`local_bind_failure`], not a replacement, and the split is the point.
 /// That one reports only a port the engine holds but never bound — "serving in-process only". This
-/// one reports the rest of `apply_failures`: a stored record that will not parse, a refused
-/// `SetEnabled`, a rejected stub patch, and since #576 a refused flow store. For those the port may
+/// one reports the rest of `apply_failures` — a refused `SetEnabled`, a rejected stub patch — and
+/// the derived refusals: a committed config this engine refuses or cannot parse (D-102), and a
+/// refused flow store (#576, D-76). For those the port may
 /// be perfectly bound and serving, which is exactly why `rift-cluster-bind-failures` is the wrong home for
 /// them — it asserts a bind outcome, and asserting one here would point an operator at the socket
 /// when the socket is fine.
@@ -2003,15 +2005,55 @@ fn local_engine_failure(state: &FrontState, params: &[(&'static str, String)]) -
         );
         return None;
     };
-    // Two sources, and the second is why the first is not enough. `apply_failures` records what a
-    // *drive* did and is reaped by later drives; a refused flow store is a standing property of the
-    // applied config, so it is derived per read (D-76). Recorded first: a live drive failure is the
-    // more urgent fact, and a port with both is far more likely to be diagnosed from the drive.
-    let reason = node.apply_failures().get(&port).cloned().or_else(|| {
+    // Three sources. `apply_failures` records what a *drive* did and is reaped by later drives; a
+    // refused config (D-102) and a refused flow store (D-76) are standing properties of the applied
+    // config, so they are derived per read. The refused config first: the engine is not running
+    // that config at all, so nothing a drive recorded against the port describes what it serves.
+    let reason = engine_refusal(&node, port)?;
+    Some(format!("local-engine={reason}"))
+}
+
+/// `text` spelled in visible ASCII, everything else escaped (`\u{e9}`, `\n`). An engine refusal
+/// echoes the operator's own config — a selector, a pattern — and a header value must be ASCII for
+/// clients to read it (`HeaderValue::to_str`) and free of control characters for `set_header` to
+/// keep it at all, so an unescaped reason could lose the whole warning.
+fn header_safe(text: &str) -> String {
+    text.chars()
+        .map(|c| {
+            if c == ' ' || c.is_ascii_graphic() {
+                c.to_string()
+            } else {
+                c.escape_default().to_string()
+            }
+        })
+        .collect()
+}
+
+/// The one reason this node's engine gives for `port`, in the order [`local_engine_failure`]
+/// explains: a config it refuses (D-102), then a recorded drive failure, then a refused flow
+/// store (D-76). `None` when the port is served as committed.
+fn engine_refusal(node: &RaftNode, port: u16) -> Option<String> {
+    // Fail closed: a read that could not tell must not answer "served as committed".
+    let refused = match node.config_refusal(port) {
+        Ok(refused) => refused,
+        Err(e) => {
+            tracing::error!(port, error = %e, "could not read whether this port's config is refused");
+            return Some(format!(
+                "config state unreadable on this node: {}",
+                header_safe(&e.to_string())
+            ));
+        }
+    };
+    if let Some(reason) = refused {
+        return Some(format!(
+            "config refused by this engine version: {} - PUT a corrected config",
+            header_safe(&reason)
+        ));
+    }
+    node.apply_failures().get(&port).cloned().or_else(|| {
         node.flow_store_refusal(port)
             .map(|r| format!("flow store refused: {r}"))
-    })?;
-    Some(format!("local-engine={reason}"))
+    })
 }
 
 /// Which leg of the local proxy a request is on — and therefore whether the admin credential
@@ -3125,16 +3167,14 @@ async fn run_mutation(
     // to realize it (a bind, a refused toggle): §7.4.6 — success with a named
     // warning, never a silent divergence the client cannot see.
     //
-    // The derived flow-store refusal joins it (D-76), and this is the case that made recording
+    // The derived refusals join it — a config this engine refuses (D-102), a refused flow store
+    // (D-76) — and the flow store is the case that made recording
     // the verdict unworkable: the mutations that can touch a refused imposter — `disable`, a stub
     // patch — are exactly the ones whose engine arms `remove` the port's `apply_failures` entry on
     // success. So the operator pausing a refused imposter is the *most* likely person to need this
     // warning and used to be the one guaranteed not to get it.
     if let Some(port) = mutation.port
-        && let Some(failure) = node.apply_failures().get(&port).cloned().or_else(|| {
-            node.flow_store_refusal(port)
-                .map(|r| format!("flow store refused: {r}"))
-        })
+        && let Some(failure) = engine_refusal(node, port)
     {
         warnings.push(format!("local-engine={failure}"));
     }
@@ -4342,7 +4382,7 @@ fn stored_script_context(
     else {
         return Ok((HashMap::new(), "rhai".to_owned()));
     };
-    let config: ImposterConfig = serde_json::from_str(&stored)
+    let config = decode_committed_config(&stored)
         .map_err(|e| internal(&format!("stored config for {port}: {e}")))?;
     let default_engine = config.default_script_engine().to_owned();
     Ok((
@@ -4660,6 +4700,17 @@ fn barrier_warnings(barrier: &BarrierOutcome) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+
+    /// Pins D-102 (#657): a refusal echoes the operator's config, so its warning is spelled in
+    /// visible ASCII — a client reads it with `to_str`, and `set_header` keeps it — whatever the
+    /// selector held.
+    #[test]
+    fn a_refusal_reason_is_spelled_for_a_header() {
+        let safe = header_safe("selector `$.é[\n` is invalid");
+        assert_eq!(safe, "selector `$.\\u{e9}[\\n` is invalid");
+        let value = HeaderValue::from_str(&safe).expect("a valid header value");
+        assert_eq!(value.to_str().expect("ASCII"), safe);
+    }
     /// Pins D-97's spelling of the barrier's two warning items, and that a confirmed barrier adds
     /// none.
     #[test]

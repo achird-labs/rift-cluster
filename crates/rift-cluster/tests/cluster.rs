@@ -2802,3 +2802,127 @@ async fn retire_removes_a_crashed_learner_without_touching_the_voters() {
     }
     cluster.shutdown_all().await;
 }
+
+/// A config this engine's door refuses — a `copy` selector that does not compile (upstream
+/// #1262) — decoded as replay decodes it, the way an earlier engine that admitted it committed it.
+fn refused_put(port: u16) -> ControlRequest {
+    let body = serde_json::json!({
+        "port": port,
+        "protocol": "http",
+        "host": "127.0.0.1",
+        "stubs": [{
+            "id": "b",
+            "responses": [{
+                "is": { "statusCode": 200, "body": "${T}" },
+                "_behaviors": { "copy": { "from": "body", "into": "${T}",
+                    "using": { "method": "jsonpath", "selector": "$[[[bad" } } }
+            }]
+        }]
+    })
+    .to_string();
+    let config = rift_cluster::control::decode_committed_config(&body).expect("replay decodes it");
+    ControlRequest {
+        op_id: uuid::Uuid::new_v4(),
+        principal: None,
+        issued_at_secs: 0,
+        expected_revision: None,
+        op: rift_cluster::ControlOp::PutImposter {
+            config: Box::new(config),
+        },
+    }
+}
+
+async fn wait_leader(node: &RaftNode) {
+    let deadline = Instant::now() + LEADER_DEADLINE;
+    while !node.status().is_leader {
+        assert!(
+            Instant::now() < deadline,
+            "no leader within {LEADER_DEADLINE:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// Pins D-102 (#657): a node whose **last** log entry holds a config this engine refuses starts
+/// again. Before, reading the log back failed and the node did not start at all.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_node_whose_last_entry_is_a_refused_config_restarts() {
+    let _serial = TEST_LOCK.lock().await;
+    let ports = reserve_ports(1);
+    let addr: SocketAddr = format!("127.0.0.1:{}", ports[0]).parse().expect("addr");
+    let dir = TempDir::new().expect("tempdir");
+
+    let node = spawn(1, addr, dir.path()).await;
+    node.cluster_init().await.expect("bootstrap");
+    wait_leader(&node).await;
+    node.submit(bulky_request(19601, "a", 64))
+        .await
+        .expect("good config commits");
+    node.submit(refused_put(19602))
+        .await
+        .expect("the refused config commits — it is the log's last entry");
+    node.shutdown().await.expect("shutdown");
+    drop(node);
+
+    let node = spawn(1, addr, dir.path()).await;
+    wait_leader(&node).await;
+    assert!(node.imposter_config(19601).expect("read").is_some());
+    assert!(node.imposter_config(19602).expect("read").is_some());
+    node.submit(bulky_request(19603, "c", 64))
+        .await
+        .expect("the restarted node still commits");
+    node.shutdown().await.ok();
+}
+
+/// Pins D-102 (#657): a joiner replays a refused config from the leader's log and ends with the
+/// leader's exact row, and the leader keeps leading and committing. Before, reading that range of
+/// the log for the joiner failed inside the leader, and its Raft core stopped.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_joiner_replays_a_refused_config_and_the_leader_survives() {
+    let _serial = TEST_LOCK.lock().await;
+    let ports = reserve_ports(2);
+    let addr1: SocketAddr = format!("127.0.0.1:{}", ports[0]).parse().expect("addr");
+    let addr2: SocketAddr = format!("127.0.0.1:{}", ports[1]).parse().expect("addr");
+    let dir1 = TempDir::new().expect("tempdir");
+    let dir2 = TempDir::new().expect("tempdir");
+
+    let leader = spawn(1, addr1, dir1.path()).await;
+    leader.cluster_init().await.expect("bootstrap");
+    wait_leader(&leader).await;
+    leader
+        .submit(bulky_request(19611, "a", 64))
+        .await
+        .expect("a");
+    leader.submit(refused_put(19612)).await.expect("b");
+    leader
+        .submit(bulky_request(19613, "c", 64))
+        .await
+        .expect("c");
+
+    let joiner = spawn(2, addr2, dir2.path()).await;
+    joiner
+        .join_via(leader.advertise())
+        .await
+        .expect("the joiner is admitted");
+    let deadline = Instant::now() + CONVERGE_DEADLINE;
+    while joiner.imposter_config(19613).expect("read").is_none() {
+        assert!(
+            Instant::now() < deadline,
+            "the joiner never caught up past the refused entry"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert_eq!(
+        joiner.imposter_config(19612).expect("read"),
+        leader.imposter_config(19612).expect("read"),
+        "the joiner holds the leader's exact row"
+    );
+    assert!(leader.status().is_leader, "the leader still leads");
+    leader
+        .submit(bulky_request(19614, "d", 64))
+        .await
+        .expect("a write after the join commits");
+
+    joiner.shutdown().await.ok();
+    leader.shutdown().await.ok();
+}

@@ -5169,3 +5169,105 @@ async fn each_voters_row_carries_the_write_path_that_voter_was_started_with() {
     follower.shutdown().await;
     leader.shutdown().await;
 }
+
+/// Pins D-102 (#657) where an operator looks: a config the fleet committed under an engine that
+/// admitted it, and this engine refuses, is named on the port's read and on a write to it — the
+/// `local-engine=` warning carries the engine's own reason — while the door still refuses the same
+/// config with `400`. Committed through the node directly, as an earlier engine's door would have.
+#[tokio::test]
+async fn a_refused_committed_config_is_named_and_the_door_still_refuses_it() {
+    let _serial = TEST_LOCK.lock().await;
+    use rift_cluster::control::{ControlOp, ControlRequest, decode_committed_config};
+
+    let state = TempDir::new().expect("tempdir");
+    let server = compose::start(cluster_cli(&state, &["--cluster-allow-solo"]))
+        .await
+        .expect("solo cluster starts");
+    wait_ready(&server).await;
+    let admin = server.admin_addr();
+    let port = reserve_port();
+    let client = reqwest::Client::new();
+    let body = json!({
+        "port": port,
+        "protocol": "http",
+        "stubs": [{
+            "id": "b",
+            "responses": [{
+                "is": { "statusCode": 200, "body": "${T}" },
+                "_behaviors": { "copy": { "from": "body", "into": "${T}",
+                    "using": { "method": "jsonpath", "selector": "$[[[bad" } } }
+            }]
+        }]
+    });
+
+    let door = client
+        .post(format!("http://{admin}/imposters"))
+        .json(&body)
+        .send()
+        .await
+        .expect("post imposter");
+    assert_eq!(door.status().as_u16(), 400, "the door still refuses it");
+    let refusal = door.text().await.expect("body");
+    assert!(
+        refusal.contains("jsonpath"),
+        "with the engine's message: {refusal}"
+    );
+
+    let config = decode_committed_config(&body.to_string()).expect("replay decodes it");
+    server
+        .node()
+        .expect("clustered")
+        .submit(ControlRequest {
+            op_id: uuid::Uuid::new_v4(),
+            principal: None,
+            issued_at_secs: 0,
+            expected_revision: None,
+            op: ControlOp::PutImposter {
+                config: Box::new(config),
+            },
+        })
+        .await
+        .expect("committed past the door");
+
+    let node = server.node().expect("clustered");
+    let refused = node.config_refusal(port).expect("read");
+    assert!(
+        refused.is_some(),
+        "the node derives the refusal: {:?}",
+        node.imposter_config(port)
+    );
+    let expected = "local-engine=config refused by this engine version";
+    let read = client
+        .get(format!("http://{admin}/imposters/{port}"))
+        .send()
+        .await
+        .expect("get imposter");
+    let warnings = read
+        .headers()
+        .get("rift-cluster-warnings")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_owned();
+    assert!(
+        warnings.contains(expected),
+        "the read names the refusal: {read:?}"
+    );
+
+    let paused = client
+        .post(format!("http://{admin}/imposters/{port}/disable"))
+        .send()
+        .await
+        .expect("disable");
+    let warnings = paused
+        .headers()
+        .get("rift-cluster-warnings")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_owned();
+    assert!(
+        warnings.contains(expected),
+        "a write to the port names the refusal, not a drive failure: {warnings:?}"
+    );
+
+    server.shutdown().await;
+}

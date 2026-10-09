@@ -170,6 +170,13 @@ pub mod seams {
     /// error the engine reports when an apply side-effect fails.
     pub use rift_mock_core::imposter::{ImposterConfig, ImposterError, Stub, StubResponse};
 
+    /// Replay versus admission (upstream #1267, rift-cluster #657, D-102): decode a config the fleet
+    /// already committed without re-running the engine's admission checks, and run those checks
+    /// separately, at the engine drive.
+    pub use rift_mock_core::imposter::{
+        admission_check, admission_check_stub, deserialize_replayed,
+    };
+
     /// The per-imposter flow-state block, and the passthrough map a
     /// provider-supplied store reads its own options out of (upstream #845).
     ///

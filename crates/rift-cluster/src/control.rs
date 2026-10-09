@@ -8,7 +8,9 @@
 //! that can differ per node (port binds, listener state) lives in the engine
 //! drive *after* apply, never here.
 
-use rift_cluster_base::seams::{ImposterConfig, RecordedResponse, RouteTable, Stub};
+use rift_cluster_base::seams::{
+    ImposterConfig, RecordedResponse, RouteTable, Stub, deserialize_replayed,
+};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -74,10 +76,16 @@ pub enum ControlOp {
     PutImposter {
         // Boxed: an inline `ImposterConfig` would make every op as large as the
         // biggest one (clippy::large_enum_variant); serde is transparent to it.
+        //
+        // Replayed, never admitted (D-102): a committed op must read back under
+        // whatever engine reads it. The door admits; see `decode_committed_config`.
+        #[serde(deserialize_with = "deserialize_replayed")]
         config: Box<ImposterConfig>,
     },
     PatchStubs {
         port: u16,
+        // Its `Stub`s admit when decoded — replayed for the same reason (D-102).
+        #[serde(deserialize_with = "deserialize_replayed")]
         edit: StubEditScript,
     },
     DeleteImposter {
@@ -160,7 +168,10 @@ pub enum ControlOp {
         /// The replayable recorded response. Stored on consensus so `lookup()` answers from
         /// any node's applied state: for a stub-less proxyOnce recording this is the replay
         /// source *forever*, not just during a replication window.
+        // Structural: status, headers and bytes — nothing the engine admits.
         resp: RecordedResponse,
+        // A recorded `Stub` admits when decoded — replayed (D-102).
+        #[serde(deserialize_with = "deserialize_replayed")]
         stub: Option<RecordedStub>,
     },
     /// Delete every recorded-proxy marker for a port (#226) — the clustered half of
@@ -502,6 +513,19 @@ fn hex_decode(s: &str) -> Option<Vec<u8>> {
         .step_by(2)
         .map(|i| u8::from_str_radix(s.get(i..i + 2)?, 16).ok())
         .collect()
+}
+
+/// Decode a config the fleet already committed — a stored row, a snapshot row — without the
+/// engine's admission checks (D-102). Admission is the door's: a config this engine would refuse
+/// still decodes here, to the bytes that were committed, and is refused per port at the engine
+/// drive instead of making the state unreadable.
+///
+/// # Errors
+///
+/// A row that is not an imposter config at all — malformed JSON, or a shape no engine ever
+/// admitted (the refusals replay still makes, upstream's "replay floor").
+pub fn decode_committed_config(json: &str) -> serde_json::Result<ImposterConfig> {
+    deserialize_replayed(&mut serde_json::Deserializer::from_str(json))
 }
 
 /// The rules every config carried by the log must satisfy — an operator's own
@@ -917,6 +941,57 @@ mod tests {
         for op in ok {
             assert_eq!(validate(&op), Ok(()), "{op:?}");
         }
+    }
+
+    /// A stub this engine refuses at its door — a `copy` selector that does not compile — as JSON.
+    fn refused_stub_json(id: &str) -> serde_json::Value {
+        json!({
+            "id": id,
+            "responses": [{
+                "is": { "statusCode": 200, "body": "${T}" },
+                "_behaviors": { "copy": { "from": "body", "into": "${T}",
+                    "using": { "method": "jsonpath", "selector": "$[[[bad" } } }
+            }]
+        })
+    }
+
+    /// Pins D-102 (#657): every engine-typed field a log entry carries decodes without the
+    /// engine's admission checks — a config, a stub-edit script and a recorded stub — so a
+    /// committed op reads back whatever engine reads it. Admission is the door's, not the log's.
+    #[test]
+    fn every_config_bearing_op_decodes_without_admission() {
+        assert!(
+            serde_json::from_value::<Stub>(refused_stub_json("b")).is_err(),
+            "precondition: this engine's door refuses the stub"
+        );
+        let ops = [
+            json!({ "PutImposter": { "config": {
+                "port": 8080, "protocol": "http", "stubs": [refused_stub_json("b")] } } }),
+            json!({ "PatchStubs": { "port": 8080, "edit": [
+                { "Add": { "stub": refused_stub_json("c") } },
+                { "ReplaceById": { "id": "c", "stub": refused_stub_json("c") } } ] } }),
+            json!({ "ProxyRecorded": {
+                "port": 8080,
+                "sig_hash": "aa11",
+                "resp": { "status": 200, "headers": [], "body": [], "latency_ms": null, "timestamp_secs": 0 },
+                "stub": { "stub": refused_stub_json("r"), "placement": "beforeProxy", "proxy_to": "http://u" } } }),
+        ];
+        for op in ops {
+            let decoded: Result<ControlOp, _> = serde_json::from_value(op.clone());
+            assert!(decoded.is_ok(), "{op} must decode: {:?}", decoded.err());
+        }
+    }
+
+    /// Pins D-102 (#657): the committed-config decode skips admission, the door's does not —
+    /// the same bytes, two answers.
+    #[test]
+    fn a_committed_config_decodes_where_the_door_refuses_it() {
+        let body = json!({ "port": 8080, "protocol": "http", "stubs": [refused_stub_json("b")] })
+            .to_string();
+        assert!(serde_json::from_str::<ImposterConfig>(&body).is_err());
+        let config = decode_committed_config(&body).expect("replay decodes it");
+        assert_eq!(config.stubs.len(), 1);
+        assert_eq!(config.stubs[0].id.as_deref(), Some("b"));
     }
 
     #[test]

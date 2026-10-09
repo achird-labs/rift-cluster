@@ -745,6 +745,35 @@ impl RaftLogStorage<TypeConfig> for RedbLogStore {
 // State machine
 // ---------------------------------------------------------------------------
 
+/// The engine's view of `sm_configs` as of one op (D-102): every port the tables name, split by
+/// whether this engine admits the row.
+///
+/// `held` is the whole key set, refused ports included: a whole-set drive deletes only engine ports
+/// outside it, and the bookkeeping it reaps is scoped to it. So a refused row is neither served nor
+/// torn down — a live imposter keeps its last-known config, and a port the engine does not hold is
+/// not created — while every admitted row is realized.
+#[derive(Debug, Default)]
+struct DesiredSet {
+    admitted: Vec<ImposterConfig>,
+    held: BTreeSet<u16>,
+    refused: Vec<(u16, String)>,
+}
+
+/// Decode one `sm_configs` row and admit it, or say why this engine will not run it (D-102).
+///
+/// The one rule for both readers: the drive's [`DesiredSet`] and the derived
+/// [`RedbStateMachine::config_refusal`], so what is reported refused is exactly what is not served.
+/// The decode is the replay decode — the row is what the fleet committed — and admission is a
+/// separate, per-port check.
+fn admit_row(row: &str) -> Result<ImposterConfig, String> {
+    let stored: StoredImposter =
+        serde_json::from_str(row).map_err(|e| format!("stored record will not parse: {e}"))?;
+    let config = control::decode_committed_config(stored.config.get())
+        .map_err(|e| format!("stored config will not parse: {e}"))?;
+    rift_cluster_base::seams::admission_check(&config)?;
+    Ok(config)
+}
+
 /// What the post-commit engine drive must do for one applied op, in log order.
 ///
 /// `Sync` carries the desired config set *as of that op* (snapshotted inside
@@ -758,7 +787,7 @@ impl RaftLogStorage<TypeConfig> for RedbLogStore {
 /// op" state for the one port they touch.
 #[derive(Debug)]
 enum EngineAction {
-    Sync(Vec<ImposterConfig>),
+    Sync(DesiredSet),
     Put {
         config: Box<ImposterConfig>,
     },
@@ -774,13 +803,6 @@ enum EngineAction {
     SetEnabled {
         port: u16,
         enabled: bool,
-    },
-    /// A sync that must NOT run: a stored record failed to parse, and a partial
-    /// desired set would delete the live imposters it omits. Recorded as an
-    /// apply failure for the named port; the engine keeps its current state.
-    RefuseSync {
-        port: u16,
-        error: String,
     },
     /// Recompile and hot-swap the front door's route table (issue #131),
     /// carrying the desired table computed *as of that op* — the same
@@ -1230,6 +1252,18 @@ impl RedbStateMachine {
     /// handle (both share one `Arc<Database>`) purely for reads.
     #[allow(clippy::result_large_err)]
     pub fn read_config(&self, port: u16) -> StorageResult<Option<String>> {
+        self.read_config_row(port)?
+            .map(|row| {
+                serde_json::from_str::<StoredImposter>(&row)
+                    .map(|stored| stored.config.get().to_owned())
+                    .map_err(|e| StorageError::from(StorageIOError::read_state_machine(&e)))
+            })
+            .transpose()
+    }
+
+    /// `port`'s `sm_configs` row as stored, unparsed.
+    #[allow(clippy::result_large_err)]
+    fn read_config_row(&self, port: u16) -> StorageResult<Option<String>> {
         let read_txn = self
             .db
             .begin_read()
@@ -1237,15 +1271,10 @@ impl RedbStateMachine {
         let table = read_txn
             .open_table(SM_CONFIGS_TABLE)
             .map_err(|e| StorageIOError::read_state_machine(&e))?;
-        table
+        Ok(table
             .get(port)
             .map_err(|e| StorageIOError::read_state_machine(&e))?
-            .map(|g| {
-                serde_json::from_str::<StoredImposter>(g.value())
-                    .map(|stored| stored.config.get().to_owned())
-                    .map_err(|e| StorageError::from(StorageIOError::read_state_machine(&e)))
-            })
-            .transpose()
+            .map(|g| g.value().to_owned()))
     }
 
     /// Every port fleet-wide that currently has an applied config, ascending —
@@ -1407,6 +1436,25 @@ impl RedbStateMachine {
         self.full_syncs.load(Ordering::Relaxed)
     }
 
+    /// Why this engine will not run the config stored for `port`, or `None` when it does (or the
+    /// port holds none) — D-102. The row will not parse, or its config fails the engine's admission
+    /// checks: a config an earlier engine admitted and the fleet committed.
+    ///
+    /// Derived on each call, never recorded, for D-76's reason: the toggle and stub-patch arms reap
+    /// a port's `apply_failures` entry, so a recorded refusal would vanish the first time someone
+    /// paused the refused imposter. The same rule as the drive ([`admit_row`]), so what is named
+    /// refused here is exactly what the engine is not serving.
+    ///
+    /// # Errors
+    ///
+    /// The state-machine read failed.
+    #[allow(clippy::result_large_err)]
+    pub fn config_refusal(&self, port: u16) -> StorageResult<Option<String>> {
+        Ok(self
+            .read_config_row(port)?
+            .and_then(|row| admit_row(&row).err()))
+    }
+
     /// Why `port`'s flow store is unusable, or `None` when it is fine (#576, D-76).
     ///
     /// **Derived from the applied config on every read, never recorded.** That is the whole design,
@@ -1424,12 +1472,12 @@ impl RedbStateMachine {
     /// `FlowConfig::from_imposter` on the same stored config, so they cannot drift.
     ///
     /// A stored record that will not parse yields `None` here, deliberately: that is a different
-    /// failure with its own reporting (`RefuseSync` records it in `apply_failures`), and answering
-    /// "the flow store is refused" for it would name the wrong cause.
+    /// failure with its own reporting ([`Self::config_refusal`]), and answering "the flow store is
+    /// refused" for it would name the wrong cause.
     #[must_use]
     pub fn flow_store_refusal(&self, port: u16) -> Option<String> {
         let stored = self.read_config(port).ok().flatten()?;
-        let config: ImposterConfig = serde_json::from_str(&stored).ok()?;
+        let config = control::decode_committed_config(&stored).ok()?;
         crate::stores::FlowConfig::from_imposter(&config).err()
     }
 
@@ -1438,8 +1486,7 @@ impl RedbStateMachine {
     /// is not serving it at all, or when there is no local engine.
     ///
     /// Narrower than [`Self::apply_failures`] on purpose, and the distinction is the whole point.
-    /// That map records *every* kind of engine-side failure — a stored record that will not parse,
-    /// a refused `SetEnabled`, a rejected stub patch, an unreadable TLS cert — and stringifies the
+    /// That map records *every* kind of engine-side failure the drive meets — a refused `SetEnabled`, a rejected stub patch, an unreadable TLS cert — and stringifies the
     /// error, discarding which kind it was. Reporting any of those as a bind failure would tell an
     /// operator "this node is still serving it in-process", which for every one of those cases is
     /// false: the imposter is not in the map at all, and the read they are looking at is a 404.
@@ -1832,30 +1879,22 @@ impl RedbStateMachine {
         // read *order* (D-5, the #573 amendment), not exclusion, and the apply
         // loop must be free to make progress across it — the sweep's own seam
         // exists to let a test commit there.
-        let sweep_after = {
+        {
             let _drive = self.engine_drive.lock().await;
             self.sync_engine_under_drive_lock(between_read_and_drive)
-                .await?
-        };
-        if sweep_after {
-            self.sweep_orphaned_imposter_state(between_sweep_reads)
                 .await?;
-        } else {
-            // Still awaited on the refuse path, so an interleaving a test asks
-            // for is never silently dropped along with the sweep.
-            between_sweep_reads.await;
         }
-        Ok(())
+        self.sweep_orphaned_imposter_state(between_sweep_reads)
+            .await
     }
 
     /// The engine-sync half of [`Self::reconcile_engine_interleaved`], with
-    /// `engine_drive` already held by the caller. Returns whether the sweep
-    /// should follow.
+    /// `engine_drive` already held by the caller.
     #[allow(clippy::result_large_err)]
     async fn sync_engine_under_drive_lock(
         &self,
         between_read_and_drive: impl Future<Output = ()>,
-    ) -> StorageResult<bool> {
+    ) -> StorageResult<()> {
         // Both tables read fresh, in one call: a restart's local `ImposterManager`
         // and `ArcSwap<CompiledRoutes>` both start empty (they are process-local,
         // rebuilt from persisted `sm_configs`/`sm_routes`), and a live commit only
@@ -1869,12 +1908,10 @@ impl RedbStateMachine {
             let configs = read_txn
                 .open_table(SM_CONFIGS_TABLE)
                 .map_err(|e| StorageIOError::read_state_machine(&e))?;
-            let config_action = match Self::desired_configs(&configs)
-                .map_err(|e| StorageError::from(StorageIOError::read_state_machine(&e)))?
-            {
-                Ok(desired) => EngineAction::Sync(desired),
-                Err((port, error)) => EngineAction::RefuseSync { port, error },
-            };
+            let config_action = EngineAction::Sync(
+                Self::desired_configs(&configs)
+                    .map_err(|e| StorageError::from(StorageIOError::read_state_machine(&e)))?,
+            );
             let routes = read_txn
                 .open_table(SM_ROUTES_TABLE)
                 .map_err(|e| StorageIOError::read_state_machine(&e))?;
@@ -1886,12 +1923,6 @@ impl RedbStateMachine {
             };
             (config_action, routes_action)
         };
-        // Whether the sweep below follows a sync that happened. A `RefuseSync`
-        // leaves the engine holding whatever it held, and the sweep is the
-        // other half of the same reconcile: with the engine not rebuilt it
-        // does nothing either, rather than clear against a set the engine
-        // itself was not trusted with.
-        let config_synced = matches!(config_action, EngineAction::Sync(_));
         // The #574 seam: an apply committed and driven here must not be able to
         // undo the drive below. Awaited while `engine_drive` is held, so a test's
         // concurrent apply parks on the lock rather than racing us.
@@ -1906,7 +1937,7 @@ impl RedbStateMachine {
             AttributedAction::unattributed(routes_action),
         ])
         .await;
-        Ok(config_synced)
+        Ok(())
     }
 
     /// Test-only: overwrite a raw `sm_configs` row, bypassing validation — the
@@ -2022,51 +2053,74 @@ impl RedbStateMachine {
     }
 
     /// The desired engine state as of now, read from an open (possibly
-    /// mid-transaction) view of `sm_configs`: every applied config,
-    /// parsed — disabled ones included (a paused imposter stays bound, #817).
+    /// mid-transaction) view of `sm_configs`: every applied config this engine
+    /// admits — disabled ones included (a paused imposter stays bound, #817) —
+    /// and, apart, every row it refuses (D-102).
     ///
-    /// `Ok(Err((port, reason)))` means a stored record failed to parse. That
-    /// must abort the sync, not shrink it: `apply_config` deletes every live
-    /// imposter missing from the desired set, so silently skipping a broken
-    /// record would tear down a healthy imposter and report it as an
-    /// operator-issued delete. The caller refuses the sync and records the
-    /// failure instead — the engine keeps serving its last-known state.
+    /// A row that will not parse, or that this engine's admission checks refuse,
+    /// is held, not dropped: a whole-set drive deletes only what the tables no
+    /// longer name, so the refusal costs that one port and no other. Before
+    /// D-102 one such row refused the whole sync, which kept a live imposter
+    /// alive but on a restarted node — whose engine starts empty — left every
+    /// port unserved.
     fn desired_configs(
         table: &impl ReadableTable<u16, &'static str>,
-    ) -> Result<Result<Vec<ImposterConfig>, (u16, String)>, redb::StorageError> {
-        let mut desired = Vec::new();
+    ) -> Result<DesiredSet, redb::StorageError> {
+        let mut desired = DesiredSet::default();
         for item in table.iter()? {
             let (key, value) = item?;
             let port = key.value();
-            let stored = match serde_json::from_str::<StoredImposter>(value.value()) {
-                Ok(stored) => stored,
-                Err(e) => {
-                    return Ok(Err((port, format!("stored record will not parse: {e}"))));
-                }
-            };
-            // Disabled configs stay in the desired set: upstream keeps a
-            // paused imposter bound (serving 503) — dropping it here would
-            // read as "delete it" to apply_config (#817).
-            match serde_json::from_str::<ImposterConfig>(stored.config.get()) {
-                Ok(config) => desired.push(config),
-                Err(e) => {
-                    return Ok(Err((port, format!("stored config will not parse: {e}"))));
-                }
+            desired.held.insert(port);
+            match admit_row(value.value()) {
+                Ok(config) => desired.admitted.push(config),
+                Err(reason) => desired.refused.push((port, reason)),
             }
         }
-        Ok(Ok(desired))
+        Ok(desired)
     }
 
-    /// Build the engine action for a config op: a full sync when every stored
-    /// record parses, a recorded refusal when one does not.
+    /// The whole-set engine action for a config op.
     #[allow(clippy::result_large_err)]
     fn sync_action(configs: &Table<'_, u16, &'static str>) -> StorageResult<EngineAction> {
-        let io =
-            |e: redb::StorageError| StorageError::from(StorageIOError::write_state_machine(&e));
-        Ok(match Self::desired_configs(configs).map_err(io)? {
-            Ok(desired) => EngineAction::Sync(desired),
-            Err((port, error)) => EngineAction::RefuseSync { port, error },
-        })
+        Self::desired_configs(configs)
+            .map(EngineAction::Sync)
+            .map_err(|e| StorageError::from(StorageIOError::write_state_machine(&e)))
+    }
+
+    /// The drive for an edit — a toggle, a stub patch, a recording — that left
+    /// `config` on `port` (D-102). `was_admitted` is whether this engine admitted
+    /// the config the edit started from.
+    ///
+    /// - The edit leaves a config this engine refuses: no drive at all. The engine
+    ///   keeps serving what it last admitted there, and the port's warning stays
+    ///   the derived refusal rather than whatever a drive against an imposter it
+    ///   does not hold would record.
+    /// - The edit repairs a refused config: the whole config, as a `Put`. The
+    ///   engine never ran the row the edit started from — it holds nothing there,
+    ///   or an older config — so an incremental `action` would fail as not found
+    ///   or land on the wrong base.
+    /// - Otherwise `action`, the incremental drive.
+    fn edit_drive(
+        port: u16,
+        was_admitted: bool,
+        config: &ImposterConfig,
+        action: EngineAction,
+    ) -> Vec<EngineAction> {
+        if let Err(reason) = rift_cluster_base::seams::admission_check(config) {
+            tracing::error!(
+                port,
+                %reason,
+                "config refused by this engine version; the edit is committed but not served on this node"
+            );
+            return Vec::new();
+        }
+        if !was_admitted {
+            return vec![EngineAction::Put {
+                // A clone: the caller still writes the row from it.
+                config: Box::new(config.clone()),
+            }];
+        }
+        vec![action]
     }
 
     /// The desired route table as of now, read from an open (possibly
@@ -2255,13 +2309,14 @@ impl RedbStateMachine {
                         },
                     }
                 };
-                let mut config: ImposterConfig = match serde_json::from_str(record.config.get()) {
+                let mut config = match control::decode_committed_config(record.config.get()) {
                     Ok(config) => config,
                     Err(e) => {
                         tracing::error!(port = *port, error = %e, "corrupt stored config");
                         return Ok(Err(format!("corrupt stored config for port {port}: {e}")));
                     }
                 };
+                let was_admitted = rift_cluster_base::seams::admission_check(&config).is_ok();
                 if let Err(reason) = control::apply_edit(&mut config.stubs, edit) {
                     return Ok(Err(reason));
                 }
@@ -2272,10 +2327,15 @@ impl RedbStateMachine {
                     .map_err(|e| StorageIOError::write_state_machine(&e))?;
                 configs.insert(*port, value.as_str()).map_err(io)?;
                 crate::metrics::config_applied(*port, index);
-                Ok(Ok(vec![EngineAction::Patch {
-                    port: *port,
-                    edit: edit.clone(),
-                }]))
+                Ok(Ok(Self::edit_drive(
+                    *port,
+                    was_admitted,
+                    &config,
+                    EngineAction::Patch {
+                        port: *port,
+                        edit: edit.clone(),
+                    },
+                )))
             }
             ControlOp::DeleteImposter { port } => {
                 // Removing an absent port is a no-op, not a failure: deletes are
@@ -2327,13 +2387,15 @@ impl RedbStateMachine {
                 // is what the engine, snapshots and the desired-set builder
                 // consume; the record field is a redundant projection kept in
                 // sync so later slices can read it without a config parse.
-                let mut config: ImposterConfig = match serde_json::from_str(record.config.get()) {
+                let mut config = match control::decode_committed_config(record.config.get()) {
                     Ok(config) => config,
                     Err(e) => {
                         tracing::error!(port = *port, error = %e, "corrupt stored config");
                         return Ok(Err(format!("corrupt stored config for port {port}: {e}")));
                     }
                 };
+                // The flag is not something admission judges, so the edit cannot change it.
+                let was_admitted = rift_cluster_base::seams::admission_check(&config).is_ok();
                 record.enabled = *enabled;
                 config.enabled = *enabled;
                 record.config =
@@ -2343,10 +2405,15 @@ impl RedbStateMachine {
                     .map_err(|e| StorageIOError::write_state_machine(&e))?;
                 configs.insert(*port, value.as_str()).map_err(io)?;
                 crate::metrics::config_applied(*port, index);
-                Ok(Ok(vec![EngineAction::SetEnabled {
-                    port: *port,
-                    enabled: *enabled,
-                }]))
+                Ok(Ok(Self::edit_drive(
+                    *port,
+                    was_admitted,
+                    &config,
+                    EngineAction::SetEnabled {
+                        port: *port,
+                        enabled: *enabled,
+                    },
+                )))
             }
             ControlOp::PutRoutes { table } => {
                 // Whole-table replace: clear every row, then insert
@@ -2467,13 +2534,14 @@ impl RedbStateMachine {
                         },
                     }
                 };
-                let mut config: ImposterConfig = match serde_json::from_str(record.config.get()) {
+                let mut config = match control::decode_committed_config(record.config.get()) {
                     Ok(config) => config,
                     Err(e) => {
                         tracing::error!(port = *port, error = %e, "corrupt stored config");
                         return Ok(Err(format!("corrupt stored config for port {port}: {e}")));
                     }
                 };
+                let was_admitted = rift_cluster_base::seams::admission_check(&config).is_ok();
                 let mut stub_value = (*recorded.stub).clone();
                 if stub_value.id.is_none() {
                     // Addressable identity: the engine drive replaces a merged stub by id, and
@@ -2518,9 +2586,14 @@ impl RedbStateMachine {
                     // The merge target was a user-authored stub with no id: nothing addresses
                     // it in a patch script, so fall back to the full-sync drive — rare, and
                     // always correct.
-                    PlacedRecording::MergedAnonymous => Self::sync_action(configs)?,
+                    // A whole-set drive judges every row itself, this one included, so it is not
+                    // gated on this port's admission — and it is also D-81's heal for every other
+                    // port, which skipping it would forgo.
+                    PlacedRecording::MergedAnonymous => {
+                        return Ok(Ok(vec![Self::sync_action(configs)?]));
+                    }
                 };
-                Ok(Ok(vec![action]))
+                Ok(Ok(Self::edit_drive(*port, was_admitted, &config, action)))
             }
             ControlOp::ProxyRecordedClear { port } => {
                 // Clearing an empty table is a no-op, not a failure — idempotent like every
@@ -2570,25 +2643,90 @@ impl RedbStateMachine {
         }
     }
 
+    /// The whole-set drive with refused rows in the table (D-102): `apply_config`'s
+    /// two halves, done per port so that a refused port is in neither. Engine ports
+    /// the tables no longer name are deleted; every admitted config is applied on
+    /// its own. One report, as `apply_config` would give, so the bookkeeping after
+    /// it is the same code either way.
+    ///
+    /// Not `apply_config` with the admitted set: that deletes every port the set
+    /// omits, a refused live one included — the teardown D-102 exists to prevent.
+    async fn apply_admitted(
+        engine: &ImposterManager,
+        admitted: Vec<ImposterConfig>,
+        held: &BTreeSet<u16>,
+    ) -> ApplyReport {
+        let mut report = ApplyReport::default();
+        let stale: Vec<u16> = engine
+            .list_imposters()
+            .iter()
+            .filter_map(|imposter| imposter.config.port)
+            .filter(|port| !held.contains(port))
+            .collect();
+        for port in stale {
+            match engine.delete_imposter(port).await {
+                Ok(_) => report.deleted.push(port),
+                // Listed a moment ago and gone now: a concurrent removal already did this.
+                Err(ImposterError::NotFound(_)) => {}
+                Err(e) => report.failed.push((port, e)),
+            }
+        }
+        for config in admitted {
+            let Some(port) = config.port else {
+                // The arm refuses a port-less config before it commits, so a row
+                // never holds one; say so if it ever does, rather than drop it.
+                tracing::error!("a stored config carried no port; nothing applied");
+                continue;
+            };
+            match engine.apply_one(config).await {
+                Ok(one) => {
+                    report.created.extend(one.created);
+                    report.replaced.extend(one.replaced);
+                    report.stub_patched.extend(one.stub_patched);
+                    report.toggled.extend(one.toggled);
+                    report.deleted.extend(one.deleted);
+                    report.failed.extend(one.failed);
+                }
+                Err(e) => report.failed.push((port, e)),
+            }
+        }
+        report
+    }
+
     /// One action against the engine / route table. Runs inside the caller's
     /// principal scope; see [`AttributedAction`].
     async fn drive_one(&self, action: EngineAction) {
         match action {
-            EngineAction::Sync(desired) => {
+            EngineAction::Sync(DesiredSet {
+                admitted,
+                held: desired_ports,
+                refused,
+            }) => {
                 // The whole-config level of D-5: upstream's `apply_config` (U-6)
                 // diffs on stable stub keys, so a replicated write never resets
                 // an untouched imposter's runtime state.
                 let Some(engine) = &self.engine else { return };
                 self.full_syncs.fetch_add(1, Ordering::Relaxed);
-                let desired_ports: std::collections::BTreeSet<u16> =
-                    desired.iter().filter_map(|c| c.port).collect();
+                for (port, reason) in &refused {
+                    tracing::error!(
+                        port,
+                        %reason,
+                        "config refused by this engine version; not serving it on this node"
+                    );
+                }
                 // Before the engine call, and from the same set: the sequencer
                 // must not answer for a config the engine has accepted while
-                // this map still describes the previous one.
+                // this map still describes the previous one. A refused port keeps
+                // its entry, as the engine keeps its imposter.
                 if let Some(sequencing) = &self.sequencing {
-                    sequencing.apply(&desired);
+                    sequencing.apply_holding(&admitted, &desired_ports);
                 }
-                match engine.apply_config(desired).await {
+                let outcome = if refused.is_empty() {
+                    engine.apply_config(admitted).await
+                } else {
+                    Ok(Self::apply_admitted(engine, admitted, &desired_ports).await)
+                };
+                match outcome {
                     Ok(report) => {
                         // Read before `record_report` reaps the map, because the
                         // ports this needs are exactly the ones it is about to
@@ -2666,6 +2804,17 @@ impl RedbStateMachine {
                         .insert(0, "a committed config carried no port".to_owned());
                     return;
                 };
+                // D-102: the engine runs what it admits. A refused config leaves the port as it
+                // was — a live imposter keeps its last-known config — and is reported derived, by
+                // `config_refusal`, never recorded here.
+                if let Err(reason) = rift_cluster_base::seams::admission_check(&config) {
+                    tracing::error!(
+                        port,
+                        %reason,
+                        "config refused by this engine version; not serving it on this node"
+                    );
+                    return;
+                }
                 if let Some(sequencing) = &self.sequencing {
                     sequencing.set(port, &config);
                 }
@@ -2701,18 +2850,6 @@ impl RedbStateMachine {
                         self.apply_failures.lock().insert(port, e.to_string());
                     }
                 }
-            }
-            EngineAction::RefuseSync { port, error } => {
-                if self.engine.is_none() {
-                    return;
-                }
-                tracing::error!(
-                    port,
-                    error = %error,
-                    "refusing engine sync: a stored record will not parse \
-                     (a partial sync would delete live imposters)"
-                );
-                self.apply_failures.lock().insert(port, error);
             }
             EngineAction::SetEnabled { port, enabled } => {
                 let Some(engine) = &self.engine else { return };
@@ -3128,7 +3265,7 @@ impl RedbStateMachine {
     /// Every row this crate writes is a JSON object. One that is not JSON at all is corruption,
     /// and it travels as a JSON **string** holding the row unchanged — what the snapshot did with
     /// every row before D-100 — so [`Self::stored_row`] restores it byte for byte and the
-    /// receiving node reports it exactly as this one does (a refused sync, a corrupt-record
+    /// receiving node reports it exactly as this one does (a refused port, a corrupt-record
     /// error). Failing the build instead would fail every build until the row is removed, and
     /// openraft ends the Raft core on a snapshot-build error: one bad row would stop the node.
     #[allow(clippy::result_large_err)]
@@ -3641,12 +3778,10 @@ impl RedbStateMachine {
                     .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
             }
 
-            let config_action = match Self::desired_configs(&configs_table)
-                .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?
-            {
-                Ok(desired) => EngineAction::Sync(desired),
-                Err((port, error)) => EngineAction::RefuseSync { port, error },
-            };
+            let config_action = EngineAction::Sync(
+                Self::desired_configs(&configs_table)
+                    .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?,
+            );
 
             // Cleared before it is repopulated, exactly like the tables above: a payload carrying
             // no key means no console login has ever minted one on the leader, and leaving a stale local
@@ -5565,14 +5700,13 @@ mod tests {
         }
     }
 
-    /// One unparseable stored record must refuse the whole engine sync — a
-    /// partial desired set would read as "delete the missing imposters".
-    ///
-    /// A row only stops parsing across a restart (a different binary or engine reads it), so the
-    /// first whole-set drive to meet it is the startup reconcile, which records it. From then on
-    /// the node is degraded (D-99) and every config op is a whole-set drive that refuses again.
+    /// Pins D-102 (#657): a stored record that will not parse refuses **its own port only**. The
+    /// whole-set refusal it replaces kept a live imposter alive — the claim kept here — but on a
+    /// restarted node, whose engine starts empty, it left every port unserved and refused every
+    /// later sync. Now the other ports are realized, the broken one is neither created nor deleted,
+    /// and the reason is derived per read rather than recorded.
     #[tokio::test]
-    async fn a_broken_stored_record_refuses_sync_instead_of_deleting() {
+    async fn a_broken_stored_record_refuses_only_its_own_port() {
         let engine = Arc::new(ImposterManager::new());
         let (_td, mut sm) = fresh_sm(Some(engine.clone())).await;
         sm.apply(vec![entry(1, put(1, 18087, json!([{ "id": "a" }])))])
@@ -5584,28 +5718,355 @@ mod tests {
         reconcile_bounded(&sm)
             .await
             .expect("the reconcile records, never fails");
-        assert_eq!(engine.count(), 1, "the reconcile tore nothing down");
-        assert!(sm.apply_failures().contains_key(&18088));
+        assert_eq!(
+            engine_stub_ids(&engine, 18087),
+            vec!["a"],
+            "the live imposter stays"
+        );
+        assert!(
+            engine.get_imposter(18088).is_err(),
+            "the broken row is not created"
+        );
+        let reason = sm.config_refusal(18088).expect("read").expect("refused");
+        assert!(reason.contains("will not parse"), "{reason}");
+        assert!(
+            sm.apply_failures().is_empty(),
+            "derived, not recorded: {:?}",
+            sm.apply_failures()
+        );
 
         let responses = sm
             .apply(vec![entry(2, put(2, 18089, json!([])))])
             .await
-            .expect("apply still succeeds — the refusal is engine status");
+            .expect("apply");
         assert_eq!(responses, vec![ControlResponse::applied(2)]);
-        assert_eq!(
-            engine.count(),
-            1,
-            "the live imposter must NOT be torn down, and the new one must not \
-             be created by a partial sync"
-        );
-        assert_eq!(engine_stub_ids(&engine, 18087), vec!["a"]);
+        assert!(engine.get_imposter(18089).is_ok(), "a later put is served");
+        assert_eq!(engine.count(), 2);
+
+        engine.shutdown().await;
+    }
+
+    /// A config this engine refuses at its door — a `copy` behavior whose `jsonpath` selector does
+    /// not compile (upstream #1262) — decoded the way replay decodes it: as an earlier engine that
+    /// admitted it would have committed it (#657).
+    fn refused_config(port: u16, id: &str) -> ImposterConfig {
+        let body = json!({
+            "port": port,
+            "protocol": "http",
+            "host": "127.0.0.1",
+            "stubs": [{
+                "id": id,
+                "responses": [{
+                    "is": { "statusCode": 200, "body": "${T}" },
+                    "_behaviors": { "copy": { "from": "body", "into": "${T}",
+                        "using": { "method": "jsonpath", "selector": "$[[[bad" } } }
+                }]
+            }]
+        })
+        .to_string();
         assert!(
-            sm.apply_failures().contains_key(&18088),
-            "the broken record is surfaced as node status: {:?}",
+            serde_json::from_str::<ImposterConfig>(&body).is_err(),
+            "precondition: this engine's door refuses the config"
+        );
+        crate::control::decode_committed_config(&body).expect("replay decodes it")
+    }
+
+    fn put_config(op_id: u128, config: ImposterConfig) -> ControlRequest {
+        request(
+            op_id,
+            ControlOp::PutImposter {
+                config: Box::new(config),
+            },
+        )
+    }
+
+    /// Pins D-102 (#657): a committed config this engine refuses is not served — the engine runs
+    /// what it admits, never what it would refuse — and nothing else on the node notices: the
+    /// ports around it are served, a later put is served, and no failure is recorded anywhere.
+    /// The refusal is derived, and names the engine's own reason.
+    #[tokio::test]
+    async fn a_refused_config_is_not_served_and_does_not_stop_the_rest() {
+        let engine = Arc::new(ImposterManager::new());
+        let (_td, mut sm) = fresh_sm(Some(engine.clone())).await;
+        apply_one(&mut sm, 1, put(1, 18501, json!([{ "id": "a" }]))).await;
+        let refused = apply_one(&mut sm, 2, put_config(2, refused_config(18502, "b"))).await;
+        assert_eq!(
+            refused,
+            ControlResponse::applied(2),
+            "the log commits what the fleet wrote"
+        );
+        apply_one(&mut sm, 3, put(3, 18503, json!([{ "id": "c" }]))).await;
+
+        assert!(engine.get_imposter(18501).is_ok());
+        assert!(
+            engine.get_imposter(18502).is_err(),
+            "the refused config is not served"
+        );
+        assert!(engine.get_imposter(18503).is_ok());
+        let reason = sm.config_refusal(18502).expect("read").expect("refused");
+        assert!(
+            reason.contains("`copy` behavior `jsonpath` selector `$[[[bad` is invalid"),
+            "the engine's own reason: {reason}"
+        );
+        assert_eq!(sm.config_refusal(18501).expect("read"), None);
+
+        apply_one(&mut sm, 4, put(4, 18504, json!([]))).await;
+        assert!(engine.get_imposter(18504).is_ok(), "a later put is served");
+        assert!(sm.apply_failures().is_empty(), "{:?}", sm.apply_failures());
+
+        engine.shutdown().await;
+    }
+
+    /// Pins D-102 (#657): a refused config committed over a live imposter does not tear it down —
+    /// the port keeps serving its last-known config, the invariant the whole-set refusal existed
+    /// for — while the table records what the fleet committed.
+    #[tokio::test]
+    async fn a_refused_config_for_a_live_port_keeps_its_last_config() {
+        let engine = Arc::new(ImposterManager::new());
+        let (_td, mut sm) = fresh_sm(Some(engine.clone())).await;
+        apply_one(&mut sm, 1, put(1, 18510, json!([{ "id": "old" }]))).await;
+        apply_one(&mut sm, 2, put_config(2, refused_config(18510, "new"))).await;
+
+        assert_eq!(
+            engine_stub_ids(&engine, 18510),
+            vec!["old"],
+            "still serving the last config"
+        );
+        assert_eq!(
+            stored_stub_ids(&sm, 18510),
+            vec!["new"],
+            "the row is what was committed"
+        );
+        assert!(sm.config_refusal(18510).expect("read").is_some());
+
+        engine.shutdown().await;
+    }
+
+    /// Pins D-102 (#657): a pause and a stub patch on a refused port commit and change the row as
+    /// on every node, and the port's warning stays the refusal — never a drive failure such as
+    /// "imposter not found" from an engine that does not hold it.
+    #[tokio::test]
+    async fn edits_on_a_refused_port_change_the_row_and_keep_the_refusal() {
+        let engine = Arc::new(ImposterManager::new());
+        let (_td, mut sm) = fresh_sm(Some(engine.clone())).await;
+        apply_one(&mut sm, 1, put_config(1, refused_config(18520, "b"))).await;
+        let paused = apply_one(
+            &mut sm,
+            2,
+            request(
+                2,
+                ControlOp::SetEnabled {
+                    port: 18520,
+                    enabled: false,
+                },
+            ),
+        )
+        .await;
+        assert_eq!(paused, ControlResponse::applied(2));
+        let patched = apply_one(
+            &mut sm,
+            3,
+            request(
+                3,
+                ControlOp::PatchStubs {
+                    port: 18520,
+                    edit: StubEditScript(vec![StubEdit::Add {
+                        stub: serde_json::from_value(json!({ "id": "z" })).expect("parses"),
+                        index: None,
+                    }]),
+                },
+            ),
+        )
+        .await;
+        assert_eq!(patched, ControlResponse::applied(3));
+        assert_eq!(stored_stub_ids(&sm, 18520), vec!["b", "z"]);
+        assert!(sm.config_refusal(18520).expect("read").is_some());
+        assert!(
+            sm.apply_failures().is_empty(),
+            "no drive failure stands in for the refusal: {:?}",
             sm.apply_failures()
         );
 
         engine.shutdown().await;
+    }
+
+    /// Pins D-102 (#657): recovery is an ordinary write — a corrected config through the door is
+    /// served, and the refusal is gone because the row changed.
+    #[tokio::test]
+    async fn a_corrected_put_clears_a_refusal() {
+        let engine = Arc::new(ImposterManager::new());
+        let (_td, mut sm) = fresh_sm(Some(engine.clone())).await;
+        apply_one(&mut sm, 1, put_config(1, refused_config(18530, "b"))).await;
+        assert!(sm.config_refusal(18530).expect("read").is_some());
+        apply_one(&mut sm, 2, put(2, 18530, json!([{ "id": "b" }]))).await;
+        assert_eq!(engine_stub_ids(&engine, 18530), vec!["b"]);
+        assert_eq!(sm.config_refusal(18530).expect("read"), None);
+
+        engine.shutdown().await;
+    }
+
+    /// Pins D-102 (#657): a whole-set drive — the startup reconcile, here — realizes every
+    /// admissible row and leaves a refused one alone either way: a refused row for a live port
+    /// does not tear it down, and one for a port the engine does not hold is not created.
+    #[tokio::test]
+    async fn a_reconcile_serves_the_admissible_rows_and_tears_down_no_refused_one() {
+        let engine = Arc::new(ImposterManager::new());
+        let (_td, mut sm) = fresh_sm(Some(engine.clone())).await;
+        apply_one(&mut sm, 1, put(1, 18540, json!([{ "id": "a" }]))).await;
+        apply_one(&mut sm, 2, put(2, 18541, json!([{ "id": "old" }]))).await;
+        // Rows an earlier engine admitted, as this one finds them after a restart.
+        let row = |config: ImposterConfig| {
+            json!({ "config": config, "enabled": true, "revision": 9 }).to_string()
+        };
+        sm.inject_raw_config(18541, &row(refused_config(18541, "new")));
+        sm.inject_raw_config(18542, &row(refused_config(18542, "c")));
+
+        reconcile_bounded(&sm).await.expect("reconcile");
+        assert_eq!(engine_stub_ids(&engine, 18540), vec!["a"]);
+        assert_eq!(
+            engine_stub_ids(&engine, 18541),
+            vec!["old"],
+            "a live port is not torn down"
+        );
+        assert!(
+            engine.get_imposter(18542).is_err(),
+            "a refused port is not created"
+        );
+        assert!(sm.config_refusal(18541).expect("read").is_some());
+        assert!(sm.config_refusal(18542).expect("read").is_some());
+        assert!(sm.apply_failures().is_empty(), "{:?}", sm.apply_failures());
+
+        engine.shutdown().await;
+    }
+
+    /// Pins D-102 (#657): a stub patch that *repairs* a refused config is driven as the whole
+    /// corrected config. The engine never ran the row the patch started from, so an incremental
+    /// patch would fail as not found (here) or land on an older config — and with the row now
+    /// admitted the refusal warning would be gone too, leaving the port unserved and unexplained.
+    #[tokio::test]
+    async fn a_patch_that_repairs_a_refused_config_serves_the_whole_config() {
+        let engine = Arc::new(ImposterManager::new());
+        let (_td, mut sm) = fresh_sm(Some(engine.clone())).await;
+        apply_one(&mut sm, 1, put_config(1, refused_config(18560, "b"))).await;
+        assert!(engine.get_imposter(18560).is_err());
+        let repaired = apply_one(
+            &mut sm,
+            2,
+            request(
+                2,
+                ControlOp::PatchStubs {
+                    port: 18560,
+                    edit: StubEditScript(vec![StubEdit::ReplaceById {
+                        id: "b".to_owned(),
+                        stub: serde_json::from_value(json!({
+                            "id": "b",
+                            "responses": [{ "is": { "statusCode": 200, "body": "fixed" } }]
+                        }))
+                        .expect("parses"),
+                    }]),
+                },
+            ),
+        )
+        .await;
+        assert_eq!(repaired, ControlResponse::applied(2));
+        assert_eq!(
+            engine_stub_ids(&engine, 18560),
+            vec!["b"],
+            "the corrected config is served"
+        );
+        assert_eq!(sm.config_refusal(18560).expect("read"), None);
+        assert!(sm.apply_failures().is_empty(), "{:?}", sm.apply_failures());
+
+        engine.shutdown().await;
+    }
+
+    /// Pins D-102 (#657): the per-port whole-set drive still does `apply_config`'s other half — an
+    /// engine port the tables no longer name is deleted — while a refused live port is kept.
+    #[tokio::test]
+    async fn a_whole_set_drive_with_a_refused_row_still_deletes_a_port_the_tables_dropped() {
+        let engine = Arc::new(ImposterManager::new());
+        let (_td, mut sm) = fresh_sm(Some(engine.clone())).await;
+        apply_one(&mut sm, 1, put(1, 18570, json!([{ "id": "old" }]))).await;
+        let row = json!({ "config": refused_config(18570, "new"), "enabled": true, "revision": 9 })
+            .to_string();
+        sm.inject_raw_config(18570, &row);
+        // Held by the engine, named by no row: what a delete the engine missed leaves behind.
+        let stray: ImposterConfig = serde_json::from_value(json!({
+            "port": 18571, "protocol": "http", "host": "127.0.0.1", "stubs": []
+        }))
+        .expect("parses");
+        engine.apply_one(stray).await.expect("stray created");
+
+        reconcile_bounded(&sm).await.expect("reconcile");
+        assert!(
+            engine.get_imposter(18571).is_err(),
+            "the dropped port is deleted"
+        );
+        assert_eq!(
+            engine_stub_ids(&engine, 18570),
+            vec!["old"],
+            "the refused live port is kept"
+        );
+
+        engine.shutdown().await;
+    }
+
+    /// Pins D-102 (#657): a whole-set drive with a refused row keeps that port's sequencing mode —
+    /// the engine still serves its last config there — rather than rebuilding the map from the
+    /// admitted rows alone, which would drop an owner-mode port to local sequencing.
+    #[tokio::test]
+    async fn a_whole_set_drive_keeps_a_refused_ports_sequencing_mode() {
+        use crate::stores::sequencer::{SequencingMode, SequencingRegistry};
+        let engine = Arc::new(ImposterManager::new());
+        let registry = SequencingRegistry::new();
+        let (_td, sm) = fresh_sm(Some(engine.clone())).await;
+        let mut sm = sm.with_sequencing_registry(Arc::clone(&registry));
+        let owner: ImposterConfig = serde_json::from_value(json!({
+            "port": 18580, "protocol": "http", "host": "127.0.0.1", "stubs": [],
+            "_rift": { "sequencing": { "mode": "owner" } },
+        }))
+        .expect("parses");
+        apply_one(&mut sm, 1, put_config(1, owner)).await;
+        assert_eq!(registry.mode(18580), SequencingMode::Owner);
+        let row = json!({ "config": refused_config(18580, "b"), "enabled": true, "revision": 9 })
+            .to_string();
+        sm.inject_raw_config(18580, &row);
+
+        reconcile_bounded(&sm).await.expect("reconcile");
+        assert_eq!(
+            registry.mode(18580),
+            SequencingMode::Owner,
+            "kept with the live imposter"
+        );
+
+        engine.shutdown().await;
+    }
+
+    /// Pins D-102 (#657): the Raft log reads back an entry whose config this engine refuses. Before,
+    /// the read failed — fatal to openraft's core: a node whose last entry held such a config did
+    /// not start, and a leader asked for that range by a joiner lost its core.
+    #[tokio::test]
+    async fn a_log_entry_holding_a_refused_config_reads_back() {
+        use openraft::storage::{RaftLogReader as _, RaftLogStorage as _};
+        let td = TempDir::new().expect("tempdir");
+        let (mut log, _sm) = new(td.path().join("raft.redb")).await.expect("open store");
+        let refused = entry(1, put_config(1, refused_config(18550, "b")));
+        {
+            let write = log.db.begin_write().expect("write txn");
+            {
+                let mut table = write.open_table(super::LOG_TABLE).expect("log table");
+                let bytes = serde_json::to_vec(&refused).expect("encode entry");
+                table.insert(1, bytes.as_slice()).expect("insert");
+            }
+            write.commit().expect("commit");
+        }
+        let read = log
+            .try_get_log_entries(1..2)
+            .await
+            .expect("the entry reads back");
+        assert_eq!(read.len(), 1);
+        let state = log.get_log_state().await.expect("log state");
+        assert_eq!(state.last_log_id.map(|id| id.index), Some(1));
     }
 
     /// Issue #9 slice 3: the node-local intent ledger — park, report, retire.
@@ -7205,8 +7666,8 @@ mod tests {
 
     /// Pins D-100 (#653): a state directory that carries no format row but does carry state —
     /// one a pre-#653 binary wrote, whose `sm_configs` rows hold escaped strings — is refused at
-    /// open, with the remedy in the message. Opening it would otherwise refuse every engine sync
-    /// on a "corrupt record" for the life of the process.
+    /// open, with the remedy in the message. Opening it would otherwise refuse every port's config
+    /// as a "corrupt record" for the life of the process.
     #[tokio::test]
     async fn a_state_dir_without_a_format_row_is_refused_at_open() {
         let td = TempDir::new().expect("tempdir");
