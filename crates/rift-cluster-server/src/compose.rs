@@ -28,7 +28,7 @@ use rift_cluster::{
 use rift_cluster_base::seams::{
     CompiledRoutes, FileSource, HttpSource, ImposterConfig, ImposterManager, OutboundTls,
     RunningFrontDoor, RunningServer, ServerBuilder, SourceRef, SourceRegistry, TlsDefaults,
-    bind_front_door, build_upstream_client, parse_uri_list,
+    bind_front_door, body_limits_from, build_upstream_client, parse_uri_list,
 };
 
 use crate::admin_front::{self, AdminFront, FrontConfig};
@@ -1455,6 +1455,17 @@ fn cluster_manager(
         .then(|| build_upstream_client(&outbound_tls))
         .transpose()?;
 
+    // The body ceiling, the shared body memory budget (upstream #1439) and the per-imposter journal
+    // byte budget (upstream #1441), from the same `--max-body-size` / `--body-memory-budget` /
+    // `--journal-max-bytes` flags and with upstream's own validation, so a budget below the
+    // ceiling is a startup error here too. Mirrored for the same reason as the TLS policy above:
+    // without it a clustered node would run the engine's built-in defaults whatever the operator
+    // set. Upstream's defaults are sized for Mountebank parity, not for a pod; the chart sets
+    // pod-sized values through the flags' `RIFT_*` environment variables (#687).
+    let body_limits = body_limits_from(cli.oss.max_body_size, cli.oss.body_memory_budget)?;
+    let journal_max_bytes = std::num::NonZeroUsize::new(cli.oss.journal_max_bytes)
+        .context("--journal-max-bytes must be at least 1")?;
+
     let manager = ImposterManager::with_datadir(cli.oss.datadir.clone())
         .with_tls_defaults(TlsDefaults {
             default_cert,
@@ -1462,6 +1473,8 @@ fn cluster_manager(
             allow_self_signed: !cli.oss.no_self_signed_tls,
         })
         .with_accept_runtimes(accept_runtimes)
+        .with_body_limits(body_limits)
+        .with_journal_max_bytes(journal_max_bytes)
         .with_response_decorator(Arc::new(ClusterDecorator))
         // RFC-001 §7.4.6 (issue #143): an imposter exists cluster-wide regardless of whether any
         // one node could bind its port, so a node that loses the port to an unrelated process must

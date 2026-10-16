@@ -179,6 +179,15 @@ spec:
               value: "/var/lib/rift/_cluster"
             - name: MB_DATADIR
               value: "/var/lib/rift/data"
+            # Body and journal bounds sized for the 1Gi limit below (#687). The engine's defaults
+            # (512 MiB per body, a 1 GiB shared budget, 768 MiB of journal per imposter) are sized
+            # for Mountebank parity, and the budget alone would fill this pod. Scale with the limit.
+            - name: RIFT_MAX_BODY_SIZE
+              value: "67108864" # 64 MiB
+            - name: RIFT_BODY_MEMORY_BUDGET
+              value: "268435456" # 256 MiB
+            - name: RIFT_JOURNAL_MAX_BYTES
+              value: "67108864" # 64 MiB, per imposter
             - name: RIFT_CLUSTER_SECRET
               valueFrom:
                 secretKeyRef:

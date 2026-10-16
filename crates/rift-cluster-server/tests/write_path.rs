@@ -347,9 +347,71 @@ async fn an_imposter_with_no_rift_block_reads_as_three_inherited_defaults() {
     server.shutdown().await;
 }
 
+/// rift-cluster#692 (upstream #1460): an oversize body on a terminated write route is answered
+/// `413`, and the client actually *reads* it. The front refuses as soon as the declared length is
+/// over its 16 MiB cap, with the body still arriving; an abrupt close with unread bytes in the
+/// socket is a TCP reset, so a client still writing its body saw "connection reset" instead of the
+/// 413. The lingering close drains the tail first.
+///
+/// Raw socket, written the way upstream's own probe (`issue_1460_lingering_close.rs`) writes:
+/// part of the body, a pause long enough for the refusal to be written and the connection closed,
+/// then the rest — and both halves are asserted, the write completing and the read yielding 413.
+#[tokio::test]
+async fn an_oversize_write_body_is_answered_413_not_reset() {
+    let _serial = TEST_LOCK.lock().await;
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    let state = TempDir::new().expect("tempdir");
+    let server = compose::start(cluster_cli(&state, &["--cluster-allow-solo"]))
+        .await
+        .expect("solo cluster starts");
+    wait_ready(&server).await;
+    let admin = server.admin_addr();
+
+    // Over the front's terminated-route cap, well inside the lingering close's 64 MiB drain.
+    const DECLARED: usize = 20 * 1024 * 1024;
+    const FIRST: usize = 256 * 1024;
+    let mut stream = tokio::net::TcpStream::connect(admin)
+        .await
+        .expect("connect to the admin front");
+    let head = format!(
+        "POST /imposters HTTP/1.1\r\nHost: {admin}\r\nContent-Type: application/json\r\n\
+         Content-Length: {DECLARED}\r\n\r\n"
+    );
+    stream
+        .write_all(head.as_bytes())
+        .await
+        .expect("write the head");
+    stream
+        .write_all(&vec![b'x'; FIRST])
+        .await
+        .expect("write the first part of the body");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    stream
+        .write_all(&vec![b'x'; DECLARED - FIRST])
+        .await
+        .expect("writing the rest of the body after the refusal must not be reset");
+    stream.flush().await.expect("flush the body");
+
+    let mut response = Vec::new();
+    tokio::time::timeout(Duration::from_secs(10), stream.read_to_end(&mut response))
+        .await
+        .expect("EOF within the read budget")
+        .expect("reading the 413 must not be reset");
+    let text = String::from_utf8_lossy(&response);
+    assert!(
+        text.starts_with("HTTP/1.1 413"),
+        "expected a 413, got {:?}",
+        text.chars().take(200).collect::<String>()
+    );
+
+    server.shutdown().await;
+}
+
 /// Issue #370 — the security boundary, asserted on a **live** response rather than on the rewriter
 /// in isolation. Upstream's allowlist strips `flowState.redis` because it can carry a credentialed
-/// URL; the EE decoration must not put it back on the way out.
+/// URL; the EE decoration must not put it back on the way out. The engine no longer has a Redis
+/// backend (rift#1337), but the block still decodes — into `RiftFlowStateConfig.extra`, from a
+/// stored config or a client that still sends one — so the boundary still has something to hold.
 #[tokio::test]
 async fn the_imposter_read_never_exposes_the_redis_connection_url() {
     let _serial = TEST_LOCK.lock().await;
@@ -514,13 +576,27 @@ async fn delete_imposter_returns_the_removed_config_and_unbinds() {
         .expect("get after delete");
     assert_eq!(read.status().as_u16(), 404);
 
-    // Deleting it again is a 404 straight from the front — nothing to commit.
+    // Deleting it again answers `200 {}` straight from the front — nothing to commit. Mountebank's
+    // idempotent teardown, which the engine adopted in rift#1371 (#683); it used to be a 404.
     let again = client
         .delete(format!("http://{admin}/imposters/{port}"))
         .send()
         .await
         .expect("delete again");
-    assert_eq!(again.status().as_u16(), 404);
+    assert_eq!(again.status().as_u16(), 200);
+    assert_eq!(
+        again
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok()),
+        Some("application/json; charset=utf-8")
+    );
+    assert!(
+        again.headers().get("rift-cluster-revision").is_none(),
+        "nothing was committed, so there is no revision to name"
+    );
+    let again: serde_json::Value = again.json().await.expect("json");
+    assert_eq!(again, json!({}));
 
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     loop {

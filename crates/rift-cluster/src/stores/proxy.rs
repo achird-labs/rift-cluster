@@ -108,11 +108,12 @@ pub fn proxy_sig_key(port: u16, sig: &RequestSignature) -> String {
     format!("{port}:{}", sig_hash(sig))
 }
 
-/// Hex `xxh64` of the signature's canonical JSON. The signature is strings end to end, so
-/// serialization is order-stable across nodes — the property the hash needs.
+/// Hex `xxh64` of the signature's canonical JSON. The signature is strings, string pairs and two
+/// optional integer hashes (rift#1317's `body_hash`, rift#1333's `predicates_hash`, each omitted
+/// when absent), so serialization is order-stable across nodes — the property the hash needs.
 fn sig_hash(sig: &RequestSignature) -> String {
-    let canonical =
-        serde_json::to_vec(sig).expect("RequestSignature is strings only; serialization is total");
+    let canonical = serde_json::to_vec(sig)
+        .expect("RequestSignature is strings and integers only; serialization is total");
     format!("{:016x}", xxh64(&canonical, 0))
 }
 
@@ -561,13 +562,17 @@ impl ProxyNet {
     }
 }
 
-/// The first proxy response's `mode` in a config — mirroring upstream
-/// `Imposter::extract_proxy_mode` **exactly** (`imposter/core/mod.rs`): lowercased;
-/// unknown, empty and absent all mean transparent; no proxy stub at all means transparent.
-/// Divergence here is a cluster node treating an imposter differently from single-node
-/// rift, which is precisely the fidelity #226's acceptance forbids — a mode-less proxy
-/// stub round-trips as `"mode": ""`, and reading that as anything but transparent would
-/// silently turn a forward-everything proxy into a record-once one.
+/// The first proxy response's `mode` in a config, read the way upstream's `ProxyResponse::mode`
+/// reads it: trimmed and lowercased, and an empty or absent `mode` is `proxyOnce` — Mountebank's
+/// default, and the engine's since rift#1314 (v0.21.0); before that it was transparent, and this
+/// mirrored it (#682). An unknown mode is refused at the engine's admission, so it can only
+/// arrive in a config an older engine committed; it stays transparent here, the answer that
+/// neither gates traffic nor records. No proxy stub at all means transparent. Divergence here is
+/// a cluster node treating an imposter differently from single-node rift, which is precisely the
+/// fidelity #226's acceptance forbids.
+///
+/// Still per *port* — the first proxy stub decides for the whole imposter. Upstream decides per
+/// request since rift#1387 (`try_claim_as`); adopting that is the rest of #682.
 /// Turn a claim-path failure into the refusing form (D-66) and count it.
 ///
 /// Mirrors `stores/flow.rs::unavailable`, with one deliberate difference: the flow store splits
@@ -619,10 +624,10 @@ fn parse_proxy_mode(config_json: &str) -> PortMode {
         .flatten()
         .find_map(|resp| {
             resp.get("proxy")
-                .map(|proxy| proxy["mode"].as_str().unwrap_or("").to_lowercase())
+                .map(|proxy| proxy["mode"].as_str().unwrap_or("").trim().to_lowercase())
         });
     match mode.as_deref() {
-        Some("proxyonce") => PortMode::Once,
+        Some("proxyonce" | "") => PortMode::Once,
         Some("proxyalways") => PortMode::Always,
         _ => PortMode::Transparent,
     }
@@ -1262,10 +1267,10 @@ impl ProxyRecordingStore for ClusterProxyStore {
 mod tests {
     use super::*;
 
-    /// Pins the `extract_proxy_mode` mirror: a mode-less proxy stub round-trips as
-    /// `"mode": ""`, and upstream reads empty, unknown and absent all as transparent.
-    /// Reading any of them as `Once` would turn a forward-everything proxy into a
-    /// record-once one — the exact single-node divergence #226's fidelity gate forbids.
+    /// Pins the mirror of upstream's mode parse: a mode-less proxy stub round-trips as
+    /// `"mode": ""`, and since rift#1314 upstream reads empty and absent as `proxyOnce`
+    /// (Mountebank's default; #682). Reading them as transparent would forward every request a
+    /// single node replays — the single-node divergence #226's fidelity gate forbids.
     #[test]
     fn proxy_mode_parsing_mirrors_upstream_extract_proxy_mode() {
         let with_mode = |mode: &str| {
@@ -1283,7 +1288,11 @@ mod tests {
             parse_proxy_mode(&with_mode("proxyTransparent")),
             PortMode::Transparent
         );
-        assert_eq!(parse_proxy_mode(&with_mode("")), PortMode::Transparent);
+        assert_eq!(parse_proxy_mode(&with_mode("")), PortMode::Once);
+        assert_eq!(
+            parse_proxy_mode(&with_mode(" proxyAlways ")),
+            PortMode::Always
+        );
         assert_eq!(
             parse_proxy_mode(&with_mode("somethingElse")),
             PortMode::Transparent
@@ -1291,7 +1300,7 @@ mod tests {
 
         let mode_less =
             r#"{"port":1,"protocol":"http","stubs":[{"responses":[{"proxy":{"to":"http://u"}}]}]}"#;
-        assert_eq!(parse_proxy_mode(mode_less), PortMode::Transparent);
+        assert_eq!(parse_proxy_mode(mode_less), PortMode::Once);
 
         let no_proxy_stub = r#"{"port":1,"protocol":"http","stubs":[]}"#;
         assert_eq!(parse_proxy_mode(no_proxy_stub), PortMode::Transparent);

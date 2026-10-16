@@ -1297,7 +1297,7 @@ async fn test_rejoin_after_leave_with_retained_state_dir() {
 fn counter(name: &str, label: Option<(&str, &str)>) -> f64 {
     prometheus::gather()
         .into_iter()
-        .find(|family| family.get_name() == name)
+        .find(|family| family.name() == name)
         .and_then(|family| {
             family
                 .get_metric()
@@ -1307,9 +1307,9 @@ fn counter(name: &str, label: Option<(&str, &str)>) -> f64 {
                     Some((key, value)) => metric
                         .get_label()
                         .iter()
-                        .any(|l| l.get_name() == key && l.get_value() == value),
+                        .any(|l| l.name() == key && l.value() == value),
                 })
-                .map(|metric| metric.get_counter().get_value())
+                .map(|metric| metric.get_counter().value())
         })
         .unwrap_or(0.0)
 }

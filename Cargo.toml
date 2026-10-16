@@ -47,7 +47,6 @@ rift-mock-core = { path = "vendor/rift/crates/rift-mock-core" }
 # invariant — a feature default-on in the core reaches nothing through a
 # `default-features = false` consumer unless it is forwarded).
 rift-http-proxy = { path = "vendor/rift/crates/rift-http-proxy", default-features = false, features = [
-    "redis-backend",
     "javascript",
     "quamina-matching",
 ] }
@@ -147,9 +146,9 @@ redb = "4"
 # Stable, fast hash for rendezvous (HRW) ownership — must be identical across
 # nodes and versions, so a fixed algorithm (not the std default hasher) is used.
 xxhash-rust = { version = "0.8", features = ["xxh64"] }
-# Must stay semver-compatible with the version rift-mock-core declares (0.13):
+# Must stay semver-compatible with the version rift-mock-core declares (0.14 since rift v0.22.0):
 # `collect_metrics` serves `prometheus::gather()`, the crate's *global default*
 # registry, so a second incompatible copy of this crate would give the cluster
 # metrics their own registry and they would never appear on /metrics.
-prometheus = "0.13"
+prometheus = "0.14"
 lazy_static = "1"

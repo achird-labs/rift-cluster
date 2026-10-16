@@ -124,8 +124,8 @@ fn is_not_ready(reason: &str) -> bool {
 /// The store-face error for a failure caused by the cluster's *state* (D-65):
 /// the D-17 isolation refusal, an owner that could not be reached, a shed
 /// bridge, a node that is not ready. It carries [`BackendUnavailable`], the
-/// one type upstream's `backend_error_response` keys a 503 on (#318) — the
-/// same type `rift-store-redis` attaches to every Redis outage. A fault in the
+/// one type upstream's `backend_error_response` keys a 503 on (#318), and the
+/// one a provider-supplied store is meant to attach to a store outage. A fault in the
 /// request or in this node stays a plain error and answers 500, because a
 /// retry cannot help it.
 fn unavailable(detail: impl Into<String>) -> anyhow::Error {

@@ -154,6 +154,13 @@ spec:
                   name: {{ . }}
                   key: {{ include "rift-cluster.adminApiKeySecretKey" $ }}
             {{- end }}
+            # Pod-sized body and journal bounds; see `limits` in values.yaml (#687).
+            - name: RIFT_MAX_BODY_SIZE
+              value: {{ .Values.limits.maxBodyBytes | int64 | quote }}
+            - name: RIFT_BODY_MEMORY_BUDGET
+              value: {{ .Values.limits.bodyMemoryBudgetBytes | int64 | quote }}
+            - name: RIFT_JOURNAL_MAX_BYTES
+              value: {{ .Values.limits.journalMaxBytes | int64 | quote }}
             {{- with .Values.sources.imposters }}
             - name: RIFT_IMPOSTERS
               value: {{ . | quote }}

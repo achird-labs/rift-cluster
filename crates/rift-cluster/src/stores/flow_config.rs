@@ -264,8 +264,10 @@ impl KnobSource {
 
 /// The three per-imposter `_rift` knobs the admin imposter read publishes (#370).
 ///
-/// Upstream's `expose_flow_state` is an allowlist — `backend`, `ttlSeconds` and `flowIdSource`
-/// only — because `flowState.redis` can carry a credentialed connection URL. `durability` and
+/// Upstream's `expose_flow_state` is an allowlist — `ttlSeconds` and `flowIdSource` only — because
+/// `flowState` can carry a credentialed connection URL: a `redis` block written before rift#1337
+/// removed the Redis backend still decodes, into the `extra` passthrough, from stored bytes and
+/// from a client that sends one. `durability` and
 /// `readConsistency` therefore never reach a client by passthrough, and this is what the EE front
 /// decorates the read with instead.
 ///

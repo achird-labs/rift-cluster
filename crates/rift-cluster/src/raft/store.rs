@@ -4108,9 +4108,31 @@ mod tests {
             "port": port,
             "protocol": "http",
             "host": "127.0.0.1",
-            "stubs": stubs,
+            "stubs": with_responses(stubs),
         }))
         .expect("test config parses")
+    }
+
+    /// Give every fixture stub that names no `responses` a minimal one. The engine refuses a
+    /// response-less stub at admission since rift#1372, so a fixture written as `{ "id": "a" }`
+    /// for brevity would no longer parse; what these tests care about is the stub's identity and
+    /// position, not what it answers. A fixture that sets `responses` keeps its own.
+    fn with_responses(mut stubs: serde_json::Value) -> serde_json::Value {
+        if let Some(list) = stubs.as_array_mut() {
+            for stub in list {
+                if let Some(obj) = stub.as_object_mut() {
+                    obj.entry("responses")
+                        .or_insert_with(|| json!([{ "is": {} }]));
+                }
+            }
+        }
+        stubs
+    }
+
+    /// One fixture stub, through the same admission parse and [`with_responses`] default.
+    fn test_stub(stub: serde_json::Value) -> rift_cluster_base::seams::Stub {
+        let mut list = with_responses(json!([stub]));
+        serde_json::from_value(list[0].take()).expect("test stub parses")
     }
 
     fn put(op_id: u128, port: u16, stubs: serde_json::Value) -> ControlRequest {
@@ -4267,7 +4289,7 @@ mod tests {
                 ControlOp::PatchStubs {
                     port: 8080,
                     edit: StubEditScript(vec![StubEdit::Add {
-                        stub: serde_json::from_value(json!({ "id": "a" })).expect("parses"),
+                        stub: test_stub(json!({ "id": "a" })),
                         index: None,
                     }]),
                 },
@@ -4502,9 +4524,12 @@ mod tests {
     /// and whatever order its JSON keys arrived in. The expected key is literal on purpose — a
     /// future change to the engine's content hash restarts every keyless cluster cursor once,
     /// so it must fail here and be recorded, not slip in with a pin bump (#655).
+    ///
+    /// Recorded moves: `~d29d8fa0b36e0ffc#0` until rift v0.22.0, whose rift#1369 prints and
+    /// hashes an `is` response as written (#684, D-98's v0.22.0 note).
     #[tokio::test]
     async fn a_committed_stub_keys_the_same_on_every_parse() {
-        const KEY: &str = "~d29d8fa0b36e0ffc#0";
+        const KEY: &str = "~e68c13ff24697700#0";
         let (_td, mut sm) = fresh_sm(None).await;
         apply_one(&mut sm, 1, put(1, 18690, json!([multi_key_stub("A")]))).await;
         let row = sm.read_config(18690).expect("read").expect("committed");
@@ -5252,7 +5277,7 @@ mod tests {
                 ControlOp::PatchStubs {
                     port: 4444,
                     edit: StubEditScript(vec![StubEdit::Add {
-                        stub: serde_json::from_value(json!({ "id": "a" })).expect("parses"),
+                        stub: test_stub(json!({ "id": "a" })),
                         index: None,
                     }]),
                 },
@@ -5501,7 +5526,7 @@ mod tests {
                 ControlOp::PatchStubs {
                     port,
                     edit: StubEditScript(vec![StubEdit::Add {
-                        stub: serde_json::from_value(json!({ "id": "b" })).expect("parses"),
+                        stub: test_stub(json!({ "id": "b" })),
                         index: None,
                     }]),
                 },
@@ -5817,6 +5842,51 @@ mod tests {
         engine.shutdown().await;
     }
 
+    /// rift-cluster#685: rift#1372 refuses a stub with no `responses` at admission, and engines up
+    /// to v0.21.0 admitted one. Such a stub can therefore already be in the log. Replay still
+    /// decodes it (the refusal is an admission check, not a decode refusal), and D-102 refuses
+    /// that one port at the drive with the engine's reason, without wedging the drive: the ports
+    /// around it are served and a later put is served.
+    #[tokio::test]
+    async fn a_committed_response_less_stub_refuses_only_its_own_port() {
+        let engine = Arc::new(ImposterManager::new());
+        let (_td, mut sm) = fresh_sm(Some(engine.clone())).await;
+        apply_one(&mut sm, 1, put(1, 18505, json!([{ "id": "a" }]))).await;
+
+        let body = json!({
+            "port": 18506,
+            "protocol": "http",
+            "host": "127.0.0.1",
+            "stubs": [{ "id": "b", "predicates": [{ "equals": { "path": "/x" } }] }],
+        })
+        .to_string();
+        assert!(
+            serde_json::from_str::<ImposterConfig>(&body).is_err(),
+            "precondition: this engine's door refuses a response-less stub"
+        );
+        let committed =
+            crate::control::decode_committed_config(&body).expect("replay still decodes it");
+        let applied = apply_one(&mut sm, 2, put_config(2, committed)).await;
+        assert_eq!(applied, ControlResponse::applied(2), "the log commits it");
+
+        assert!(engine.get_imposter(18505).is_ok());
+        assert!(
+            engine.get_imposter(18506).is_err(),
+            "the refused config is not served"
+        );
+        let reason = sm.config_refusal(18506).expect("read").expect("refused");
+        assert!(
+            reason.contains("'responses' must be a non-empty array"),
+            "the engine's own reason: {reason}"
+        );
+
+        apply_one(&mut sm, 3, put(3, 18507, json!([{ "id": "c" }]))).await;
+        assert!(engine.get_imposter(18507).is_ok(), "a later put is served");
+        assert!(sm.apply_failures().is_empty(), "{:?}", sm.apply_failures());
+
+        engine.shutdown().await;
+    }
+
     /// Pins D-102 (#657): a refused config committed over a live imposter does not tear it down —
     /// the port keeps serving its last-known config, the invariant the whole-set refusal existed
     /// for — while the table records what the fleet committed.
@@ -5871,7 +5941,7 @@ mod tests {
                 ControlOp::PatchStubs {
                     port: 18520,
                     edit: StubEditScript(vec![StubEdit::Add {
-                        stub: serde_json::from_value(json!({ "id": "z" })).expect("parses"),
+                        stub: test_stub(json!({ "id": "z" })),
                         index: None,
                     }]),
                 },
@@ -6542,7 +6612,7 @@ mod tests {
         std::fs::remove_dir_all(&datadir).expect("remove datadir");
         std::fs::write(&datadir, b"not a directory").expect("squat the datadir");
         let add = |id: &str| StubEdit::Add {
-            stub: serde_json::from_value(json!({ "id": id })).expect("parses"),
+            stub: test_stub(json!({ "id": id })),
             index: None,
         };
         apply_one(
@@ -6674,7 +6744,7 @@ mod tests {
         let add = |id: &str| ControlOp::PatchStubs {
             port: 8080,
             edit: StubEditScript(vec![StubEdit::Add {
-                stub: serde_json::from_value(json!({ "id": id })).expect("parses"),
+                stub: test_stub(json!({ "id": id })),
                 index: None,
             }]),
         };
@@ -7539,7 +7609,7 @@ mod tests {
                 ControlOp::PatchStubs {
                     port: 19_301,
                     edit: StubEditScript(vec![StubEdit::Add {
-                        stub: serde_json::from_value(json!({ "id": "b" })).expect("parses"),
+                        stub: test_stub(json!({ "id": "b" })),
                         index: None,
                     }]),
                 },

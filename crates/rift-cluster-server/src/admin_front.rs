@@ -83,10 +83,10 @@ use rift_cluster::{
     RaftNode, SESSION_KEY_BYTES, SessionKey,
 };
 use rift_cluster_base::seams::{
-    ErrorKind, FaultCell, FaultIo, ImposterConfig, RiftScriptConfig, RouteTable, ScriptBaseDir,
-    Stub, apply_tcp_fault, classify as classify_upstream, config_uses_script_surface,
-    error_response_typed, is_injected_fault, not_a_stub_reason, resolve_scripts,
-    resolve_stub_scripts, tcp_fault_carrier, validate_stub, validate_stubs,
+    ErrorKind, FaultCell, FaultIo, ImposterConfig, LingerOnClose, RiftScriptConfig, RouteTable,
+    ScriptBaseDir, Stub, apply_tcp_fault, arm_linger_if_requested, classify as classify_upstream,
+    config_uses_script_surface, error_response_typed, is_injected_fault, not_a_stub_reason,
+    resolve_scripts, resolve_stub_scripts, tcp_fault_carrier, validate_stub, validate_stubs,
 };
 // The compiler crate (RFC-004 §3.1–§3.3): `POST /specs/compile` runs it on the accepting node and
 // hands the result straight back, storing nothing (D-72, #549). `serde_json::Value` stays
@@ -386,7 +386,16 @@ pub async fn bind(config: FrontConfig, node: &Arc<RaftNode>) -> std::io::Result<
                         // arms the cell and is handed back for `FaultIo` to trip on its write;
                         // the `Err` (an HTTP/2 stream reset) cannot arise here.
                         let version = req.version();
-                        apply_tcp_fault(handle(state, req).await, version, &fault_cell)
+                        let response =
+                            apply_tcp_fault(handle(state, req).await, version, &fault_cell);
+                        // A body refusal — this front's own 413s, or the engine's 413/503 on the
+                        // in-process gateway leg — closes after a bounded drain of the unread
+                        // request (upstream #1460), so the client reads the refusal instead of a
+                        // reset. Inert for every response without `LingerOnClose`.
+                        if let Ok(response) = &response {
+                            arm_linger_if_requested(response, version, &fault_cell);
+                        }
+                        response
                     }
                 });
                 if let Err(e) = hyper::server::conn::http1::Builder::new()
@@ -3903,10 +3912,15 @@ async fn build_mutation(
             let (status, content_type, captured) =
                 fetch(state, &format!("/imposters/{port}"), host).await?;
             if status == StatusCode::NOT_FOUND {
-                // Mirror upstream: deleting an absent imposter is a 404, and
-                // committing nothing keeps the log free of no-ops.
+                // Mirror upstream: deleting an absent imposter is idempotent, `200` with `{}`
+                // (Mountebank's teardown, rift#1371), and committing nothing keeps the log free
+                // of no-ops.
                 return Err(
-                    match buffered_response(StatusCode::NOT_FOUND, captured, content_type) {
+                    match buffered_response(
+                        StatusCode::OK,
+                        Bytes::from_static(b"{}"),
+                        Some(HeaderValue::from_static("application/json; charset=utf-8")),
+                    ) {
                         Ok(response) | Err(response) => response,
                     },
                 );
@@ -4617,8 +4631,20 @@ fn stub_index_missing(index: usize) -> Response<FrontBody> {
 }
 
 fn typed_error(status: StatusCode, kind: ErrorKind, message: &str) -> Response<FrontBody> {
-    error_response_typed(status, kind, message)
-        .map(|body| body.map_err(|never| match never {}).boxed())
+    let mut response = error_response_typed(status, kind, message)
+        .map(|body| body.map_err(|never| match never {}).boxed());
+    // Every 413 here refuses a body this front stopped reading, so the connection cannot be
+    // reused and must close — and an abrupt close with unread request bytes in the socket is a
+    // TCP reset, which loses the 413 itself on a large share of HTTP/1 requests. Upstream's own
+    // body refusals do the same (`BodyError::TooLarge`, #1460): `Connection: close` plus the
+    // marker `bind` turns into a bounded lingering close.
+    if status == StatusCode::PAYLOAD_TOO_LARGE {
+        response
+            .headers_mut()
+            .insert(hyper::header::CONNECTION, HeaderValue::from_static("close"));
+        response.extensions_mut().insert(LingerOnClose);
+    }
+    response
 }
 
 fn internal(message: &str) -> Response<FrontBody> {
@@ -5176,7 +5202,9 @@ mod tests {
     /// the *stored* config rather than the parsed knobs would undo that redaction from the EE side —
     /// so this asserts the boundary holds through EE's addition, both when upstream has already
     /// stripped `redis` and in the belt-and-braces case where a `redis` block is present in the body
-    /// being decorated.
+    /// being decorated. Still live after rift#1337 removed the Redis backend: a leftover `redis`
+    /// block decodes into the `flowState` `extra` passthrough, which is exactly where the
+    /// cluster's own knobs are read from.
     #[test]
     fn the_redis_block_is_never_exposed_by_the_decoration() {
         let config = serde_json::from_value(serde_json::json!({
@@ -5192,7 +5220,7 @@ mod tests {
         let knobs = ResolvedKnobs::from_imposter(&config).expect("valid");
 
         // Upstream's allowlist has already stripped `redis` from what it answered.
-        let body = br#"{"port":4545,"_rift":{"flowState":{"backend":"redis","ttlSeconds":300}}}"#;
+        let body = br#"{"port":4545,"_rift":{"flowState":{"ttlSeconds":300}}}"#;
         let out = rewrite_flow_state_resolved(body, &knobs).expect("decorates");
         let text = String::from_utf8(out).expect("utf-8");
 

@@ -89,27 +89,12 @@ const CLUSTER_ADDITIONS: &[&str] = &[
 /// without an upstream default, and it must carry the reason. Entries are
 /// checked for staleness — see `declined_entries_are_still_real`.
 const INTENTIONALLY_NOT_MIRRORED: &[&str] = &[
-    // The named `_rift.flowState.backend` registry — `"redis"` and anything
-    // else a build serves beyond `"inmemory"` (upstream #853, which moved the
-    // Redis store into the opt-in `rift-store-redis` crate).
-    //
-    // Declined because under `--cluster` the registry is unreachable by
-    // construction, not merely unused: `with_flow_store_provider` is consulted
-    // *before* the built-in `flowState` selection, and
-    // `ClusteredFlowStoreProvider::provide` returns `Some` for every imposter
-    // unconditionally (issue #120 — a process-local store is wrong for every
-    // imposter behind a round-robin LB, not just the configured ones). Nothing
-    // clustered ever reaches the backend lookup, so registering backends here
-    // would be configuration that cannot be consulted — and worse, it would
-    // imply `backend: "redis"` is honoured clustered when it categorically is
-    // not.
-    //
-    // What an operator actually sees, unchanged by this bump: clustered,
-    // `FlowConfig` reads only `readConsistency`/`durability`/`ttlSeconds` and
-    // ignores `backend`, so a config naming `"redis"` is admitted and served by
-    // the clustered store. Un-clustered, upstream's own construction runs and
-    // `"redis"` resolves through the registry exactly as before.
-    "with_flow_store_backends",
+    // Empty since rift#1463 removed `with_flow_store_backends` and the named
+    // `_rift.flowState.backend` registry it fed (#688), which was the only
+    // waiver. `FlowStoreProvider` is now upstream's sole flow-store seam, and
+    // the clustered path already installs it (`with_flow_store_provider`). A
+    // leftover `backend` key — `"redis"` included — decodes into
+    // `RiftFlowStateConfig.extra` and selects nothing, on either path.
 ];
 
 const UPSTREAM_SERVER_RS: &str = "vendor/rift/crates/rift-http-proxy/src/server.rs";

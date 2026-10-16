@@ -436,7 +436,6 @@ def ledger_api() -> dict:
         "recordRequests": True,
         "_rift": {
             "flowState": {
-                "backend": "inmemory",
                 "ttlSeconds": 600,
                 "flowIdSource": "header:X-Flow-Id",
             }

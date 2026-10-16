@@ -303,8 +303,9 @@ paths:
       summary: Delete one imposter
       description: >
         Terminates: mirrors upstream's own semantics — deleting an absent
-        imposter answers `404` and commits nothing (keeps the log free of
-        no-ops).
+        imposter is idempotent, answering `200` with `{}` as Mountebank does
+        (rift#1371), and commits nothing (keeps the log free of no-ops), so
+        that answer carries no `Rift-Cluster-*` headers.
       tags: [imposters]
       x-rift-origin: ee
       parameters:
@@ -313,7 +314,9 @@ paths:
         - $ref: '#/components/parameters/CsrfHeader'
       responses:
         '200':
-          description: The deleted imposter, as it was just before removal.
+          description: >
+            The deleted imposter, as it was just before removal; or `{}`, with
+            no `Rift-Cluster-*` headers, when the port held no imposter.
           headers:
             Rift-Cluster-Revision:
               $ref: '#/components/headers/RiftClusterRevision'
@@ -322,20 +325,16 @@ paths:
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/Imposter'
+                oneOf:
+                  - $ref: '#/components/schemas/Imposter'
+                  - type: object
+                    maxProperties: 0
         '202':
           $ref: '#/components/responses/AcceptedParked'
         '401':
           $ref: '#/components/responses/Unauthorized'
         '403':
           $ref: '#/components/responses/Forbidden'
-        '404':
-          description: >
-            No such imposter on this port.
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/Error'
         '409':
           $ref: '#/components/responses/RevisionConflict'
         '500':
@@ -2255,8 +2254,9 @@ paths:
       description: >
         Terminates: idempotent at the state-machine level, but the admin
         surface still answers `404` for a route id that was never in the
-        table (captured before the delete commits,
-        the same shape as `deleteImposter`). A delete mutates the table, so
+        table (captured before the delete commits). `deleteImposter` no longer
+        shares that shape: since rift#1371 an absent imposter answers `200 {}`.
+        A delete mutates the table, so
         it advances the table's revision and invalidates any outstanding
         `If-Match` against it.
       tags: [front-door]

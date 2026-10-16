@@ -225,24 +225,24 @@ fn assert_backend_unavailable(err: &anyhow::Error, what: &str) {
 fn gauge(name: &str) -> u64 {
     prometheus::gather()
         .into_iter()
-        .filter(|family| family.get_name() == name)
+        .filter(|family| family.name() == name)
         .flat_map(|family| family.get_metric().to_owned())
-        .map(|metric| metric.get_gauge().get_value() as u64)
+        .map(|metric| metric.get_gauge().value() as u64)
         .sum()
 }
 
 fn counter(name: &str, label: (&str, &str)) -> u64 {
     prometheus::gather()
         .into_iter()
-        .filter(|family| family.get_name() == name)
+        .filter(|family| family.name() == name)
         .flat_map(|family| family.get_metric().to_owned())
         .find(|metric| {
             metric
                 .get_label()
                 .iter()
-                .any(|l| l.get_name() == label.0 && l.get_value() == label.1)
+                .any(|l| l.name() == label.0 && l.value() == label.1)
         })
-        .map_or(0, |metric| metric.get_counter().get_value() as u64)
+        .map_or(0, |metric| metric.get_counter().value() as u64)
 }
 
 /// The heart of Gap C: a write made through one node is observed by a `strong`
