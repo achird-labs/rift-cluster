@@ -134,7 +134,7 @@ jobs:
       # tool and runs the check.
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: nightly-2026-07-01
+          toolchain: nightly-2026-08-01
 
       - uses: Swatinem/rust-cache@v2
 
