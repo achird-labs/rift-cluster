@@ -217,15 +217,15 @@ fn sig(path: &str) -> RequestSignature {
 fn counter(name: &str, label: (&str, &str)) -> u64 {
     prometheus::gather()
         .into_iter()
-        .filter(|family| family.get_name() == name)
+        .filter(|family| family.name() == name)
         .flat_map(|family| family.get_metric().to_owned())
         .find(|metric| {
             metric
                 .get_label()
                 .iter()
-                .any(|l| l.get_name() == label.0 && l.get_value() == label.1)
+                .any(|l| l.name() == label.0 && l.value() == label.1)
         })
-        .map_or(0, |metric| metric.get_counter().get_value() as u64)
+        .map_or(0, |metric| metric.get_counter().value() as u64)
 }
 
 fn resp(body: &str) -> RecordedResponse {
@@ -502,9 +502,9 @@ async fn concurrent_first_hits_record_exactly_once_fleet_wide() {
     );
     let recordings = prometheus::gather()
         .into_iter()
-        .filter(|family| family.get_name() == "rift_cluster_proxy_recordings_total")
+        .filter(|family| family.name() == "rift_cluster_proxy_recordings_total")
         .flat_map(|family| family.get_metric().to_owned())
-        .map(|metric| metric.get_counter().get_value() as u64)
+        .map(|metric| metric.get_counter().value() as u64)
         .sum::<u64>();
     assert!(recordings >= 1, "the recordings counter moved");
 }

@@ -53,6 +53,15 @@
         "className": { "type": "string" },
         "size": { "type": "string", "minLength": 1 }
       }
+    },
+    "limits": {
+      "type": "object",
+      "required": ["maxBodyBytes", "bodyMemoryBudgetBytes", "journalMaxBytes"],
+      "properties": {
+        "maxBodyBytes": { "type": "integer", "minimum": 1 },
+        "bodyMemoryBudgetBytes": { "type": "integer", "minimum": 0 },
+        "journalMaxBytes": { "type": "integer", "minimum": 1 }
+      }
     }
   }
 }

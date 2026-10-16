@@ -776,10 +776,12 @@ mod tests {
             .expect("minimal config parses")
     }
 
+    /// A minimal stub. It carries a response because the engine refuses a response-less stub at
+    /// admission since rift#1372; these tests are about ids and positions, not answers.
     fn stub(id: Option<&str>) -> Stub {
-        let mut v = json!({});
+        let mut v = json!({ "responses": [{ "is": {} }] });
         if let Some(id) = id {
-            v = json!({ "id": id });
+            v["id"] = json!(id);
         }
         serde_json::from_value(v).expect("minimal stub parses")
     }
@@ -1032,7 +1034,10 @@ mod tests {
             config: serde_json::from_value(json!({
                 "port": 1,
                 "protocol": "http",
-                "stubs": [ { "id": "a" }, { "id": "a" } ],
+                "stubs": [
+                    { "id": "a", "responses": [{ "is": {} }] },
+                    { "id": "a", "responses": [{ "is": {} }] },
+                ],
             }))
             .expect("parses"),
         };
@@ -1172,6 +1177,7 @@ mod tests {
         let replacement: Stub = serde_json::from_value(json!({
             "id": "renamed-away",
             "routePattern": "/users/:id",
+            "responses": [{ "is": {} }],
         }))
         .expect("parses");
         apply_edit(

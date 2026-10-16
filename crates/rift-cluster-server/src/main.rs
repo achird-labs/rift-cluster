@@ -8,7 +8,7 @@
 use anyhow::Context as _;
 use clap::Parser as _;
 use rift_cluster_base::rift_http_proxy::bootstrap::log_filter;
-use rift_cluster_base::rift_http_proxy::{healthcheck, runtime, script_cli};
+use rift_cluster_base::rift_http_proxy::{healthcheck, intercept_ca_cli, runtime, script_cli};
 use rift_cluster_base::seams::Commands;
 use rift_cluster_server::bootstrap;
 use rift_cluster_server::cli::EeCli;
@@ -31,8 +31,14 @@ fn main() -> anyhow::Result<()> {
     // `script` is a self-contained program that wants only its own exit code,
     // and reads no host or port, so it runs ahead of everything — including the
     // rcfile. (Upstream's order, step for step.)
+    // `--no-parse` is the global flag since upstream #1316.
     if let Some(Commands::Script { action }) = cli.oss.command.clone() {
-        return script_cli::dispatch(action);
+        return script_cli::dispatch(action, cli.oss.no_parse);
+    }
+    // Likewise `intercept-ca` (upstream #1274): offline file work, nothing to
+    // bootstrap, and `dispatch` exits the process itself.
+    if let Some(Commands::InterceptCa { action }) = cli.oss.command.clone() {
+        intercept_ca_cli::dispatch(action);
     }
 
     // The rcfile comes next: before `healthcheck`, and before tracing.

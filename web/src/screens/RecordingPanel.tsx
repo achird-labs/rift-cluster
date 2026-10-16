@@ -29,9 +29,9 @@ import {
   numberAt,
   proxyStubFor,
   recordAt,
+  recordedRequestField,
   recordingState,
   responseFields,
-  stringAt,
 } from "../features/recording/state.ts";
 
 type Imposter = components["schemas"]["Imposter"];
@@ -329,9 +329,8 @@ function RecordedSection({
  * reviewing a different document from the one that gets promoted.
  */
 function RecordedRow({ stub, index }: { stub: Stub; index: number }): ReactNode {
-  const equals = recordAt(stub.predicates?.[0], "equals");
-  const method = stringAt(equals, "method");
-  const path = stringAt(equals, "path");
+  const method = recordedRequestField(stub.predicates, "method");
+  const path = recordedRequestField(stub.predicates, "path");
 
   // Read through `responseFields`, which unwraps `{ is: … }` when the projection used the wrapped
   // form. Reading only the flat form renders a wrapped capture as a blank row with an unknown

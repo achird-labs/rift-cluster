@@ -216,6 +216,27 @@ describe("the review table", () => {
     expect(body.textContent).not.toContain('"is"');
   });
 
+  it("reads method and path from per-field predicates, as rift >= 0.21 records them", async () => {
+    /*
+     * rift #1329: a generator records one predicate per matched field (`deepEquals` for a whole
+     * field, with `caseSensitive` beside it when the generator sets it) instead of one `equals`
+     * over all of them. Reading only `predicates[0].equals` rendered the route as unknown.
+     */
+    const perField: Stub = {
+      predicates: [
+        { deepEquals: { method: "GET" }, caseSensitive: false },
+        { deepEquals: { path: "/orders/42" }, caseSensitive: false },
+      ],
+      responses: [{ statusCode: 200, body: '{"id":42}' }],
+    };
+    stubFetch(routes([PROXY_STUB], { recorded: [perField] }));
+    renderInApp(<ImposterDetail port={4545} />);
+
+    const row = await screen.findByTestId("recorded-row-0");
+    expect(row.textContent).toMatch(/GET/);
+    expect(row.textContent).toContain("/orders/42");
+  });
+
   it("renders a wrapped-form recorded response too, and promotes it unchanged", async () => {
     /*
      * The projection emits **either** form. The flat case is above; this is the canonical

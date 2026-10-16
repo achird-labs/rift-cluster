@@ -309,7 +309,11 @@ For customers whose requirements exceed AP-with-bounded-windows — strict
 sequencing, zero adoption staleness — the same seams accept **Redis-backed
 implementations** (cluster, Phases 4–5; D-12, none built yet): the external
 store becomes the single writer and the windows above collapse to Redis's own
-guarantees. Exactly-once proxy recording no longer needs this hatch: it shipped
+guarantees. The engine no longer ships one either: rift v0.22.0 removed its Redis
+backend (rift#1337) and the named `flowState.backend` registry (rift#1463), so
+`FlowStoreProvider` is the only way any store, external or not, reaches an imposter.
+A leftover `backend: "redis"` key selects nothing on a standalone engine or here; D-47
+stands. Exactly-once proxy recording no longer needs this hatch: it shipped
 cluster-native on consensus (the last section of this chapter, #226). Zero-dependency by default,
 external store by choice; the trait boundary makes the swap invisible to
 imposter configs.

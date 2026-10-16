@@ -346,7 +346,7 @@ mod tests {
     fn gauge_from_registry(name: &str, label: Option<(&str, &str)>) -> Option<f64> {
         prometheus::gather()
             .into_iter()
-            .find(|family| family.get_name() == name)?
+            .find(|family| family.name() == name)?
             .get_metric()
             .iter()
             .find(|metric| match label {
@@ -354,9 +354,9 @@ mod tests {
                 Some((key, value)) => metric
                     .get_label()
                     .iter()
-                    .any(|l| l.get_name() == key && l.get_value() == value),
+                    .any(|l| l.name() == key && l.value() == value),
             })
-            .map(|metric| metric.get_gauge().get_value())
+            .map(|metric| metric.get_gauge().value())
     }
 
     /// Every family the chaos tier and the in-process tests read reaches the
@@ -386,7 +386,7 @@ mod tests {
 
         let families: std::collections::HashSet<String> = prometheus::gather()
             .into_iter()
-            .map(|f| f.get_name().to_owned())
+            .map(|f| f.name().to_owned())
             .collect();
         for name in [
             "rift_cluster_config_revision",

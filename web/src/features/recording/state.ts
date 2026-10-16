@@ -114,6 +114,33 @@ export function proxyStubFor(form: ProxyStubForm): Stub {
   };
 }
 
+/** The operators a predicate generator records a matched field's captured value under. */
+const RECORDED_VALUE_OPERATORS = ["deepEquals", "equals"] as const;
+
+/**
+ * A recorded request's `method` or `path`, whichever shape its predicates were recorded in.
+ *
+ * Since rift 0.21.0 (#1329) a generator records **one predicate per matched field**, as Mountebank
+ * does — `[{ deepEquals: { method: "GET" } }, { deepEquals: { path: "/x" } }]`, each possibly
+ * carrying `caseSensitive`/`except` beside the operator. Older engines recorded **one `equals` over
+ * all fields** — `[{ equals: { method: "GET", path: "/x" } }]` — and stored configs replay, so both
+ * shapes can reach the review table. The first predicate holding the field wins.
+ *
+ * Reading only, like `responseFields`: promote sends the predicates back exactly as they arrived.
+ */
+export function recordedRequestField(
+  predicates: readonly unknown[] | undefined,
+  field: "method" | "path",
+): string | undefined {
+  for (const predicate of predicates ?? []) {
+    for (const operator of RECORDED_VALUE_OPERATORS) {
+      const value = stringAt(recordAt(predicate, operator), field);
+      if (value !== undefined) return value;
+    }
+  }
+  return undefined;
+}
+
 /**
  * The fields of a recorded response, whichever form it arrived in.
  *

@@ -24,3 +24,9 @@ resources:
     memory: 512Mi
   limits:
     memory: 2Gi
+
+# Scaled with the 2Gi limit above; see `limits` in values.yaml.
+limits:
+  maxBodyBytes: 134217728        # 128 MiB
+  bodyMemoryBudgetBytes: 536870912  # 512 MiB
+  journalMaxBytes: 134217728     # 128 MiB

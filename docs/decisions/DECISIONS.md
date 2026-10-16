@@ -4523,6 +4523,15 @@ holds only for a delta that is additive in all three. The pin-bump PR says which
 three counts: #1259 changes keys (#1265 only caches the same hash), #1261/#1263 change JSONPath and
 XPath matching, #1262 changes admission.
 
+*The rift v0.22.0 bump* (`6a6abf9`→`64cee15`, rift-cluster#688) is whole-fleet on all three counts
+too. **Keys:** rift#1369 hashes an `is` response as written, which moves the pinned key in
+`a_committed_stub_keys_the_same_on_every_parse` (recorded there), and rift#1317 adds a body hash to
+the proxy claim key of a request recorded without `predicateGenerators`. **Matching:** among others rift#1365, #1403, #1408, #1455 and #1478.
+**Admission:** rift#1372 refuses a stub with no `responses`, which every earlier engine admitted, so
+such a stub can already be in a log. Replay still decodes it, and D-102 refuses only its port at the
+drive (`a_committed_response_less_stub_refuses_only_its_own_port`, #685). rift#1314, #1353 and #1413
+add refusals too. `docs/architecture/10-operations.md` lists them for operators.
+
 **Why documentation, not a mechanism.** Cluster cursors live in memory on their owner (D-8), so
 the restart an upgrade needs resets them whatever their keys are; there is nothing to migrate. In a
 mixed-version window, old and new nodes key a keyless stub differently, so an owner-mode stub can

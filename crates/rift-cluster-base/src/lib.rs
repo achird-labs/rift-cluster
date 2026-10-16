@@ -25,12 +25,12 @@ pub mod seams {
     /// Flow / scenario state: keyed KV with compare-and-set, plus the provider
     /// hook that lets an embedder supply the store per imposter.
     ///
-    /// U-1's compare-and-set is implemented by upstream's own
-    /// `rift-store-redis::RedisFlowStore` as well as by the cluster's stores:
-    /// by decision D-6 the existing Redis backend, CAS included, stays upstream
-    /// and nothing Redis-shaped is withheld on this side of the facade. The
-    /// cluster's implementations of these traits are its own (redb-backed,
-    /// D-16) — none of them is Redis.
+    /// U-1's compare-and-set is implemented by upstream's in-memory store and by
+    /// the cluster's stores. Upstream removed its Redis backend
+    /// (`rift-store-redis`) in v0.22.0 (rift#1337), and with it the named
+    /// `flowState.backend` registry (rift#1463): `FlowStoreProvider` is now the
+    /// only flow-store seam. The cluster's implementations of these traits are
+    /// its own (redb-backed, D-16).
     pub use rift_mock_core::extensions::flow_state::{
         CasOutcome, FlowStore, FlowStoreProvider, NoOpFlowStore,
     };
@@ -46,7 +46,7 @@ pub mod seams {
     /// Recorded-request storage backing `savedRequests` and `numberOfRequests`,
     /// including the cursor read used by the `since=` API and the SSE streams.
     pub use rift_mock_core::imposter::journal::{
-        JournalEntry, JournalRead, JournalReadSince, LocalJournal, MAX_RECORDED_REQUESTS,
+        DEFAULT_JOURNAL_MAX_BYTES, JournalEntry, JournalRead, JournalReadSince, LocalJournal,
         RequestJournal,
     };
 
@@ -256,8 +256,16 @@ pub mod seams {
     /// the write; HTTP/2 returns [`InjectedFault`], which resets that one stream.
     /// [`is_injected_fault`] tells such a connection end from a real error, so it can be logged
     /// below `error!`.
+    ///
+    /// The same cell also closes a body refusal cleanly (upstream #1460): a `413`/`503` that
+    /// carries [`LingerOnClose`] and is passed through [`arm_linger_if_requested`] drains the
+    /// unread request briefly before the close, so the client reads the refusal instead of a TCP
+    /// reset.
     pub use rift_http_proxy::gateway::apply_tcp_fault;
-    pub use rift_mock_core::{FaultCell, FaultIo, InjectedFault, is_injected_fault};
+    pub use rift_mock_core::{
+        FaultCell, FaultIo, InjectedFault, LingerOnClose, arm_linger_if_requested,
+        is_injected_fault,
+    };
 
     /// Backend-outage reporting and response decoration: how a backend surfaces
     /// as a structured 503, and how per-request annotations become response
@@ -283,7 +291,8 @@ pub mod seams {
     /// (#344, [`handle_imposter_request`]) and the `Rift-Cluster-*` decoration.
     pub use rift_http_proxy::gateway::dispatch_to_port;
     pub use rift_http_proxy::server::{
-        Cli, Commands, RunningServer, ServerBuilder, run_metrics_server,
+        Cli, Commands, RunningServer, ServerBuilder, body_limits_from, replay_configfile,
+        run_metrics_server,
     };
     /// The per-imposter half of [`dispatch_to_port`], for a caller that already holds the
     /// `Arc<Imposter>` and must not re-resolve it (issue #344): the admin front's in-process
@@ -408,7 +417,7 @@ mod tests {
         let _ = CasOutcome::Applied;
         let _ = ResponsePhase::DataPlane;
         let _ = ClaimOutcome::InFlight;
-        let _ = MAX_RECORDED_REQUESTS;
+        let _: usize = DEFAULT_JOURNAL_MAX_BYTES;
         fn _named<T>() {}
         _named::<SequenceKey<'_>>();
         _named::<JournalEntry>();
@@ -444,6 +453,8 @@ mod tests {
         _named::<RunningServer>();
         _named::<Cli>();
         _named::<Commands>();
+        let _ = replay_configfile;
+        let _ = body_limits_from;
         let _ = (
             annotate,
             backend_error_response,
@@ -457,6 +468,8 @@ mod tests {
         _named::<InjectedFault>();
         let _ = is_injected_fault;
         let _ = apply_tcp_fault::<()>;
+        let _ = LingerOnClose;
+        let _ = arm_linger_if_requested::<()>;
         let _ = (
             run_metrics_server,
             with_annotation_scope::<std::future::Ready<()>>,
@@ -536,13 +549,13 @@ mod tests {
         use crate::seams::RiftFlowStateConfig;
 
         let config: RiftFlowStateConfig = serde_json::from_value(serde_json::json!({
-            "backend": "inmemory",
+            "ttlSeconds": 30,
             "readConsistency": "strong",
             "durability": "async",
         }))
         .expect("flowState with provider options parses");
 
-        assert_eq!(config.backend, "inmemory", "typed fields still bind");
+        assert_eq!(config.ttl_seconds, 30, "typed fields still bind");
         assert_eq!(
             config.extra.get("readConsistency").and_then(|v| v.as_str()),
             Some("strong"),

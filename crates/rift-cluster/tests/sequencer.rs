@@ -185,9 +185,9 @@ async fn peek_on(
 fn counter(name: &str) -> u64 {
     prometheus::gather()
         .into_iter()
-        .filter(|family| family.get_name() == name)
+        .filter(|family| family.name() == name)
         .flat_map(|family| family.get_metric().to_owned())
-        .map(|metric| metric.get_counter().get_value() as u64)
+        .map(|metric| metric.get_counter().value() as u64)
         .sum()
 }
 
@@ -197,19 +197,19 @@ fn counter(name: &str) -> u64 {
 fn decisions(op: &str, path: &str) -> u64 {
     prometheus::gather()
         .into_iter()
-        .filter(|family| family.get_name() == "rift_cluster_sequence_decisions_total")
+        .filter(|family| family.name() == "rift_cluster_sequence_decisions_total")
         .flat_map(|family| family.get_metric().to_owned())
         .filter(|metric| {
             let labelled = |name: &str| {
                 metric
                     .get_label()
                     .iter()
-                    .find(|l| l.get_name() == name)
-                    .map(|l| l.get_value().to_owned())
+                    .find(|l| l.name() == name)
+                    .map(|l| l.value().to_owned())
             };
             labelled("op").as_deref() == Some(op) && labelled("path").as_deref() == Some(path)
         })
-        .map(|metric| metric.get_counter().get_value() as u64)
+        .map(|metric| metric.get_counter().value() as u64)
         .sum()
 }
 

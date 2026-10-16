@@ -94,6 +94,22 @@ resources:
   limits:
     memory: 1Gi
 
+# The engine's body and journal bounds (#687), rendered as `RIFT_MAX_BODY_SIZE`,
+# `RIFT_BODY_MEMORY_BUDGET` and `RIFT_JOURNAL_MAX_BYTES`. The engine's own defaults (512 MiB per
+# body, a 1 GiB shared budget, 768 MiB of journal per imposter; rift #1439/#1441) are sized for
+# Mountebank parity on a workstation, and the budget alone is the whole of the 1Gi limit above, so
+# one node could be OOM-killed. These are sized for that limit; scale them with it.
+#   - maxBodyBytes: the largest request, admin or proxied-response body; over it, 413. Also the
+#     only bound on the admin routes the front reverse-proxies to the engine.
+#   - bodyMemoryBudgetBytes: shared by every body being buffered at once; spent, a request gets
+#     503 with Retry-After. Must be at least maxBodyBytes; 0 means unbounded.
+#   - journalMaxBytes: recorded requests kept **per imposter**, oldest evicted first. N imposters
+#     can hold N times this.
+limits:
+  maxBodyBytes: 67108864         # 64 MiB
+  bodyMemoryBudgetBytes: 268435456  # 256 MiB
+  journalMaxBytes: 67108864      # 64 MiB
+
 # Left empty, the template supplies a one-per-zone spread with `ScheduleAnyway` — rather than
 # `DoNotSchedule`, so a cluster with fewer zones than replicas still comes up, degraded in placement
 # instead of stuck Pending.

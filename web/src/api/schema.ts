@@ -57,7 +57,7 @@ export interface paths {
         post?: never;
         /**
          * Delete one imposter
-         * @description Terminates: mirrors upstream's own semantics — deleting an absent imposter answers `404` and commits nothing (keeps the log free of no-ops).
+         * @description Terminates: mirrors upstream's own semantics — deleting an absent imposter is idempotent, answering `200` with `{}` as Mountebank does (rift#1371), and commits nothing (keeps the log free of no-ops), so that answer carries no `Rift-Cluster-*` headers.
          */
         delete: operations["deleteImposter"];
         options?: never;
@@ -651,7 +651,7 @@ export interface paths {
         post?: never;
         /**
          * Delete one front-door route by id
-         * @description Terminates: idempotent at the state-machine level, but the admin surface still answers `404` for a route id that was never in the table (captured before the delete commits, the same shape as `deleteImposter`). A delete mutates the table, so it advances the table's revision and invalidates any outstanding `If-Match` against it.
+         * @description Terminates: idempotent at the state-machine level, but the admin surface still answers `404` for a route id that was never in the table (captured before the delete commits). `deleteImposter` no longer shares that shape: since rift#1371 an absent imposter answers `200 {}`. A delete mutates the table, so it advances the table's revision and invalidates any outstanding `If-Match` against it.
          */
         delete: operations["deleteFrontDoorRoute"];
         options?: never;
@@ -1881,7 +1881,7 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description The deleted imposter, as it was just before removal. */
+            /** @description The deleted imposter, as it was just before removal; or `{}`, with no `Rift-Cluster-*` headers, when the port held no imposter. */
             200: {
                 headers: {
                     "Rift-Cluster-Revision": components["headers"]["RiftClusterRevision"];
@@ -1889,21 +1889,12 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["Imposter"];
+                    "application/json": components["schemas"]["Imposter"] | Record<string, never>;
                 };
             };
             202: components["responses"]["AcceptedParked"];
             401: components["responses"]["Unauthorized"];
             403: components["responses"]["Forbidden"];
-            /** @description No such imposter on this port. */
-            404: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Error"];
-                };
-            };
             409: components["responses"]["RevisionConflict"];
             500: components["responses"]["InternalError"];
             503: components["responses"]["Unavailable"];
