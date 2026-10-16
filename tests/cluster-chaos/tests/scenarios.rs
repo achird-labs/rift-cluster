@@ -3758,6 +3758,10 @@ async fn origin_calls_per_path() -> anyhow::Result<std::collections::BTreeMap<St
 }
 
 /// The recorded (non-proxy) stubs a node's applied config holds for `port`.
+///
+/// The path is read from whichever predicate carries it: rift 0.21.0 (#1329)
+/// records one predicate per matched field (`{"deepEquals": {"path": …}}`),
+/// where older engines wrote one `{"equals": {…}}` over every field.
 async fn recorded_stub_paths(admin: u16, port: u16) -> anyhow::Result<Vec<String>> {
     let (status, body) = get_json(admin, &format!("/imposters/{port}")).await?;
     if status != 200 {
@@ -3777,10 +3781,15 @@ async fn recorded_stub_paths(admin: u16, port: u16) -> anyhow::Result<Vec<String
         if is_proxy {
             continue;
         }
-        if let Some(path) = stub
-            .pointer("/predicates/0/equals/path")
-            .and_then(serde_json::Value::as_str)
-        {
+        let path = stub
+            .get("predicates")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .flat_map(|predicate| ["deepEquals", "equals"].map(|op| predicate.get(op)))
+            .flatten()
+            .find_map(|fields| fields.get("path").and_then(serde_json::Value::as_str));
+        if let Some(path) = path {
             paths.push(path.to_owned());
         }
     }
