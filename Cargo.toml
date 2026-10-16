@@ -32,7 +32,7 @@ edition = "2024"
 license = "Apache-2.0"
 authors = ["Mohsen Zainalpour <zainalpour@gmail.com>"]
 repository = "https://github.com/achird-labs/rift-cluster"
-rust-version = "1.92"
+rust-version = "1.99"
 
 [workspace.dependencies]
 # Open-source Rift, pinned via the vendor/rift submodule. Paths are resolved

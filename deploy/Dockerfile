@@ -46,7 +46,7 @@
 # pane says the server still validates every save — so this stage adds a
 # capability to the image rather than gating it. The asserts are what turn
 # "wasm-pack exited 0" into "the two files the console actually imports exist".
-FROM rust:1.92-slim-bookworm AS wasm
+FROM rust:1.99-slim-bookworm AS wasm
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends build-essential curl ca-certificates \
@@ -147,7 +147,7 @@ RUN pnpm build \
 # not optional. `git` is here for rift-cluster-base's build script, which reads the
 # vendored submodule's pin to put the upstream version in `--version`; without
 # it the banner degrades to `rift unknown` rather than failing the build.
-FROM rust:1.92-slim-bookworm AS chef
+FROM rust:1.99-slim-bookworm AS chef
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends build-essential pkg-config git \
@@ -276,7 +276,7 @@ RUN cargo build --locked --release -p rift-cluster-server --features console
 # time during a release. The asymmetry is the point: the stage that runs on every
 # cluster-touching PR is the one worth restructuring, and it is the one CI
 # exercises on every change.
-FROM rust:1.92-slim-bookworm AS builder-static
+FROM rust:1.99-slim-bookworm AS builder-static
 
 # `musl-tools`/`musl-dev` alongside the same `build-essential pkg-config git` the `chef` stage
 # installs above — `ring` still needs a C toolchain regardless of libc, and `git` is
