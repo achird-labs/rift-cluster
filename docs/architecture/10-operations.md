@@ -366,6 +366,24 @@ from replacing keyless multi-key imposters), JSONPath reads Mountebank's selecto
 JSONPath or XPath predicate matches when any selected value satisfies it, and a `copy`/`lookup`
 behavior whose selector does not compile is refused at load.
 
+The bump to rift **v0.22.0** (`6a6abf9`→`64cee15`) is all three again:
+
+- **Keys.** An `is` response is printed and hashed as written (rift#1369), so the key of an id-less
+  stub moves, and every keyless shared cursor restarts once. Proxy recordings print
+  `"_mode": "text"` too. The proxy claim key of a request recorded without
+  `predicateGenerators` gains a body hash (rift#1317).
+- **Matching.** For example, `exists` reads an empty value as absent (rift#1403), `except` applies
+  before `exists` (rift#1408), XPath follows xmldom 0.9 (rift#1455) and is case-insensitive where
+  Mountebank is (rift#1478), and a request without a body is `""` (rift#1365).
+- **Admission.** A stub with no `responses` is refused (rift#1372; engines up to v0.21.0 served the
+  imposter's `defaultResponse` for it), as are an unknown proxy `mode` (rift#1314), an unknown proxy
+  `predicateOperator` (rift#1353) and an unreadable `predicateGenerators` entry (rift#1413).
+
+Response behaviour also changes for stored configs with no change to their bytes: under a
+`defaultResponse`, an `is` that omits `statusCode` or `headers` now takes them from it
+(rift#1369), and a mode-less proxy records as `proxyOnce` (rift#1314). A mixed fleet answers such
+requests differently per node until every node runs the new binary.
+
 **Before a whole-fleet upgrade of a fleet that keeps its state directory**, export the imposters and
 load them into the new engine, and fix or delete anything it refuses. `rift-lint` is not a
 substitute: it checks regex selectors (E051) but carries no JSONPath or XPath parser. A fleet
