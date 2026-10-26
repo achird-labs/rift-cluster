@@ -31,7 +31,9 @@ jobs:
     # Belt and braces alongside the `types: [labeled]` trigger: that fires for *any* label, so
     # without this, labelling a PR `needs-triage` would regenerate its baselines.
     if: github.event.label.name == 'update-baselines'
-    runs-on: ubuntu-latest
+    # Pinned: Playwright cannot install chromium on the ubuntu-26.04 image `ubuntu-latest` moved to,
+    # and the screenshot baselines must render on the same image as the job that compares them.
+    runs-on: ubuntu-24.04
     defaults:
       run:
         working-directory: web
