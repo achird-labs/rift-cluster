@@ -622,6 +622,24 @@ pub fn precondition_target(op: &ControlOp) -> Option<PreconditionTarget> {
     }
 }
 
+impl StubEdit {
+    /// Whether this step puts new stub content in the config (an add or a replacement), as opposed
+    /// to removing or reordering what is there. The admin front admits only the former (D-104).
+    #[must_use]
+    pub fn adds_content(&self) -> bool {
+        matches!(self, Self::Add { .. } | Self::ReplaceById { .. })
+    }
+}
+
+/// The stub list `script` leaves when applied to `stubs`, or why the state machine will refuse it.
+/// The admin front judges a stub edit by the config it leaves (D-104), so it needs the same
+/// application the state machine commits, without committing anything.
+pub fn edited_stubs(stubs: &[Stub], script: &StubEditScript) -> Result<Vec<Stub>, String> {
+    let mut next = stubs.to_vec();
+    apply_edit(&mut next, script)?;
+    Ok(next)
+}
+
 /// Apply `script` to `stubs` deterministically, mirroring the upstream stub
 /// lifecycle semantics exactly: `Add` rejects a duplicate explicit id and
 /// clamps `index` to the list length; `ReplaceById` keeps the slot's position

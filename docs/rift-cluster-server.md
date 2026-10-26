@@ -785,6 +785,14 @@ at the timeout, `unreachable=` for one that could not be heard from (D-97). Ever
 route-table write) and
 `Rift-Cluster-Op-Id`.
 
+**What the door admits (D-104).** A body the engine will not decode is a `400 bad data` led by
+standalone Rift's label for the route (`Invalid imposter JSON`, `Invalid batch JSON`,
+`Invalid stub JSON`, `Invalid stubs JSON`). A write that adds stubs or configs is also refused
+when the config it would leave fails the engine's `admission_check` — for example `matches` on a
+`"mode": "binary"` imposter (rift#1578) — naming the engine's reason, before anything commits.
+Removals (stub and imposter deletes, pause and resume) are never refused for that, so a stub the
+engine refuses can always be deleted. `--imposters` applies the same check at startup.
+
 Acceptance is never lost (R4): every mutation is durably parked on the
 accepting node *before* it is submitted. With no reachable leader the write
 answers `503` (`unavailable` type) with `Retry-After` and its

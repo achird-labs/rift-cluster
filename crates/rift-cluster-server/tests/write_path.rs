@@ -5347,3 +5347,411 @@ async fn a_refused_committed_config_is_named_and_the_door_still_refuses_it() {
 
     server.shutdown().await;
 }
+
+/// A config this engine refuses, committed past the door as an earlier engine's door would have:
+/// stub 0 is fine, stub 1 carries a `copy` selector that does not compile.
+async fn seed_refused(server: &ComposedServer, port: u16) {
+    use rift_cluster::control::{ControlOp, ControlRequest, decode_committed_config};
+    let body = json!({
+        "port": port,
+        "protocol": "http",
+        "stubs": [
+            { "id": "good", "responses": [{ "is": { "statusCode": 200, "body": "good" } }] },
+            {
+                "id": "bad",
+                "predicates": [{ "equals": { "path": "/bad" } }],
+                "responses": [{
+                    "is": { "statusCode": 200, "body": "${T}" },
+                    "_behaviors": { "copy": { "from": "body", "into": "${T}",
+                        "using": { "method": "jsonpath", "selector": "$[[[bad" } } }
+                }]
+            }
+        ]
+    });
+    let config = decode_committed_config(&body.to_string()).expect("replay decodes it");
+    let node = server.node().expect("clustered");
+    node.submit(ControlRequest {
+        op_id: uuid::Uuid::new_v4(),
+        principal: None,
+        issued_at_secs: 0,
+        expected_revision: None,
+        op: ControlOp::PutImposter {
+            config: Box::new(config),
+        },
+    })
+    .await
+    .expect("committed past the door");
+    assert!(
+        node.config_refusal(port).expect("read").is_some(),
+        "precondition: this engine refuses the seeded config"
+    );
+}
+
+fn revision(server: &ComposedServer, port: u16) -> Option<u64> {
+    server
+        .node()
+        .expect("clustered")
+        .imposter_revision(port)
+        .expect("read the revision")
+}
+
+/// Pins D-104 (#705, gap 3): the index-addressed stub routes read the stored config the way
+/// replay does, so on a port this engine refuses they repair it instead of answering `500`.
+#[tokio::test]
+async fn the_stub_index_routes_repair_a_refused_port() {
+    let _serial = TEST_LOCK.lock().await;
+    let state = TempDir::new().expect("tempdir");
+    let server = compose::start(cluster_cli(&state, &["--cluster-allow-solo"]))
+        .await
+        .expect("solo cluster starts");
+    wait_ready(&server).await;
+    let admin = server.admin_addr();
+    let client = reqwest::Client::new();
+    let node = server.node().expect("clustered");
+
+    let replaced = reserve_port();
+    seed_refused(&server, replaced).await;
+    let fixed = client
+        .put(format!("http://{admin}/imposters/{replaced}/stubs/1"))
+        .json(&json!({ "id": "bad", "responses": [{ "is": { "body": "fixed" } }] }))
+        .send()
+        .await
+        .expect("put stub");
+    assert_eq!(fixed.status().as_u16(), 200, "{:?}", fixed.text().await);
+    assert_eq!(node.config_refusal(replaced).expect("read"), None);
+    assert!(
+        wait_served(replaced, "good").await,
+        "the repaired port serves (stub 0 answers first)"
+    );
+
+    let deleted = reserve_port();
+    seed_refused(&server, deleted).await;
+    let gone = client
+        .delete(format!("http://{admin}/imposters/{deleted}/stubs/1"))
+        .send()
+        .await
+        .expect("delete stub");
+    assert_eq!(gone.status().as_u16(), 200, "{:?}", gone.text().await);
+    assert_eq!(node.config_refusal(deleted).expect("read"), None);
+
+    server.shutdown().await;
+}
+
+/// Pins D-104: a content write is admitted by the config it leaves, so adding a good stub beside
+/// a refused one is a `400` that commits nothing, while a removal that leaves the refused stub in
+/// place is not checked at all.
+#[tokio::test]
+async fn a_content_edit_that_leaves_a_refused_config_is_refused_and_a_removal_is_not() {
+    let _serial = TEST_LOCK.lock().await;
+    let state = TempDir::new().expect("tempdir");
+    let server = compose::start(cluster_cli(&state, &["--cluster-allow-solo"]))
+        .await
+        .expect("solo cluster starts");
+    wait_ready(&server).await;
+    let admin = server.admin_addr();
+    let client = reqwest::Client::new();
+    let port = reserve_port();
+    seed_refused(&server, port).await;
+    let before = revision(&server, port);
+
+    let added = client
+        .post(format!("http://{admin}/imposters/{port}/stubs"))
+        .json(&json!({ "stub": { "id": "more", "responses": [{ "is": { "body": "more" } }] } }))
+        .send()
+        .await
+        .expect("post stub");
+    assert_eq!(added.status().as_u16(), 400);
+    let text = added.text().await.expect("body");
+    assert!(text.contains("jsonpath"), "names what to fix: {text}");
+    assert!(text.contains("bad data"), "{text}");
+    assert_eq!(revision(&server, port), before, "nothing committed");
+
+    // Every content route, not only `POST …/stubs`: each leaves the refused stub in place.
+    let good = json!({ "id": "good", "responses": [{ "is": { "body": "still good" } }] });
+    for (label, request) in [
+        (
+            "PUT …/stubs/0",
+            client
+                .put(format!("http://{admin}/imposters/{port}/stubs/0"))
+                .json(&good),
+        ),
+        (
+            "PUT …/stubs/by-id/good",
+            client
+                .put(format!("http://{admin}/imposters/{port}/stubs/by-id/good"))
+                .json(&good),
+        ),
+        (
+            "POST …/spaces/s/stubs",
+            client
+                .post(format!("http://{admin}/imposters/{port}/spaces/s/stubs"))
+                .json(&json!({ "responses": [{ "is": { "body": "space" } }] })),
+        ),
+    ] {
+        let response = request.send().await.expect("send");
+        assert_eq!(response.status().as_u16(), 400, "{label}");
+        let text = response.text().await.expect("body");
+        assert!(
+            text.contains("jsonpath"),
+            "{label} names what to fix: {text}"
+        );
+        assert_eq!(
+            revision(&server, port),
+            before,
+            "{label}: nothing committed"
+        );
+    }
+
+    let removed = client
+        .delete(format!("http://{admin}/imposters/{port}/stubs/0"))
+        .send()
+        .await
+        .expect("delete stub");
+    // Its render is D-102's business, not this test's: the port is still refused, so the engine
+    // has no imposter to re-read. What D-104 decides is that the door did not refuse it.
+    let status = removed.status().as_u16();
+    assert!(
+        status != 400 && status < 500,
+        "the door does not refuse it: {status} {:?}",
+        removed.text().await
+    );
+    assert_ne!(revision(&server, port), before, "the removal committed");
+
+    server.shutdown().await;
+}
+
+/// #705 gap 4: a body the engine will not decode is refused with standalone Rift's own prefix
+/// for that route, not a cluster-specific one.
+#[tokio::test]
+async fn decode_refusals_carry_standalones_per_route_prefix() {
+    let _serial = TEST_LOCK.lock().await;
+    let state = TempDir::new().expect("tempdir");
+    let server = compose::start(cluster_cli(&state, &["--cluster-allow-solo"]))
+        .await
+        .expect("solo cluster starts");
+    wait_ready(&server).await;
+    let admin = server.admin_addr();
+    let client = reqwest::Client::new();
+    let port = reserve_port();
+    let bad_stub = json!({
+        "predicates": [{ "matches": { "body": "(" } }],
+        "responses": [{ "is": { "body": "x" } }]
+    });
+    let created = client
+        .post(format!("http://{admin}/imposters"))
+        .json(&json!({ "port": port, "protocol": "http", "stubs": [] }))
+        .send()
+        .await
+        .expect("post imposter");
+    assert_eq!(created.status().as_u16(), 201);
+
+    let cases = [
+        (
+            client
+                .post(format!("http://{admin}/imposters"))
+                .json(&json!({ "port": reserve_port(), "protocol": "http", "stubs": [bad_stub] })),
+            "Invalid imposter JSON: ",
+        ),
+        (
+            client
+                .put(format!("http://{admin}/imposters"))
+                .json(&json!({
+                    "imposters": [{ "port": port, "protocol": "http", "stubs": [bad_stub] }]
+                })),
+            "Invalid batch JSON: ",
+        ),
+        (
+            client
+                .post(format!("http://{admin}/imposters/{port}/stubs"))
+                .json(&json!({ "stub": bad_stub })),
+            "Invalid stub JSON: ",
+        ),
+        (
+            client
+                .put(format!("http://{admin}/imposters/{port}/stubs"))
+                .json(&json!({ "stubs": [bad_stub] })),
+            "Invalid stubs JSON: ",
+        ),
+        (
+            client
+                .post(format!("http://{admin}/imposters/{port}/spaces/s/stubs"))
+                .json(&bad_stub),
+            "Invalid stub JSON: ",
+        ),
+        (
+            client
+                .put(format!("http://{admin}/imposters/{port}/stubs/by-id/x"))
+                .json(&bad_stub),
+            "Invalid stub JSON: ",
+        ),
+        // A cluster-only body has no standalone counterpart, so it keeps the cluster's wording.
+        (
+            client
+                .put(format!("http://{admin}/front-door/routes"))
+                .body("not json"),
+            "invalid request JSON: ",
+        ),
+    ];
+    for (request, prefix) in cases {
+        let response = request.send().await.expect("send");
+        assert_eq!(response.status().as_u16(), 400);
+        let text = response.text().await.expect("body");
+        assert!(text.contains(prefix), "expected `{prefix}`: {text}");
+    }
+
+    server.shutdown().await;
+}
+
+/// rift#1578 through the cluster door: `mode` lives only on the request body (it is never
+/// stored), so the door is the one place a binary imposter's `matches` can be refused. Stub
+/// routes on a stored binary imposter answer `200`, as standalone and Mountebank do.
+#[tokio::test]
+async fn a_binary_mode_imposter_is_refused_at_create_and_its_stub_routes_still_answer() {
+    let _serial = TEST_LOCK.lock().await;
+    let state = TempDir::new().expect("tempdir");
+    let server = compose::start(cluster_cli(&state, &["--cluster-allow-solo"]))
+        .await
+        .expect("solo cluster starts");
+    wait_ready(&server).await;
+    let admin = server.admin_addr();
+    let client = reqwest::Client::new();
+    let port = reserve_port();
+    let matching = json!({
+        "predicates": [{ "matches": { "body": "^AQ" } }],
+        "responses": [{ "is": { "body": "x" } }]
+    });
+    let message = "the matches predicate is not allowed in binary mode";
+
+    let created = client
+        .post(format!("http://{admin}/imposters"))
+        .json(&json!({ "port": port, "protocol": "http", "mode": "binary", "stubs": [matching] }))
+        .send()
+        .await
+        .expect("post");
+    assert_eq!(created.status().as_u16(), 400);
+    assert!(created.text().await.expect("body").contains(message));
+    assert_eq!(revision(&server, port), None, "nothing committed");
+
+    // The refused imposter second, so a refusal that let the first one through would show.
+    let first = reserve_port();
+    let batch = client
+        .put(format!("http://{admin}/imposters"))
+        .json(&json!({ "imposters": [
+            { "port": first, "protocol": "http", "stubs": [] },
+            { "port": port, "protocol": "http", "mode": "binary", "stubs": [matching] }
+        ] }))
+        .send()
+        .await
+        .expect("put");
+    assert_eq!(batch.status().as_u16(), 400);
+    let text = batch.text().await.expect("body");
+    assert!(
+        text.contains(&format!(
+            "Invalid imposter set (imposters unchanged): {message}"
+        )),
+        "standalone's replace_all wording: {text}"
+    );
+    assert_eq!(
+        revision(&server, first),
+        None,
+        "nothing from the set committed"
+    );
+    assert_eq!(revision(&server, port), None, "nothing committed");
+
+    let valid = client
+        .post(format!("http://{admin}/imposters"))
+        .json(&json!({ "port": port, "protocol": "http", "mode": "binary", "stubs": [] }))
+        .send()
+        .await
+        .expect("post");
+    assert_eq!(valid.status().as_u16(), 201);
+    let added = client
+        .post(format!("http://{admin}/imposters/{port}/stubs"))
+        .json(&json!({ "stub": matching }))
+        .send()
+        .await
+        .expect("post stub");
+    assert_eq!(
+        added.status().as_u16(),
+        200,
+        "mode is not stored, so nothing refuses it"
+    );
+
+    server.shutdown().await;
+}
+
+/// rift#1550 and rift#1551 reach the cluster through decode: a path in `proxy.to`, and a response
+/// with two types, are `400`s that commit nothing.
+#[tokio::test]
+async fn the_engines_new_decode_refusals_commit_nothing() {
+    let _serial = TEST_LOCK.lock().await;
+    let state = TempDir::new().expect("tempdir");
+    let server = compose::start(cluster_cli(&state, &["--cluster-allow-solo"]))
+        .await
+        .expect("solo cluster starts");
+    wait_ready(&server).await;
+    let admin = server.admin_addr();
+    let client = reqwest::Client::new();
+    for (response, reason) in [
+        (
+            json!({ "proxy": { "to": "http://localhost:1/path" } }),
+            "proxy.to must not contain a path '/path'",
+        ),
+        (
+            json!({ "is": { "body": "x" }, "proxy": { "to": "http://localhost:1" } }),
+            "each response object must have only one response type",
+        ),
+    ] {
+        let port = reserve_port();
+        let refused = client
+            .post(format!("http://{admin}/imposters"))
+            .json(&json!({ "port": port, "protocol": "http",
+                "stubs": [{ "responses": [response] }] }))
+            .send()
+            .await
+            .expect("post");
+        assert_eq!(refused.status().as_u16(), 400, "{response}");
+        let text = refused.text().await.expect("body");
+        assert!(text.contains("Invalid imposter JSON: "), "{text}");
+        assert!(text.contains(reason), "the engine's reason: {text}");
+        assert_eq!(revision(&server, port), None, "nothing committed");
+    }
+    server.shutdown().await;
+}
+
+/// Pins D-104 for `--imposters`: the bootstrap is a door too, so a document standalone's
+/// `--configfile` would refuse at startup is refused here before anything commits.
+#[tokio::test]
+async fn an_imposters_document_the_engine_refuses_fails_startup() {
+    let _serial = TEST_LOCK.lock().await;
+    let state = TempDir::new().expect("tempdir");
+    let port = reserve_port();
+    let doc = state.path().join("imposters.json");
+    std::fs::write(
+        &doc,
+        json!({ "imposters": [{ "port": port, "protocol": "http", "mode": "binary",
+            "stubs": [{ "predicates": [{ "matches": { "body": "^AQ" } }],
+                        "responses": [{ "is": { "body": "x" } }] }] }] })
+        .to_string(),
+    )
+    .expect("write the document");
+    let uri = format!("file:{}", doc.to_string_lossy());
+    let refused = compose::start(cluster_cli(
+        &state,
+        &["--cluster-allow-solo", "--imposters", &uri],
+    ))
+    .await;
+    let e = match refused {
+        Ok(server) => {
+            server.shutdown().await;
+            panic!("a document the engine refuses must fail startup");
+        }
+        Err(e) => format!("{e:#}"),
+    };
+    assert!(
+        e.contains(&format!(
+            "imposter on port {port} is refused by this engine"
+        )) && e.contains("the matches predicate is not allowed in binary mode"),
+        "{e}"
+    );
+}

@@ -4800,6 +4800,11 @@ engine at or after the floor.
 **Admission stays at the door.** The HTTP door parses a client's body with the validating
 `Deserialize`; a config this engine refuses is still a `400` with the engine's message.
 
+> **Amended by D-104** (2026-10-26, #705): the door also runs `admission_check` on the config a
+> content write *leaves* — the incoming config, or the stored one with the stub edit applied — and
+> the index-addressed stub routes read the stored config as replay does, so they can repair a
+> refused port. Removals are never checked.
+
 **The engine admits per port, at the drive.** `admit_row` — decode the row, replay-decode its
 config, run `admission_check` — is the one rule. A whole-set drive builds a `DesiredSet` of admitted
 configs, every port the tables name (`held`), and the refused rows. With none refused it is
@@ -4894,4 +4899,51 @@ imposter at `PeerPolicy::Any`.
 
 `with_outbound_tls` (rift#1609, client-certificate proxies) is mirrored under the condition upstream
 sets it and is not a decision.
+
+### D-104 — The door admits a write by the config it leaves; removals are not checked
+
+- **Status:** active
+- **Decided:** 2026-10-26 · #705
+- **Amends:** D-102
+- **Implemented by:** #705
+- **Code:** crates/rift-cluster-server/src/admin_front.rs, crates/rift-cluster-server/src/compose.rs, crates/rift-cluster/src/control.rs, crates/rift-cluster-server/tests/write_path.rs
+
+D-102 left admission to decode at the door: a body this engine will not decode is a `400`. Two
+things escaped it. A rule upstream runs on the whole config after decode never reached the cluster:
+rift#1578 refuses `matches`/`jsonpath`/`xpath` on a `"mode": "binary"` imposter, and `mode` is
+never serialised, so the committed config carries no trace of it and every node served it. And the
+index-addressed stub routes (`PUT …/stubs`, `PUT`/`DELETE …/stubs/{i}`) decoded the stored config
+with the validating decode, so on a port this engine refuses they answered `500` and could not be
+used to repair it.
+
+**A write that adds content is admitted only if the config it leaves passes `admission_check`.**
+For a whole config (`POST`/`PUT /imposters`, and the index routes, which commit the stored config
+with the edit applied) that is the incoming value, checked before it is serialised, while `mode` is
+still on it. For a stub edit (`POST …/stubs`, a space stub, `PUT …/stubs/by-id/{id}`) it is the
+stored config, replay-decoded, with the edit applied. The refusal is `400 bad data` with the
+engine's own reason, and nothing is minted or parked. A batch is refused whole, worded as
+standalone's `replace_all` words it: `Invalid imposter set (imposters unchanged): <reason>`. It
+runs after script validation, the order standalone's manager checks run in. The `--imposters`
+bootstrap applies the same check to every imposter in the document before submitting any, and fails
+startup, as standalone's `--configfile` does.
+
+**Removals are not checked.** A stub delete by index or id, an imposter delete, a pause, a move:
+none adds content, and each must stay usable to strip the stub a refused config is refused for.
+A content edit on a refused port that does not repair it is now a `400`, where it used to commit
+and keep the refusal; send a corrected config, or delete the bad stub first.
+
+**The check reads the local applied config**, which can trail the leader. The drive stays
+authoritative (D-102): a race at worst commits a config the drive refuses per port, or refuses an
+edit a retry admits. Edits the state machine will refuse (no imposter, an unknown or duplicate id)
+are left to it, so its `404`/`400` stays the answer. Nothing changes on the replay side: the state
+machine never refuses an op for admission. A node that has not yet applied a port the leader
+already holds reads no stored config, so it admits the edit and the drive judges it per port.
+
+**Binary mode is judged at create only.** `mode` is never stored, so a stub added later to a binary
+imposter is admitted — which is what Mountebank and standalone Rift answer on their stub routes
+too, and the cluster serves that imposter as committed.
+
+Decode refusals now lead with standalone's label for the route (`Invalid imposter JSON`,
+`Invalid batch JSON`, `Invalid stub JSON`, `Invalid stubs JSON`); cluster-only bodies keep
+`invalid request JSON`.
 

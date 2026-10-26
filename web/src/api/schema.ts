@@ -1527,7 +1527,7 @@ export interface components {
         };
     };
     responses: {
-        /** @description Malformed or semantically invalid request (e.g. missing required port, If-Match on a collection route). */
+        /** @description Malformed or semantically invalid request (e.g. missing required port, If-Match on a collection route). A body the engine will not decode leads with standalone Rift's label for the route (`Invalid imposter JSON`, `Invalid batch JSON`, `Invalid stub JSON`, `Invalid stubs JSON`). A write that adds stubs or configs is also refused when the config it would leave is one this engine refuses, naming the engine's reason, and nothing commits (D-104); removals are never refused for that. */
         BadData: {
             headers: {
                 [name: string]: unknown;

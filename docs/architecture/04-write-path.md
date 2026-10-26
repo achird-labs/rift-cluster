@@ -49,7 +49,8 @@ The steps that make the guarantees:
   restart (R3).
 - **Step 8 — validation precedes append; apply cannot fail.** A config the
   fleet would reject never enters the log; a config in the log lands on every
-  node deterministically. Apply drives only the port the op names — upstream's
+  node deterministically. That includes the engine's `admission_check` on the
+  config a content write leaves, run at the door (D-104). Apply drives only the port the op names — upstream's
   `apply_one`, the per-port arm of the order-aware incremental reconciler (#316),
   or `delete_imposter` — so applying config for port 8080 never disturbs port
   8081's scenario state, cursors, or recorded requests, and costs the same at

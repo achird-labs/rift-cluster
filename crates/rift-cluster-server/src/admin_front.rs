@@ -85,9 +85,10 @@ use rift_cluster::{
 use rift_cluster_base::rift_http_proxy::server::ListenAddr;
 use rift_cluster_base::seams::{
     ErrorKind, FaultCell, FaultIo, ImposterConfig, LingerOnClose, RiftScriptConfig, RouteTable,
-    ScriptBaseDir, Stub, apply_tcp_fault, arm_linger_if_requested, classify as classify_upstream,
-    config_uses_script_surface, error_response_typed, is_injected_fault, not_a_stub_reason,
-    resolve_scripts, resolve_stub_scripts, tcp_fault_carrier, validate_stub, validate_stubs,
+    ScriptBaseDir, Stub, admission_check, apply_tcp_fault, arm_linger_if_requested,
+    classify as classify_upstream, config_uses_script_surface, error_response_typed,
+    is_injected_fault, not_a_stub_reason, resolve_scripts, resolve_stub_scripts, tcp_fault_carrier,
+    validate_stub, validate_stubs,
 };
 // The compiler crate (RFC-004 §3.1–§3.3): `POST /specs/compile` runs it on the accepting node and
 // hands the result straight back, storing nothing (D-72, #549). `serde_json::Value` stays
@@ -2871,7 +2872,27 @@ struct Mutation {
     port: Option<u16>,
     /// How the success response is rendered.
     render: Render,
+    /// Whether the write adds content the engine must admit (D-104).
+    admit: Admit,
 }
+
+/// Whether a write adds content, and so must leave a config the engine admits (D-104).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Admit {
+    /// The write adds or replaces stubs or whole configs.
+    Content,
+    /// The write removes, reorders or toggles: nothing new to admit, and it must stay usable to
+    /// strip a stub the engine refuses.
+    Nothing,
+}
+
+// Each content route's body refusal leads with the label standalone Rift gives that route.
+const IMPOSTER_DOOR: &str = "Invalid imposter JSON";
+const BATCH_DOOR: &str = "Invalid batch JSON";
+const STUB_DOOR: &str = "Invalid stub JSON";
+const STUBS_DOOR: &str = "Invalid stubs JSON";
+/// Cluster-only bodies have no standalone counterpart to match.
+const CLUSTER_DOOR: &str = "invalid request JSON";
 
 enum Render {
     /// `GET` this loopback path after the barrier and answer with its body.
@@ -2891,10 +2912,7 @@ enum Render {
 /// Split out of the original `build_and_run` (issue #278): building a `Mutation` from a
 /// [`Terminated`] route stayed in [`build_mutation`], everything after that — validate, the
 /// precondition, the injection gate, script resolve/validate, mint, park, submit, the barrier, the
-/// render, the cluster headers — moved here, so that the three spec writes (`terminate_spec_put`,
-/// `terminate_spec_delete`, `terminate_spec_deploy`), which build their own `Mutation` for reasons
-/// `build_mutation`'s own arms for them explain, can inherit this tail without going through a
-/// `Terminated` classification a second time.
+/// render, the cluster headers — moved here. [`build_mutation`] is now its only producer.
 #[allow(clippy::too_many_arguments)]
 // A rendered refusal in the error channel, as in `ensure_session_key` above.
 #[allow(clippy::result_large_err)]
@@ -2903,9 +2921,8 @@ async fn run_mutation(
     node: &Arc<RaftNode>,
     mut mutation: Mutation,
     // Whether this is `PUT /imposters`'s whole-array replace — the one route whose script errors
-    // are labelled `imposters[{idx}]` (see `batch_indices` below). Passed by the caller that still
-    // holds the `Terminated` kind; the spec writes, which build their own `Mutation`, are never
-    // batches.
+    // are labelled `imposter[{idx}]` (see `batch_indices` below). Passed by the caller that still
+    // holds the `Terminated` kind.
     is_batch: bool,
     host: Option<&HeaderValue>,
     idempotency: Option<&str>,
@@ -2966,6 +2983,13 @@ async fn run_mutation(
     }
     for (op, batch_index) in mutation.ops.iter().zip(&batch_indices) {
         validate_op_scripts(op, *batch_index)?;
+    }
+    // After the scripts, as standalone runs its manager-level checks after them, so a body with
+    // two faults names the one standalone names first.
+    if mutation.admit == Admit::Content {
+        for (op, batch_index) in mutation.ops.iter().zip(&batch_indices) {
+            admit_op(op, node, *batch_index)?;
+        }
     }
 
     // Mint deterministically from the client's Idempotency-Key (when given),
@@ -3677,7 +3701,7 @@ async fn terminate_try_imposter(
             );
         }
     };
-    let spec: TryRequest = match parse(&body) {
+    let spec: TryRequest = match parse(&body, CLUSTER_DOOR) {
         Ok(spec) => spec,
         Err(response) => return response,
     };
@@ -3823,7 +3847,7 @@ async fn build_mutation(
 ) -> Result<Mutation, Response<FrontBody>> {
     match kind {
         Terminated::Create => {
-            let config: ImposterConfig = parse(body)?;
+            let config: ImposterConfig = parse(body, IMPOSTER_DOOR)?;
             let Some(port) = config.port else {
                 return Err(typed_error(
                     StatusCode::BAD_REQUEST,
@@ -3841,10 +3865,11 @@ async fn build_mutation(
                     path: format!("/imposters/{port}"),
                     status: StatusCode::CREATED,
                 },
+                admit: Admit::Content,
             })
         }
         Terminated::ReplaceAllImposters => {
-            let replace: ReplaceAllBody = parse(body)?;
+            let replace: ReplaceAllBody = parse(body, BATCH_DOOR)?;
             // Upsert the new set first, then prune the leftovers — never a
             // DeleteAll up front. The ops commit as separate Raft entries, so a
             // mid-sequence loss of quorum tears the sequence; torn this way the
@@ -3881,6 +3906,7 @@ async fn build_mutation(
                 }
             }
             Ok(Mutation {
+                admit: Admit::Content,
                 ops,
                 port: None,
                 render: Render::FetchAfter {
@@ -3890,8 +3916,9 @@ async fn build_mutation(
             })
         }
         Terminated::FleetNamePut => {
-            let parsed: fleet::FleetNameBody = parse(body)?;
+            let parsed: fleet::FleetNameBody = parse(body, CLUSTER_DOOR)?;
             Ok(Mutation {
+                admit: Admit::Nothing,
                 ops: vec![ControlOp::FleetNamePut { name: parsed.name }],
                 // Fleet-wide state, not an imposter record: no port to label the revision
                 // header with, and `precondition_target` answers `None` for this op, so an
@@ -3909,6 +3936,7 @@ async fn build_mutation(
         Terminated::DeleteAllImposters => {
             let (_, content_type, captured) = fetch(state, "/imposters", host).await?;
             Ok(Mutation {
+                admit: Admit::Nothing,
                 ops: vec![ControlOp::DeleteAll],
                 port: None,
                 render: Render::Captured {
@@ -3936,6 +3964,7 @@ async fn build_mutation(
                 );
             }
             Ok(Mutation {
+                admit: Admit::Nothing,
                 ops: vec![ControlOp::DeleteImposter { port }],
                 port: Some(port),
                 render: Render::Captured {
@@ -3946,8 +3975,9 @@ async fn build_mutation(
             })
         }
         Terminated::AddStub(port) => {
-            let add: AddStubBody = parse(body)?;
+            let add: AddStubBody = parse(body, STUB_DOOR)?;
             Ok(Mutation {
+                admit: Admit::Content,
                 ops: vec![ControlOp::PatchStubs {
                     port,
                     edit: StubEditScript(vec![StubEdit::Add {
@@ -3971,7 +4001,7 @@ async fn build_mutation(
             // its space. The two sibling routes disagree about their envelope (`POST
             // .../stubs` takes `{"stub": …}`, this one the bare stub), which is how the mistake is
             // actually reached.
-            let payload: serde_json::Value = parse(body)?;
+            let payload: serde_json::Value = parse(body, STUB_DOOR)?;
             if let Some(reason) = not_a_stub_reason(&payload) {
                 return Err(typed_error(
                     StatusCode::BAD_REQUEST,
@@ -3979,11 +4009,12 @@ async fn build_mutation(
                     &reason,
                 ));
             }
-            let mut stub: Stub = parse(body)?;
+            let mut stub: Stub = parse(body, STUB_DOOR)?;
             // The path names the space, not the body — exactly as upstream's handler does it, so a
             // caller cannot file a stub into a space the URL never mentioned.
             stub.space = Some(flow.clone());
             Ok(Mutation {
+                admit: Admit::Content,
                 ops: vec![ControlOp::PatchStubs {
                     port,
                     edit: StubEditScript(vec![StubEdit::Add { stub, index: None }]),
@@ -3998,19 +4029,19 @@ async fn build_mutation(
             })
         }
         Terminated::ReplaceStubs(port) => {
-            let replace: ReplaceStubsBody = parse(body)?;
+            let replace: ReplaceStubsBody = parse(body, STUBS_DOOR)?;
             let mut config = stored_config(node, port)?;
             config.stubs = replace.stubs;
-            Ok(put_config_mutation(port, config))
+            Ok(put_config_mutation(port, config, Admit::Content))
         }
         Terminated::ReplaceStubAt(port, index) => {
-            let stub: Stub = parse(body)?;
+            let stub: Stub = parse(body, STUB_DOOR)?;
             let mut config = stored_config(node, port)?;
             if index >= config.stubs.len() {
                 return Err(stub_index_missing(index));
             }
             config.stubs[index] = stub;
-            Ok(put_config_mutation(port, config))
+            Ok(put_config_mutation(port, config, Admit::Content))
         }
         Terminated::DeleteStubAt(port, index) => {
             let mut config = stored_config(node, port)?;
@@ -4018,11 +4049,14 @@ async fn build_mutation(
                 return Err(stub_index_missing(index));
             }
             config.stubs.remove(index);
-            Ok(put_config_mutation(port, config))
+            // Commits as a whole-config put, but it only removes: exempt, so it can strip the
+            // stub a refused config is refused for (D-104).
+            Ok(put_config_mutation(port, config, Admit::Nothing))
         }
         Terminated::ReplaceStubById(port, id) => {
-            let stub: Stub = parse(body)?;
+            let stub: Stub = parse(body, STUB_DOOR)?;
             Ok(Mutation {
+                admit: Admit::Content,
                 ops: vec![ControlOp::PatchStubs {
                     port,
                     edit: StubEditScript(vec![StubEdit::ReplaceById { id, stub }]),
@@ -4037,6 +4071,7 @@ async fn build_mutation(
         Terminated::SetEnabled(port, enabled) => {
             let state = if enabled { "enabled" } else { "disabled" };
             Ok(Mutation {
+                admit: Admit::Nothing,
                 ops: vec![ControlOp::SetEnabled { port, enabled }],
                 port: Some(port),
                 // Upstream's own response shape, byte-identical — no re-read
@@ -4051,6 +4086,7 @@ async fn build_mutation(
             })
         }
         Terminated::DeleteStubById(port, id) => Ok(Mutation {
+            admit: Admit::Nothing,
             ops: vec![ControlOp::PatchStubs {
                 port,
                 edit: StubEditScript(vec![StubEdit::DeleteById { id }]),
@@ -4062,7 +4098,7 @@ async fn build_mutation(
             },
         }),
         Terminated::PutRoutes => {
-            let table: RouteTable = parse(body)?;
+            let table: RouteTable = parse(body, CLUSTER_DOOR)?;
             // No loopback re-read: there is no upstream `/front-door/routes`
             // to fetch from (U-11's admin CRUD was deferred). A whole-table
             // replace is deterministic and pre-validated (`build_and_run`
@@ -4073,6 +4109,7 @@ async fn build_mutation(
             //
             let body = serde_json::to_vec(&table).map_err(|e| internal(&e.to_string()))?;
             Ok(Mutation {
+                admit: Admit::Nothing,
                 ops: vec![ControlOp::PutRoutes { table }],
                 // No single stored record: a whole-table replace has no port to
                 // label the revision header with, so it emits (and accepts) the
@@ -4105,6 +4142,7 @@ async fn build_mutation(
             };
             let body = serde_json::to_vec(route).map_err(|e| internal(&e.to_string()))?;
             Ok(Mutation {
+                admit: Admit::Nothing,
                 ops: vec![ControlOp::DeleteRoute { id }],
                 port: None,
                 render: Render::Captured {
@@ -4121,6 +4159,7 @@ async fn build_mutation(
         // front that still commits; the `savedRequests` clear is the local engine's own again
         // (D-74), proxied like every other verb on that path.
         Terminated::ClearSavedProxyResponses(port) => Ok(Mutation {
+            admit: Admit::Nothing,
             ops: vec![ControlOp::ProxyRecordedClear { port }],
             port: Some(port),
             // Byte-identical to what upstream's own clear answers with (`handle_get(port, ...)`,
@@ -4162,7 +4201,7 @@ async fn build_mutation(
 /// with the stub list edited — the engine's #316 diff still patches only the
 /// touched stubs in place.
 ///
-fn put_config_mutation(port: u16, config: ImposterConfig) -> Mutation {
+fn put_config_mutation(port: u16, config: ImposterConfig, admit: Admit) -> Mutation {
     Mutation {
         ops: vec![ControlOp::PutImposter {
             config: Box::new(config),
@@ -4172,10 +4211,12 @@ fn put_config_mutation(port: u16, config: ImposterConfig) -> Mutation {
             path: format!("/imposters/{port}"),
             status: StatusCode::OK,
         },
+        admit,
     }
 }
 
-/// The committed config for `port` from the local applied state, parsed.
+/// The committed config for `port` from the local applied state, decoded as replay decodes it
+/// (D-102): a config this engine refuses still reads, so an edit can repair it.
 // The Err IS the client response (the early-return channel this module
 // uses everywhere); boxing it would just move the bytes to every call site.
 #[allow(clippy::result_large_err)]
@@ -4190,7 +4231,8 @@ fn stored_config(node: &Arc<RaftNode>, port: u16) -> Result<ImposterConfig, Resp
             &format!("no imposter on port {port}"),
         ));
     };
-    serde_json::from_str(&stored).map_err(|e| internal(&format!("stored config for {port}: {e}")))
+    decode_committed_config(&stored)
+        .map_err(|e| internal(&format!("stored config for {port}: {e}")))
 }
 
 fn mint(op_id: Uuid, op: ControlOp, expected_revision: Option<u64>) -> ControlRequest {
@@ -4468,6 +4510,82 @@ fn resolve_op_scripts(
     }
 }
 
+/// Refuse an op whose resulting config this engine would not admit (D-104), as standalone Rift's
+/// doors do: `400 bad data` with the engine's own reason, which a batch leads with standalone's
+/// `Invalid imposter set (imposters unchanged)`.
+///
+/// Reads the **local** applied config, which can trail the leader. That is acceptable because the
+/// drive stays authoritative (D-102): a race at worst commits a config the drive then refuses per
+/// port, or refuses an edit a retry admits.
+#[allow(clippy::result_large_err)]
+fn admit_op(
+    op: &ControlOp,
+    node: &RaftNode,
+    batch_index: Option<usize>,
+) -> Result<(), Response<FrontBody>> {
+    let stored = match op {
+        ControlOp::PatchStubs { port, .. } => node
+            .get_imposter(*port)
+            .map_err(|e| internal(&format!("reading the stored config for {port}: {e}")))?,
+        _ => None,
+    };
+    match admission_refusal(op, stored.as_deref()) {
+        None => Ok(()),
+        Some(reason) => Err(typed_error(
+            StatusCode::BAD_REQUEST,
+            ErrorKind::BadData,
+            &admission_message(&reason, batch_index.is_some()),
+        )),
+    }
+}
+
+/// Why this engine would not admit the config `op` leaves, given the port's stored config. `None`
+/// when it would, and when the op is not this check's to judge:
+/// - a removal, move or toggle adds nothing, and must stay usable to strip a refused stub;
+/// - a stub edit on a port with no stored config, or one the state machine will refuse (an unknown
+///   or duplicate id), is left to the state machine, whose refusal is the answer the client gets;
+/// - a stored config that does not even replay-decode is the drive's to judge (D-102), not a reason
+///   to refuse the edit that may repair it.
+fn admission_refusal(op: &ControlOp, stored: Option<&str>) -> Option<String> {
+    match op {
+        ControlOp::PutImposter { config } => admission_check(config).err(),
+        ControlOp::PatchStubs { edit, .. } => {
+            if !edit.0.iter().any(StubEdit::adds_content) {
+                return None;
+            }
+            // No stored config: the state machine answers "no imposter on port".
+            let stored = stored?;
+            // Not even replay-decodable: the drive's to judge (D-102); the state machine refuses
+            // the edit as a corrupt stored config.
+            let mut config = decode_committed_config(stored).ok()?;
+            // An unknown or duplicate id: the state machine refuses it with its own reason.
+            config.stubs = control::edited_stubs(&config.stubs, edit).ok()?;
+            admission_check(&config).err()
+        }
+        // Listed, not `_`: an op that comes to carry content must decide here whether it is
+        // admitted. A recording's stub comes from the upstream, and the drive judges it.
+        ControlOp::DeleteImposter { .. }
+        | ControlOp::DeleteAll
+        | ControlOp::SetEnabled { .. }
+        | ControlOp::PutRoutes { .. }
+        | ControlOp::DeleteRoute { .. }
+        | ControlOp::SessionKeyPut { .. }
+        | ControlOp::FleetNamePut { .. }
+        | ControlOp::ProxyRecorded { .. }
+        | ControlOp::ProxyRecordedClear { .. } => None,
+    }
+}
+
+/// Standalone answers a refused single create with the bare reason, and a refused batch with its
+/// `replace_all` wording: the set is refused whole, so no index is named.
+fn admission_message(reason: &str, in_batch: bool) -> String {
+    if in_batch {
+        format!("Invalid imposter set (imposters unchanged): {reason}")
+    } else {
+        reason.to_owned()
+    }
+}
+
 /// Validate one *resolved* op's scripts; `Err` is the client-shaped 400 with
 /// upstream's exact message. `batch_index` is `Some` for `PUT /imposters` ops.
 ///
@@ -4590,12 +4708,15 @@ async fn fetch(
 // The Err IS the client response (the early-return channel this module
 // uses everywhere); boxing it would just move the bytes to every call site.
 #[allow(clippy::result_large_err)]
-fn parse<T: serde::de::DeserializeOwned>(body: &[u8]) -> Result<T, Response<FrontBody>> {
+fn parse<T: serde::de::DeserializeOwned>(
+    body: &[u8],
+    door: &str,
+) -> Result<T, Response<FrontBody>> {
     serde_json::from_slice(body).map_err(|e| {
         typed_error(
             StatusCode::BAD_REQUEST,
             ErrorKind::BadData,
-            &format!("invalid request JSON: {e}"),
+            &format!("{door}: {e}"),
         )
     })
 }
@@ -7182,6 +7303,166 @@ mod tests {
         fn the_published_limits_are_the_enforced_ones() {
             assert_eq!(TRY_BUDGET, Duration::from_secs(10));
             assert_eq!(TRY_MAX_RESPONSE_BYTES, 1024 * 1024);
+        }
+    }
+
+    /// Pins D-104: the door admits a write by the config it leaves. Pure over the op and the
+    /// stored config, so every rule is checked without a cluster.
+    mod admission {
+        use super::*;
+
+        const BAD_COPY: &str = r#"{"port": 4545, "protocol": "http", "stubs": [
+            {"id": "good", "responses": [{"is": {"body": "ok"}}]},
+            {"id": "bad", "responses": [{"is": {"body": "${T}"},
+                "_behaviors": {"copy": {"from": "body", "into": "${T}",
+                    "using": {"method": "jsonpath", "selector": "$[[[bad"}}}}]}]}"#;
+        const GOOD: &str = r#"{"port": 4545, "protocol": "http", "stubs": [
+            {"id": "good", "responses": [{"is": {"body": "ok"}}]}]}"#;
+
+        fn replayed(json: &str) -> ImposterConfig {
+            decode_committed_config(json).expect("replay decodes it")
+        }
+
+        fn put(config: ImposterConfig) -> ControlOp {
+            ControlOp::PutImposter {
+                config: Box::new(config),
+            }
+        }
+
+        fn patch(step: StubEdit) -> ControlOp {
+            ControlOp::PatchStubs {
+                port: 4545,
+                edit: StubEditScript(vec![step]),
+            }
+        }
+
+        fn stub(config: &str, id: &str) -> Stub {
+            replayed(config)
+                .stubs
+                .into_iter()
+                .find(|s| s.id.as_deref() == Some(id))
+                .expect("stub present")
+        }
+
+        #[test]
+        fn a_whole_config_the_engine_refuses_is_refused() {
+            let reason = admission_refusal(&put(replayed(BAD_COPY)), None)
+                .expect("a bad copy selector is refused");
+            assert!(reason.contains("jsonpath"), "upstream's reason: {reason}");
+            assert_eq!(admission_refusal(&put(replayed(GOOD)), None), None);
+        }
+
+        /// rift#1578: `mode` exists only on the incoming body, so this is the one place it can
+        /// be judged.
+        #[test]
+        fn a_binary_mode_imposter_with_matches_is_refused_with_mountebanks_message() {
+            let config: ImposterConfig = serde_json::from_str(
+                r#"{"port": 4545, "protocol": "http", "mode": "binary", "stubs": [
+                    {"predicates": [{"matches": {"body": "^AQ"}}],
+                     "responses": [{"is": {"body": "x"}}]}]}"#,
+            )
+            .expect("decodes: the rule is not a decode rule");
+            assert_eq!(
+                admission_refusal(&put(config), None).as_deref(),
+                Some("the matches predicate is not allowed in binary mode")
+            );
+        }
+
+        #[test]
+        fn adding_a_refused_stub_to_a_good_config_is_refused() {
+            let op = patch(StubEdit::Add {
+                stub: stub(BAD_COPY, "bad"),
+                index: None,
+            });
+            let reason = admission_refusal(&op, Some(GOOD)).expect("refused");
+            assert!(reason.contains("jsonpath"), "{reason}");
+        }
+
+        #[test]
+        fn adding_a_good_stub_beside_a_refused_one_is_refused() {
+            let op = patch(StubEdit::Add {
+                stub: stub(GOOD, "good"),
+                index: None,
+            });
+            let mut fresh = stub(GOOD, "good");
+            fresh.id = Some("fresh".to_owned());
+            let op_fresh = patch(StubEdit::Add {
+                stub: fresh,
+                index: None,
+            });
+            // The duplicate id is the state machine's refusal to make, not ours.
+            assert_eq!(admission_refusal(&op, Some(BAD_COPY)), None);
+            let reason = admission_refusal(&op_fresh, Some(BAD_COPY))
+                .expect("the config it leaves still holds the refused stub");
+            assert!(reason.contains("jsonpath"), "{reason}");
+        }
+
+        #[test]
+        fn replacing_the_refused_stub_repairs_and_is_admitted() {
+            let mut fixed = stub(GOOD, "good");
+            fixed.id = Some("bad".to_owned());
+            let op = patch(StubEdit::ReplaceById {
+                id: "bad".to_owned(),
+                stub: fixed,
+            });
+            assert_eq!(admission_refusal(&op, Some(BAD_COPY)), None);
+        }
+
+        #[test]
+        fn removals_carry_nothing_to_admit() {
+            let op = patch(StubEdit::DeleteById {
+                id: "good".to_owned(),
+            });
+            assert_eq!(
+                admission_refusal(&op, Some(BAD_COPY)),
+                None,
+                "even one that leaves the refused stub in place"
+            );
+        }
+
+        #[test]
+        fn an_edit_the_state_machine_will_refuse_is_left_to_it() {
+            let op = patch(StubEdit::ReplaceById {
+                id: "missing".to_owned(),
+                stub: stub(BAD_COPY, "bad"),
+            });
+            assert_eq!(admission_refusal(&op, Some(GOOD)), None, "unknown id: 404");
+            let add = patch(StubEdit::Add {
+                stub: stub(BAD_COPY, "bad"),
+                index: None,
+            });
+            assert_eq!(admission_refusal(&add, None), None, "no imposter: 404");
+        }
+
+        #[test]
+        fn a_batch_refusal_reads_as_standalones_replace_all() {
+            assert_eq!(
+                admission_message("the matches predicate is not allowed in binary mode", true),
+                "Invalid imposter set (imposters unchanged): the matches predicate is not \
+                 allowed in binary mode"
+            );
+            assert_eq!(admission_message("why", false), "why");
+        }
+
+        #[test]
+        fn replacing_a_good_stub_with_a_refused_one_is_refused() {
+            let mut bad = stub(BAD_COPY, "bad");
+            bad.id = Some("good".to_owned());
+            let op = patch(StubEdit::ReplaceById {
+                id: "good".to_owned(),
+                stub: bad,
+            });
+            let reason = admission_refusal(&op, Some(GOOD)).expect("refused");
+            assert!(reason.contains("jsonpath"), "{reason}");
+        }
+
+        #[test]
+        fn a_stored_config_replay_cannot_decode_is_left_to_the_drive() {
+            let op = patch(StubEdit::Add {
+                stub: stub(GOOD, "good"),
+                index: None,
+            });
+            assert_eq!(admission_refusal(&op, Some("not json")), None);
         }
     }
 }
