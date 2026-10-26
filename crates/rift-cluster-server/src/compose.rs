@@ -1064,6 +1064,20 @@ async fn bootstrap_imposters(
         // document leaves the others' ids unchanged and hides that the document moved at all.
         let digest = document_digest(&fetched.configs)
             .with_context(|| format!("hashing the document at --imposters {uri}"))?;
+        // The bootstrap is a door too (D-104): `mode` exists only on the document, never in the
+        // log, so a rule keyed on it is judged here or nowhere, as standalone's `--configfile`
+        // judges it at startup. Every imposter is judged before any is submitted, so a refusal
+        // never leaves the ones before it committed fleet-wide.
+        for config in &fetched.configs {
+            if let Err(reason) = rift_cluster_base::seams::admission_check(config) {
+                let port = config
+                    .port
+                    .map_or_else(|| "(none)".to_owned(), |port| port.to_string());
+                anyhow::bail!(
+                    "--imposters {uri}: imposter on port {port} is refused by this engine: {reason}"
+                );
+            }
+        }
         for config in fetched.configs {
             let Some(port) = config.port else {
                 anyhow::bail!(

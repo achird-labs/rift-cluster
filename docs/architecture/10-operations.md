@@ -411,6 +411,9 @@ do on any restart (D-8).
 
 > **Amended by D-102** (2026-10-04, #657): this section is new.
 
+> **Amended by D-104** (2026-10-26, #705): a content edit that leaves a refused config is refused
+> at the door (`400`, nothing committed), and the stub index routes now work on a refused port.
+
 What the fleet committed is read back without the engine's admission checks, so an upgrade never
 makes the state directory unreadable: a node whose log holds a config its engine refuses still
 starts, still replicates it to a joiner, and holds the same rows as every other node. The engine
@@ -424,10 +427,12 @@ then declines to **serve** that one config, on that one port:
   time a drive skips it.
 
 To recover, `PUT` a corrected config for the port; the warning clears because the row changed. A
-stub patch that replaces the refused stub works too: the node then realizes the whole corrected
-config. Pausing the port, or a patch that leaves the config refused, still commits and still
-changes the row, but the engine keeps declining it — and keeps serving whatever it last admitted
-there, unpaused — until the config itself is admitted.
+stub replace (by id or by index) that fixes the refused stub works too, and so does deleting it:
+the node then realizes the whole corrected config. A stub add or replace that leaves the config
+refused is answered `400` naming the engine's reason, and nothing commits (D-104). Pausing the
+port, or deleting a different stub, still commits and still changes the row, but the engine keeps
+declining it — and keeps serving whatever it last admitted there, unpaused — until the config
+itself is admitted.
 
 ### State-directory format changes (D-100)
 
