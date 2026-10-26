@@ -4532,7 +4532,7 @@ such a stub can already be in a log. Replay still decodes it, and D-102 refuses 
 drive (`a_committed_response_less_stub_refuses_only_its_own_port`, #685). rift#1314, #1353 and #1413
 add refusals too. `docs/architecture/10-operations.md` lists them for operators.
 
-*The rift master bump* (`64cee15`→`9a91fdc`, past v0.23.0) is whole-fleet on all three counts.
+*The rift master bump* (`64cee15`→`7161b1a`, past v0.23.0) is whole-fleet on all three counts.
 **Keys:** a repeated query key records as an array (rift#1553), which moves the proxyOnce claim key
 of a repeated-key request recorded with `predicateGenerators`; a behaviors element carrying a
 non-behavior key and an element-level `repeat` (rift#1582, #1672) move the key of an id-less stub
@@ -4540,7 +4540,9 @@ that has one. **Matching:** a repeated query, form or header key matches by Moun
 (rift#1553), and JSON body predicates follow its array, null and number rules (rift#1630).
 **Admission:** a path in `proxy.to` (rift#1550), a response with two types or none (rift#1551),
 `matches`/`jsonpath`/`xpath` on a binary-mode imposter (rift#1578) and door-only behavior shapes
-(rift#1582) are refused; D-102 refuses only their ports on replay. One change is a **decode**
+(rift#1582) are refused; D-102 refuses only their ports on replay. **Response behaviour** changes with no change
+to stored bytes: a `_behaviors` block beside `behaviors` (a `null` one included) or a top-level
+`repeat` is now ignored, as Mountebank ignores it (rift#1709), so a mixed fleet runs it on old nodes only. One change is a **decode**
 widening rather than an admission one: a `copy`/`lookup` token in `is.statusCode` (rift#1558)
 decodes only on the new engine, so a mixed fleet in which a new leader commits one leaves an old
 follower unable to apply that log entry (#710). Hence writes stay paused until every node runs the
