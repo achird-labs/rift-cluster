@@ -84,12 +84,15 @@ async fn console_is_not_served_when_the_feature_is_off() {
             seen.status, 404,
             "GET {path} must proxy upstream and 404 with the feature off: {seen}"
         );
-        // The header is the console module's signature. Its absence is what proves the request was
-        // never handled by console code — a stronger statement than the status alone, which upstream
-        // could produce for unrelated reasons.
-        assert_eq!(
-            seen.header("content-security-policy"),
-            None,
+        // The console module's `default-src 'self'` policy is its signature. Its absence is what
+        // proves the request was never handled by console code — a stronger statement than the
+        // status alone, which upstream could produce for unrelated reasons. Upstream's own 404 page
+        // carries Express's `default-src 'none'` since the 0.23 line, so the header's mere presence
+        // proves nothing.
+        assert!(
+            !seen
+                .header("content-security-policy")
+                .is_some_and(|csp| csp.contains("default-src 'self'")),
             "console code ran with the feature off: {seen}"
         );
         assert!(

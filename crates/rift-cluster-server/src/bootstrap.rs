@@ -265,7 +265,7 @@ pub fn dispatch(cli: &mut EeCli) -> anyhow::Result<AfterBootstrap> {
             // A keyed node answers `GET /imposters` with 401 until the key is
             // presented (upstream #1154).
             save_imposters(
-                &cli.oss.host,
+                cli.oss.connect_host(),
                 cli.oss.port,
                 savefile,
                 *remove_proxies,

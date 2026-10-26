@@ -102,7 +102,12 @@ async fn a_non_cluster_server_does_not_serve_the_console() {
             "GET {path} must 404 without --cluster, as the OSS binary does"
         );
         assert!(
-            response.headers().get("content-security-policy").is_none(),
+            // The console's `default-src 'self'` policy, not upstream's 404 `default-src 'none'`.
+            !response
+                .headers()
+                .get("content-security-policy")
+                .and_then(|csp| csp.to_str().ok())
+                .is_some_and(|csp| csp.contains("default-src 'self'")),
             "GET {path}: console code answered on an unclustered node"
         );
         assert!(

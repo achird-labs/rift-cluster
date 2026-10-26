@@ -88,7 +88,7 @@ fn main() -> anyhow::Result<()> {
                 probes::HealthcheckTarget::AdminPlane => (None, api_key),
             },
         };
-        return healthcheck::dispatch(url, &cli.oss.host, cli.oss.port, timeout, key);
+        return healthcheck::dispatch(url, cli.oss.connect_host(), cli.oss.port, timeout, key);
     }
 
     // `--debug` is the server-flag spelling of debug mode; `RIFT_DEBUG` is the
