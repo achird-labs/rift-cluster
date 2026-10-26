@@ -4532,6 +4532,22 @@ such a stub can already be in a log. Replay still decodes it, and D-102 refuses 
 drive (`a_committed_response_less_stub_refuses_only_its_own_port`, #685). rift#1314, #1353 and #1413
 add refusals too. `docs/architecture/10-operations.md` lists them for operators.
 
+*The rift master bump* (`64cee15`→`7161b1a`, past v0.23.0) is whole-fleet on all three counts.
+**Keys:** a repeated query key records as an array (rift#1553), which moves the proxyOnce claim key
+of a repeated-key request recorded with `predicateGenerators`; a behaviors element carrying a
+non-behavior key and an element-level `repeat` (rift#1582, #1672) move the key of an id-less stub
+that has one. **Matching:** a repeated query, form or header key matches by Mountebank's array rules
+(rift#1553), and JSON body predicates follow its array, null and number rules (rift#1630).
+**Admission:** a path in `proxy.to` (rift#1550), a response with two types or none (rift#1551),
+`matches`/`jsonpath`/`xpath` on a binary-mode imposter (rift#1578) and door-only behavior shapes
+(rift#1582) are refused; D-102 refuses only their ports on replay. **Response behaviour** changes with no change
+to stored bytes: a `_behaviors` block beside `behaviors` (a `null` one included) or a top-level
+`repeat` is now ignored, as Mountebank ignores it (rift#1709), so a mixed fleet runs it on old nodes only. One change is a **decode**
+widening rather than an admission one: a `copy`/`lookup` token in `is.statusCode` (rift#1558)
+decodes only on the new engine, so a mixed fleet in which a new leader commits one leaves an old
+follower unable to apply that log entry (#710). Hence writes stay paused until every node runs the
+new binary, as this decision already requires.
+
 **Why documentation, not a mechanism.** Cluster cursors live in memory on their owner (D-8), so
 the restart an upgrade needs resets them whatever their keys are; there is nothing to migrate. In a
 mixed-version window, old and new nodes key a keyless stub differently, so an owner-mode stub can
@@ -4841,3 +4857,41 @@ Pinned by `every_config_bearing_op_decodes_without_admission`,
 `a_node_whose_last_entry_is_a_refused_config_restarts`,
 `a_joiner_replays_a_refused_config_and_the_leader_survives` (`tests/cluster.rs`);
 `a_refused_committed_config_is_named_and_the_door_still_refuses_it` (`tests/write_path.rs`).
+
+### D-103 — A cluster node mirrors upstream's listener and manager defaults, except that `--local-only` never reaches imposter ports
+
+- **Status:** active
+- **Decided:** 2026-10-26 · #700, #703, #712
+- **Refines:** D-79
+- **Implemented by:** #700
+- **Code:** crates/rift-cluster-server/src/cli.rs, crates/rift-cluster-server/src/admin_front.rs, crates/rift-cluster-server/src/compose.rs, crates/rift-cluster-server/tests/manager_parity.rs
+
+The engine bump past rift v0.23.0 changes four defaults that a clustered node replaces wholesale by
+injecting its own manager and binding its own admin front. Each is settled here.
+
+**The admin front listens like upstream's admin.** With no `--host` it binds `[::]` dual-stack and
+falls back to `0.0.0.0` on a host without IPv6 (rift#1528). `EeCli::resolve_front_admin` returns
+upstream's `ListenAddr`, the exposure check judges `ListenAddr::judged` (`[::]:port`, still
+"exposed"), and the front binds through `ListenAddr::bind`, so the judged and the bound address
+stay one value (D-79). `--local-only` keeps the front on `127.0.0.1` alone. Upstream also binds
+`[::1]` there, but the front has one listener.
+
+**Host-less imposters bind the node's own `--host`** (`with_default_host`, rift#1517), read before
+the core admin is re-pointed at loopback. The host is never stored in a config, so each node
+applies its own.
+
+**`require()` and `lookup` read below `--scripts-dir` only** (`with_script_file_access(network)`,
+rift#1611): the access upstream's own manager gives every imposter, fleet-wide because the cluster
+has no tenant to vary it by (D-73). Without `--scripts-dir` no file is readable. The files are read
+on whichever node serves the request and are not replicated, so every node needs the same
+`--scripts-dir` contents.
+
+**`--local-only` does not narrow imposter ports** (`with_peer_policy` is declined in
+`manager_parity`). Upstream refuses non-loopback clients on imposters under `--local-only`
+(rift#1523). On a cluster node that would refuse the load balancer's and peer nodes' traffic, which
+is all of it. D-79 already limits the flag to the admin plane; this keeps the front door and every
+imposter at `PeerPolicy::Any`.
+
+`with_outbound_tls` (rift#1609, client-certificate proxies) is mirrored under the condition upstream
+sets it and is not a decision.
+

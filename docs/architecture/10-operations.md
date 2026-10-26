@@ -384,6 +384,23 @@ Response behaviour also changes for stored configs with no change to their bytes
 (rift#1369), and a mode-less proxy records as `proxyOnce` (rift#1314). A mixed fleet answers such
 requests differently per node until every node runs the new binary.
 
+The bump to rift **master `7161b1a`** (past v0.23.0) is all three again, and more:
+
+- **Keys.** A repeated query key records as an array (rift#1553). Behaviors elements that carry a
+  non-behavior key or an element-level `repeat` (rift#1582, #1672) move the key of an id-less stub
+  once.
+- **Matching.** Repeated query, form and header keys and JSON body predicates follow Mountebank's
+  array, null and number rules (rift#1553, #1630).
+- **Admission.** A path in `proxy.to`, a response with two types or none, text predicates on a
+  binary-mode imposter and door-only behavior shapes are refused (rift#1550, #1551, #1578, #1582).
+- **Responses.** A `_behaviors` block beside `behaviors` or a top-level `repeat` is ignored, as in
+  Mountebank (rift#1709); old nodes still run it.
+- **Decode.** A `copy`/`lookup` token in `is.statusCode` (rift#1558) cannot be decoded by an older
+  node at all. Take no config writes until every node runs the new binary.
+- **Listeners (D-103).** With no `--host`, the admin front and host-less imposters listen dual-stack
+  on `[::]`, falling back to `0.0.0.0` without IPv6. `require()` and `lookup` read only below
+  `--scripts-dir`, on whichever node serves the request: mount the same files on every node.
+
 **Before a whole-fleet upgrade of a fleet that keeps its state directory**, export the imposters and
 load them into the new engine, and fix or delete anything it refuses. `rift-lint` is not a
 substitute: it checks regex selectors (E051) but carries no JSONPath or XPath parser. A fleet

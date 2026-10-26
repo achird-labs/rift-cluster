@@ -25,10 +25,11 @@ use rift_cluster::{
     LeaveOutcome, NodeConfig, NodeError, NodeIdentity, PullOnMissInterceptor, RaftNode, ReadyProbe,
     metrics,
 };
+use rift_cluster_base::rift_http_proxy::server::ListenAddr;
 use rift_cluster_base::seams::{
     CompiledRoutes, FileSource, HttpSource, ImposterConfig, ImposterManager, OutboundTls,
-    RunningFrontDoor, RunningServer, ServerBuilder, SourceRef, SourceRegistry, TlsDefaults,
-    bind_front_door, body_limits_from, build_upstream_client, parse_uri_list,
+    RunningFrontDoor, RunningServer, ScriptFileAccess, ServerBuilder, SourceRef, SourceRegistry,
+    TlsDefaults, bind_front_door, body_limits_from, build_upstream_client, parse_uri_list,
 };
 
 use crate::admin_front::{self, AdminFront, FrontConfig};
@@ -736,7 +737,7 @@ pub async fn start_with_runtimes(
 async fn attach_data_plane(
     mut cli: EeCli,
     // Already resolved and already judged by `EeCli::resolve_front_admin`.
-    front_admin: SocketAddr,
+    front_admin: ListenAddr,
     node: &Arc<RaftNode>,
     readiness: &Arc<Readiness>,
     manager: Arc<ImposterManager>,
@@ -766,7 +767,7 @@ async fn attach_data_plane(
     let api_key = cli.oss.api_key.clone();
     let allow_injection = cli.oss.allow_injection;
     let scripts_dir = cli.oss.scripts_dir.clone();
-    cli.oss.host = "127.0.0.1".to_owned();
+    cli.oss.host = Some("127.0.0.1".to_owned());
     cli.oss.port = 0;
     // **`cli.oss.api_key` is deliberately left in place** (#550, D-73). Before tenancy was
     // removed this was cleared here: upstream's `ServerBuilder` gates the loopback admin on a raw
@@ -828,7 +829,7 @@ async fn attach_data_plane(
     // flag, and D-79 makes the front honour the flag, so the two now agree.
     let server = ServerBuilder::from_cli(cli.oss)
         .manager(Arc::clone(&manager))
-        .reported_admin_port(public_admin.port())
+        .reported_admin_port(public_admin.judged().port())
         .start()
         .await?;
 
@@ -870,7 +871,7 @@ async fn attach_data_plane(
 
     let front = match admin_front::bind(
         FrontConfig {
-            public_addr: public_admin,
+            public_listen: public_admin,
             upstream_admin: server.admin_addr(),
             api_key,
             allow_injection,
@@ -896,7 +897,8 @@ async fn attach_data_plane(
             }
             server.shutdown().await;
             return Err(anyhow::Error::new(e).context(format!(
-                "binding the clustered admin front on {public_admin}"
+                "binding the clustered admin front on {}",
+                public_admin.judged()
             )));
         }
     };
@@ -1467,6 +1469,16 @@ fn cluster_manager(
         .context("--journal-max-bytes must be at least 1")?;
 
     let manager = ImposterManager::with_datadir(cli.oss.datadir.clone())
+        // Upstream's own manager names `network(--scripts-dir)`: `require()` and `lookup` read only
+        // below `--scripts-dir`, and nothing at all without it (upstream #1611). One fleet-wide
+        // access, because the cluster has no tenant to vary it by (D-73); the files are read on
+        // whichever node serves the request, so every node needs the same `--scripts-dir` (D-103).
+        .with_script_file_access(ScriptFileAccess::network(cli.oss.scripts_dir.as_deref()))
+        // Host-less imposters bind the operator's `--host`, as upstream's do (upstream #1517).
+        // Read here, before `attach_data_plane` re-points `cli.oss.host` at the core admin's
+        // loopback leg; unset is upstream's dual-stack `[::]`. Not stored in any config, so each
+        // node applies its own (D-103).
+        .with_default_host(cli.oss.host.clone())
         .with_tls_defaults(TlsDefaults {
             default_cert,
             default_key,
@@ -1506,7 +1518,11 @@ fn cluster_manager(
         );
 
     Ok(match upstream_client {
-        Some(client) => manager.with_upstream_client(client),
+        // The policy too, for `proxy` stubs presenting a client certificate (upstream #1609), and
+        // under the same condition upstream sets it.
+        Some(client) => manager
+            .with_upstream_client(client)
+            .with_outbound_tls(outbound_tls),
         None => manager,
     })
 }

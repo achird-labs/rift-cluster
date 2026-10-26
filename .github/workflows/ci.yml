@@ -851,7 +851,9 @@ jobs:
   # filter which is wrong fails open into skipping, i.e. into a green check that verified nothing.
   # The whole job is well under a minute; a filter would cost more in risk than it saves in time.
   console-web:
-    runs-on: ubuntu-latest
+    # Pinned: Playwright cannot install chromium on the ubuntu-26.04 image `ubuntu-latest` moved to,
+    # and the screenshot baselines must render on the same image as the job that compares them.
+    runs-on: ubuntu-24.04
     defaults:
       run:
         working-directory: web

@@ -82,6 +82,7 @@ use rift_cluster::{
     BarrierOutcome, ControlOutcome, ControlResponse, KeyClass, NodeError, NodeId, OwnedKey,
     RaftNode, SESSION_KEY_BYTES, SessionKey,
 };
+use rift_cluster_base::rift_http_proxy::server::ListenAddr;
 use rift_cluster_base::seams::{
     ErrorKind, FaultCell, FaultIo, ImposterConfig, LingerOnClose, RiftScriptConfig, RouteTable,
     ScriptBaseDir, Stub, apply_tcp_fault, arm_linger_if_requested, classify as classify_upstream,
@@ -133,12 +134,14 @@ pub struct FrontConfig {
     /// (D-79), which is where `--local-only` and `--require-admin-auth` are
     /// applied.
     ///
-    /// A `SocketAddr`, not a string: it used to be one "because the core CLI
-    /// accepts hostnames", which was never true of upstream — `start()` parses
-    /// `--host` as a literal and errors on a name. Carrying it resolved is what
-    /// makes the address that was judged and the address that is bound the same
-    /// value rather than two spellings of one.
-    pub public_addr: SocketAddr,
+    /// Carried resolved, not as a string: that is what makes the address that
+    /// was judged and the address that is bound the same value rather than two
+    /// spellings of one. Upstream's `ListenAddr` rather than a `SocketAddr`
+    /// because the default (`Any`) binds `[::]` dual-stack and falls back to
+    /// `0.0.0.0` on a host without IPv6 (rift#1528); a plain `[::]` bind would
+    /// fail there. Never `Loopback`: `resolve_front_admin` pins that to one
+    /// `127.0.0.1` listener.
+    pub public_listen: ListenAddr,
     /// The loopback address the core admin actually bound.
     pub upstream_admin: SocketAddr,
     /// The fleet's one admin credential (`--api-key` / `MB_APIKEY`), or `None` for an open
@@ -286,7 +289,7 @@ struct FrontState {
     /// See [`FrontConfig::front_door`].
     front_door: Option<SocketAddr>,
     /// The admin port this node **bound** — the listener's own `local_addr`, not the configured
-    /// `public_addr`, because `--port 0` resolves to an OS-assigned port and the configured `0` is
+    /// `public_listen`, because `--port 0` resolves to an OS-assigned port and the configured `0` is
     /// not a port any client reached this node on. Reported so a client can detect address
     /// translation between itself and the node (D-91).
     admin_port: u16,
@@ -298,7 +301,14 @@ struct FrontState {
 
 /// Bind the public admin address and start serving.
 pub async fn bind(config: FrontConfig, node: &Arc<RaftNode>) -> std::io::Result<AdminFront> {
-    let listener = TcpListener::bind(config.public_addr).await?;
+    // `Any` and `Exact` each bind exactly one listener.
+    let listener = config
+        .public_listen
+        .bind()?
+        .into_iter()
+        .next()
+        .ok_or_else(|| std::io::Error::other("binding the admin front produced no listener"))?;
+    let listener = TcpListener::from_std(listener)?;
     let local_addr = listener.local_addr()?;
     tracing::info!(
         %local_addr,
@@ -316,7 +326,7 @@ pub async fn bind(config: FrontConfig, node: &Arc<RaftNode>) -> std::io::Result<
         readiness: config.readiness,
         flow_net: config.flow_net,
         front_door: config.front_door,
-        // `local_addr`, not `config.public_addr`: `--port 0` is legal and the configured `0` is
+        // `local_addr`, not `config.public_listen`: `--port 0` is legal and the configured `0` is
         // not a port a client could have reached this node on — which is the whole question this
         // field exists to answer. Same rule as `front_door` beside it.
         admin_port: local_addr.port(),
@@ -5608,7 +5618,7 @@ mod tests {
         .expect("bind flow net");
         let front = bind(
             FrontConfig {
-                public_addr: "127.0.0.1:0".parse().expect("valid address"),
+                public_listen: ListenAddr::Exact("127.0.0.1:0".parse().expect("valid address")),
                 upstream_admin: "127.0.0.1:1".parse().expect("addr"),
                 api_key: None,
                 // No front door in the unit fronts: `/_fleet/members` then reports
@@ -5999,7 +6009,7 @@ mod tests {
         let (node, dir) = test_node().await;
         let front = bind(
             FrontConfig {
-                public_addr: "127.0.0.1:0".parse().expect("valid address"),
+                public_listen: ListenAddr::Exact("127.0.0.1:0".parse().expect("valid address")),
                 upstream_admin: "127.0.0.1:1".parse().expect("addr"),
                 api_key: None,
                 // No front door in the unit fronts: `/_fleet/members` then reports

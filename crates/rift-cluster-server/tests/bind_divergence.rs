@@ -88,13 +88,21 @@ fn imposter(port: u16, body: &str) -> serde_json::Value {
 /// The squat a real deployment sees: an unrelated process holding the port with a plain
 /// (non-SO_REUSEPORT) listener, so the node's reusable bind cannot join it.
 ///
-/// `0.0.0.0`, not `127.0.0.1`: an imposter binds the wildcard address, and `SO_REUSEADDR` lets a
-/// wildcard bind succeed *over* a loopback-specific one on macOS. Squatting loopback therefore
-/// produces a node that binds cleanly and a test that passes without exercising anything.
+/// The dual-stack wildcard `[::]`, the very address a host-less imposter binds since upstream
+/// #1536 — not `127.0.0.1` and no longer `0.0.0.0`. With `SO_REUSEADDR` the BSD family lets a
+/// wildcard bind succeed beside a holder on any *other* address: beside a loopback one, and (once
+/// imposters went dual-stack) beside an IPv4-only `0.0.0.0` one. Squatting either produces a node
+/// that binds cleanly on macOS and a test that passes without exercising anything. Linux refuses
+/// both, so `[::]` is the squat that conflicts on every kernel. Falls back to `0.0.0.0` on a host
+/// with no IPv6, where the imposter falls back the same way.
 async fn squat(port: u16) -> tokio::net::TcpListener {
-    tokio::net::TcpListener::bind(("0.0.0.0", port))
-        .await
-        .expect("squatter bind")
+    match tokio::net::TcpListener::bind(("::", port)).await {
+        Ok(listener) => listener,
+        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => panic!("squatter bind: {e}"),
+        Err(_) => tokio::net::TcpListener::bind(("0.0.0.0", port))
+            .await
+            .expect("squatter bind"),
+    }
 }
 
 /// Whether the node reports bind divergence for `port`.

@@ -203,6 +203,11 @@ pub mod seams {
         RiftScriptConfig, ScriptBaseDir, ScriptResolveError, resolve_scripts, resolve_stub_scripts,
     };
 
+    /// Which files a script's `require()` and a `lookup` CSV may read (upstream #1611). A manager
+    /// that names none refuses every file, so the clustered manager names the same
+    /// `network(--scripts-dir)` access upstream's own manager does.
+    pub use rift_mock_core::imposter::ScriptFileAccess;
+
     /// Post-resolution script validation (upstream's admin-time 400 gate): the
     /// clustered admin front validates resolved ops before parking, so nothing
     /// syntactically broken is ever committed to the log. Only meaningful

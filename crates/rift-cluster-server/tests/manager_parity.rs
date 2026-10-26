@@ -89,12 +89,12 @@ const CLUSTER_ADDITIONS: &[&str] = &[
 /// without an upstream default, and it must carry the reason. Entries are
 /// checked for staleness — see `declined_entries_are_still_real`.
 const INTENTIONALLY_NOT_MIRRORED: &[&str] = &[
-    // Empty since rift#1463 removed `with_flow_store_backends` and the named
-    // `_rift.flowState.backend` registry it fed (#688), which was the only
-    // waiver. `FlowStoreProvider` is now upstream's sole flow-store seam, and
-    // the clustered path already installs it (`with_flow_store_provider`). A
-    // leftover `backend` key — `"redis"` included — decodes into
-    // `RiftFlowStateConfig.extra` and selects nothing, on either path.
+    // Upstream's `--local-only` refuses non-loopback clients on imposter ports (rift#1523). On a
+    // cluster node `--local-only` pins the admin plane only (D-79): imposter traffic arrives from
+    // the load balancer and from peer nodes, never over loopback, so mirroring it would refuse
+    // every request the fleet exists to serve. The manager's default `PeerPolicy::Any` stays, and
+    // the front door follows it (#703, D-103).
+    "with_peer_policy",
 ];
 
 const UPSTREAM_SERVER_RS: &str = "vendor/rift/crates/rift-http-proxy/src/server.rs";

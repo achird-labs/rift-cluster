@@ -4,11 +4,12 @@
 //! never drift: a flag added upstream appears here on the next pin bump, and the
 //! parity test in `tests/cli.rs` fails if flattening ever stops covering it.
 
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::LazyLock;
 
 use rift_cluster::{Authority, ClusterConfig, ConfigError, RuntimeTopology};
+use rift_cluster_base::rift_http_proxy::server::ListenAddr;
 use rift_cluster_base::seams::Cli as OssCli;
 
 /// The `--cluster*` flags.
@@ -316,8 +317,14 @@ impl EeCli {
     /// too, so the rule still has one definition across both binaries. That
     /// matters beyond tidiness: an earlier copy here parsed `"{host}:{port}"`,
     /// which reads `::1:2525`'s port as one more hextet — the very defect
-    /// upstream fixed for every door in rift#1144. Rift never resolves `--host`
-    /// through DNS, so a hostname is a startup error there and here.
+    /// upstream fixed for every door in rift#1144. A DNS-name `--host` resolves to
+    /// its first address (rift#1658); one that does not resolve is a startup
+    /// error there and here.
+    ///
+    /// Returned as upstream's [`ListenAddr`], not a bare address: with no
+    /// `--host` the front listens dual-stack on `[::]`, falling back to
+    /// `0.0.0.0` on a host without IPv6 (rift#1528), and only `ListenAddr::bind`
+    /// knows how. The exposure check judges [`ListenAddr::judged`].
     ///
     /// Only the admin plane is pinned. Upstream's `--local-only` moves the admin
     /// API and `/metrics`; imposter ports — and so this crate's front door, which
@@ -330,7 +337,7 @@ impl EeCli {
     /// address; or the resolved address is reachable off-host with no `--api-key`
     /// while `--require-admin-auth` is set — upstream's
     /// `AdminExposurePolicy::Refuse`.
-    pub fn resolve_front_admin(&self) -> anyhow::Result<SocketAddr> {
+    pub fn resolve_front_admin(&self) -> anyhow::Result<ListenAddr> {
         // The key is validated *first*, and that order is load-bearing:
         // `check_admin_exposure` takes `Some(_)` to mean a usable key only because
         // `validate_admin_api_key` has already refused a blank one — upstream's
@@ -340,18 +347,26 @@ impl EeCli {
         rift_cluster_base::rift_http_proxy::admin_api::validate_admin_api_key(
             self.oss.api_key.as_deref(),
         )?;
-        let addr = rift_cluster_base::rift_http_proxy::server::admin_bind_addr(&self.oss)?;
+        let listen = match rift_cluster_base::rift_http_proxy::server::admin_listen_addr(&self.oss)?
+        {
+            // Upstream's `--local-only` listens on `127.0.0.1` and `[::1]`; the front has always
+            // bound `127.0.0.1` alone (D-79), and keeps doing so — one listener, one address.
+            ListenAddr::Loopback(port) => {
+                ListenAddr::Exact(SocketAddr::from((Ipv4Addr::LOCALHOST, port)))
+            }
+            other => other,
+        };
 
         // Upstream's function, policy enum and `bool` mapping, not a local
         // re-reading of them: the flag must mean the same thing in both
         // binaries, and the operator must get the same message. `Warn` (the
         // default) logs it; `Refuse` (`--require-admin-auth`) aborts startup.
         rift_cluster_base::rift_http_proxy::admin_api::check_admin_exposure(
-            addr,
+            listen.judged(),
             self.oss.api_key.as_deref(),
             self.oss.require_admin_auth.into(),
         )?;
-        Ok(addr)
+        Ok(listen)
     }
 
     /// How the open-source flags ask the data plane to be scheduled, as the
@@ -476,7 +491,8 @@ mod tests {
     fn local_only_pins_the_front_to_loopback() {
         let pinned = front(&["--local-only", "--port", "2525"])
             .resolve_front_admin()
-            .expect("resolves");
+            .expect("resolves")
+            .judged();
         assert!(
             pinned.ip().is_loopback(),
             "--local-only must pin the front's admin bind: {pinned}"
@@ -484,12 +500,32 @@ mod tests {
 
         let open = front(&["--port", "2525"])
             .resolve_front_admin()
-            .expect("resolves");
+            .expect("resolves")
+            .judged();
         assert!(
             !open.ip().is_loopback(),
-            "without it the front keeps --host's default 0.0.0.0: {open}"
+            "without it the front keeps --host's default, dual-stack [::]: {open}"
         );
         assert_eq!(open.port(), 2525, "the operator's port is what is bound");
+    }
+
+    /// Pins D-103: with no `--host` the front listens like upstream's admin —
+    /// `Any`, which binds `[::]` dual-stack and falls back to `0.0.0.0` — and
+    /// `--local-only` keeps it on the one `127.0.0.1` listener it always had.
+    #[test]
+    fn the_front_listens_dual_stack_unless_local_only() {
+        assert_eq!(
+            front(&["--port", "2525"])
+                .resolve_front_admin()
+                .expect("resolves"),
+            ListenAddr::Any(2525)
+        );
+        assert_eq!(
+            front(&["--local-only", "--port", "2525"])
+                .resolve_front_admin()
+                .expect("resolves"),
+            ListenAddr::Exact(SocketAddr::from((Ipv4Addr::LOCALHOST, 2525)))
+        );
     }
 
     /// `--local-only` outranks an explicit `--host`, matching upstream's
@@ -498,7 +534,8 @@ mod tests {
     fn local_only_outranks_an_explicit_host() {
         let addr = front(&["--host", "10.0.0.5", "--local-only"])
             .resolve_front_admin()
-            .expect("resolves");
+            .expect("resolves")
+            .judged();
         assert!(addr.ip().is_loopback(), "{addr}");
     }
 
@@ -512,7 +549,7 @@ mod tests {
         let e = refused.expect_err("an off-host admin plane with no key must be refused");
         let chain = format!("{e:#}");
         assert!(
-            chain.contains("0.0.0.0:2525"),
+            chain.contains("[::]:2525"),
             "the refusal must name the address actually judged — the front's, not \
              the core's loopback leg: {chain}"
         );
@@ -548,7 +585,8 @@ mod tests {
     fn a_bare_ipv6_host_resolves_like_upstream() {
         let addr = front(&["--host", "::1", "--port", "2525"])
             .resolve_front_admin()
-            .expect("a bare IPv6 literal is a valid host");
+            .expect("a bare IPv6 literal is a valid host")
+            .judged();
         assert!(addr.is_ipv6() && addr.ip().is_loopback(), "{addr}");
         assert_eq!(addr.port(), 2525);
     }
@@ -569,15 +607,15 @@ mod tests {
         );
     }
 
-    /// Upstream parses `--host` as a literal and never resolves DNS; a name is a
-    /// startup error there, and must be one here rather than becoming an address
-    /// nobody judged.
+    /// Upstream resolves a DNS-name `--host` and binds its first address
+    /// (rift#1658); a name that does not resolve is a startup error naming it,
+    /// here as there, rather than becoming an address nobody judged.
     #[test]
-    fn a_hostname_is_refused_rather_than_resolved() {
-        let e = front(&["--host", "rift.internal"])
+    fn an_unresolvable_hostname_is_refused_naming_it() {
+        let e = front(&["--host", "rift.invalid"])
             .resolve_front_admin()
-            .expect_err("a hostname is not a literal socket address");
-        assert!(format!("{e:#}").contains("rift.internal"), "{e:#}");
+            .expect_err("a name that does not resolve has no address to bind");
+        assert!(format!("{e:#}").contains("rift.invalid"), "{e:#}");
     }
 
     #[test]
