@@ -76,15 +76,18 @@ export type ResponseModel = {
    * is its own `StubResponse` variant, dispatched after `is`/`proxy`/`inject`.
    */
   fault: FaultModel | null;
-  /** `null` means the key is ABSENT, not that the status is zero — the engine then defaults to 200. */
+  /**
+   * `null` means the key is ABSENT, not that the status is zero — the engine then answers the
+   * imposter's `defaultResponse` status when it names one (rift#1369), else 200.
+   */
   statusCode: number | null;
   /**
    * Did the source spell `statusCode` as a STRING?
    *
-   * The engine always emits the string form: `IsResponseOut.status_code` goes through
-   * `serialize_status_code_as_string`, deliberately, for Mountebank wire compatibility. So every
-   * response read back from `GET /imposters/:port` carries `"statusCode": "200"` — which means that
-   * before #257, modelling only the number spelling sent EVERY EXISTING STUB to raw-only. The form
+   * Engines before rift#1361 always emitted the string form (`serialize_status_code_as_string`,
+   * for Mountebank wire compatibility); since then the engine prints a number, as Mountebank does.
+   * Stored and hand-written stubs still carry `"statusCode": "200"`, and before #257, modelling only
+   * the number spelling sent every such stub to raw-only. The form
    * was reachable in practice for a never-saved stub and nothing else, which quietly undid the form
    * work in #188, #247 and #248.
    *
@@ -104,6 +107,15 @@ export type ResponseModel = {
    * an export (#251) it is a diff on almost every response.
    */
   headersPresent: boolean;
+  /**
+   * Did the source carry `"_mode": "text"`?
+   *
+   * Since rift#1369 every code-built response — a proxy recording above all — prints it, as
+   * Mountebank's recorder does. Carried and written back unchanged, so a recorded stub opens in the
+   * form instead of raw-only and leaves it without a diff. `"binary"` is not modelled: its body is
+   * base64, which this form cannot edit without corrupting it.
+   */
+  modeText: boolean;
   headers: ResponseHeader[];
   body: ResponseBody;
 };
@@ -123,10 +135,24 @@ export type ResponseLabel = {
 export const DEFAULT_STATUS_CODE = 200;
 
 /**
- * The keys an `is` response (wrapped or flat) may hold in the form. Anything else it carries —
- * `_mode` above all — is named as unmodelled and sends the stub to raw-only.
+ * The keys an `is` response (wrapped or flat) may hold in the form. `_mode` is admitted only as
+ * `"text"` (see `modeText`); anything else it carries is named as unmodelled and sends the stub to
+ * raw-only.
  */
-const IS_KEYS = ["statusCode", "headers", "body"] as const;
+const IS_KEYS = ["statusCode", "headers", "body", "_mode"] as const;
+
+/**
+ * The status an imposter's `defaultResponse` answers with, when it names one — what an `is` response
+ * that omits `statusCode` answers with since rift#1369 (Mountebank's merge). `null` when there is no
+ * default, or it names no readable status.
+ */
+export function defaultResponseStatus(defaultResponse: unknown): number | null {
+  if (typeof defaultResponse !== "object" || defaultResponse === null) return null;
+  const status = (defaultResponse as Record<string, unknown>).statusCode;
+  if (typeof status === "number" && Number.isInteger(status)) return status;
+  if (typeof status === "string" && isCanonicalStatusText(status)) return Number(status);
+  return null;
+}
 
 /**
  * The response variants this form does not edit, in the order they are reported.
@@ -217,6 +243,7 @@ export function blankResponse(): ResponseModel {
     // it back as a string on the next read; that is its serialization, not a rewrite by this form.
     statusText: false,
     headersPresent: false,
+    modeText: false,
     headers: [],
     body: { kind: "absent" },
     behaviors: null,
@@ -302,6 +329,8 @@ function renderIsBody(response: ResponseModel): Record<string, unknown> {
   }
   if (response.body.kind === "text") rendered.body = response.body.text;
   else if (response.body.kind === "json") rendered.body = response.body.value;
+  // After the body, where the engine's `IsResponseOut` prints it.
+  if (response.modeText) rendered._mode = "text";
   return rendered;
 }
 
@@ -335,7 +364,7 @@ type ParseResult<T> = { ok: true; value: T } | { ok: false; issues: string[] };
 /** The parts of a response that live inside `is` — everything `parseIsBody` is responsible for. */
 type IsBodyFields = Pick<
   ResponseModel,
-  "statusCode" | "statusText" | "headersPresent" | "headers" | "body"
+  "statusCode" | "statusText" | "headersPresent" | "modeText" | "headers" | "body"
 >;
 
 /**
@@ -400,12 +429,14 @@ function parseHeaders(raw: unknown, path: string, headers: ResponseHeader[]): st
 function parseIsBody(value: Record<string, unknown>, path: string): ParseResult<IsBodyFields> {
   const issues: string[] = [];
 
-  // `_mode: "binary"` means the body is base64. The form has no way to edit that without
-  // corrupting it, so it is named rather than modelled — as the issue asks.
   const allowed = new Set<string>(IS_KEYS);
   for (const key of Object.keys(value)) {
     if (!allowed.has(key)) issues.push(`${path}.${key}`);
   }
+  // `_mode: "binary"` means the body is base64. The form has no way to edit that without
+  // corrupting it, so it is named rather than modelled; `"text"` is carried (see `modeText`).
+  const modeText = value._mode === "text";
+  if ("_mode" in value && !modeText) issues.push(`${path}._mode`);
 
   let statusCode: number | null = null;
   let statusText = false;
@@ -442,7 +473,7 @@ function parseIsBody(value: Record<string, unknown>, path: string): ParseResult<
   }
 
   if (issues.length > 0) return { ok: false, issues };
-  return { ok: true, value: { statusCode, statusText, headersPresent, headers, body } };
+  return { ok: true, value: { statusCode, statusText, headersPresent, modeText, headers, body } };
 }
 
 /**
