@@ -1030,6 +1030,22 @@ mod tests {
         }
     }
 
+    /// Pins D-106: rift#1558 widened `statusCode` to any string, so a committed token status
+    /// decodes through `decode_committed_config` (the same `deserialize_replayed` a log entry
+    /// uses) and re-serializes `statusCode` as the same string.
+    #[test]
+    fn a_token_status_code_decodes_on_replay_and_round_trips() {
+        let body = json!({ "port": 1, "protocol": "http",
+            "stubs": [{ "responses": [{ "is": { "statusCode": "${code}" } }] }] })
+        .to_string();
+        let config = decode_committed_config(&body).expect("replay decodes a token status");
+        let written = serde_json::to_value(&config).expect("serializes");
+        assert_eq!(
+            written["stubs"][0]["responses"][0]["is"]["statusCode"],
+            json!("${code}")
+        );
+    }
+
     #[test]
     fn validate_rejects_a_config_without_an_explicit_port() {
         let op = ControlOp::PutImposter {
