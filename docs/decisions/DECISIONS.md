@@ -3975,6 +3975,9 @@ decision, not a side effect of a pin bump.
 - **Refines:** D-33, D-88
 - **Code:** crates/rift-cluster-server/src/main.rs, crates/rift-cluster-server/src/bootstrap.rs, crates/rift-cluster-server/src/compose.rs, crates/rift-cluster-server/tests/cli.rs
 
+> **Amended by D-107** (2026-10-27, #716): the PID file is written once startup has returned, never
+> before; a start that fails or is abandoned writes none.
+
 **The gap.** D-33 promises that without `--cluster` this binary behaves as `rift` does. rift#1155
 gave `rift` a SIGTERM/SIGINT handler, a bounded runtime teardown, and a server that removes its own
 PID file. This binary's unclustered path still returned `join()` with no handler: SIGTERM's default
@@ -5014,4 +5017,38 @@ tolerate unknown fields covers new *fields* only, never a wider value of an exis
 What the new binary itself must still do is pinned: a token `statusCode` replays and re-serializes
 as written, and a numeric string keys an id-less stub as the number it spells, so no committed
 stub's shared cursor moves at the bump.
+
+### D-107 — The PID file is written once the server serves, never before; a start that fails writes none
+
+- **Status:** active
+- **Decided:** 2026-10-27 · #716
+- **Refines:** D-89, D-33
+- **Implemented by:** #716
+- **Code:** crates/rift-cluster-server/src/main.rs, crates/rift-cluster-server/src/bootstrap.rs, crates/rift-cluster-server/tests/cli.rs
+
+Upstream writes `--pidfile` inside its binary's `serve()`, once `ServerBuilder::start` has returned
+(rift#1657): a tool that waits on the file then never races the first request. This binary wrote it
+before startup, so an unclustered node diverged from `rift` (D-33) and a clustered one claimed to
+be running before it had joined.
+
+**The file is written after `compose::start` returns.** Unclustered, that is upstream's point: the
+admin API and every startup imposter (`--imposters`, `--datadir`) are bound. Clustered, it is the
+point where the node has joined, its admin front is bound and the `--imposters` import has
+committed. Whether the replicated imposters are bound on this node is `/readyz`'s answer
+(`GATE_RECONCILED`), not the PID file's. Still after the dispatch (upstream #827), so `restart` and
+`save` never record or clobber a PID.
+
+A start that fails, or is abandoned on a signal (D-89), writes no file. A file that cannot be
+written shuts the server down at once with `ComposedServer::shutdown`, not a graceful leave, and
+returns `writing the PID file <path>`: crash-equivalent, as an abandoned start already is, and the
+next start resumes from the durable log.
+
+**Consequence, stated:** a clustered node still joining (up to `--cluster`'s 30 s seed deadline)
+has no PID file yet, so `stop` cannot find it and `restart` starts fresh. Signal the process itself
+to stop a node mid-join; D-89 abandons the start cleanly.
+
+**Rejected:** waiting for `GATE_RECONCILED` before writing — with a port that cannot bind (D-81) a
+node can stay unreconciled indefinitely, and then `stop` could not find it. Writing it inside
+`compose::start` — that is an embedding seam, the same reason upstream keeps the write out of
+`ServerBuilder::start`.
 

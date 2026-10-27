@@ -119,12 +119,6 @@ fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    // After the dispatch, not before it — the one place every serving entry
-    // converges, mirroring upstream #827. Written ahead of it, `restart` recorded
-    // its own PID and then SIGTERMed itself, and a transient `save` clobbered a
-    // running server's file.
-    bootstrap::write_pidfile(&cli)?;
-
     info!(
         version = %rift_cluster_base::version_banner(),
         cluster = cli.cluster.cluster,
@@ -135,7 +129,7 @@ fn main() -> anyhow::Result<()> {
     // alike (#627, upstream #1155); a Ctrl+C, a plain `kill` or a `docker stop`
     // used to leave a stale one behind.
     let written_pidfile = cli.oss.pidfile.clone();
-    let result = run(cli);
+    let result = run(cli, written_pidfile.as_deref());
     if let Some(pidfile) = written_pidfile {
         bootstrap::remove_own_pidfile(&pidfile);
     }
@@ -143,7 +137,7 @@ fn main() -> anyhow::Result<()> {
     result
 }
 
-fn run(cli: EeCli) -> anyhow::Result<()> {
+fn run(cli: EeCli, pidfile: Option<&std::path::Path>) -> anyhow::Result<()> {
     // Topology selection mirrors the open-source binary (RFC-712): clap has
     // already merged the RIFT_RUNTIME env fallback, and the platform gate then
     // downgrades or refuses per-core per its own rules.
@@ -161,7 +155,7 @@ fn run(cli: EeCli) -> anyhow::Result<()> {
             let tokio_runtime = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()?;
-            let result = tokio_runtime.block_on(serve(cli, Vec::new()));
+            let result = tokio_runtime.block_on(serve(cli, Vec::new(), pidfile));
             // Bounded, not an implicit drop: a script still running on a
             // blocking thread would otherwise hold a graceful shutdown for
             // ever. See `runtime::BLOCKING_DRAIN` (upstream #1155).
@@ -186,7 +180,7 @@ fn run(cli: EeCli) -> anyhow::Result<()> {
                 );
             }
             info!("Per-core workers up: {}", alive.len());
-            let result = control.block_on(serve(cli, workers.handles()));
+            let result = control.block_on(serve(cli, workers.handles(), pidfile));
             workers.shutdown();
             control.shutdown_timeout(runtime::BLOCKING_DRAIN);
             result
@@ -194,7 +188,11 @@ fn run(cli: EeCli) -> anyhow::Result<()> {
     }
 }
 
-async fn serve(cli: EeCli, accept_runtimes: Vec<tokio::runtime::Handle>) -> anyhow::Result<()> {
+async fn serve(
+    cli: EeCli,
+    accept_runtimes: Vec<tokio::runtime::Handle>,
+    pidfile: Option<&std::path::Path>,
+) -> anyhow::Result<()> {
     // Installed before anything starts, so a signal that lands during startup is
     // held rather than dropped — as a container's PID 1, a SIGTERM with no
     // handler is discarded by the kernel (D-89, upstream #1155).
@@ -217,6 +215,19 @@ async fn serve(cli: EeCli, accept_runtimes: Vec<tokio::runtime::Handle>) -> anyh
         }
         server = compose::start_with_runtimes(cli, accept_runtimes) => server?,
     };
+    // Only now, once the server serves (D-107, upstream rift#1657): after the dispatch, so
+    // `restart` and `save` never record or clobber a PID (upstream #827), and after startup, so a
+    // tool that waits on the file never races the first request. A start that failed or was
+    // abandoned on a signal has returned above and writes nothing. If the file cannot be written
+    // the server is shut down at once — crash-equivalent, as an abandoned start already is (D-89).
+    if let Some(path) = pidfile
+        && let Err(e) = bootstrap::write_pidfile(path)
+    {
+        server.shutdown().await;
+        return Err(
+            anyhow::Error::new(e).context(format!("writing the PID file {}", path.display()))
+        );
+    }
     info!(admin = %server.admin_addr(), "admin API listening");
     if let Some(probes) = server.probe_addr() {
         info!(%probes, "probes listening");
