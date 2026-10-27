@@ -1602,3 +1602,51 @@ async fn releasing_a_gated_claim_on_a_proxy_always_port_frees_the_signature() {
         "the released signature is claimable again"
     );
 }
+
+/// Pins D-117: clearing saved proxy responses removes a recorded stub from the committed config on
+/// every member — standalone rift's clear (rift#1239, rift#1519) — not only its marker.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_clear_removes_recorded_stubs_fleet_wide() {
+    let _lock = TEST_LOCK.lock().await;
+    let members = proxy_cluster_of(2, Duration::from_secs(30)).await;
+    install_imposter(&members, TEST_PORT, "proxyOnce").await;
+    let s = sig("/cleared-stub");
+    let store = store_on(&members[0]);
+    let ClaimOutcome::Claimed(token) = claim(&store, TEST_PORT, &s).await else {
+        panic!("first claim wins");
+    };
+    let marked: Stub = serde_json::from_value(serde_json::json!({
+        "predicates": [{ "equals": { "path": "/cleared-stub" } }],
+        "responses": [{ "is": { "statusCode": 200, "body": "rec", "_proxyResponseTime": 4 } }],
+    }))
+    .expect("stub parses");
+    let store2 = Arc::clone(&store);
+    let s2 = s.clone();
+    tokio::task::spawn_blocking(move || {
+        store2.complete_recorded(
+            TEST_PORT,
+            s2,
+            token,
+            resp("rec"),
+            RecordedStub {
+                stub: Box::new(marked),
+                placement: RecordedStubPlacement::BeforeProxy,
+                proxy_to: "http://upstream.example".to_owned(),
+                anchor_index: None,
+            },
+        )
+    })
+    .await
+    .expect("join")
+    .expect("recording lands");
+    wait_stub_count(&members, TEST_PORT, 2).await;
+
+    members[1]
+        .node
+        .submit(mint(rift_cluster::ControlOp::ProxyRecordedClear {
+            port: TEST_PORT,
+        }))
+        .await
+        .expect("clear commits");
+    wait_stub_count(&members, TEST_PORT, 1).await;
+}

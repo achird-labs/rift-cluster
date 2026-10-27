@@ -347,7 +347,7 @@ export interface paths {
         post?: never;
         /**
          * Clear saved proxy responses for an imposter, converging by consensus
-         * @description The cluster front **terminates** this route (issue #226) rather than proxying: the clear commits as one Raft op that deletes the fleet's exactly-once recording markers, so every signature records afresh on every node — a proxied clear could only reach one node's in-process store. Recorded *stubs* are imposter config and are deleted through the stub-edit surfaces, not here. Having cleared, the handler delegates to the single-imposter read and answers *its* body — so the response is an `Imposter`, not a receipt for the deletion, exactly as `clearRequests` behaves.
+         * @description The cluster front **terminates** this route (issue #226) rather than proxying: the clear commits as one Raft op that deletes the fleet's exactly-once recording markers, so every signature records afresh on every node — a proxied clear could only reach one node's in-process store. As standalone Rift's clear does, it also removes every proxy-recorded response (an `is` with a numeric `_proxyResponseTime`) from the imposter's stubs, drops a stub left empty and an unmarked `recordedFrom` stub, and restarts every surviving stub's response cycle (D-117). Recorded requests are kept. Having cleared, the handler delegates to the single-imposter read and answers *its* body — so the response is an `Imposter`, not a receipt for the deletion, exactly as `clearRequests` behaves.
          */
         delete: operations["clearSavedProxyResponses"];
         options?: never;
