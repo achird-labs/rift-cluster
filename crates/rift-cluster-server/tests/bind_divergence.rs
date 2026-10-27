@@ -836,7 +836,15 @@ async fn a_joiner_starts_over_a_committed_imposter_on_its_front_door_port() {
     let port = reserve_port();
     let created = reqwest::Client::new()
         .post(format!("http://{}/imposters", founder.admin_addr()))
-        .json(&imposter(port, "caught-up"))
+        // Both nodes share this process's network: on the wildcard the founder's own listener
+        // would hold the port against the joiner's front door on Linux. `127.0.0.2` binds on Linux
+        // and keeps the case real there; where it does not exist (macOS) the founder's imposter is
+        // a bind failure, which changes nothing about the joiner.
+        .json(&{
+            let mut config = imposter(port, "caught-up");
+            config["host"] = json!("127.0.0.2");
+            config
+        })
         .send()
         .await
         .expect("post imposter");
