@@ -4896,8 +4896,10 @@ Pinned by `every_config_bearing_op_decodes_without_admission`,
 `a_refused_committed_config_is_named_and_the_door_still_refuses_it` (`tests/write_path.rs`).
 
 ### D-103 — A cluster node mirrors upstream's listener and manager defaults, except that `--local-only` never reaches imposter ports
+> **Amended by D-118** (2026-10-27, #712): the front's write door refuses a `lookup` CSV the
+> fleet's `network(--scripts-dir)` access could never read, as upstream's doors do.
 
-- **Status:** active
+- **Status:** amended
 - **Decided:** 2026-10-26 · #700, #703, #712
 - **Refines:** D-79
 - **Implemented by:** #700
@@ -5424,4 +5426,30 @@ kept, as upstream keeps them.
   clear, the same residual upstream documents for an old datadir.
 - An old-engine node that re-serializes a row drops the marks from its own row.
 - The release carrying this changes an op's apply semantics, so it is a whole-fleet upgrade (D-98).
+
+### D-118 — The front's write door refuses a `lookup` CSV the fleet's script-file access could never read
+
+- **Status:** active
+- **Decided:** 2026-10-27 · #712
+- **Implemented by:** #712
+- **Code:** crates/rift-cluster-server/src/admin_front.rs, crates/rift-cluster-base/src/lib.rs, deploy/helm/rift-cluster/templates/statefulset.yaml
+
+D-103 gives the fleet's engine `ScriptFileAccess::network(--scripts-dir)`, so `require()` and
+`lookup` CSVs are read at serve time under that root. Upstream's admin doors also refuse, with a
+`400`, a `lookup` whose CSV is outside the root, or any lookup with no root (rift#1617,
+`check_lookup_paths`). The cluster terminates those writes in the front, so upstream's check never
+ran. Such a config was accepted, replicated, and quietly served unreplaced tokens on every node.
+
+**The front runs upstream's check with the fleet's access, between its resolve and validate
+passes** (upstream's order). It covers a `PutImposter`'s stubs and a `PatchStubs` add or replace,
+and answers upstream's `400`.
+- **Content writes only (D-104):** a removal is never refused because of a sibling stub.
+- **Never on replay or admission (D-102):** what is readable depends on the node's flags, not on
+  the config.
+- **The judgement holds fleet-wide** because every node runs the same `--scripts-dir` contents
+  (D-103).
+
+The Helm chart gains `scripts.volume`: any volume source, mounted read-only at
+`/opt/rift/scripts` as `--scripts-dir`. Before it, a chart fleet had no `require()` or `lookup` at
+all.
 

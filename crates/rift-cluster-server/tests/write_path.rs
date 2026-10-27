@@ -6735,3 +6735,253 @@ async fn a_planted_cursor_file_is_not_resumed() {
     );
     restarted.shutdown().await;
 }
+
+/// A stub on `route` whose response looks `?id=` up in the CSV at `path` and answers its `name`.
+fn lookup_stub(route: &str, path: &str) -> serde_json::Value {
+    json!({
+        "predicates": [{ "equals": { "path": route } }],
+        "responses": [{
+            "is": { "body": "name=${row}[name]" },
+            "_behaviors": { "lookup": {
+                "key": { "from": { "query": "id" }, "using": { "method": "regex", "selector": ".*" } },
+                "fromDataSource": { "csv": { "path": path, "keyColumn": "id" } },
+                "into": "${row}"
+            } }
+        }]
+    })
+}
+
+/// A `--scripts-dir` holding `d.csv` and `m.js`, beside a sibling `outside.csv` no path under the
+/// root reaches.
+fn scripts_tree() -> TempDir {
+    let tree = TempDir::new().expect("tempdir");
+    std::fs::create_dir(tree.path().join("sd")).expect("mkdir");
+    std::fs::write(
+        tree.path().join("sd/d.csv"),
+        "id,name\n1,from-scripts-dir\n",
+    )
+    .expect("csv");
+    std::fs::write(
+        tree.path().join("sd/m.js"),
+        "module.exports = { v: 'from-module' };\n",
+    )
+    .expect("js");
+    std::fs::write(tree.path().join("outside.csv"), "id,name\n1,OUTSIDE\n").expect("csv");
+    tree
+}
+
+/// Pins D-118: the front's write door refuses, with upstream's `400`, a `lookup` whose CSV the
+/// fleet's access could never read — outside `--scripts-dir`, or any path with none configured —
+/// at the imposter door and the stub door alike, and commits nothing.
+#[tokio::test]
+async fn a_lookup_outside_scripts_dir_is_refused_at_the_door() {
+    let _serial = TEST_LOCK.lock().await;
+    let tree = scripts_tree();
+    let sd = tree.path().join("sd").to_string_lossy().into_owned();
+    let state = TempDir::new().expect("tempdir");
+    let server = compose::start(cluster_cli(
+        &state,
+        &["--cluster-allow-solo", "--scripts-dir", &sd],
+    ))
+    .await
+    .expect("solo cluster starts");
+    wait_ready(&server).await;
+    let admin = server.admin_addr();
+    let client = reqwest::Client::new();
+    let port = reserve_port();
+    let refused = client
+        .post(format!("http://{admin}/imposters"))
+        .json(&json!({ "port": port, "protocol": "http", "stubs": [lookup_stub("/l", "../outside.csv")] }))
+        .send()
+        .await
+        .expect("post");
+    assert_eq!(refused.status().as_u16(), 400);
+    let body = refused.text().await.expect("body");
+    assert!(
+        body.contains("lookup CSV path '../outside.csv' is outside --scripts-dir"),
+        "{body}"
+    );
+    assert!(!body.contains("OUTSIDE"), "never echoes the file: {body}");
+    assert_eq!(revision(&server, port), None, "nothing committed");
+
+    let created = client
+        .post(format!("http://{admin}/imposters"))
+        .json(&json!({ "port": port, "protocol": "http" }))
+        .send()
+        .await
+        .expect("post");
+    assert_eq!(created.status().as_u16(), 201);
+    let stub_refused = client
+        .post(format!("http://{admin}/imposters/{port}/stubs"))
+        .json(&json!({ "stub": lookup_stub("/l", "../outside.csv") }))
+        .send()
+        .await
+        .expect("post stub");
+    assert_eq!(
+        stub_refused.status().as_u16(),
+        400,
+        "the stub door refuses it too"
+    );
+    server.shutdown().await;
+
+    let state = TempDir::new().expect("tempdir");
+    let rootless = compose::start(cluster_cli(&state, &["--cluster-allow-solo"]))
+        .await
+        .expect("solo cluster starts");
+    wait_ready(&rootless).await;
+    let refused = reqwest::Client::new()
+        .post(format!("http://{}/imposters", rootless.admin_addr()))
+        .json(&json!({ "port": reserve_port(), "protocol": "http", "stubs": [lookup_stub("/l", "d.csv")] }))
+        .send()
+        .await
+        .expect("post");
+    assert_eq!(refused.status().as_u16(), 400);
+    assert!(
+        refused
+            .text()
+            .await
+            .expect("body")
+            .contains("no --scripts-dir is configured")
+    );
+    rootless.shutdown().await;
+}
+
+/// Pins D-118 with D-102 and D-104: lookup paths are judged on content writes at the door, never on
+/// replay and never on a removal — a committed config with a refused lookup still applies, and a
+/// sibling stub can still be deleted from it.
+#[tokio::test]
+async fn a_removal_is_not_refused_for_a_sibling_lookup() {
+    let _serial = TEST_LOCK.lock().await;
+    let state = TempDir::new().expect("tempdir");
+    let server = compose::start(cluster_cli(&state, &["--cluster-allow-solo"]))
+        .await
+        .expect("solo cluster starts");
+    wait_ready(&server).await;
+    let admin = server.admin_addr();
+    let port = reserve_port();
+    let config: rift_cluster_base::seams::ImposterConfig = serde_json::from_value(json!({
+        "port": port, "protocol": "http",
+        "stubs": [
+            { "predicates": [{ "equals": { "path": "/plain" } }], "responses": [{ "is": { "body": "plain" } }] },
+            lookup_stub("/l", "../outside.csv"),
+        ],
+    }))
+    .expect("config parses");
+    let committed = server
+        .node()
+        .expect("clustered")
+        .submit(rift_cluster::ControlRequest {
+            op_id: uuid::Uuid::new_v4(),
+            principal: None,
+            issued_at_secs: 0,
+            expected_revision: None,
+            expect_absent: false,
+            op: rift_cluster::ControlOp::PutImposter {
+                config: Box::new(config),
+                restart: None,
+            },
+        })
+        .await
+        .expect("a committed config is applied, not judged");
+    assert_eq!(committed.outcome, rift_cluster::ControlOutcome::Applied);
+    let removed = reqwest::Client::new()
+        .delete(format!("http://{admin}/imposters/{port}/stubs/0"))
+        .send()
+        .await
+        .expect("delete");
+    assert_eq!(
+        removed.status().as_u16(),
+        200,
+        "a removal is not judged by a sibling's lookup"
+    );
+    server.shutdown().await;
+}
+
+/// Pins D-103: every node's engine confines `require()` and `lookup` to `--scripts-dir`, as
+/// upstream's admin door does — a module and a CSV under the root work through each node of the
+/// fleet, read there at serve time, and a module outside it is refused.
+#[tokio::test]
+async fn require_and_lookup_are_confined_to_scripts_dir_on_every_node() {
+    let _serial = TEST_LOCK.lock().await;
+    let tree = scripts_tree();
+    let sd = tree.path().join("sd").to_string_lossy().into_owned();
+    let founder_state = TempDir::new().expect("tempdir");
+    let founder = compose::start(cluster_cli(
+        &founder_state,
+        &[
+            "--cluster-allow-solo",
+            "--scripts-dir",
+            &sd,
+            "--allow-injection",
+        ],
+    ))
+    .await
+    .expect("founder starts");
+    wait_ready(&founder).await;
+    let seed = founder.cluster_addr().expect("cluster addr").to_string();
+    let joiner_state = TempDir::new().expect("tempdir");
+    let joiner = compose::start(cluster_cli(
+        &joiner_state,
+        &[
+            "--cluster-seeds",
+            &seed,
+            "--scripts-dir",
+            &sd,
+            "--allow-injection",
+        ],
+    ))
+    .await
+    .expect("joiner joins");
+    wait_ready(&joiner).await;
+
+    let port = reserve_port();
+    let decorate = |module: &str| {
+        json!({
+            "predicates": [{ "equals": { "path": format!("/{}", module.replace(['.', '/'], "")) } }],
+            "responses": [{
+                "is": { "body": "unset" },
+                "_behaviors": { "decorate":
+                    format!("(config) => {{ config.response.body = require('{module}').v; }}") }
+            }]
+        })
+    };
+    let created = reqwest::Client::new()
+        .post(format!("http://{}/imposters", founder.admin_addr()))
+        .json(&json!({ "port": port, "protocol": "http", "stubs": [
+            lookup_stub("/l", "d.csv"),
+            decorate("./m.js"),
+            decorate("/etc/hosts"),
+        ] }))
+        .send()
+        .await
+        .expect("post");
+    assert_eq!(created.status().as_u16(), 201);
+    for admin in [founder.admin_addr(), joiner.admin_addr()] {
+        let looked_up = reqwest::get(format!("http://{admin}/__rift/{port}/l?id=1"))
+            .await
+            .expect("lookup")
+            .text()
+            .await
+            .expect("body");
+        assert_eq!(looked_up, "name=from-scripts-dir", "{admin}");
+        let required = reqwest::get(format!("http://{admin}/__rift/{port}/mjs"))
+            .await
+            .expect("require")
+            .text()
+            .await
+            .expect("body");
+        assert_eq!(required, "from-module", "{admin}");
+        let outside = reqwest::get(format!("http://{admin}/__rift/{port}/etchosts"))
+            .await
+            .expect("require outside")
+            .text()
+            .await
+            .expect("body");
+        assert!(
+            !outside.contains("localhost"),
+            "{admin}: a module outside the root is never read: {outside}"
+        );
+    }
+    joiner.shutdown().await;
+    founder.shutdown().await;
+}

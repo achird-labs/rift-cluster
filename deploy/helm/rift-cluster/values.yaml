@@ -155,6 +155,16 @@ sources:
   # The key keeps the name `sources` for chart compatibility; it is not a source subsystem.
   imposters: ""
 
+scripts:
+  # The volume mounted read-only at `--scripts-dir` (`/opt/rift/scripts`) — any volume source: a
+  # `configMap`, a ReadOnlyMany `persistentVolumeClaim`, and so on. Empty means no `--scripts-dir`,
+  # so `require()` and `lookup` CSVs are refused. They are read on each pod at serve time and never
+  # replicated, so every pod must see the same files (D-103). Example:
+  #   volume:
+  #     configMap:
+  #       name: rift-scripts
+  volume: {}
+
 # Appended verbatim to the container's env. Anything set here wins over nothing — the chart does not
 # de-duplicate against its own vars, so setting one the template already sets is undefined.
 extraEnv: []

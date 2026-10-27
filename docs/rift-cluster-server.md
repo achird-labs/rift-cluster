@@ -830,8 +830,12 @@ Cluster-mode divergences from a single node: an imposter must carry an explicit
 `port` (an auto-assigned port cannot replicate). `_rift.script` `file:`/`ref:`
 sources resolve on the node that accepts the write, under that node's
 `--scripts-dir`, before replication (upstream #356) — followers receive
-inline code and need no scripts dir of their own, so deploy script files to
-every node that can receive admin writes. A resolution failure is upstream's
+inline code for those. **Modules a script `require()`s and `lookup` CSVs are
+different:** they are read at serve time on the node that answers, under its
+own `--scripts-dir`, and never replicated (D-103), so every node needs the same
+`--scripts-dir` contents (the chart's `scripts.volume`). The front refuses a
+`lookup` whose CSV is outside `--scripts-dir`, or any lookup with none
+configured, with upstream's 400 (D-118). A resolution failure is upstream's
 400 (`bad data` type, `Script resolution failed: …` message). What resolution
 produces is then compiled before it is accepted, so a script that resolves but
 does not parse is refused the same way (`Script validation failed: …`) instead

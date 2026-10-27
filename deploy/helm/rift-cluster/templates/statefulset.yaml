@@ -169,6 +169,11 @@ spec:
             - name: RIFT_IMPOSTERS
               value: {{ . | quote }}
             {{- end }}
+            {{- if .Values.scripts.volume }}
+            # D-103: require() and lookup CSVs are read at serve time on each node, under this root.
+            - name: RIFT_SCRIPTS_DIR
+              value: /opt/rift/scripts
+            {{- end }}
             {{- with .Values.extraEnv }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
@@ -212,6 +217,11 @@ spec:
             # readOnlyRootFilesystem is on, so anything wanting a scratch path needs one provided.
             - name: tmp
               mountPath: /tmp
+            {{- if .Values.scripts.volume }}
+            - name: scripts
+              mountPath: /opt/rift/scripts
+              readOnly: true
+            {{- end }}
           {{- with .Values.resources }}
           resources:
             {{- toYaml . | nindent 12 }}
@@ -224,6 +234,10 @@ spec:
       volumes:
         - name: tmp
           emptyDir: {}
+        {{- with .Values.scripts.volume }}
+        - name: scripts
+          {{- toYaml . | nindent 10 }}
+        {{- end }}
         - name: cluster-secret
           secret:
             secretName: {{ include "rift-cluster.secretName" . }}

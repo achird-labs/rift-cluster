@@ -85,10 +85,10 @@ use rift_cluster::{
 use rift_cluster_base::rift_http_proxy::server::ListenAddr;
 use rift_cluster_base::seams::{
     ErrorKind, FaultCell, FaultIo, ImposterConfig, LingerOnClose, RiftScriptConfig, RouteTable,
-    ScriptBaseDir, Stub, admission_check, apply_tcp_fault, arm_linger_if_requested,
-    classify as classify_upstream, config_uses_script_surface, error_response_typed,
-    is_injected_fault, not_a_stub_reason, resolve_scripts, resolve_stub_scripts, tcp_fault_carrier,
-    validate_stub, validate_stubs,
+    ScriptBaseDir, ScriptFileAccess, Stub, admission_check, apply_tcp_fault,
+    arm_linger_if_requested, check_lookup_paths, classify as classify_upstream,
+    config_uses_script_surface, error_response_typed, is_injected_fault, not_a_stub_reason,
+    resolve_scripts, resolve_stub_scripts, tcp_fault_carrier, validate_stub, validate_stubs,
 };
 // The compiler crate (RFC-004 §3.1–§3.3): `POST /specs/compile` runs it on the accepting node and
 // hands the result straight back, storing nothing (D-72, #549). `serde_json::Value` stays
@@ -703,6 +703,31 @@ fn query_param<'q>(query: Option<&'q str>, name: &str) -> Option<&'q str> {
             _ if pair == name => Some(""),
             _ => None,
         })
+}
+
+/// The `lookup` CSVs an op writes, judged against the fleet's script-file access with upstream's
+/// own check and its `400` (D-118, rift#1617). The front's judgement holds fleet-wide because every
+/// node runs the same `--scripts-dir` contents (D-103).
+#[allow(clippy::result_large_err)]
+fn check_op_lookups(op: &ControlOp, access: &ScriptFileAccess) -> Result<(), Response<FrontBody>> {
+    let checked = match op {
+        ControlOp::PutImposter { config, .. } => check_lookup_paths(&config.stubs, access),
+        ControlOp::PatchStubs { edit, .. } => {
+            let written: Vec<Stub> = edit
+                .0
+                .iter()
+                .filter_map(|step| match step {
+                    StubEdit::Add { stub, .. } | StubEdit::ReplaceById { stub, .. } => {
+                        Some(stub.clone())
+                    }
+                    _ => None,
+                })
+                .collect();
+            check_lookup_paths(&written, access)
+        }
+        _ => Ok(()),
+    };
+    checked.map_err(|message| typed_error(StatusCode::BAD_REQUEST, ErrorKind::BadData, &message))
 }
 
 /// `PUT /imposters`'s `?reconcile=` (rift#1518), read as upstream's private `reconcile_param` reads
@@ -3106,6 +3131,15 @@ async fn run_mutation(
     // failure. Interleaving would report whichever op came first instead.
     for (op, batch_index) in mutation.ops.iter_mut().zip(&batch_indices) {
         resolve_op_scripts(op, node, &script_base, *batch_index)?;
+    }
+    // D-118: a `lookup` CSV the fleet's access could never read is refused here, between the
+    // resolve and validate passes as upstream's doors run it. Content writes only (D-104): a
+    // removal must stay usable even beside a stub whose lookup is refused.
+    if mutation.admit == Admit::Content {
+        let access = ScriptFileAccess::network(state.scripts_dir.as_deref());
+        for op in &mutation.ops {
+            check_op_lookups(op, &access)?;
+        }
     }
     for (op, batch_index) in mutation.ops.iter().zip(&batch_indices) {
         validate_op_scripts(op, *batch_index)?;
