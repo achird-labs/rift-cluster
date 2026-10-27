@@ -1485,7 +1485,8 @@ async fn an_oversize_recording_is_skipped_and_released() {
     let ClaimOutcome::Claimed(token) = claim(&store, TEST_PORT, &s).await else {
         panic!("first claim wins");
     };
-    let body = "x".repeat(2 * 1024 * 1024);
+    // 4 MiB of text serializes to about 9.3 MiB: base64 in `resp` (D-120) plus the stub's copy.
+    let body = "x".repeat(4 * 1024 * 1024);
     let refused = complete_recorded(&store, TEST_PORT, &s, token, &body).await;
     match refused {
         Err(ProxyStoreError::Unavailable(message)) => {

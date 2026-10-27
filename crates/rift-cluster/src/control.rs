@@ -200,7 +200,9 @@ pub enum ControlOp {
         /// The replayable recorded response. Stored on consensus so `lookup()` answers from
         /// any node's applied state: for a stub-less proxyOnce recording this is the replay
         /// source *forever*, not just during a replication window.
-        // Structural: status, headers and bytes — nothing the engine admits.
+        // Structural: status, headers and bytes — nothing the engine admits. The body travels
+        // as base64, and an entry written before that (an integer array) still decodes (D-120).
+        #[serde(with = "recorded_response_wire")]
         resp: RecordedResponse,
         // A recorded `Stub` admits when decoded — replayed (D-102).
         #[serde(deserialize_with = "deserialize_replayed")]
@@ -369,6 +371,126 @@ pub fn admission_verdict(config: &ImposterConfig) -> Result<(), String> {
         cache.insert(key, verdict.clone());
     }
     verdict
+}
+
+/// The cluster's wire and storage form of a [`RecordedResponse`] (D-120): upstream's fields, with
+/// `body` as a standard base64 string rather than serde's integer array — about 1.33 characters a
+/// byte instead of 3.6. Used for the log entry, the `sm_proxy_recorded` row (and so snapshots) and
+/// the proxyOnce RPCs.
+///
+/// Decoding accepts **both** shapes, forever, so every entry, row and snapshot written before
+/// this still reads: a string is strict base64 (invalid is an error, never a silent empty body),
+/// an array is bytes. It admits nothing (D-102). An older binary cannot read the new shape, so the
+/// release carrying it is a whole-fleet upgrade (D-98).
+pub mod recorded_response_wire {
+    use base64::Engine as _;
+    use rift_cluster_base::seams::RecordedResponse;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    #[derive(Serialize)]
+    struct Out<'a> {
+        status: u16,
+        headers: &'a [(String, String)],
+        body: String,
+        latency_ms: Option<u64>,
+        timestamp_secs: u64,
+    }
+
+    #[derive(Deserialize)]
+    struct In {
+        status: u16,
+        headers: Vec<(String, String)>,
+        #[serde(deserialize_with = "body")]
+        body: Vec<u8>,
+        latency_ms: Option<u64>,
+        timestamp_secs: u64,
+    }
+
+    /// A body as either shape: a base64 string (this format) or an integer array (before it).
+    fn body<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<u8>, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Body {
+            Encoded(String),
+            Bytes(Vec<u8>),
+        }
+        match Body::deserialize(deserializer)? {
+            Body::Encoded(text) => base64::engine::general_purpose::STANDARD
+                .decode(text)
+                .map_err(serde::de::Error::custom),
+            Body::Bytes(bytes) => Ok(bytes),
+        }
+    }
+
+    /// # Errors
+    ///
+    /// The serializer's.
+    pub fn serialize<S: Serializer>(
+        response: &RecordedResponse,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        // Destructured exhaustively: a field upstream adds fails to compile here rather than
+        // being dropped from the log.
+        let RecordedResponse {
+            status,
+            headers,
+            body,
+            latency_ms,
+            timestamp_secs,
+        } = response;
+        Out {
+            status: *status,
+            headers,
+            body: base64::engine::general_purpose::STANDARD.encode(body),
+            latency_ms: *latency_ms,
+            timestamp_secs: *timestamp_secs,
+        }
+        .serialize(serializer)
+    }
+
+    /// # Errors
+    ///
+    /// A body that is neither shape, or invalid base64; any other malformed field.
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<RecordedResponse, D::Error> {
+        let In {
+            status,
+            headers,
+            body,
+            latency_ms,
+            timestamp_secs,
+        } = In::deserialize(deserializer)?;
+        Ok(RecordedResponse {
+            status,
+            headers,
+            body,
+            latency_ms,
+            timestamp_secs,
+        })
+    }
+
+    /// A [`RecordedResponse`] that serializes in this form — for the proxyOnce RPC bodies.
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct Wire(#[serde(with = "self")] pub RecordedResponse);
+
+    /// The `sm_proxy_recorded` row (and the owner's completion cache) for `response`.
+    ///
+    /// # Errors
+    ///
+    /// The serializer's; practically unreachable.
+    pub fn encode_row(response: &RecordedResponse) -> Result<String, serde_json::Error> {
+        serde_json::to_string(&Wire(response.clone()))
+    }
+
+    /// A row in either shape.
+    ///
+    /// # Errors
+    ///
+    /// A corrupt row.
+    pub fn decode_row(row: &str) -> Result<RecordedResponse, serde_json::Error> {
+        serde_json::from_str::<Wire>(row).map(|wire| wire.0)
+    }
 }
 
 /// The largest *raw* recorded body a [`ControlOp::ProxyRecorded`] may carry, checked at apply.
@@ -1247,11 +1369,12 @@ mod tests {
     }
 
     /// Pins D-110: a log entry is bounded by its serialized size, not its raw body. A 2 MiB body
-    /// is far under the raw bound and serializes to about 10 MiB, over the 8 MiB entry bound.
+    /// is under the raw bound and serializes to about 9.3 MiB (D-120's base64 plus the stub's copy),
+    /// over the 8 MiB entry bound.
     #[test]
     fn an_entry_is_bounded_by_its_serialized_size_not_its_raw_body() {
-        let big = proxy_recorded_request(2 * 1024 * 1024);
-        let refused = admit_entry_size(&big).expect_err("2 MiB raw serializes over 8 MiB");
+        let big = proxy_recorded_request(4 * 1024 * 1024);
+        let refused = admit_entry_size(&big).expect_err("4 MiB raw serializes over 8 MiB");
         assert!(refused.size > MAX_ENTRY_BYTES, "{refused}");
         assert_eq!(refused.limit, MAX_ENTRY_BYTES);
         assert!(admit_entry_size(&proxy_recorded_request(1024 * 1024)).is_ok());
@@ -1262,7 +1385,7 @@ mod tests {
     #[test]
     fn the_entry_bound_is_admission_not_apply() {
         assert_eq!(
-            validate(&proxy_recorded_request(2 * 1024 * 1024).op),
+            validate(&proxy_recorded_request(4 * 1024 * 1024).op),
             Ok(())
         );
     }
@@ -1345,6 +1468,123 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    fn sample_response(body: Vec<u8>) -> RecordedResponse {
+        RecordedResponse {
+            status: 200,
+            headers: vec![("X-A".to_owned(), "1".to_owned())],
+            body,
+            latency_ms: Some(3),
+            timestamp_secs: 7,
+        }
+    }
+
+    /// Pins D-120: a recorded body travels as base64 — once in `resp`, once in the generated stub —
+    /// so a 1 MiB binary recording serializes to at most 2.8× its body, down from about 4.9×.
+    #[test]
+    fn a_recorded_body_travels_as_base64_once_per_half() {
+        use base64::Engine as _;
+        let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+        let body: Vec<u8> = (0..1024 * 1024)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                x.to_le_bytes()[0]
+            })
+            .collect();
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&body);
+        let stub: Stub = serde_json::from_value(json!({
+            "responses": [{ "is": { "body": encoded, "_mode": "binary" } }]
+        }))
+        .expect("stub parses");
+        let request = ControlRequest {
+            op_id: Uuid::nil(),
+            principal: None,
+            issued_at_secs: 0,
+            expected_revision: None,
+            expect_absent: false,
+            op: ControlOp::ProxyRecorded {
+                port: 8080,
+                sig_hash: "00ab".to_owned(),
+                resp: sample_response(body),
+                stub: Some(RecordedStub {
+                    stub: Box::new(stub),
+                    placement: RecordedStubPlacement::BeforeProxy,
+                    proxy_to: "http://u.example".to_owned(),
+                    anchor_index: None,
+                }),
+            },
+        };
+        let wire = serde_json::to_vec(&request).expect("serialize");
+        assert!(
+            wire.len() * 10 <= 1024 * 1024 * 28,
+            "{} bytes for a 1 MiB body",
+            wire.len()
+        );
+        let value: serde_json::Value = serde_json::from_slice(&wire).expect("json");
+        assert!(
+            value["op"]["ProxyRecorded"]["resp"]["body"].is_string(),
+            "the body is base64"
+        );
+    }
+
+    /// Pins D-120's replay compatibility: an entry and a row written before it — the body as an
+    /// integer array — still decode, and re-encode as base64; a body that is neither shape, or not
+    /// valid base64, is an error rather than a silent empty body.
+    #[test]
+    fn a_pre_change_recording_decodes() {
+        let old = json!({ "ProxyRecorded": {
+            "port": 8080, "sig_hash": "00ab",
+            "resp": { "status": 200, "headers": [], "body": [0, 1, 127, 128, 255],
+                      "latency_ms": null, "timestamp_secs": 0 },
+            "stub": null
+        } });
+        let op: ControlOp = serde_json::from_value(old).expect("a pre-#690 entry decodes");
+        let ControlOp::ProxyRecorded { resp, .. } = &op else {
+            panic!("expected ProxyRecorded");
+        };
+        assert_eq!(resp.body, vec![0, 1, 127, 128, 255]);
+        assert_eq!(
+            serde_json::to_value(&op).expect("serialize")["ProxyRecorded"]["resp"]["body"],
+            json!("AAF/gP8=")
+        );
+        let row =
+            r#"{"status":200,"headers":[],"body":[104,105],"latency_ms":null,"timestamp_secs":0}"#;
+        assert_eq!(
+            recorded_response_wire::decode_row(row)
+                .expect("an old row decodes")
+                .body,
+            b"hi".to_vec()
+        );
+        for broken in [
+            r#"{"status":200,"headers":[],"body":[256],"latency_ms":null,"timestamp_secs":0}"#,
+            r#"{"status":200,"headers":[],"body":"not base64!","latency_ms":null,"timestamp_secs":0}"#,
+        ] {
+            assert!(
+                recorded_response_wire::decode_row(broken).is_err(),
+                "{broken}"
+            );
+        }
+    }
+
+    /// Pins D-120's upgrade rule: the new shape is unreadable by the pre-change decoder — upstream's
+    /// plain derive — so the release carrying it is a whole-fleet upgrade (D-98).
+    #[test]
+    fn the_new_shape_is_unreadable_by_the_pre_change_decoder() {
+        let row =
+            recorded_response_wire::encode_row(&sample_response(b"hi".to_vec())).expect("encode");
+        assert!(
+            serde_json::from_str::<RecordedResponse>(&row).is_err(),
+            "{row}"
+        );
+        assert_eq!(
+            recorded_response_wire::decode_row(&row)
+                .expect("round trip")
+                .body,
+            b"hi".to_vec()
+        );
     }
 
     /// Pins D-106: rift#1558 widened `statusCode` to any string, so a committed token status

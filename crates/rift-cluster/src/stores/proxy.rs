@@ -39,6 +39,8 @@ use rift_cluster_base::seams::{
     RecordedResponse, RequestSignature, StubPlacement, StubPublication,
 };
 use serde::{Deserialize, Serialize};
+
+use crate::control::recorded_response_wire::Wire;
 use uuid::Uuid;
 use xxhash_rust::xxh64::xxh64;
 
@@ -363,7 +365,7 @@ impl ProxyNet {
                 _ => return SettleReply::Stale,
             }
         }
-        let resp_json = match serde_json::to_string(&req.resp) {
+        let resp_json = match crate::control::recorded_response_wire::encode_row(&req.resp.0) {
             Ok(json) => json,
             Err(e) => {
                 // Practically unreachable (bytes and strings serialize totally), but every
@@ -386,7 +388,7 @@ impl ProxyNet {
             op: ControlOp::ProxyRecorded {
                 port: req.port,
                 sig_hash: req.sig_hash.clone(),
-                resp: req.resp,
+                resp: req.resp.0,
                 stub: req.stub,
             },
         };
@@ -486,20 +488,22 @@ impl ProxyNet {
             Err(_) => None,
         };
         LookupReply {
-            resp: resp_json.and_then(|json| match serde_json::from_str(&json) {
-                Ok(resp) => Some(resp),
-                Err(e) => {
-                    // Wrong-but-quiet is worse than loud: a corrupt row must not read as
-                    // "never recorded" with nothing server-side to correlate — the same
-                    // house rule the apply path's corrupt-config arms follow.
-                    tracing::error!(
-                        port = req.port,
-                        error = %e,
-                        "corrupt stored proxy recording; replay unavailable"
-                    );
-                    None
-                }
-            }),
+            resp: resp_json.and_then(
+                |json| match crate::control::recorded_response_wire::decode_row(&json) {
+                    Ok(resp) => Some(Wire(resp)),
+                    Err(e) => {
+                        // Wrong-but-quiet is worse than loud: a corrupt row must not read as
+                        // "never recorded" with nothing server-side to correlate — the same
+                        // house rule the apply path's corrupt-config arms follow.
+                        tracing::error!(
+                            port = req.port,
+                            error = %e,
+                            "corrupt stored proxy recording; replay unavailable"
+                        );
+                        None
+                    }
+                },
+            ),
         }
     }
 
@@ -599,7 +603,7 @@ struct CompleteReq {
     sig_hash: String,
     token: u64,
     m_idx: u64,
-    resp: RecordedResponse,
+    resp: Wire,
     stub: Option<RecordedStub>,
 }
 
@@ -628,7 +632,7 @@ struct LookupReq {
 
 #[derive(Debug, Serialize, Deserialize)]
 struct LookupReply {
-    resp: Option<RecordedResponse>,
+    resp: Option<Wire>,
 }
 
 /// The wire surface: four POST routes on the cluster port, HMAC-authed and
@@ -817,7 +821,7 @@ impl ClusterProxyStore {
                         sig_hash: hash.clone(),
                         token: token.value(),
                         m_idx: ring.m_idx(),
-                        resp: resp.clone(),
+                        resp: Wire(resp.clone()),
                         stub: stub.clone(),
                     };
                     let reply = if owner == node.id() {
@@ -1144,7 +1148,7 @@ impl ProxyRecordingStore for ClusterProxyStore {
         // Local applied state first: after the op applies everywhere this answers with no
         // RPC, and after the recorded stub applies the engine stops asking altogether.
         if let Ok(Some(json)) = node.proxy_recorded(port, &hash) {
-            match serde_json::from_str(&json) {
+            match crate::control::recorded_response_wire::decode_row(&json) {
                 Ok(resp) => return Some(resp),
                 Err(e) => {
                     // Corrupt local copy: loud, then fall through to the owner path below —
@@ -1183,7 +1187,7 @@ impl ProxyRecordingStore for ClusterProxyStore {
                 }
             })
             .ok()?;
-        reply.resp
+        reply.resp.map(|wire| wire.0)
     }
 
     /// Local caches only — deliberately **no Raft write and no RPC**, ever.
