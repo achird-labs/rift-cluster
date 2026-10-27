@@ -347,3 +347,17 @@ describe("AC5 — behaviours this form does not edit are named, not swallowed", 
     ]);
   });
 });
+
+describe("#735 — a repeat count the engine refuses is never modelled", () => {
+  it.each([0, -1, 1.5, 4294967296])(
+    "sends a loaded _behaviors repeat of %s to raw-only rather than modelling it",
+    (repeat) => {
+      expect(refused({ is: { statusCode: 200 }, _behaviors: { repeat } })).toContain("responses[0]._behaviors.repeat");
+    },
+  );
+
+  it.each([0, -1, 1.5, 4294967296])("sends a loaded response-level repeat of %s to raw-only", (repeat) => {
+    expect(refused({ repeat, is: { statusCode: 200 } })).toContain("responses[0].repeat");
+  });
+});
+

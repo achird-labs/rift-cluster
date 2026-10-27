@@ -65,6 +65,21 @@ export type BehaviorModel = {
 };
 
 /** The four TCP fault kinds, in the engine's canonical spelling — what this form writes. */
+/**
+ * The engine's own refusal of a repeat count it does not admit (`REPEAT_NOT_POSITIVE`,
+ * rift#1582), verbatim, so the form says what a save would answer.
+ */
+export const REPEAT_NOT_POSITIVE = '"repeat" field must be an integer greater than 0';
+
+/**
+ * Whether the engine admits `n` as a `repeat` count: a JSON integer in `1..=4294967295` (a `u32`).
+ * `0` and `null` are refused as not positive; a negative, a fraction (`2.0` included) or anything
+ * above `u32::MAX` fails the decode (rift `behaviors/types.rs`, `imposter/types.rs`).
+ */
+export function isEngineRepeat(n: number): boolean {
+  return Number.isInteger(n) && n >= 1 && n <= 4_294_967_295;
+}
+
 export const FAULT_KINDS = [
   "CONNECTION_RESET_BY_PEER",
   "EMPTY_RESPONSE",
@@ -243,7 +258,8 @@ export function parseBehaviors(
       continue;
     }
     if (key === "repeat") {
-      if (typeof value !== "number") {
+      // A count the engine would refuse is never modelled: shown raw, never re-emitted by the form.
+      if (typeof value !== "number" || !isEngineRepeat(value)) {
         issues.push(`${path}.repeat`);
         continue;
       }
