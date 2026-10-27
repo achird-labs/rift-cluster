@@ -1066,9 +1066,9 @@ export interface components {
             method: string;
             /** @example /users/42 */
             path: string;
-            /** @description Decoded query parameters. Always present; an empty object when the request had none. */
+            /** @description Decoded query parameters. Always present; an empty object when the request had none. A key sent once is a string; a repeated key is an array of its values in request order, as Mountebank prints it (rift#1553). */
             query: {
-                [key: string]: string;
+                [key: string]: string | string[];
             };
             /** @description Request headers. A single-valued header is a bare string, not a one-element array (upstream `multi_value_headers::serialize`). On the way in the engine additionally tolerates JSON numbers and booleans for Mountebank compatibility, but it always serializes strings back out. */
             headers: {
@@ -1076,6 +1076,14 @@ export interface components {
             };
             /** @description The request body, absent when there was none. Base64-encoded when `_mode` is `binary`; UTF-8 text otherwise. */
             body?: string;
+            /** @description The client's address without its port, derived from `requestFrom` as Mountebank prints `request.ip` (rift#1602). Absent when `requestFrom` is not an address. */
+            ip?: string;
+            /** @description A urlencoded text body's fields, printed like `query` (rift#1602). Absent for any other body, a binary one, or none. */
+            form?: {
+                [key: string]: string | string[];
+            };
+            /** @description Present (and `true`) only when the body exceeded the journal's whole byte budget and the request was recorded without it (rift#1441). */
+            _bodyOmitted?: boolean;
             /**
              * @description Present only when `body` is base64-encoded binary (upstream issue #636). A text body omits this field, which is why `text` never appears on the wire even though it is the underlying default — absence means text.
              * @enum {string}

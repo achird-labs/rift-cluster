@@ -74,6 +74,8 @@ export function stubFromRequest(request: RecordedRequest, selection: FieldSelect
   if (selection.path && request.path !== undefined) equals.path = request.path;
 
   if (selection.query && request.query !== undefined && Object.keys(request.query).length > 0) {
+    // Copied as recorded: a repeated key is an array (rift#1553), and an array expectation is
+    // exactly what matches it, as the engine's own predicateGenerators record it.
     equals.query = { ...request.query };
   }
 
