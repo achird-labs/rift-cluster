@@ -110,8 +110,9 @@ use crate::readiness::Readiness;
 use crate::session;
 use crate::write_path::WritePathSettings;
 
-/// Largest admin request body the front accepts on a terminated route. The
-/// proxied path streams and is not subject to this.
+/// Largest admin request body the front accepts, terminated or reverse-proxied (D-109). The engine's
+/// own ceiling (`--max-body-size`, a data-plane knob) is not the admin plane's bound. The gateway leg
+/// is not an admin route and keeps the engine's cap.
 const MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
 
 /// How long a terminated write may take to commit (forwarding included) before
@@ -2152,14 +2153,24 @@ async fn proxy(
     // credential landing in an app-under-test's predicates and request log is precisely why
     // upstream exempts that prefix from its own key gate. The gateway leg has the opposite
     // duty — see `strip_admin_bearer` and `strip_session_cookie`.
-    match leg {
-        ProxyLeg::Admin => present_fleet_key(&mut parts.headers, state.api_key.as_deref()),
+    let sent = match leg {
+        ProxyLeg::Admin => {
+            present_fleet_key(&mut parts.headers, state.api_key.as_deref());
+            // D-109: bounded like a terminated route, then forwarded whole. Only the request is
+            // buffered; the response still streams, so the admin SSE streams are unaffected.
+            let body = match bounded_admin_body(&parts.headers, body).await {
+                Ok(body) => body,
+                Err(refusal) => return refusal,
+            };
+            state.fetch.request(Request::from_parts(parts, body)).await
+        }
         ProxyLeg::Gateway => {
             strip_admin_bearer(&mut parts.headers, state.api_key.as_deref());
             strip_session_cookie(&mut parts.headers);
+            state.proxy.request(Request::from_parts(parts, body)).await
         }
-    }
-    match state.proxy.request(Request::from_parts(parts, body)).await {
+    };
+    match sent {
         // The response body streams through as-is — buffering here would break
         // the admin SSE streams.
         Ok(response) => response.map(BodyExt::boxed),
@@ -2168,6 +2179,45 @@ async fn proxy(
             ErrorKind::Unavailable,
             &format!("local admin backend unreachable: {e}"),
         ),
+    }
+}
+
+/// A reverse-proxied admin request's body, collected under [`MAX_BODY_BYTES`] (D-109). A declared
+/// length over the cap is refused before anything is read; an undeclared one is counted as it
+/// arrives. Over the cap is `413`; any other read failure (a reset, a malformed chunked stream) is
+/// the client's `400`, never folded into "too large".
+#[allow(clippy::result_large_err)]
+async fn bounded_admin_body(
+    headers: &hyper::HeaderMap,
+    body: Incoming,
+) -> Result<Full<Bytes>, Response<FrontBody>> {
+    let too_large = || {
+        typed_error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            ErrorKind::RequestTooLarge,
+            &format!("admin request body exceeds {MAX_BODY_BYTES} bytes"),
+        )
+    };
+    let declared = headers
+        .get(hyper::header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok());
+    if declared.is_some_and(|len| len > MAX_BODY_BYTES as u64) {
+        return Err(too_large());
+    }
+    match Limited::new(body, MAX_BODY_BYTES).collect().await {
+        Ok(collected) => Ok(Full::new(collected.to_bytes())),
+        Err(e)
+            if e.downcast_ref::<http_body_util::LengthLimitError>()
+                .is_some() =>
+        {
+            Err(too_large())
+        }
+        Err(e) => Err(typed_error(
+            StatusCode::BAD_REQUEST,
+            ErrorKind::BadData,
+            &format!("admin request body could not be read: {e}"),
+        )),
     }
 }
 
