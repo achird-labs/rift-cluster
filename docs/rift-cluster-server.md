@@ -742,6 +742,10 @@ worst case for a rescued request is the 500 ms budget **plus** a second
 `scriptEngine.timeoutMs`. For imposters whose predicates are pure this is
 invisible; for imposters whose predicates mutate state through `inject`, it is a
 duplicate mutation on every rescue, and worth knowing before relying on the net.
+Since rift#1678 the retried inject runs on its imposter's owner worker and shares
+the imposter's one live `state`, as every run of that imposter does; it still runs
+twice. Script scheduling — pool size, imposter affinity, `timeoutMs` — is the
+engine's on a cluster node, exactly as standalone has it (D-121).
 
 A request to a port with **no imposter at all** is still outside this net: it
 reaches no imposter handler, so there is nothing to hook. Readiness gating is
