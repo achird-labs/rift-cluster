@@ -1030,6 +1030,78 @@ async fn index_addressed_stub_edits_terminate_via_the_stored_config() {
         .expect("post imposter");
     assert_eq!(response.status().as_u16(), 201);
 
+    // An index that names no current stub is Mountebank's `404 bad data`, and nothing commits
+    // (rift#1552, #707): out of range, and every non-canonical spelling of a real position. Both
+    // stubs still exist here, so `01` and `+1` name a real position (1) in the wrong spelling.
+    let message = "'stubIndex' must be a valid integer, representing the array index position \
+                   of the stub to replace";
+    let before = server
+        .node()
+        .expect("clustered")
+        .imposter_revision(port)
+        .expect("read");
+    for raw in [
+        "7",
+        "01",
+        "+1",
+        "00",
+        "abc",
+        "-1",
+        "1.0",
+        "18446744073709551616",
+    ] {
+        for (method, request) in [
+            (
+                "PUT",
+                client
+                    .put(format!("http://{admin}/imposters/{port}/stubs/{raw}"))
+                    // Not even JSON: the index is judged before the body.
+                    .body("{"),
+            ),
+            (
+                "DELETE",
+                client.delete(format!("http://{admin}/imposters/{port}/stubs/{raw}")),
+            ),
+        ] {
+            let response = request.send().await.expect("send");
+            assert_eq!(response.status().as_u16(), 404, "{method} stubs/{raw}");
+            let body: serde_json::Value = response.json().await.expect("json");
+            assert_eq!(
+                body["errors"][0]["type"], "bad data",
+                "{method} stubs/{raw}"
+            );
+            assert_eq!(
+                body["errors"][0]["message"], message,
+                "{method} stubs/{raw}"
+            );
+        }
+    }
+    assert_eq!(
+        server
+            .node()
+            .expect("clustered")
+            .imposter_revision(port)
+            .expect("read"),
+        before,
+        "nothing committed"
+    );
+    // An absent imposter keeps its own answer, whatever the index.
+    let absent = reserve_port();
+    let response = client
+        .delete(format!("http://{admin}/imposters/{absent}/stubs/01"))
+        .send()
+        .await
+        .expect("delete on an absent port");
+    assert_eq!(response.status().as_u16(), 404);
+    assert!(
+        response
+            .text()
+            .await
+            .expect("body")
+            .contains("no imposter on port"),
+        "the imposter's 404, not the index's"
+    );
+
     // Positional replace of index 0, positional delete of index 1.
     let response = client
         .put(format!("http://{admin}/imposters/{port}/stubs/0"))
@@ -1048,14 +1120,6 @@ async fn index_addressed_stub_edits_terminate_via_the_stored_config() {
         .await
         .expect("delete at index");
     assert_eq!(response.status().as_u16(), 200);
-
-    // Out-of-bounds is a clean 404 with nothing committed.
-    let response = client
-        .delete(format!("http://{admin}/imposters/{port}/stubs/7"))
-        .send()
-        .await
-        .expect("delete out of bounds");
-    assert_eq!(response.status().as_u16(), 404);
 
     // Whole-list replace through PUT /stubs.
     let response = client

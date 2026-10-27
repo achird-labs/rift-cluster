@@ -146,7 +146,7 @@ export interface paths {
             path: {
                 /** @description The imposter's port number. */
                 port: components["parameters"]["Port"];
-                /** @description Zero-based position of the stub in the imposter's stub list. */
+                /** @description Zero-based position of the stub in the imposter's stub list, as its canonical decimal. Any other spelling (`01`, `+1`, `1.0`, `-1`) names no stub and is answered like an out-of-range index (rift#1552). */
                 stubIndex: number;
             };
             cookie?: never;
@@ -155,13 +155,13 @@ export interface paths {
         get: operations["getStubAt"];
         /**
          * Replace the stub at an index
-         * @description Terminates: index-addressed, so it commits as a full `PutImposter` of the stored config with that one stub replaced. Answers `404` if `stubIndex` is out of range.
+         * @description Terminates: index-addressed, so it commits as a full `PutImposter` of the stored config with that one stub replaced. Answers `404` `bad data` (Mountebank's `'stubIndex' must be a valid integer…`) if `stubIndex` names no current stub, judged before the body is read.
          */
         put: operations["replaceStubAt"];
         post?: never;
         /**
          * Delete the stub at an index
-         * @description Terminates: index-addressed, commits as a full `PutImposter` with that stub removed. Answers `404` if `stubIndex` is out of range.
+         * @description Terminates: index-addressed, commits as a full `PutImposter` with that stub removed. Answers `404` `bad data` if `stubIndex` names no current stub.
          */
         delete: operations["deleteStubAt"];
         options?: never;
@@ -2165,7 +2165,7 @@ export interface operations {
             path: {
                 /** @description The imposter's port number. */
                 port: components["parameters"]["Port"];
-                /** @description Zero-based position of the stub in the imposter's stub list. */
+                /** @description Zero-based position of the stub in the imposter's stub list, as its canonical decimal. Any other spelling (`01`, `+1`, `1.0`, `-1`) names no stub and is answered like an out-of-range index (rift#1552). */
                 stubIndex: number;
             };
             cookie?: never;
@@ -2184,7 +2184,7 @@ export interface operations {
             };
             401: components["responses"]["Unauthorized"];
             403: components["responses"]["Forbidden"];
-            /** @description No such imposter on this port, or no such stub index. */
+            /** @description No such imposter on this port (`no such resource`), or a `stubIndex` that names no current stub (`bad data`, Mountebank's message). */
             404: {
                 headers: {
                     [name: string]: unknown;
@@ -2209,7 +2209,7 @@ export interface operations {
             path: {
                 /** @description The imposter's port number. */
                 port: components["parameters"]["Port"];
-                /** @description Zero-based position of the stub in the imposter's stub list. */
+                /** @description Zero-based position of the stub in the imposter's stub list, as its canonical decimal. Any other spelling (`01`, `+1`, `1.0`, `-1`) names no stub and is answered like an out-of-range index (rift#1552). */
                 stubIndex: number;
             };
             cookie?: never;
@@ -2236,7 +2236,7 @@ export interface operations {
             400: components["responses"]["BadData"];
             401: components["responses"]["Unauthorized"];
             403: components["responses"]["Forbidden"];
-            /** @description No such imposter on this port, or no such stub index. */
+            /** @description No such imposter on this port (`no such resource`), or a `stubIndex` that names no current stub (`bad data`, Mountebank's message). */
             404: {
                 headers: {
                     [name: string]: unknown;
@@ -2266,7 +2266,7 @@ export interface operations {
             path: {
                 /** @description The imposter's port number. */
                 port: components["parameters"]["Port"];
-                /** @description Zero-based position of the stub in the imposter's stub list. */
+                /** @description Zero-based position of the stub in the imposter's stub list, as its canonical decimal. Any other spelling (`01`, `+1`, `1.0`, `-1`) names no stub and is answered like an out-of-range index (rift#1552). */
                 stubIndex: number;
             };
             cookie?: never;
@@ -2288,7 +2288,7 @@ export interface operations {
             202: components["responses"]["AcceptedParked"];
             401: components["responses"]["Unauthorized"];
             403: components["responses"]["Forbidden"];
-            /** @description No such imposter on this port, or no such stub index. */
+            /** @description No such imposter on this port (`no such resource`), or a `stubIndex` that names no current stub (`bad data`, Mountebank's message). */
             404: {
                 headers: {
                     [name: string]: unknown;
