@@ -3599,10 +3599,16 @@ components:
         query:
           type: object
           additionalProperties:
-            type: string
+            oneOf:
+              - type: string
+              - type: array
+                items:
+                  type: string
           description: >
             Decoded query parameters. Always present; an empty object when the
-            request had none.
+            request had none. A key sent once is a string; a repeated key is an
+            array of its values in request order, as Mountebank prints it
+            (rift#1553).
         headers:
           type: object
           description: >
@@ -3622,6 +3628,28 @@ components:
           description: >
             The request body, absent when there was none. Base64-encoded when
             `_mode` is `binary`; UTF-8 text otherwise.
+        ip:
+          type: string
+          description: >
+            The client's address without its port, derived from `requestFrom`
+            as Mountebank prints `request.ip` (rift#1602). Absent when
+            `requestFrom` is not an address.
+        form:
+          type: object
+          additionalProperties:
+            oneOf:
+              - type: string
+              - type: array
+                items:
+                  type: string
+          description: >
+            A urlencoded text body's fields, printed like `query` (rift#1602).
+            Absent for any other body, a binary one, or none.
+        _bodyOmitted:
+          type: boolean
+          description: >
+            Present (and `true`) only when the body exceeded the journal's whole
+            byte budget and the request was recorded without it (rift#1441).
         _mode:
           type: string
           enum: [binary]

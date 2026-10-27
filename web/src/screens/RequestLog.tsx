@@ -13,7 +13,7 @@ import { Confirm, Empty, ErrorNote, Ident, Truncated } from "../components/primi
 import type { MatchOutcome, OutcomeView } from "../features/requests/diagnostics.ts";
 import { describeOutcome } from "../features/requests/diagnostics.ts";
 import type { RecordedRequest } from "../features/requests/source.ts";
-import { headerValues, page } from "../features/requests/source.ts";
+import { formatQuery, headerValues, page } from "../features/requests/source.ts";
 import {
   type FieldSelection,
   defaultSelection,
@@ -768,12 +768,6 @@ function formatHeaders(headers: Record<string, unknown> | undefined): string {
   const entries = Object.entries(headers ?? {});
   if (entries.length === 0) return "(none)";
   return entries.map(([name, value]) => `${name}: ${headerValues(value).join(", ")}`).join("\n");
-}
-
-function formatQuery(query: Record<string, string> | undefined): string {
-  const entries = Object.entries(query ?? {});
-  if (entries.length === 0) return "(none)";
-  return entries.map(([name, value]) => `${name}=${value}`).join("\n");
 }
 
 /**

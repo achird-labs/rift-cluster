@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { page, readLog } from "./source.ts";
+import { formatQuery, page, readLog } from "./source.ts";
 
 describe("readLog", () => {
   it("reads the bare array the endpoint serves", () => {
@@ -39,5 +39,18 @@ describe("page", () => {
 
   it("reports an empty source as empty with no more pages", () => {
     expect(page([], { offset: 0, size: 50 })).toEqual({ rows: [], total: 0, hasMore: false });
+  });
+});
+
+describe("formatQuery", () => {
+  // rift#1553: a repeated key is an array of its values. Printing it as `k=a,b` would read as the
+  // old comma-joined value the engine no longer means.
+  it("prints one name=value line per value, a repeated key on several lines", () => {
+    expect(formatQuery({ k: ["a", "b"], one: "1" })).toBe("k=a\nk=b\none=1");
+  });
+
+  it("says (none) for an empty or missing query", () => {
+    expect(formatQuery({})).toBe("(none)");
+    expect(formatQuery(undefined)).toBe("(none)");
   });
 });

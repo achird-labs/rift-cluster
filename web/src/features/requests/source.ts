@@ -77,6 +77,18 @@ export function headerValues(value: unknown): string[] {
 }
 
 /**
+ * A recorded query, one `name=value` line per value. A key sent once is a string and a repeated
+ * key an array of its values in request order (rift#1553), so a repeated key prints on several
+ * lines — never as `k=a,b`, the comma-joined form the engine no longer means.
+ */
+export function formatQuery(query: Record<string, unknown> | undefined): string {
+  const lines = Object.entries(query ?? {}).flatMap(([name, value]) =>
+    headerValues(value).map((one) => `${name}=${one}`),
+  );
+  return lines.length === 0 ? "(none)" : lines.join("\n");
+}
+
+/**
  * `String(x)` is not total: an object whose `toString` is not callable throws
  * `Cannot convert object to primitive value`. The engine cannot produce that shape from
  * `HashMap<String, Vec<String>>`, but this function's contract is that it does not throw, and a

@@ -1185,6 +1185,108 @@ mod tests {
         );
     }
 
+    /// Pins the contract half of rift#1553 and keeps the next widening from drifting silently:
+    /// a real `RecordedRequest`, decoded and re-serialized by the engine, emits only fields the
+    /// schema declares, and its query values take only the declared shapes — a key sent once is a
+    /// string, a repeated key an array of its values in request order.
+    #[test]
+    fn a_recorded_request_the_engine_serializes_fits_the_declared_schema() {
+        let recorded: rift_cluster_base::seams::RecordedRequest =
+            serde_json::from_value(serde_json::json!({
+                "requestFrom": "127.0.0.1:5000",
+                "method": "GET",
+                "path": "/p",
+                "query": { "k": ["a", "b"], "one": "1" },
+                "headers": {
+                    "Host": "h",
+                    "Content-Type": "application/x-www-form-urlencoded",
+                },
+                "body": "f=x&f=y&g=z",
+                "timestamp": "2026-10-27T00:00:00.000Z",
+            }))
+            .expect("the engine decodes a recorded request");
+        let wire = serde_json::to_value(&recorded).expect("serializes");
+
+        assert_eq!(wire["query"]["k"], serde_json::json!(["a", "b"]));
+        assert_eq!(wire["query"]["one"], serde_json::json!("1"));
+        // The derived fields (rift#1602) are emitted too, so the check below covers them.
+        assert_eq!(wire["ip"], serde_json::json!("127.0.0.1"));
+        assert_eq!(wire["form"]["f"], serde_json::json!(["x", "y"]));
+
+        let doc = parsed();
+        let properties = doc
+            .get("components")
+            .and_then(|c| c.get("schemas"))
+            .and_then(|s| s.get("RecordedRequest"))
+            .and_then(|r| r.get("properties"))
+            .and_then(serde_json::Value::as_object)
+            .expect("RecordedRequest declares properties");
+        // The optional fields, set, in a second sample: `_bodyOmitted` suppresses `form`, so the
+        // two cannot share one. Without it a renamed or new optional field would never be emitted
+        // here and could drift undetected.
+        let optional: rift_cluster_base::seams::RecordedRequest =
+            serde_json::from_value(serde_json::json!({
+                "requestFrom": "127.0.0.1:5000",
+                "method": "POST",
+                "path": "/p",
+                "query": {},
+                "headers": {},
+                "_bodyOmitted": true,
+                "_mode": "binary",
+                "status": 200,
+                "latencyMs": 5,
+                "node": "n1",
+                "timestamp": "2026-10-27T00:00:00.000Z",
+            }))
+            .expect("the engine decodes a recorded request with its optional fields");
+        let optional = serde_json::to_value(&optional).expect("serializes");
+        for field in ["_bodyOmitted", "_mode", "status", "latencyMs", "node"] {
+            assert!(
+                optional.get(field).is_some(),
+                "precondition: the engine emits `{field}` when it is set: {optional}"
+            );
+        }
+
+        let emitted: BTreeSet<&str> = wire
+            .as_object()
+            .expect("an object")
+            .keys()
+            .chain(optional.as_object().expect("an object").keys())
+            .map(String::as_str)
+            .collect();
+        let undeclared: Vec<&&str> = emitted
+            .iter()
+            .filter(|key| !properties.contains_key(**key))
+            .collect();
+        assert!(
+            undeclared.is_empty(),
+            "the engine emits fields the contract does not declare: {undeclared:?}"
+        );
+
+        let query_values = properties
+            .get("query")
+            .and_then(|q| q.get("additionalProperties"))
+            .expect("query must declare its value shape");
+        let shapes: BTreeSet<&str> = query_values
+            .get("oneOf")
+            .or_else(|| query_values.get("anyOf"))
+            .and_then(serde_json::Value::as_array)
+            .expect("a query value is either a string or an array of strings")
+            .iter()
+            .filter_map(|a| a.get("type"))
+            .filter_map(serde_json::Value::as_str)
+            .collect();
+        assert_eq!(shapes, BTreeSet::from(["array", "string"]));
+        let form_values = properties
+            .get("form")
+            .and_then(|f| f.get("additionalProperties"))
+            .expect("form must declare its value shape");
+        assert_eq!(
+            form_values, query_values,
+            "form prints exactly like query (rift#1602)"
+        );
+    }
+
     /// The cursor headers are the endpoint's pagination contract, and their **presence** is the
     /// protocol: an SDK probes for `x-rift-next-index` to learn whether cursoring is offered at
     /// all, and `x-rift-truncated` appears only when it is true, so a client tests for the header

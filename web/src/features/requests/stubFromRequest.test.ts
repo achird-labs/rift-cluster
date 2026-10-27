@@ -67,6 +67,18 @@ describe("the default selection agrees with the recording flow's", () => {
       responses: RESPONSE,
     });
   });
+
+  // rift#1553: a repeated key is recorded as an array, and an array expectation is what matches
+  // it (each element among the request's values). Joining it would match nothing.
+  it("keeps a repeated query key as the array the engine recorded", () => {
+    const repeated: RecordedRequest = { ...GET, query: { k: ["a", "b"], one: "1" } };
+    expect(stubFromRequest(repeated, defaultSelection())).toEqual({
+      predicates: [
+        { equals: { method: "GET", path: "/users/42", query: { k: ["a", "b"], one: "1" } } },
+      ],
+      responses: RESPONSE,
+    });
+  });
 });
 
 describe("the response is a default, because the journal has no response to reconstruct", () => {
