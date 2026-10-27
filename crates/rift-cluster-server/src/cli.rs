@@ -618,6 +618,15 @@ mod tests {
         assert!(format!("{e:#}").contains("rift.invalid"), "{e:#}");
     }
 
+    /// Pins D-105: Mountebank's `--apikey` spelling of the key flag (upstream rift#1565) parses
+    /// under `--cluster` too, into the same credential.
+    #[test]
+    fn the_mountebank_apikey_spelling_sets_the_admin_key() {
+        let cli = EeCli::try_parse_from(["rift-cluster-server", "--cluster", "--apikey", "k"])
+            .expect("parses");
+        assert_eq!(cli.oss.api_key.as_deref(), Some("k"));
+    }
+
     #[test]
     fn state_dir_follows_the_datadir_by_default() {
         let cli = EeCli::try_parse_from(["rift-cluster-server", "--datadir", "/srv/rift"])

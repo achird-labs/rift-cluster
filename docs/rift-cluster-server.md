@@ -267,8 +267,10 @@ Each flag also has an environment-variable spelling (`RIFT_CLUSTER_BIND`,
 ### The admin credential (D-73, #550)
 
 The admin plane has **one** credential: open-source Rift's own `--api-key`
-(`MB_APIKEY`), sent as the *entire, raw* `Authorization` header value — there is
-no `Bearer ` prefix and none is stripped — and compared in constant time.
+(`MB_APIKEY`; Mountebank's `--apikey` spelling works too), sent as the *entire,
+raw* `Authorization` header value — there is no `Bearer ` prefix and none is
+stripped — or, when no `Authorization` is sent, as Mountebank's `x-api-key`
+(D-105), and compared in constant time. A present `Authorization` decides alone.
 
 - **`--api-key` set ⇒ the admin plane is closed** to that key. Every route this
   binary serves demands it: terminated, proxied, `/front-door/routes`,
@@ -1051,10 +1053,10 @@ The intended flow is two calls, and the second is an ordinary write:
 
 ```sh
 curl -sX POST "$ADMIN/specs/compile?port=9090&name=petstore" \
-  -H "Authorization: Bearer $KEY" -H 'Content-Type: application/yaml' \
+  -H "Authorization: $KEY" -H 'Content-Type: application/yaml' \
   --data-binary @petstore.yaml | jq .imposter > imposter.json
 
-curl -sX PUT "$ADMIN/imposters" -H "Authorization: Bearer $KEY" \
+curl -sX PUT "$ADMIN/imposters" -H "Authorization: $KEY" \
   -H 'Content-Type: application/json' --data-binary @imposter.json
 ```
 
