@@ -399,9 +399,15 @@ The bump to rift **master `7161b1a`** (past v0.23.0) is all three again, and mor
 
 - **Keys.** A repeated query key records as an array (rift#1553). Behaviors elements that carry a
   non-behavior key or an element-level `repeat` (rift#1582, #1672) move the key of an id-less stub
-  once.
+  once. A `+` in a query or form value decodes as a space (rift#1607), which moves the proxyOnce
+  claim key, and the recorded stub's id, of a request carrying one that was recorded with query or
+  form `predicateGenerators`.
 - **Matching.** Repeated query, form and header keys and JSON body predicates follow Mountebank's
-  array, null and number rules (rift#1553, #1630).
+  array, null and number rules (rift#1553, #1630). `+` reads as a space in query and form values,
+  as Node's `querystring` reads it; `%2B` is a literal plus (rift#1607). An XPath selector that
+  compiles but fails when it runs — most often a prefix not bound in `ns` — now answers
+  `500 malformed xpath predicate selector` in a predicate or `copy`, where it used to select
+  nothing (rift#1585).
 - **Admission.** A path in `proxy.to` or a `to` that is not a URL, a response with two types or none, text predicates on a
   binary-mode imposter and door-only behavior shapes are refused (rift#1550, #1551, #1578, #1582).
 - **Responses.** A `_behaviors` block beside `behaviors` or a top-level `repeat` is ignored, as in

@@ -4564,8 +4564,14 @@ add refusals too. `docs/architecture/10-operations.md` lists them for operators.
 **Keys:** a repeated query key records as an array (rift#1553), which moves the proxyOnce claim key
 of a repeated-key request recorded with `predicateGenerators`; a behaviors element carrying a
 non-behavior key and an element-level `repeat` (rift#1582, #1672) move the key of an id-less stub
-that has one. **Matching:** a repeated query, form or header key matches by Mountebank's array rules
-(rift#1553), and JSON body predicates follow its array, null and number rules (rift#1630).
+that has one; a `+` in a query or form value now decodes as a space (rift#1607), which moves the
+proxyOnce claim key, and the recorded stub's id, of a request carrying one recorded with query or
+form `predicateGenerators`. **Matching:** a repeated query, form or header key matches by Mountebank's
+array rules (rift#1553), and JSON body predicates follow its array, null and number rules
+(rift#1630); `+` reads as a space in query and form values, as Node's `querystring` reads it, with
+`%2B` a literal plus (rift#1607); and an XPath selector that compiles but fails when it runs — most
+often a prefix not bound in `ns` — answers `500 malformed xpath predicate selector` in a predicate
+or `copy` where it used to select nothing (rift#1585).
 **Admission:** a path in `proxy.to` (rift#1550), a response with two types or none (rift#1551),
 `matches`/`jsonpath`/`xpath` on a binary-mode imposter (rift#1578) and door-only behavior shapes
 (rift#1582) are refused; D-102 refuses only their ports on replay. **Response behaviour** changes with no change
