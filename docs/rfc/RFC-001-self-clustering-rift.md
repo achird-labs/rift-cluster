@@ -924,6 +924,10 @@ revision.
 
 #### 7.4.5 Persistence, cold start, and tombstone safety
 
+> **Amended by D-124** — a cluster node gives the engine no datadir: the core `--datadir`
+> write-through is not kept, no `{port}.json`, `.cursors` or `.requests.jsonl` is written or read,
+> and `--datadir` only anchors `--cluster-state-dir`. `GET /imposters` is the export.
+
 - Every node persists the **replicated desired-state** — configs (bodies), `(g, revision)`
   per port, tombstones, clear generations, its own incarnation — to
   `--cluster-state-dir`, updated write-through on reconcile. This subsumes the datadir

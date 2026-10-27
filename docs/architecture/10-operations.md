@@ -322,8 +322,9 @@ still **not built**; it is kept as the design of what it would have to look like
   end inspected via `cluster inspect`), then rejoin others empty. Documented
   as data-loss-possible, operator-confirmed, twice *(sketch — not built)*.
 - **Backup**: configs are exportable at any moment via `GET /imposters`
-  (Mountebank-compatible JSON) or the core `--datadir` write-through; the
-  state dir itself is snapshot-friendly (redb single file, crash-consistent).
+  (Mountebank-compatible JSON); the state dir itself is snapshot-friendly (redb
+  single file, crash-consistent). A cluster node keeps no `--datadir`
+  write-through (D-124).
 - **Stuck scenario triage**: `GET /_cluster/health` on each node gives
   `isolated` and the ring it is computing against (`ring.m_idx`, `ring.members`).
   Same `m_idx` everywhere and no node isolated means the fleet agrees who owns

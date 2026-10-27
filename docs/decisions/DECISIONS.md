@@ -5647,3 +5647,40 @@ and the Raft log's is D-110 (8 MiB per serialized entry). The sizing is not yet 
 RSS profile of a ~1000-imposter fleet under concurrent max-size bodies; record those numbers here
 when they exist, and lower the budget, not the ceiling, if they do not fit.
 
+### D-124 — A cluster node gives the engine no datadir; `--datadir` only anchors the cluster state directory
+
+- **Status:** active
+- **Decided:** 2026-10-27 · #732
+- **Implemented by:** #732
+- **Amends:** RFC-001 §7.4.5
+- **Code:** crates/rift-cluster-server/src/compose.rs, crates/rift-cluster-server/tests/write_path.rs, crates/rift-cluster-server/tests/manager_parity.rs
+
+The cluster built its engine `with_datadir(--datadir)` and passed the flag to upstream's
+`ServerBuilder` unchanged. The engine's datadir behaviour assumes the datadir is the imposter's
+source of truth. On a cluster node it is not: the Raft log is (D-102). Measured on master:
+- every `recordRequests` imposter flushed `{port}.requests.jsonl` (rift#1608) onto the volume that
+  holds the Raft log, about 2× `--journal-max-bytes` each;
+- a graceful stop deleted every datadir file, but after a crash the crashed node alone resurrected
+  its pre-crash journal;
+- an operator's stray `{port}.json` was loaded into the engine at start and unlinked by the whole-set
+  drive, though the docs said it was left untouched;
+- `POST /admin/reload` against a node's engine re-read the datadir and served its `{port}.json` on
+  that node alone, outside Raft.
+
+**The engine is built `with_datadir(None)`, and `attach_data_plane` clears `--datadir` before
+`ServerBuilder` sees it.** `--datadir` keeps one job under `--cluster`: anchoring
+`--cluster-state-dir` (`<datadir>/_cluster`), which is resolved before the node starts. Effects:
+- no `{port}.json`, `.cursors` (rift#1603) or `.requests.jsonl` is written or read;
+- `POST /admin/reload` has no datadir to re-read;
+- `GET /config` reports none;
+- the operator's files are untouched.
+
+Recorded requests stay in each node's memory (D-74) and reset on restart, as cursors do (D-8).
+
+- **Rejected:** injecting a `RequestJournal` to switch only the journal file off. It replaces
+  upstream's `LocalJournal`, so `--journal-max-bytes` stops applying and clear semantics change
+  (against D-74), and it leaves the load-then-delete and reload paths in place.
+- **Given up:** RFC-001 §7.4.5's "single-node-compatible snapshots" through the datadir. A graceful
+  stop already wiped them; `GET /imposters` is the export. Existing datadir files on a chart PVC are
+  ignored and may be deleted.
+

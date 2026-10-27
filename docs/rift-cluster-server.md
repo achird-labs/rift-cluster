@@ -196,10 +196,12 @@ embedder calling `compose::start` directly — `replay`'s refusal is now one
 spelling of a general rule rather than the only guard.
 
 `--datadir` is **not** refused: it legitimately anchors the cluster state
-directory (below), and under `--cluster` its imposters are not loaded — the
-directory's `{port}.json` files are left untouched and nothing from them is
-bound or listed. A regression test pins that, because the suppression is a
-property of the clustered composition rather than of an explicit guard.
+directory (below), and that is all it does under `--cluster` (D-124). The engine
+is built without it, so the directory's `{port}.json` files are never loaded,
+bound, listed, rewritten or deleted, `POST /admin/reload` does not re-read them,
+and the engine writes no `{port}.json`, `{port}.cursors` or
+`{port}.requests.jsonl` there. Recorded requests stay in each node's memory and
+reset on restart, like response cursors (D-8). Regression tests pin this.
 
 ### PID-file semantics (upstream behaviour, reproduced)
 
