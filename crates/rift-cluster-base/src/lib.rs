@@ -223,6 +223,11 @@ pub mod seams {
     /// it runs the check itself (D-118). Never on replay (D-102).
     pub use rift_mock_core::imposter::check_lookup_paths;
 
+    /// One admin request's bound on proxy client-key derivation (rift#1609): the front decodes a
+    /// config body under one, as upstream's doors do, so a key repeated in the body is derived once
+    /// and a body upstream refuses is refused with its words (D-119).
+    pub use rift_mock_core::proxy::client_identity::AdmissionBudget;
+
     /// Post-resolution script validation (upstream's admin-time 400 gate): the
     /// clustered admin front validates resolved ops before parking, so nothing
     /// syntactically broken is ever committed to the log. Only meaningful
@@ -566,6 +571,8 @@ mod tests {
         // D-118: the front's lookup-path door check.
         let _ = check_lookup_paths;
         let _ = ScriptFileAccess::network;
+        // D-119: the front's per-request key-derivation scope.
+        let _ = AdmissionBudget::enter;
         // Issue #368's counting seam.
         _named::<&dyn RouteObserver>();
         let _ = bind_front_door_with_observer;

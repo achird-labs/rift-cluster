@@ -60,13 +60,54 @@ export function exportOptionsQuery(options: ExportOptions): string {
  */
 const TLS_MATERIAL_FIELDS = ["cert", "key"] as const;
 
+/**
+ * A `proxy` response's client identity (rift#1609, D-119): its private key, the certificate that
+ * pairs with it, and the key's passphrase. All three go together — the engine refuses half an
+ * identity, and a stub without one is a proxy that presents none, which the engine admits.
+ */
+const PROXY_IDENTITY_FIELDS = ["cert", "key", "passphrase"] as const;
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/** Each `stubs[].responses[].proxy` object of an imposter document. */
+function proxiesOf(imposter: Record<string, unknown>): Record<string, unknown>[] {
+  const stubs = Array.isArray(imposter.stubs) ? imposter.stubs : [];
+  return stubs.flatMap((stub) =>
+    isRecord(stub) && Array.isArray(stub.responses)
+      ? stub.responses.flatMap((response) =>
+          isRecord(response) && isRecord(response.proxy) ? [response.proxy] : [],
+        )
+      : [],
+  );
+}
+
 function carriesTlsMaterial(imposter: Record<string, unknown>): boolean {
-  return TLS_MATERIAL_FIELDS.some((field) => field in imposter);
+  return (
+    TLS_MATERIAL_FIELDS.some((field) => field in imposter) ||
+    proxiesOf(imposter).some((proxy) => PROXY_IDENTITY_FIELDS.some((field) => field in proxy))
+  );
 }
 
 function withoutTlsMaterial(imposter: Record<string, unknown>): Record<string, unknown> {
   const stripped: Record<string, unknown> = { ...imposter };
   for (const field of TLS_MATERIAL_FIELDS) delete stripped[field];
+  if (Array.isArray(stripped.stubs)) {
+    stripped.stubs = stripped.stubs.map((stub) =>
+      isRecord(stub) && Array.isArray(stub.responses)
+        ? {
+            ...stub,
+            responses: stub.responses.map((response) => {
+              if (!isRecord(response) || !isRecord(response.proxy)) return response;
+              const proxy: Record<string, unknown> = { ...response.proxy };
+              for (const field of PROXY_IDENTITY_FIELDS) delete proxy[field];
+              return { ...response, proxy };
+            }),
+          }
+        : stub,
+    );
+  }
   return stripped;
 }
 
@@ -151,11 +192,14 @@ export function renderImposterExport(setText: string, port: number, tls: boolean
  */
 export function exportCurl(scope: ExportScope, options: ExportOptions): string {
   const read = `curl -s '/imposters${exportOptionsQuery(options)}'`;
-  const strip = `del(${TLS_MATERIAL_FIELDS.map((field) => `.${field}`).join(", ")})`;
+  const proxyStrip = `del(${PROXY_IDENTITY_FIELDS.map((field) => `.${field}`).join(", ")})`;
+  const strip =
+    `del(${TLS_MATERIAL_FIELDS.map((field) => `.${field}`).join(", ")}) | ` +
+    `(.stubs[]?.responses[]? |= (if .proxy then .proxy |= ${proxyStrip} else . end))`;
   if (scope.kind === "all") {
     return options.tls
       ? `${read} > ${EXPORT_SET_FILENAME}`
-      : `${read} | jq '.imposters[] |= ${strip}' > ${EXPORT_SET_FILENAME}`;
+      : `${read} | jq '.imposters[] |= (${strip})' > ${EXPORT_SET_FILENAME}`;
   }
   const select = `.imposters[] | select(.port == ${String(scope.port)})`;
   const filter = options.tls ? select : `${select} | ${strip}`;

@@ -134,6 +134,30 @@ describe("selecting one imposter out of a set export", () => {
  * from a downloaded file unless the operator asked to keep it — and removes nothing else, because
  * `ca`, `mutualAuth` and `rejectUnauthorized` are public and change what the imposter does.
  */
+describe("a proxy's client identity is TLS material too (D-84, D-119)", () => {
+  const WITH_IDENTITY = {
+    port: 4646,
+    protocol: "http",
+    stubs: [
+      { responses: [{ proxy: { to: "https://u", cert: "C", key: "K", passphrase: "P", mode: "proxyOnce" } }] },
+      { responses: [{ is: { statusCode: 200 } }] },
+    ],
+  };
+  const raw = JSON.stringify({ imposters: [WITH_IDENTITY] });
+
+  it("removes a proxy's cert, key and passphrase together, keeping the rest of the stub", () => {
+    const rendered = renderSetExport(raw, false);
+    if (rendered.kind !== "ok") throw new Error(rendered.message);
+    expect(rendered.tlsPorts).toEqual([4646]);
+    const proxy = JSON.parse(rendered.text).imposters[0].stubs[0].responses[0].proxy;
+    expect(proxy).toEqual({ to: "https://u", mode: "proxyOnce" });
+  });
+
+  it("keeps the identity when the operator asks for TLS material", () => {
+    expect(renderSetExport(raw, true)).toEqual({ kind: "ok", tlsPorts: [4646], tlsWithoutPort: 0, text: raw });
+  });
+});
+
 describe("TLS material in an export (D-84)", () => {
   const HTTPS = {
     port: 4545,
@@ -393,7 +417,7 @@ describe("TLS material in an export (D-84)", () => {
     const off = { replayable: true, removeProxies: true, tls: false };
     const on = { ...off, tls: true };
     expect(exportCurl({ kind: "all" }, off)).toBe(
-      "curl -s '/imposters?replayable=true&removeProxies=true' | jq '.imposters[] |= del(.cert, .key)' > imposters.json",
+      "curl -s '/imposters?replayable=true&removeProxies=true' | jq '.imposters[] |= (del(.cert, .key) | (.stubs[]?.responses[]? |= (if .proxy then .proxy |= del(.cert, .key, .passphrase) else . end)))' > imposters.json",
     );
     expect(exportCurl({ kind: "all" }, on)).toBe(
       "curl -s '/imposters?replayable=true&removeProxies=true' > imposters.json",
@@ -405,7 +429,7 @@ describe("TLS material in an export (D-84)", () => {
     // must not name a route the console deliberately does not use.
     const off = { replayable: true, removeProxies: false, tls: false };
     expect(exportCurl({ kind: "one", port: 4545 }, off)).toBe(
-      "curl -s '/imposters?replayable=true&removeProxies=false' | jq '.imposters[] | select(.port == 4545) | del(.cert, .key)' > imposter-4545.json",
+      "curl -s '/imposters?replayable=true&removeProxies=false' | jq '.imposters[] | select(.port == 4545) | del(.cert, .key) | (.stubs[]?.responses[]? |= (if .proxy then .proxy |= del(.cert, .key, .passphrase) else . end))' > imposter-4545.json",
     );
     expect(exportCurl({ kind: "one", port: 4545 }, { ...off, tls: true })).toBe(
       "curl -s '/imposters?replayable=true&removeProxies=false' | jq '.imposters[] | select(.port == 4545)' > imposter-4545.json",

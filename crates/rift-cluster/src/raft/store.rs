@@ -846,7 +846,7 @@ fn admit_row(row: &str) -> Result<ImposterConfig, String> {
         serde_json::from_str(row).map_err(|e| format!("stored record will not parse: {e}"))?;
     let config = control::decode_committed_config(stored.config.get())
         .map_err(|e| format!("stored config will not parse: {e}"))?;
-    rift_cluster_base::seams::admission_check(&config)?;
+    control::admission_verdict(&config)?;
     Ok(config)
 }
 
@@ -2206,7 +2206,7 @@ impl RedbStateMachine {
         config: &ImposterConfig,
         action: EngineAction,
     ) -> Vec<EngineAction> {
-        if let Err(reason) = rift_cluster_base::seams::admission_check(config) {
+        if let Err(reason) = control::admission_verdict(config) {
             tracing::error!(
                 port,
                 %reason,
@@ -2540,7 +2540,7 @@ impl RedbStateMachine {
                         return Ok(Err(format!("corrupt stored config for port {port}: {e}")));
                     }
                 };
-                let was_admitted = rift_cluster_base::seams::admission_check(&config).is_ok();
+                let was_admitted = control::admission_verdict(&config).is_ok();
                 let before = config.stubs.clone();
                 if let Err(reason) = control::apply_edit(&mut config.stubs, edit) {
                     return Ok(Err(reason));
@@ -2629,7 +2629,7 @@ impl RedbStateMachine {
                     }
                 };
                 // The flag is not something admission judges, so the edit cannot change it.
-                let was_admitted = rift_cluster_base::seams::admission_check(&config).is_ok();
+                let was_admitted = control::admission_verdict(&config).is_ok();
                 record.enabled = *enabled;
                 config.enabled = *enabled;
                 record.config =
@@ -2775,7 +2775,7 @@ impl RedbStateMachine {
                         return Ok(Err(format!("corrupt stored config for port {port}: {e}")));
                     }
                 };
-                let was_admitted = rift_cluster_base::seams::admission_check(&config).is_ok();
+                let was_admitted = control::admission_verdict(&config).is_ok();
                 let mut stub_value = (*recorded.stub).clone();
                 if stub_value.id.is_none() {
                     // Addressable identity: the engine drive replaces a merged stub by id, and
@@ -2885,7 +2885,7 @@ impl RedbStateMachine {
                 // Always driven, even when nothing was stripped: restarting every cycle is part of
                 // the clear. A node that cannot drive this port incrementally syncs first.
                 let clear = EngineAction::ClearProxyResponses { port: *port };
-                if degraded || rift_cluster_base::seams::admission_check(&config).is_err() {
+                if degraded || control::admission_verdict(&config).is_err() {
                     return Ok(Ok(vec![Self::sync_action(configs)?, clear]));
                 }
                 Ok(Ok(vec![clear]))
@@ -3101,7 +3101,7 @@ impl RedbStateMachine {
                 // D-102: the engine runs what it admits. A refused config leaves the port as it
                 // was — a live imposter keeps its last-known config — and is reported derived, by
                 // `config_refusal`, never recorded here.
-                if let Err(reason) = rift_cluster_base::seams::admission_check(&config) {
+                if let Err(reason) = control::admission_verdict(&config) {
                     tracing::error!(
                         port,
                         %reason,

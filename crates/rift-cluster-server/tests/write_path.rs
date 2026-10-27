@@ -7030,3 +7030,81 @@ async fn a_single_imposter_read_returns_stub_headers_in_document_order() {
     );
     server.shutdown().await;
 }
+
+const CLIENT_CERT: &str = include_str!(
+    "../../../vendor/rift/crates/rift-http-proxy/tests/fixtures/client-identity/client.crt"
+);
+/// Three distinct keys at upstream's per-key cap (1,000,000 PBKDF2 iterations, OpenSSL-made).
+const CLIENT_KEYS_1M: [&str; 3] = [
+    include_str!(
+        "../../../vendor/rift/crates/rift-http-proxy/tests/fixtures/client-identity/client.pbes2-1m-1.key"
+    ),
+    include_str!(
+        "../../../vendor/rift/crates/rift-http-proxy/tests/fixtures/client-identity/client.pbes2-1m-2.key"
+    ),
+    include_str!(
+        "../../../vendor/rift/crates/rift-http-proxy/tests/fixtures/client-identity/client.pbes2-1m-3.key"
+    ),
+];
+
+fn proxy_identity_stub(key: &str) -> serde_json::Value {
+    json!({ "responses": [{ "proxy": {
+        "to": "https://localhost:1", "cert": CLIENT_CERT, "key": key, "passphrase": "rift-test"
+    } }] })
+}
+
+/// Pins D-119: the front decodes a config body under one request's key-derivation budget, as
+/// standalone's doors do (rift#1609) — three distinct 1M-iteration keys in one body ask for more
+/// than one request may, and are refused with upstream's words rather than admitted.
+#[tokio::test]
+async fn a_body_whose_proxy_keys_exceed_one_requests_derivation_budget_is_refused() {
+    let _serial = TEST_LOCK.lock().await;
+    let state = TempDir::new().expect("tempdir");
+    let server = compose::start(cluster_cli(&state, &["--cluster-allow-solo"]))
+        .await
+        .expect("solo cluster starts");
+    wait_ready(&server).await;
+    let port = reserve_port();
+    let stubs: Vec<_> = CLIENT_KEYS_1M
+        .iter()
+        .map(|key| proxy_identity_stub(key))
+        .collect();
+    let refused = reqwest::Client::new()
+        .put(format!("http://{}/imposters", server.admin_addr()))
+        .json(&json!({ "imposters": [{ "port": port, "protocol": "http", "stubs": stubs }] }))
+        .send()
+        .await
+        .expect("put");
+    assert_eq!(refused.status().as_u16(), 400);
+    let body = refused.text().await.expect("body");
+    assert!(
+        body.contains("more key derivation than one request may"),
+        "{body}"
+    );
+    assert_eq!(revision(&server, port), None, "nothing committed");
+    server.shutdown().await;
+}
+
+/// Pins D-119: a key repeated across a body's stubs is derived once under the request's budget, so
+/// three stubs sharing one 1M-iteration key are admitted.
+#[tokio::test]
+async fn a_key_repeated_across_stubs_is_admitted_once_per_request() {
+    let _serial = TEST_LOCK.lock().await;
+    let state = TempDir::new().expect("tempdir");
+    let server = compose::start(cluster_cli(&state, &["--cluster-allow-solo"]))
+        .await
+        .expect("solo cluster starts");
+    wait_ready(&server).await;
+    let port = reserve_port();
+    let stubs: Vec<_> = (0..3)
+        .map(|_| proxy_identity_stub(CLIENT_KEYS_1M[0]))
+        .collect();
+    let created = reqwest::Client::new()
+        .post(format!("http://{}/imposters", server.admin_addr()))
+        .json(&json!({ "port": port, "protocol": "http", "stubs": stubs }))
+        .send()
+        .await
+        .expect("post");
+    assert_eq!(created.status().as_u16(), 201, "{:?}", created.text().await);
+    server.shutdown().await;
+}

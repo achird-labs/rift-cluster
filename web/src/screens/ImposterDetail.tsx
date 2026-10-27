@@ -591,8 +591,9 @@ function ExportImposterControl({
         </div>
         {tlsRemoved ? (
           <p className="note" data-testid="export-imposter-tls" role="status">
-            Key and cert removed from the file (D-84): wherever it is imported, this imposter serves
-            that server&rsquo;s default certificate, or a self-signed one, until they are supplied
+            Key and cert removed from the file (D-84), its proxies&rsquo; client identities included:
+            wherever it is imported, this imposter serves that server&rsquo;s default certificate, or a
+            self-signed one, and its proxies present no client certificate, until they are supplied
             again. Duplicate keeps them.
           </p>
         ) : null}
