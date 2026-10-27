@@ -413,6 +413,11 @@ The bump to rift **master `7161b1a`** (past v0.23.0) is all three again, and mor
 - **Header order.** Request and response headers keep their order (rift#1606): `is`/`inject`
   headers go out, and stub and journal headers print back, as written or as sent. Old nodes answer
   them in a different order until every node runs the new binary.
+- **Proxy client identities (rift#1609, D-119).** A `proxy` stub may carry `cert`/`key`/`passphrase`:
+  a half identity, an unreadable one, or keys asking for more derivation than one request may are
+  refused at the door; old nodes drop the identity and proxy without it, so take no config writes
+  until every node is upgraded. The Raft log and snapshots hold those keys, and the console leaves
+  them out of a downloaded export unless asked (D-84).
 - **Responses.** A `_behaviors` block beside `behaviors` or a top-level `repeat` is ignored, as in
   Mountebank (rift#1709); old nodes still run it. A proxy forwards to `to`'s origin plus the
   request's own path and query (rift#1550; `defaultForward` keeps its base path): a stored `to`

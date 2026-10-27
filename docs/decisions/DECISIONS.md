@@ -3759,8 +3759,11 @@ test fixture** — the test is right; the fixture change exposed a production de
 fleet's snapshot is tens of MiB and a voter caught up by one would campaign mid-install.
 
 ### D-84 — An export is the imposter's config verbatim; the console leaves an https imposter's own cert and key out of a downloaded file unless asked
+> **Amended by D-119** (2026-10-27, #733): a `proxy` response's client identity (`cert`, `key`,
+> `passphrase`, rift#1609) is TLS material too — left out of a downloaded file unless asked, all
+> three together.
 
-- **Status:** active
+- **Status:** amended
 - **Decided:** 2026-09-17 · #367
 - **Implemented by:** #367
 - **Code:** web/src/features/imposters/portable.ts, web/src/components/exportDialog.tsx, web/src/screens/Imposters.tsx, web/src/screens/ImposterDetail.tsx
@@ -4574,7 +4577,8 @@ often a prefix not bound in `ns` — answers `500 malformed xpath predicate sele
 or `copy` where it used to select nothing (rift#1585).
 **Admission:** a path in `proxy.to` (rift#1550), a response with two types or none (rift#1551),
 `matches`/`jsonpath`/`xpath` on a binary-mode imposter (rift#1578) and door-only behavior shapes
-(rift#1582) are refused; D-102 refuses only their ports on replay. **Response behaviour** changes with no change
+(rift#1582) are refused, as are a half proxy client identity, an unreadable one and keys asking for
+more derivation than one request may (rift#1609, D-119); D-102 refuses only their ports on replay. **Response behaviour** changes with no change
 to stored bytes: a `_behaviors` block beside `behaviors` (a `null` one included) or a top-level
 `repeat` is now ignored, as Mountebank ignores it (rift#1709), so a mixed fleet runs it on old nodes only;
 request and response headers keep their order (rift#1606), so old nodes answer `is`/`inject` and
@@ -5460,4 +5464,45 @@ and answers upstream's `400`.
 The Helm chart gains `scripts.volume`: any volume source, mounted read-only at
 `/opt/rift/scripts` as `--scripts-dir`. Before it, a chart fleet had no `require()` or `lookup` at
 all.
+
+### D-119 — A proxy client key is derived once per admin request under upstream's budget, and once per config on each node; replay is never budget-refused
+
+- **Status:** active
+- **Decided:** 2026-10-27 · #733
+- **Implemented by:** #733
+- **Code:** crates/rift-cluster-server/src/admin_front.rs, crates/rift-cluster/src/control.rs, crates/rift-cluster/src/raft/store.rs, web/src/features/imposters/portable.ts
+
+rift#1609 gives a `proxy` response a client identity (`cert`, `key`, `passphrase`), and admitting
+an encrypted key decrypts it, at up to 1,000,000 PBKDF2 iterations. Upstream's doors decode a config
+body on the blocking pool under one `AdmissionBudget`. That budget allows 2,000,000 iterations per
+request, and a key repeated in the body is derived once. The cluster had neither control:
+- the front decoded on an async worker with no budget, then derived every key a second time to
+  admit the op;
+- the state machine judged a port's config on every apply that touched it, on every node, twice
+  per edit.
+
+A body standalone refuses was admitted, and an edit to a port holding encrypted keys stalled apply
+for the keys' cost.
+
+**The door decodes as upstream's does.** A config-bearing body is decoded in one `spawn_blocking`
+task under one `AdmissionBudget`, and refused with upstream's words. The op's admission check also
+runs on the blocking pool.
+
+**Everywhere else, the verdict is cached by content.** `control::admission_verdict` keys a config
+that carries a proxy client key by the hash of its serialization. The verdict is a pure function of
+the config, so a config judged once is never derived again, at the door or at apply. It runs
+without a budget: the door bounds one request, and a config grown over several requests may
+legitimately exceed one request's budget, which replay must never refuse (refines D-102).
+
+**Exports (amends D-84).** The console treats a proxy's `cert`, `key` and `passphrase` as TLS
+material. They are left out of a downloaded file unless asked, all three together, because the
+engine refuses half an identity. The curl the export dialog shows removes them with the same rule.
+
+**Mixed fleets (D-98).**
+- An id-less proxy stub carrying an identity keys differently on old and new nodes.
+- Old nodes drop the identity, so they proxy without it.
+- An old node that applies an edit to such a port re-serializes its row without the identity.
+
+D-98's "no config writes until every node runs the new binary" covers all three. The Raft log and
+snapshots now hold proxy private keys and passphrases.
 

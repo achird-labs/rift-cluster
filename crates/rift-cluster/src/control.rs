@@ -9,7 +9,7 @@
 //! drive *after* apply, never here.
 
 use rift_cluster_base::seams::{
-    ImposterConfig, RecordedResponse, RouteTable, Stub, deserialize_replayed,
+    ImposterConfig, RecordedResponse, RouteTable, Stub, StubResponse, deserialize_replayed,
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -317,6 +317,58 @@ pub fn strip_proxy_responses(stubs: &mut Vec<Stub>) -> bool {
         !stub.responses.is_empty()
     });
     stripped_any || stubs.len() != before
+}
+
+/// The engine's admission verdict on a committed or minted config (D-102), cached by content when
+/// the config carries a proxy client key (D-119).
+///
+/// Admitting such a key decrypts it — up to 1,000,000 PBKDF2 iterations each — and the state
+/// machine judges a port's config on every apply that touches it, on every node, once for the
+/// config it starts from and once for the one it leaves. The verdict is a pure function of the
+/// config, so a config judged once is not derived again. No budget applies here: the door bounds
+/// one request, and a config grown over several requests may legitimately exceed one request's
+/// budget, which replay must never refuse.
+///
+/// # Errors
+///
+/// The engine's refusal, as `admission_check` words it.
+pub fn admission_verdict(config: &ImposterConfig) -> Result<(), String> {
+    use std::collections::HashMap;
+    use std::sync::{LazyLock, Mutex};
+    /// Bounded by clearing: a miss only costs one derivation.
+    const VERDICT_CACHE_ENTRIES: usize = 256;
+    static VERDICTS: LazyLock<Mutex<HashMap<u64, Result<(), String>>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
+
+    let carries_key = config.stubs.iter().any(|stub| {
+        stub.responses.iter().any(
+            |response| matches!(response, StubResponse::Proxy { proxy, .. } if proxy.key.is_some()),
+        )
+    });
+    if !carries_key {
+        return rift_cluster_base::seams::admission_check(config);
+    }
+    // A config that does not serialize cannot be keyed; judge it uncached.
+    let Ok(bytes) = serde_json::to_vec(config) else {
+        return rift_cluster_base::seams::admission_check(config);
+    };
+    let key = xxhash_rust::xxh64::xxh64(&bytes, 0);
+    // A poisoned lock only loses the cache, never the verdict.
+    if let Some(verdict) = VERDICTS
+        .lock()
+        .ok()
+        .and_then(|cache| cache.get(&key).cloned())
+    {
+        return verdict;
+    }
+    let verdict = rift_cluster_base::seams::admission_check(config);
+    if let Ok(mut cache) = VERDICTS.lock() {
+        if cache.len() >= VERDICT_CACHE_ENTRIES {
+            cache.clear();
+        }
+        cache.insert(key, verdict.clone());
+    }
+    verdict
 }
 
 /// The largest *raw* recorded body a [`ControlOp::ProxyRecorded`] may carry, checked at apply.

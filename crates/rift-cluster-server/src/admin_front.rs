@@ -84,8 +84,8 @@ use rift_cluster::{
 };
 use rift_cluster_base::rift_http_proxy::server::ListenAddr;
 use rift_cluster_base::seams::{
-    ErrorKind, FaultCell, FaultIo, ImposterConfig, LingerOnClose, RiftScriptConfig, RouteTable,
-    ScriptBaseDir, ScriptFileAccess, Stub, admission_check, apply_tcp_fault,
+    AdmissionBudget, ErrorKind, FaultCell, FaultIo, ImposterConfig, LingerOnClose,
+    RiftScriptConfig, RouteTable, ScriptBaseDir, ScriptFileAccess, Stub, apply_tcp_fault,
     arm_linger_if_requested, check_lookup_paths, classify as classify_upstream,
     config_uses_script_surface, error_response_typed, is_injected_fault, not_a_stub_reason,
     resolve_scripts, resolve_stub_scripts, tcp_fault_carrier, validate_stub, validate_stubs,
@@ -3203,7 +3203,7 @@ async fn run_mutation(
     // two faults names the one standalone names first.
     if mutation.admit == Admit::Content {
         for (op, batch_index) in mutation.ops.iter().zip(&batch_indices) {
-            admit_op(op, node, *batch_index)?;
+            admit_op(op, node, *batch_index).await?;
         }
     }
 
@@ -4090,7 +4090,7 @@ async fn build_mutation(
 ) -> Result<Mutation, Response<FrontBody>> {
     match kind {
         Terminated::Create => {
-            let config: ImposterConfig = parse(body, IMPOSTER_DOOR)?;
+            let config: ImposterConfig = decode_config(body, IMPOSTER_DOOR).await?;
             let Some(port) = config.port else {
                 return Err(typed_error(
                     StatusCode::BAD_REQUEST,
@@ -4113,7 +4113,7 @@ async fn build_mutation(
             })
         }
         Terminated::ReplaceAllImposters => {
-            let replace: ReplaceAllBody = parse(body, BATCH_DOOR)?;
+            let replace: ReplaceAllBody = decode_config(body, BATCH_DOOR).await?;
             // Upsert the new set first, then prune the leftovers — never a
             // DeleteAll up front. The ops commit as separate Raft entries, so a
             // mid-sequence loss of quorum tears the sequence; torn this way the
@@ -4174,7 +4174,7 @@ async fn build_mutation(
             })
         }
         Terminated::FleetNamePut => {
-            let parsed: fleet::FleetNameBody = parse(body, CLUSTER_DOOR)?;
+            let parsed: fleet::FleetNameBody = decode_config(body, CLUSTER_DOOR).await?;
             Ok(Mutation {
                 admit: Admit::Nothing,
                 ops: vec![ControlOp::FleetNamePut { name: parsed.name }],
@@ -4233,7 +4233,7 @@ async fn build_mutation(
             })
         }
         Terminated::AddStub(port) => {
-            let add: AddStubBody = parse(body, STUB_DOOR)?;
+            let add: AddStubBody = decode_config(body, STUB_DOOR).await?;
             Ok(Mutation {
                 admit: Admit::Content,
                 ops: vec![ControlOp::PatchStubs {
@@ -4259,7 +4259,7 @@ async fn build_mutation(
             // its space. The two sibling routes disagree about their envelope (`POST
             // .../stubs` takes `{"stub": …}`, this one the bare stub), which is how the mistake is
             // actually reached.
-            let payload: serde_json::Value = parse(body, STUB_DOOR)?;
+            let payload: serde_json::Value = decode_config(body, STUB_DOOR).await?;
             if let Some(reason) = not_a_stub_reason(&payload) {
                 return Err(typed_error(
                     StatusCode::BAD_REQUEST,
@@ -4267,7 +4267,7 @@ async fn build_mutation(
                     &reason,
                 ));
             }
-            let mut stub: Stub = parse(body, STUB_DOOR)?;
+            let mut stub: Stub = decode_config(body, STUB_DOOR).await?;
             // The path names the space, not the body — exactly as upstream's handler does it, so a
             // caller cannot file a stub into a space the URL never mentioned.
             stub.space = Some(flow.clone());
@@ -4287,7 +4287,7 @@ async fn build_mutation(
             })
         }
         Terminated::ReplaceStubs(port) => {
-            let replace: ReplaceStubsBody = parse(body, STUBS_DOOR)?;
+            let replace: ReplaceStubsBody = decode_config(body, STUBS_DOOR).await?;
             let mut config = stored_config(node, port)?;
             config.stubs = replace.stubs;
             // Mountebank's `overwriteAll`: every stub's cycle restarts (D-116).
@@ -4303,7 +4303,7 @@ async fn build_mutation(
         Terminated::ReplaceStubAt(port, index) => {
             let mut config = stored_config(node, port)?;
             let index = stub_position(&index, config.stubs.len()).ok_or_else(bad_stub_index)?;
-            let stub: Stub = parse(body, STUB_DOOR)?;
+            let stub: Stub = decode_config(body, STUB_DOOR).await?;
             config.stubs[index] = stub;
             // Mountebank's `overwriteAtIndex`: that stub's cycle restarts (D-116, rift#1515).
             Ok(put_config_mutation(
@@ -4322,7 +4322,7 @@ async fn build_mutation(
             Ok(put_config_mutation(port, config, Admit::Nothing, None))
         }
         Terminated::ReplaceStubById(port, id) => {
-            let stub: Stub = parse(body, STUB_DOOR)?;
+            let stub: Stub = decode_config(body, STUB_DOOR).await?;
             Ok(Mutation {
                 admit: Admit::Content,
                 ops: vec![ControlOp::PatchStubs {
@@ -4366,7 +4366,7 @@ async fn build_mutation(
             },
         }),
         Terminated::PutRoutes => {
-            let table: RouteTable = parse(body, CLUSTER_DOOR)?;
+            let table: RouteTable = decode_config(body, CLUSTER_DOOR).await?;
             // No loopback re-read: there is no upstream `/front-door/routes`
             // to fetch from (U-11's admin CRUD was deferred). A whole-table
             // replace is deterministic and pre-validated (`build_and_run`
@@ -4840,8 +4840,12 @@ fn resolve_op_scripts(
 /// Reads the **local** applied config, which can trail the leader. That is acceptable because the
 /// drive stays authoritative (D-102): a race at worst commits a config the drive then refuses per
 /// port, or refuses an edit a retry admits.
+///
+/// Judged on the blocking pool (D-119): admitting a `proxy` client key decrypts it, and that must
+/// not hold an async worker. The verdict is cached by content, so this judges what the decode
+/// already derived without deriving it again for the apply.
 #[allow(clippy::result_large_err)]
-fn admit_op(
+async fn admit_op(
     op: &ControlOp,
     node: &RaftNode,
     batch_index: Option<usize>,
@@ -4852,7 +4856,12 @@ fn admit_op(
             .map_err(|e| internal(&format!("reading the stored config for {port}: {e}")))?,
         _ => None,
     };
-    match admission_refusal(op, stored.as_deref()) {
+    // A clone: the check runs on another thread, and the op is borrowed from the mutation.
+    let owned = op.clone();
+    let refusal = tokio::task::spawn_blocking(move || admission_refusal(&owned, stored.as_deref()))
+        .await
+        .map_err(|e| internal(&format!("judging the config: {e}")))?;
+    match refusal {
         None => Ok(()),
         Some(reason) => Err(typed_error(
             StatusCode::BAD_REQUEST,
@@ -4871,7 +4880,9 @@ fn admit_op(
 ///   to refuse the edit that may repair it.
 fn admission_refusal(op: &ControlOp, stored: Option<&str>) -> Option<String> {
     match op {
-        ControlOp::PutImposter { config, .. } => admission_check(config).err(),
+        ControlOp::PutImposter { config, .. } => {
+            rift_cluster::control::admission_verdict(config).err()
+        }
         ControlOp::PatchStubs { edit, .. } => {
             if !edit.0.iter().any(StubEdit::adds_content) {
                 return None;
@@ -4883,7 +4894,7 @@ fn admission_refusal(op: &ControlOp, stored: Option<&str>) -> Option<String> {
             let mut config = decode_committed_config(stored).ok()?;
             // An unknown or duplicate id: the state machine refuses it with its own reason.
             config.stubs = control::edited_stubs(&config.stubs, edit).ok()?;
-            admission_check(&config).err()
+            rift_cluster::control::admission_verdict(&config).err()
         }
         // Listed, not `_`: an op that comes to carry content must decide here whether it is
         // admitted. A recording's stub comes from the upstream, and the drive judges it.
@@ -5042,6 +5053,24 @@ fn parse<T: serde::de::DeserializeOwned>(
             &format!("{door}: {e}"),
         )
     })
+}
+
+/// [`parse`] for a config-bearing admin body, as upstream's doors decode one (D-119, rift#1609): on
+/// the blocking pool, under one [`AdmissionBudget`], because decoding a `proxy` client key decrypts
+/// it. A key repeated in the body is derived once, a body whose keys ask for more derivation than
+/// one request may is refused with upstream's words, and no async worker is held meanwhile.
+#[allow(clippy::result_large_err)]
+async fn decode_config<T: serde::de::DeserializeOwned + Send + 'static>(
+    body: &[u8],
+    door: &'static str,
+) -> Result<T, Response<FrontBody>> {
+    let body = Bytes::copy_from_slice(body);
+    tokio::task::spawn_blocking(move || {
+        let _budget = AdmissionBudget::enter();
+        parse(&body, door)
+    })
+    .await
+    .unwrap_or_else(|e| Err(internal(&format!("decoding the request body: {e}"))))
 }
 
 /// Assemble a buffered-body response with an optional upstream content type.
