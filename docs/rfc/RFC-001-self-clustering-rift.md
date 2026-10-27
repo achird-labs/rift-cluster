@@ -954,6 +954,11 @@ revision.
 
 #### 7.4.6 Port-bind divergence
 
+> **Amended by D-112** — a port this node's own listener holds (admin front, front door,
+> metrics) is reserved on its engine before the node replays or catches up on the log, so an
+> imposter committed on one is this kind of bind failure on this node, its reason naming the
+> listener, and never an admission refusal. The Raft and probe ports are not reserved yet.
+
 Every node applies the same committed config and therefore binds every imposter port;
 binds can fail on some nodes (port taken by an unrelated process). Built (#143):
 

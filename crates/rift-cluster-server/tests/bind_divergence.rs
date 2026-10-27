@@ -737,3 +737,135 @@ async fn a_healthy_imposter_is_positively_listed_as_bound() {
 
     server.shutdown().await;
 }
+
+/// A node's CLI with its front door at `front_door` and `role` (`--cluster-allow-solo`, or
+/// `--cluster-seeds <addr>`) appended.
+fn node_cli(state: &TempDir, front_door: &str, role: &[&str]) -> EeCli {
+    let state = state.path().to_string_lossy();
+    let mut args = vec![
+        "rift-cluster-server",
+        "--port",
+        "0",
+        "--metrics-port",
+        "0",
+        "--cluster",
+        "--cluster-bind",
+        "127.0.0.1:0",
+        "--cluster-probe-bind",
+        "127.0.0.1:0",
+        "--cluster-secret",
+        SECRET,
+        "--cluster-state-dir",
+        &state,
+        "--front-door",
+        front_door,
+    ];
+    args.extend_from_slice(role);
+    EeCli::try_parse_from(args).expect("parses")
+}
+
+/// Pins D-112: an imposter committed on this node's own admin port is a bind failure on this node
+/// — reserved, so it never shares the port with the admin front — not an admission refusal. The
+/// write commits with the local warning, the failure names the listener, the imposter still serves
+/// through the gateway, and the admin front keeps answering on its port.
+#[tokio::test]
+async fn an_imposter_on_the_nodes_own_admin_port_is_a_bind_failure() {
+    let state = TempDir::new().expect("tempdir");
+    let server = compose::start(cluster_cli(&state))
+        .await
+        .expect("solo cluster starts");
+    wait_ready(&server).await;
+    let admin = server.admin_addr();
+    let port = admin.port();
+
+    let created = Seen::of(
+        reqwest::Client::new()
+            .post(format!("http://{admin}/imposters"))
+            .json(&imposter(port, "on-the-admin-port"))
+            .send()
+            .await
+            .expect("post imposter"),
+    )
+    .await;
+    assert_eq!(created.status, 201, "{created}");
+    assert!(
+        created
+            .header("rift-cluster-warnings")
+            .is_some_and(|w| w.contains("local-engine=")),
+        "{created}"
+    );
+    let reason = server
+        .node()
+        .expect("clustered")
+        .bind_failure(port)
+        .expect("reported as a bind failure");
+    assert!(
+        reason.contains("admin API"),
+        "the failure names the listener: {reason}"
+    );
+
+    let gateway = Seen::of(
+        reqwest::get(format!("http://{admin}/__rift/{port}/anything"))
+            .await
+            .expect("gateway"),
+    )
+    .await;
+    assert_eq!(gateway.body, "on-the-admin-port", "{gateway}");
+    let listing = reqwest::get(format!("http://{admin}/imposters"))
+        .await
+        .expect("the admin front still answers on its port");
+    assert_eq!(listing.status().as_u16(), 200);
+    server.shutdown().await;
+}
+
+/// Pins D-112's ordering: the listener ports are reserved before the node catches up on the log.
+/// A joiner whose `--front-door` port already holds an imposter in the fleet's log starts — the
+/// caught-up imposter is a bind failure on it — instead of catch-up taking the port and the front
+/// door's bind then aborting startup.
+#[tokio::test]
+async fn a_joiner_starts_over_a_committed_imposter_on_its_front_door_port() {
+    let founder_state = TempDir::new().expect("tempdir");
+    let founder = compose::start(node_cli(
+        &founder_state,
+        "127.0.0.1:0",
+        &["--cluster-allow-solo"],
+    ))
+    .await
+    .expect("founder starts");
+    wait_ready(&founder).await;
+    let port = reserve_port();
+    let created = reqwest::Client::new()
+        .post(format!("http://{}/imposters", founder.admin_addr()))
+        .json(&imposter(port, "caught-up"))
+        .send()
+        .await
+        .expect("post imposter");
+    assert_eq!(created.status().as_u16(), 201);
+
+    let seed = founder.cluster_addr().expect("cluster addr").to_string();
+    let joiner_state = TempDir::new().expect("tempdir");
+    let joiner = compose::start(node_cli(
+        &joiner_state,
+        &format!("127.0.0.1:{port}"),
+        &["--cluster-seeds", &seed],
+    ))
+    .await
+    .expect("the joiner starts over the committed imposter");
+    wait_ready(&joiner).await;
+    assert_eq!(
+        joiner.front_door_addr().map(|a| a.port()),
+        Some(port),
+        "the front door holds its own port"
+    );
+    let reason = joiner
+        .node()
+        .expect("clustered")
+        .bind_failure(port)
+        .expect("the caught-up imposter is a bind failure");
+    assert!(
+        reason.contains("front door"),
+        "the failure names the listener: {reason}"
+    );
+    joiner.shutdown().await;
+    founder.shutdown().await;
+}
