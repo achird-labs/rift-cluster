@@ -60,19 +60,68 @@ describe("AC1 — wait and repeat round-trip in whichever of the three spellings
     }
   });
 
-  it("preserves the order of an array-spelled behaviours list, in BOTH directions", () => {
-    /*
-     * Reordering is not data loss, but it is a diff on a document the operator may be reviewing
-     * beside a file. Both orders are asserted deliberately: a renderer that sorted its keys would
-     * still round-trip whichever order happens to be the sorted one, so testing only that order
-     * proves nothing about ordering at all.
-     */
-    for (const behaviors of [
-      [{ repeat: 2 }, { wait: 50 }],
-      [{ wait: 50 }, { repeat: 2 }],
+  /*
+   * rift#1582: a config door refuses a `{repeat: n}` element in a `behaviors` array, as Mountebank
+   * does — Mountebank reads a repeat count only from the response-level `repeat`, and the engine
+   * writes it there. So under the array spelling the form writes `repeat` beside `behaviors`.
+   */
+  it("round-trips the engine's own grammar: a response-level repeat beside a behaviors array", () => {
+    const source = { repeat: 2, behaviors: [{ wait: 50 }], is: { statusCode: 200 } };
+    const response = one(source);
+    expect(response.behaviors?.repeat).toBe(2);
+    expect(response.behaviors?.wait).toEqual({ kind: "fixed", ms: 50 });
+    expect(renderResponses([response])).toEqual([source]);
+  });
+
+  it("round-trips a response-level repeat on its own", () => {
+    const source = { repeat: 3, is: { statusCode: 200 } };
+    const response = one(source);
+    expect(response.behaviors?.repeat).toBe(3);
+    expect(renderResponses([response])).toEqual([source]);
+  });
+
+  it("reads a legacy leading {repeat} element and writes it where the engine reads it", () => {
+    // Engines before rift#1582 stored this shape, so it must still open; it is never written back.
+    expect(renderResponses([one({ is: { statusCode: 200 }, behaviors: [{ repeat: 2 }, { wait: 50 }] })])).toEqual([
+      { is: { statusCode: 200 }, repeat: 2, behaviors: [{ wait: 50 }] },
+    ]);
+    expect(renderResponses([one({ is: { statusCode: 200 }, behaviors: [{ repeat: 2 }] })])).toEqual([
+      { is: { statusCode: 200 }, repeat: 2 },
+    ]);
+  });
+
+  it("names a {repeat} element after the first, which Mountebank never reads", () => {
+    // rift#1672: inert there. Promoting it to a live repeat on save would change what the stub does.
+    const projected = projectResponses({
+      responses: [{ is: { statusCode: 200 }, behaviors: [{ wait: 50 }, { repeat: 2 }] }],
+    });
+    expect(projected.kind).toBe("rawOnly");
+  });
+
+  it("names a response-level repeat that is not a number", () => {
+    for (const repeat of [null, "2"]) {
+      expect(projectResponses({ responses: [{ is: { statusCode: 200 }, repeat }] }).kind).toBe("rawOnly");
+    }
+  });
+
+  it("carries a response-level repeat on a flat response", () => {
+    const source = { statusCode: 200, body: "hi", repeat: 2 };
+    const response = one(source);
+    expect(response.wrapped).toBe(false);
+    expect(response.behaviors?.repeat).toBe(2);
+    expect(renderResponses([response])).toEqual([source]);
+  });
+
+  it("refuses a response-level repeat beside an object-spelled block, rather than guessing", () => {
+    // Beside a top-level `repeat`, Mountebank ignores `_behaviors` whole (rift#1709): no single
+    // model holds "a block the engine will not run", so the response goes raw-only, named.
+    for (const source of [
+      { is: { statusCode: 200 }, repeat: 2, _behaviors: { wait: 50 } },
+      { is: { statusCode: 200 }, repeat: 2, behaviors: { wait: 50 } },
+      { is: { statusCode: 200 }, repeat: 2, behaviors: [{ repeat: 3 }] },
     ]) {
-      const source = { is: { statusCode: 200 }, behaviors };
-      expect(renderResponses([one(source)])).toEqual([source]);
+      const projected = projectResponses({ responses: [source] });
+      expect(projected.kind).toBe("rawOnly");
     }
   });
 
