@@ -22,6 +22,14 @@
         }
       }
     },
+    "scripts": {
+      "type": "object",
+      "properties": {
+        "volume": {
+          "type": "object"
+        }
+      }
+    },
     "podDisruptionBudget": {
       "type": "object",
       "properties": {

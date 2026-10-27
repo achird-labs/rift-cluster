@@ -218,6 +218,11 @@ pub mod seams {
     /// `network(--scripts-dir)` access upstream's own manager does.
     pub use rift_mock_core::imposter::ScriptFileAccess;
 
+    /// Upstream's write-door check that a `lookup` CSV is readable under the given access
+    /// (rift#1617): the clustered front terminates the writes upstream's own door would check, so
+    /// it runs the check itself (D-118). Never on replay (D-102).
+    pub use rift_mock_core::imposter::check_lookup_paths;
+
     /// Post-resolution script validation (upstream's admin-time 400 gate): the
     /// clustered admin front validates resolved ops before parking, so nothing
     /// syntactically broken is ever committed to the log. Only meaningful
@@ -558,6 +563,9 @@ mod tests {
         let _ = parse_front_door_addr;
         _named::<ListenAddr>();
         let _ = bind_server_listener;
+        // D-118: the front's lookup-path door check.
+        let _ = check_lookup_paths;
+        let _ = ScriptFileAccess::network;
         // Issue #368's counting seam.
         _named::<&dyn RouteObserver>();
         let _ = bind_front_door_with_observer;

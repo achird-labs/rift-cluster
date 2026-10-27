@@ -99,6 +99,14 @@ worse than one that will not start. `--cluster-probe-bind` is **not** in the lis
 on purpose — it already defaults to every interface on port 2526 (`[::]` dual-stack,
 `0.0.0.0` on a host without IPv6), so passing it changes nothing.
 
+### Scripts and lookup files
+
+A script's `require()` modules and a `lookup` behavior's CSV files are read on each node at serve
+time, under `--scripts-dir`, and never replicated (D-103), so every node needs the same files. With
+the chart, give them as `scripts.volume` (a `configMap`, a ReadOnlyMany claim, …), mounted
+read-only as `--scripts-dir`. Without one, `require()` and `lookup` are refused, and the front
+answers a `lookup` write with upstream's `400` (D-118).
+
 ### IPv6 and dual-stack clusters
 
 The chart and `k8s/statefulset.yaml` run unchanged on IPv4, IPv6 and dual-stack pod networks
