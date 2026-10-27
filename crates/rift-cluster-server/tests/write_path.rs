@@ -5942,5 +5942,126 @@ async fn put_imposters_answers_in_request_order_and_get_stays_ascending() {
         .map(|i| i["port"].as_u64().expect("port"))
         .collect();
     assert_eq!(ascending, vec![u64::from(a), u64::from(b), u64::from(c)]);
+}
+
+/// Write `head` then `body` to the admin front over a raw socket and return the response's status
+/// line. The body is written in two parts with a pause, as `an_oversize_write_body_is_answered_413_not_reset`
+/// does, so a refusal sent mid-upload is read rather than surfacing as a reset.
+async fn raw_admin_status(admin: std::net::SocketAddr, head: String, body: Vec<u8>) -> String {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    let mut stream = tokio::net::TcpStream::connect(admin)
+        .await
+        .expect("connect to the admin front");
+    stream
+        .write_all(head.as_bytes())
+        .await
+        .expect("write the head");
+    let split = body.len().min(256 * 1024);
+    stream
+        .write_all(&body[..split])
+        .await
+        .expect("write the first part");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    // The front may have answered and stopped reading; the lingering close drains the rest.
+    let _ = stream.write_all(&body[split..]).await;
+    let _ = stream.flush().await;
+    let mut response = Vec::new();
+    let _ = tokio::time::timeout(Duration::from_secs(10), stream.read_to_end(&mut response)).await;
+    String::from_utf8_lossy(&response)
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .to_owned()
+}
+
+/// Pins D-109: a reverse-proxied admin route is bounded at the front's 16 MiB like a terminated
+/// one — a declared length over the cap is `413` before the engine sees anything.
+#[tokio::test]
+async fn a_proxied_admin_body_over_the_cap_is_413() {
+    let _serial = TEST_LOCK.lock().await;
+    let state = TempDir::new().expect("tempdir");
+    let server = compose::start(cluster_cli(&state, &["--cluster-allow-solo"]))
+        .await
+        .expect("solo cluster starts");
+    wait_ready(&server).await;
+    let admin = server.admin_addr();
+    let declared = 16 * 1024 * 1024 + 1;
+    let status = raw_admin_status(
+        admin,
+        format!(
+            "POST /imposters/4545/verify HTTP/1.1\r\nHost: {admin}\r\n\
+             Content-Type: application/json\r\nContent-Length: {declared}\r\n\r\n"
+        ),
+        vec![b' '; declared],
+    )
+    .await;
+    assert!(status.starts_with("HTTP/1.1 413"), "{status}");
+    server.shutdown().await;
+}
+
+/// Pins D-109 for a body with no declared length: a chunked upload over the cap is counted as it
+/// arrives and refused with `413`.
+#[tokio::test]
+async fn a_proxied_admin_chunked_body_over_the_cap_is_413() {
+    let _serial = TEST_LOCK.lock().await;
+    let state = TempDir::new().expect("tempdir");
+    let server = compose::start(cluster_cli(&state, &["--cluster-allow-solo"]))
+        .await
+        .expect("solo cluster starts");
+    wait_ready(&server).await;
+    let admin = server.admin_addr();
+    let chunk = vec![b' '; 1024 * 1024];
+    let mut body = Vec::new();
+    for _ in 0..17 {
+        body.extend_from_slice(format!("{:x}\r\n", chunk.len()).as_bytes());
+        body.extend_from_slice(&chunk);
+        body.extend_from_slice(b"\r\n");
+    }
+    body.extend_from_slice(b"0\r\n\r\n");
+    let status = raw_admin_status(
+        admin,
+        format!(
+            "POST /imposters/4545/verify HTTP/1.1\r\nHost: {admin}\r\n\
+             Content-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n"
+        ),
+        body,
+    )
+    .await;
+    assert!(status.starts_with("HTTP/1.1 413"), "{status}");
+    server.shutdown().await;
+}
+
+/// D-109's other half: a body under the cap still reaches the engine and gets its answer.
+#[tokio::test]
+async fn a_proxied_admin_body_under_the_cap_still_proxies() {
+    let _serial = TEST_LOCK.lock().await;
+    let state = TempDir::new().expect("tempdir");
+    let server = compose::start(cluster_cli(&state, &["--cluster-allow-solo"]))
+        .await
+        .expect("solo cluster starts");
+    wait_ready(&server).await;
+    let admin = server.admin_addr();
+    let port = reserve_port();
+    let created = reqwest::Client::new()
+        .post(format!("http://{admin}/imposters"))
+        .json(&json!({ "port": port, "protocol": "http", "recordRequests": true }))
+        .send()
+        .await
+        .expect("create");
+    assert_eq!(created.status().as_u16(), 201);
+    let verified = reqwest::Client::new()
+        .post(format!("http://{admin}/imposters/{port}/verify"))
+        .json(&json!({ "predicates": [] }))
+        .send()
+        .await
+        .expect("verify");
+    let status = verified.status().as_u16();
+    assert_ne!(status, 413, "a small body is not refused");
+    assert_ne!(
+        status,
+        400,
+        "and it reaches the engine intact: {:?}",
+        verified.text().await
+    );
     server.shutdown().await;
 }

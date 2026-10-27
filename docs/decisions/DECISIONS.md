@@ -5112,3 +5112,25 @@ new wrong one — until the port is next deleted or cleared, or a snapshot is in
 orphaned by a by-id delete before this release can no longer be told apart from stub-less ones: clear
 `savedProxyResponses` on proxyOnce ports that were edited by id.
 
+### D-109 — The admin front bounds every admin request body at 16 MiB, terminated or proxied
+
+- **Status:** active
+- **Decided:** 2026-10-26 · #691
+- **Implemented by:** #691
+- **Code:** crates/rift-cluster-server/src/admin_front.rs, crates/rift-cluster-server/tests/write_path.rs
+
+The front capped request bodies at 16 MiB only on the routes it terminates. Every other admin route
+— `verify`, flow-state, scenarios, intercept, anything unmatched — was reverse-proxied with its body
+streamed unbounded, so its only bound was the engine's own ceiling, which since rift#1439 is
+`--max-body-size`: a data-plane knob, 512 MiB by default. The admin plane's memory exposure followed
+a setting chosen for imposter traffic.
+
+**Every admin request body is bounded at the front.** On the admin proxy leg a declared length over
+the cap is `413` before anything is read; an undeclared one is counted as it arrives and refused at
+the cap. Any other read failure is a `400`, never folded into "too large". The bounded body is then
+forwarded whole; the response still streams, so the admin SSE streams are unaffected. The `/__rift/*`
+gateway is not an admin route: it keeps the engine's cap.
+
+A proxied admin body between 16 MiB and the engine's ceiling is now refused where it used to reach the
+engine; no verify, flow-state or scenario body comes near that size.
+
