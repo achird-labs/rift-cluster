@@ -243,11 +243,14 @@ export function StubEditor({
   original,
   revision,
   onDone,
+  defaultStatus = null,
 }: {
   port: number;
   target: StubTarget;
   /** The stub as the fleet currently has it — the text the raw editor starts from, byte for byte. */
   original: unknown;
+  /** The status the imposter's `defaultResponse` answers with, if any — what an absent stub status answers. */
+  defaultStatus?: number | null;
   /** The token from the imposter read. `null` disables saving; see `NoRevisionNote`. */
   revision: string | null;
   onDone: () => void;
@@ -465,6 +468,7 @@ export function StubEditor({
         <Summary
           predicateItems={editable.predicateItems}
           responseItems={editable.responseItems}
+          defaultStatus={defaultStatus}
         />
       ) : null}
 
@@ -596,9 +600,11 @@ function StubFields({
 function Summary({
   predicateItems,
   responseItems,
+  defaultStatus,
 }: {
   predicateItems: PredicateItem[];
   responseItems: ResponseModel[];
+  defaultStatus: number | null;
 }): ReactNode {
   const matchesEverything = predicateItems.length === 0;
   return (
@@ -621,7 +627,7 @@ function Summary({
         ) : (
           <>
             Matches requests where <b>{describePredicates(predicateItems)}</b>, and{" "}
-            <b>{describeResponseList(responseItems)}</b>.
+            <b>{describeResponseList(responseItems, defaultStatus)}</b>.
           </>
         )}
       </div>

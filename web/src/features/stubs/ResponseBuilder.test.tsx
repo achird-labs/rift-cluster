@@ -546,6 +546,14 @@ describe("the one-line summary of a response list (AC7 feeds on this)", () => {
     expect(describeResponseList([response(201)])).toBe("answers 201");
   });
 
+  // rift#1369: an `is` response that omits `statusCode` answers the imposter's defaultResponse status.
+  it("labels an absent status with the imposter's default status, and 200 only without one", () => {
+    const absent = { ...blankResponse(), statusCode: null };
+    expect(describeResponseList([absent], 404)).toBe("answers 404");
+    expect(describeResponseList([absent])).toBe("answers 200");
+    expect(describeResponseList([response(201)], 404)).toBe("answers 201");
+  });
+
   it("reports the count and the cycling when there is more than one", () => {
     expect(describeResponseList([response(202), response(200), response(500)])).toBe(
       "answers 202, then cycles through 2 more",

@@ -1,3 +1,4 @@
+import { defaultResponseStatus } from "../features/stubs/responses.ts";
 import { Fragment, type FormEvent, type ReactNode, useState } from "react";
 
 import { ApiError, apiGetText } from "../api/client.ts";
@@ -760,6 +761,7 @@ function Stubs({
           target={editing}
           original={editingStub ?? {}}
           revision={revision}
+          defaultStatus={defaultResponseStatus(imposter.defaultResponse)}
           onDone={() => onEdit(null)}
         />
       ) : (

@@ -42,11 +42,20 @@ function isWaitKind(value: string): value is WaitModel["kind"] {
   return value === "none" || value === "fixed" || value === "range";
 }
 
-/** The sentence `StubEditor`'s `Summary` shows — exported so it stays derived from one place. */
-export function describeResponseList(items: ResponseModel[]): string {
+/**
+ * The sentence `StubEditor`'s `Summary` shows — exported so it stays derived from one place.
+ *
+ * A response that omits `statusCode` answers the imposter's `defaultResponse` status when it has
+ * one (rift#1369, Mountebank's merge), so `defaultStatus` is what an absent status is labelled with;
+ * 200 only when there is no default to merge.
+ */
+export function describeResponseList(
+  items: ResponseModel[],
+  defaultStatus: number | null = null,
+): string {
   const first = items[0];
   if (first === undefined) return "carries no responses";
-  const statusCode = first.statusCode ?? DEFAULT_STATUS_CODE;
+  const statusCode = first.statusCode ?? defaultStatus ?? DEFAULT_STATUS_CODE;
   if (items.length === 1) return `answers ${statusCode}`;
   const rest = items.length - 1;
   return `answers ${statusCode}, then cycles through ${rest} more`;

@@ -10,6 +10,7 @@ import {
   type WaitModel,
 } from "./behaviors.ts";
 import {
+  defaultResponseStatus,
   type ResponseBody,
   type ResponseHeader,
   type ResponseModel,
@@ -114,6 +115,8 @@ const anyResponse: fc.Arbitrary<ResponseModel> = fc.record({
   // string one is what every response read back from the engine actually carries.
   statusText: fc.boolean(),
   headersPresent: fc.boolean(),
+  // rift#1369's `_mode: "text"`, carried — so the round-trip property covers it too.
+  modeText: fc.boolean(),
   headers: fc.array(anyHeader, { maxLength: 4 }),
   body: anyBody,
   behaviors: anyBehaviors,
@@ -622,3 +625,32 @@ describe("#257 — render and parse agree about what a string status code can be
     );
   });
 });
+
+// rift#1369: code-built responses (recordings above all) print `"_mode": "text"`.
+describe("_mode", () => {
+  it("carries a text _mode through the form and writes it back", () => {
+    const source = { is: { statusCode: 200, body: "hi", _mode: "text" } };
+    const projected = projectResponses({ responses: [source] });
+    if (projected.kind !== "responses") throw new Error(`rawOnly: ${projected.unmodelledKeys.join(", ")}`);
+    expect(projected.items[0]?.modeText).toBe(true);
+    expect(renderResponses(projected.items)).toEqual([source]);
+  });
+
+  it("keeps a binary _mode raw-only, since its body is base64", () => {
+    const projected = projectResponses({
+      responses: [{ is: { statusCode: 200, body: "3q2+7w==", _mode: "binary" } }],
+    });
+    expect(projected.kind).toBe("rawOnly");
+  });
+});
+
+describe("defaultResponseStatus", () => {
+  it("reads the default's status in either spelling, and nothing else", () => {
+    expect(defaultResponseStatus({ statusCode: 404 })).toBe(404);
+    expect(defaultResponseStatus({ statusCode: "418" })).toBe(418);
+    for (const none of [undefined, null, {}, { statusCode: "x" }, { statusCode: 1.5 }]) {
+      expect(defaultResponseStatus(none)).toBeNull();
+    }
+  });
+});
+
