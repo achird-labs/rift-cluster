@@ -201,6 +201,11 @@ pub mod seams {
     pub use rift_mock_core::imposter::build_upstream_client;
     pub use rift_mock_core::proxy::OutboundTls;
 
+    /// Upstream's server-listener socket (rift#1528): `SO_REUSEADDR` without `SO_REUSEPORT`, and
+    /// `IPV6_V6ONLY` off on every IPv6 bind, so `[::]` takes IPv4 clients whatever the kernel's
+    /// `bindv6only`. The cluster RPC listener binds through it (#698).
+    pub use rift_mock_core::proxy::bind_server_listener;
+
     /// Config-time `_rift.script` `file:`/`ref:` resolution (upstream #356):
     /// the clustered admin front resolves before replicating, so nothing
     /// unresolved is ever committed to the log.
@@ -351,8 +356,14 @@ pub mod seams {
     /// is still upstream's and the facade's job is to name the boundary.
     pub use rift_http_proxy::front_door::{
         CompiledRoutes, HeaderMatch, Route, RouteMatch, RouteObserver, RouteTable, RouteTableError,
-        RouteTarget, RunningFrontDoor, bind_front_door, bind_front_door_with_observer,
+        RouteTarget, RunningFrontDoor, bind_front_door, bind_front_door_at,
+        bind_front_door_with_observer,
     };
+
+    /// `--front-door`'s value as upstream reads it (rift#1561): `HOST:PORT` exactly, or a bare port
+    /// as [`ListenAddr::Any`] — `[::]` dual-stack with a `0.0.0.0` fallback. Bound through
+    /// [`bind_front_door_at`] (#698).
+    pub use rift_http_proxy::server::{ListenAddr, parse_front_door_addr};
 }
 
 /// Build edition marker, surfaced in banners and `--version` output.
@@ -543,6 +554,10 @@ mod tests {
         _named::<CompiledRoutes>();
         _named::<RunningFrontDoor>();
         let _ = bind_front_door;
+        let _ = bind_front_door_at;
+        let _ = parse_front_door_addr;
+        _named::<ListenAddr>();
+        let _ = bind_server_listener;
         // Issue #368's counting seam.
         _named::<&dyn RouteObserver>();
         let _ = bind_front_door_with_observer;

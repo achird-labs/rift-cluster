@@ -20,6 +20,7 @@ use hyper::body::{Bytes, Incoming};
 use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
+use rift_cluster_base::rift_http_proxy::server::ListenAddr;
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 
@@ -60,8 +61,19 @@ impl ProbeListener {
 /// Bind the probe port and start serving. A bind failure is fatal to startup:
 /// a node whose readiness gate never answers is one an orchestrator will either
 /// never route to or never stop routing to, depending on its defaults.
-pub async fn bind(addr: SocketAddr, readiness: Arc<Readiness>) -> std::io::Result<ProbeListener> {
-    let listener = TcpListener::bind(addr).await?;
+pub async fn bind(listen: ListenAddr, readiness: Arc<Readiness>) -> std::io::Result<ProbeListener> {
+    // `Any` (the dual-stack default, D-113) and `Exact` bind exactly one socket; anything else is
+    // not a probe address.
+    let mut bound = listen.bind()?;
+    let listener = match (bound.pop(), bound.is_empty()) {
+        (Some(listener), true) => TcpListener::from_std(listener)?,
+        _ => {
+            return Err(std::io::Error::other(format!(
+                "the probe listener binds one socket, but {} needs several",
+                listen.judged()
+            )));
+        }
+    };
     let local_addr = listener.local_addr()?;
     tracing::info!(%local_addr, "cluster probes listening on /readyz and /healthz");
 

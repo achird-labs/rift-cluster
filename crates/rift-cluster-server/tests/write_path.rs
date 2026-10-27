@@ -6277,3 +6277,55 @@ async fn a_create_clash_is_judged_by_the_log_not_the_receiving_node() {
     joiner.shutdown().await;
     founder.shutdown().await;
 }
+
+/// Pins D-113: a fleet forms and replicates over IPv6 — the cluster port bound and advertised at `[::1]`,
+/// the joiner seeded at a bracketed IPv6 address. Skipped where the host has no IPv6 loopback.
+#[tokio::test]
+async fn a_fleet_forms_and_replicates_over_ipv6() {
+    let _serial = TEST_LOCK.lock().await;
+    if std::net::TcpListener::bind("[::1]:0").is_err() {
+        return;
+    }
+    let founder_state = TempDir::new().expect("tempdir");
+    let founder = compose::start(cluster_cli_at(
+        &founder_state,
+        "[::1]:0",
+        &["--cluster-allow-solo"],
+    ))
+    .await
+    .expect("founder starts on [::1]");
+    wait_ready(&founder).await;
+    let seed = founder.cluster_addr().expect("cluster addr").to_string();
+    assert!(
+        seed.starts_with("[::1]:"),
+        "advertised as a bracketed IPv6 address: {seed}"
+    );
+    let joiner_state = TempDir::new().expect("tempdir");
+    let joiner = compose::start(cluster_cli_at(
+        &joiner_state,
+        "[::1]:0",
+        &["--cluster-seeds", &seed],
+    ))
+    .await
+    .expect("joiner joins over IPv6");
+    wait_ready(&joiner).await;
+
+    let port = reserve_port();
+    let created = reqwest::Client::new()
+        .post(format!("http://{}/imposters", founder.admin_addr()))
+        .json(&minimal_imposter(port))
+        .send()
+        .await
+        .expect("post");
+    assert_eq!(created.status().as_u16(), 201);
+    let replicated = reqwest::get(format!("http://{}/imposters/{port}", joiner.admin_addr()))
+        .await
+        .expect("get on the joiner");
+    assert_eq!(
+        replicated.status().as_u16(),
+        200,
+        "the joiner has the imposter"
+    );
+    joiner.shutdown().await;
+    founder.shutdown().await;
+}

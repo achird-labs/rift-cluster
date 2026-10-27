@@ -260,7 +260,7 @@ it, so a stray flag on a single node is not an error.
 | `--cluster-state-dir <DIR>` | Cluster state: identity, Raft log, snapshots. Defaults to `<datadir>/_cluster` |
 | `--cluster-node-name <NAME>` | Operator-facing node name; seeds the first node id only |
 | `--cluster-leave-timeout <SECONDS>` | Drain window after SIGTERM (default `10`) |
-| `--cluster-probe-bind <ADDR>` | Address for `/readyz` and `/healthz` (default `0.0.0.0:2526`) |
+| `--cluster-probe-bind <ADDR>` | Address for `/readyz` and `/healthz` (default: every interface on port 2526, `[::]` dual-stack with a `0.0.0.0` fallback) |
 | `--cluster-write-barrier <MODE>` | What a committed admin write waits for before its 2xx: `ready-nodes` (default — every Ready node has applied it, so any node serves it; a node that is joining, catching up or draining reports itself not Ready and is not waited for, D-97) or `none` (committed and applied locally) |
 | `--cluster-write-barrier-timeout <SECONDS>` | How long the barrier waits (default `2`) for a member that answers but is behind, before answering anyway with a `Rift-Cluster-Warnings: unapplied=<node,…>` header. A member that never answers is given up after 500 ms and named `unreachable=<node,…>` instead, so a crashed voter does not hold every write (D-97) |
 | `--cluster-admin-async` | Answer admin writes with an immediate `202` + op id after durably parking them; poll `GET /_cluster/ops/:id` for the outcome |
@@ -927,7 +927,8 @@ is `rift-http-proxy::front_door`. Chapter 13 of the architecture guide
 view.
 
 Upstream's listener (`--front-door <ADDR>`, env `RIFT_FRONT_DOOR`; a
-`HOST:PORT` or a bare port meaning every interface) resolves a request against
+`HOST:PORT`, bound exactly, or a bare port meaning every interface, IPv6 and IPv4 — `[::]`
+dual-stack with a `0.0.0.0` fallback, as upstream binds it) resolves a request against
 a content-based route table and dispatches it to an imposter port — U-11's
 listener and matcher. Its admin CRUD was deliberately deferred upstream, so
 under `--cluster` this binary provides it: the route table is a **replicated

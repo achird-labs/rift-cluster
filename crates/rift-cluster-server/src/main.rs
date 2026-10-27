@@ -80,13 +80,12 @@ fn main() -> anyhow::Result<()> {
         let api_key = cli.oss.api_key.as_deref();
         let (url, key) = match url {
             Some(explicit) => (Some(explicit), api_key),
-            None => match probes::healthcheck_target(
-                cli.cluster.cluster,
-                cli.cluster.cluster_probe_bind,
-            ) {
-                probes::HealthcheckTarget::ProbeListener(probe) => (Some(probe), None),
-                probes::HealthcheckTarget::AdminPlane => (None, api_key),
-            },
+            None => {
+                match probes::healthcheck_target(cli.cluster.cluster, cli.probe_listen().judged()) {
+                    probes::HealthcheckTarget::ProbeListener(probe) => (Some(probe), None),
+                    probes::HealthcheckTarget::AdminPlane => (None, api_key),
+                }
+            }
         };
         return healthcheck::dispatch(url, cli.oss.connect_host(), cli.oss.port, timeout, key);
     }

@@ -94,6 +94,12 @@ spec:
                 export RIFT_CLUSTER_ALLOW_SOLO=true
                 unset RIFT_CLUSTER_SEEDS
               fi
+              # An IPv6 pod IP must be bracketed to carry a port; an IPv4 one advertises exactly
+              # what it always has, so an existing fleet's membership strings do not change.
+              case "$POD_IP" in
+                *:*) export RIFT_CLUSTER_ADVERTISE="[$POD_IP]:4790" ;;
+                *)   export RIFT_CLUSTER_ADVERTISE="$POD_IP:4790" ;;
+              esac
               exec rift-cluster-server
           ports:
             - name: admin
@@ -109,19 +115,19 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.name
-            # `--cluster-advertise` takes a socket address, not a DNS name, so the pod's own IP is
-            # what it must announce. (The seed list below IS a name — that one is re-resolved on
-            # every join attempt, which is what keeps it valid across rescheduling.)
+            # The pod's own IP is what `--cluster-advertise` announces (set in the preamble above,
+            # bracketed when it is IPv6). The seed list below is a name, re-resolved on every join
+            # attempt over every A and AAAA record, which keeps it valid across rescheduling.
             - name: POD_IP
               valueFrom:
                 fieldRef:
                   fieldPath: status.podIP
             - name: RIFT_CLUSTER
               value: "true"
-            - name: RIFT_CLUSTER_ADVERTISE
-              value: "$(POD_IP):4790"
+            # `[::]` takes IPv4 peers too (dual-stack); a node on a kernel booted without IPv6 sets
+            # `cluster.bindAddress` to `0.0.0.0:4790`.
             - name: RIFT_CLUSTER_BIND
-              value: "0.0.0.0:4790"
+              value: {{ .Values.cluster.bindAddress | quote }}
             # Binding the wildcard is a deliberate acknowledgment: inside a pod network namespace it
             # is the only way to accept peer traffic. The cluster port stays protected by the shared
             # secret and by NetworkPolicy, not by the bind address.
@@ -132,8 +138,6 @@ spec:
               value: "{{ include "rift-cluster.fullname" . }}-0.{{ include "rift-cluster.peerService" . }}:4790"
             - name: RIFT_CLUSTER_NODE_NAME
               value: "$(POD_NAME)"
-            - name: RIFT_CLUSTER_PROBE_BIND
-              value: "0.0.0.0:2526"
             - name: RIFT_CLUSTER_LEAVE_TIMEOUT
               value: {{ .Values.leaveTimeoutSeconds | quote }}
             - name: RIFT_CLUSTER_STATE_DIR

@@ -25,7 +25,7 @@ rift-cluster-server \
   --cluster-admin-async              # writes answer 202 + op-id instead of waiting (Ch.4)
   --cluster-flow-fsync-interval-ms 50   # flow-shard group fsync for `async` imposters (default 50)
   --cluster-leave-timeout 10         # seconds (default 10); orchestrator grace ≥ 2× this
-  --cluster-probe-bind 0.0.0.0:2526  # unauthenticated /readyz + /healthz (default shown)
+  --cluster-probe-bind [::]:2526     # unauthenticated /readyz + /healthz (default: every interface)
   --require-admin-auth / --local-only   # upstream's flags, judged against the front's
                                       # address under --cluster (D-79, below)
 ```

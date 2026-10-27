@@ -5275,3 +5275,27 @@ response no `proxyOnce` stub recorded. Upstream keeps the two apart for the same
 configs and marker rows, so the release carrying this is a whole-fleet upgrade. D-40 and D-66 are
 unchanged: only `proxyOnce` arbitrates, and only it refuses.
 
+### D-113 — A node runs on IPv4, IPv6 and dual-stack networks: dual-stack binds, and an advertise address bracketed by the deployment
+
+- **Status:** active
+- **Decided:** 2026-10-27 · #698
+- **Implemented by:** #698
+- **Code:** crates/rift-cluster/src/rpc/server.rs, crates/rift-cluster-server/src/cli.rs, crates/rift-cluster-server/src/probes.rs, crates/rift-cluster-server/src/compose.rs, deploy/helm/rift-cluster/templates/statefulset.yaml, deploy/k8s/statefulset.yaml
+
+The chart could not run on an IPv6 pod network:
+- `$(POD_IP):4790` is refused as an unbracketed IPv6 authority;
+- the cluster and probe binds were IPv4 wildcards;
+- a bare `--front-door` port bound IPv4 only.
+
+**Each listener binds dual-stack through upstream's server socket (rift#1528):**
+- the cluster port, bound by `bind_server_listener`, with `IPV6_V6ONLY` off;
+- the probe listener, whose unset default is `ListenAddr::Any(2526)`: `[::]`, falling back to `0.0.0.0` on a host without IPv6, so a host that works today still starts;
+- a bare front-door port, now `ListenAddr::Any` through upstream's public `parse_front_door_addr` and `bind_front_door_at` (rift#1561).
+
+**The deployment brackets the advertise address.** The chart and manifest preamble export `[$POD_IP]:4790` for an IPv6 pod IP and `$POD_IP:4790` otherwise. An IPv4 fleet's membership strings are therefore byte-identical across the upgrade.
+
+- **Rejected:** a `--cluster-advertise-ip` flag, which is new CLI surface for what four lines of shell do.
+- **Rejected:** advertising the pod's DNS name, which rewrites every member's advertise string on upgrade.
+- **Rejected:** accepting unbracketed `addr:port`, the ambiguity `UnbracketedIpv6` exists to refuse.
+- `--cluster-bind` stays required and exact. The chart's `cluster.bindAddress` defaults to `[::]:4790`, and `0.0.0.0:4790` is the setting for an IPv6-less kernel.
+
