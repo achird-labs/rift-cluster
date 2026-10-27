@@ -2735,7 +2735,7 @@ impl RedbStateMachine {
                 if already_recorded && !merging {
                     return Ok(Ok(Vec::new()));
                 }
-                let resp_json = serde_json::to_string(resp)
+                let resp_json = control::recorded_response_wire::encode_row(resp)
                     .map_err(|e| StorageIOError::write_state_machine(&e))?;
                 // Checked for the stub-less path too, not just the config mutation below: a
                 // recording racing a concurrent `DeleteImposter` must not re-insert a marker

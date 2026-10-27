@@ -5189,9 +5189,9 @@ always reaches a batch that fits (D-23's large-entry finding), and is the size
   proposed; the proxy store skips the recording before any claim RPC, releases the claim, and warns —
   the client still gets the upstream response. No counter (D-71).
 
-Until #690 removes the expansion, a recordable proxied body tops out at ~1.6 MiB (binary) to ~1.8 MiB
-(text), and configs that serialize over 8 MiB — which the front's 16 MiB body cap used to admit — are
-refused.
+A recordable proxied body tops out at ~3.0 MiB (binary) to ~3.4 MiB (text) since D-120 carries the
+response body as base64 (~1.6–1.8 MiB before it), and configs that serialize over 8 MiB — which the
+front's 16 MiB body cap used to admit — are refused.
 
 ### D-111 — `POST /imposters` is create-only, judged by the state machine at the op's log position
 
@@ -5505,4 +5505,39 @@ engine refuses half an identity. The curl the export dialog shows removes them w
 
 D-98's "no config writes until every node runs the new binary" covers all three. The Raft log and
 snapshots now hold proxy private keys and passphrases.
+
+### D-120 — A recorded proxy body travels as base64 on the log, in the row and on the proxy RPCs; the integer-array shape decodes forever
+
+- **Status:** active
+- **Decided:** 2026-10-27 · #690
+- **Implemented by:** #690
+- **Code:** crates/rift-cluster/src/control.rs, crates/rift-cluster/src/raft/store.rs, crates/rift-cluster/src/stores/proxy.rs
+
+Upstream's `RecordedResponse.body` is a `Vec<u8>` with a plain derive, so serde_json wrote it as an
+integer array at about 3.6 characters per byte. Several places carried it that way: every
+`ProxyRecorded` log entry, the `sm_proxy_recorded` row and every snapshot that copies it, and the
+proxyOnce `CompleteReq`/`LookupReply` RPCs. With the generated stub's copy, an entry was 4.4–4.9×
+its body. Under D-110's 8 MiB entry bound, that capped a recordable body at about 1.6 MiB.
+
+**The cluster owns the wire form.** `control::recorded_response_wire` keeps upstream's fields and
+writes `body` as a standard base64 string. Decoding accepts both shapes, forever:
+- a string is strict base64, and invalid base64 is an error, never a silent empty body;
+- an array is bytes.
+
+Every entry, row and snapshot written before this still reads. The codec admits nothing (D-102). It
+destructures the upstream struct exhaustively, so a field upstream adds fails to compile instead of
+being dropped from the log. The ratio falls to about 2.3–2.7×, and the recordable body rises to
+about 3.0–3.4 MiB.
+
+**The stub's copy stays.** The row's body is a live replay source even when a stub exists:
+- `lookup` answers whenever a claim says `AlreadyRecorded`;
+- rebuilding the response from the stub is not byte-exact (key order, header order, timestamps);
+- deriving the stub from `resp` at apply would put upstream's recording code on the apply path.
+
+**Upgrade (refines D-98):** an encoding change to a surviving log op is a whole-fleet upgrade.
+- An old binary cannot decode the new shape, so a new leader and an old follower would stall
+  replication. Every node runs the new binary before the fleet records again.
+- The state directory stays valid, since dual decode reads every old row. `STATE_FORMAT` does not
+  move.
+- Downgrade is unsupported: an old binary logs new-shape rows as corrupt and does not replay them.
 

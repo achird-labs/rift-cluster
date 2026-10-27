@@ -370,6 +370,10 @@ upgraded on every node before the fleet takes config writes again:
   refuses" below.
 - **A decode widening** (D-106) — a field that now accepts a wider value. An old node cannot decode
   a log entry that uses it, and that fails the whole entry, not one port.
+- **A log encoding change** (D-120) — a surviving op written in a new shape. Since D-120 a recorded
+  proxy body travels as base64; the new binary reads both shapes, an old one cannot read the new.
+  Upgrade every node before the fleet records again; the state directory stays valid, and a
+  downgrade is not supported.
 
 The release notes of a pin bump say which kind it is. The bump to rift `fa205d4` (#655) is all
 three: stub keys became canonical (which fixes cross-node cursor sharing and stops unrelated writes
