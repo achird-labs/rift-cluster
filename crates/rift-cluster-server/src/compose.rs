@@ -1524,7 +1524,7 @@ fn cluster_manager(
     // ceiling is a startup error here too. Mirrored for the same reason as the TLS policy above:
     // without it a clustered node would run the engine's built-in defaults whatever the operator
     // set. Upstream's defaults are sized for Mountebank parity, not for a pod; the chart sets
-    // pod-sized values through the flags' `RIFT_*` environment variables (#687).
+    // pod-sized values through the flags' `RIFT_*` environment variables (D-123).
     let body_limits = body_limits_from(cli.oss.max_body_size, cli.oss.body_memory_budget)?;
     let journal_max_bytes = std::num::NonZeroUsize::new(cli.oss.journal_max_bytes)
         .context("--journal-max-bytes must be at least 1")?;

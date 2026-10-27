@@ -501,3 +501,14 @@ fleet config size (small), Raft log bounded by snapshot cadence. Disk: state
 dir on real block storage (fsync latency is the `sync`-durability floor);
 tens of GB is generous. Network: everything assumes single-DC LAN — the
 timeouts are wrong for WAN by design.
+
+**Body and journal limits (D-123).** A node honours `--max-body-size`,
+`--body-memory-budget` and `--journal-max-bytes` exactly as standalone rift does;
+without them it would run upstream's Mountebank-parity defaults (512 MiB / 1 GiB /
+768 MiB), which exceed a 1Gi pod. The chart sets them from `limits`: 64 MiB /
+256 MiB / 64 MiB at the 1Gi default, 128 / 512 / 128 MiB in `values-onprem.yaml`
+(2Gi). The budget caps body bytes being buffered at once (over it, `503` with
+`Retry-After`); the journal budget is **per recording imposter** and outside the
+body budget, so N `recordRequests` imposters can hold up to N × `journalMaxBytes`.
+Raise the pod's memory before raising either. Admin bodies are also capped at
+16 MiB at the front (D-109), and a log entry at 8 MiB serialized (D-110).
