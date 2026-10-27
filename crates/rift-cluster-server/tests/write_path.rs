@@ -6985,3 +6985,48 @@ async fn require_and_lookup_are_confined_to_scripts_dir_on_every_node() {
     joiner.shutdown().await;
     founder.shutdown().await;
 }
+
+/// #730: a single-imposter read through the front answers a stub's `is.headers` in document order,
+/// as standalone Rift does since rift#1606, rather than sorted by the flow-state decoration.
+#[tokio::test]
+async fn a_single_imposter_read_returns_stub_headers_in_document_order() {
+    let _serial = TEST_LOCK.lock().await;
+    let state = TempDir::new().expect("tempdir");
+    let server = compose::start(cluster_cli(&state, &["--cluster-allow-solo"]))
+        .await
+        .expect("solo cluster starts");
+    wait_ready(&server).await;
+    let admin = server.admin_addr();
+    let port = reserve_port();
+    // Sent as text: a `json!` value sorts its keys before the request ever leaves.
+    let body = format!(
+        r#"{{"port":{port},"protocol":"http","stubs":[{{"responses":[{{"is":{{"statusCode":200,"headers":{{"X-Zeta":"1","X-Mid":"2","X-Alpha":"3"}}}}}}]}}]}}"#
+    );
+    let created = reqwest::Client::new()
+        .post(format!("http://{admin}/imposters"))
+        .header("content-type", "application/json")
+        .body(body)
+        .send()
+        .await
+        .expect("post");
+    assert_eq!(created.status().as_u16(), 201);
+    let read = reqwest::get(format!("http://{admin}/imposters/{port}"))
+        .await
+        .expect("get")
+        .text()
+        .await
+        .expect("body");
+    let at = |needle: &str| {
+        read.find(needle)
+            .unwrap_or_else(|| panic!("{needle} in {read}"))
+    };
+    assert!(
+        at("X-Zeta") < at("X-Mid") && at("X-Mid") < at("X-Alpha"),
+        "headers in document order: {read}"
+    );
+    assert!(
+        read.contains("flowStateResolved"),
+        "the decoration is still there: {read}"
+    );
+    server.shutdown().await;
+}
