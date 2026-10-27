@@ -865,7 +865,8 @@ and applies unconditionally, so don't send `If-Match` from any client until
 every node in the fleet has upgraded. `PUT /imposters` commits as a sequence
 (upserts first, then prunes), so a write interrupted by a leadership change
 can transiently leave a superset of old and new imposters — a retry converges
-it.
+it. Its response lists the body's imposters in request order (#704), as
+Mountebank and standalone Rift answer; `GET /imposters` stays ascending by port.
 
 A node is not Ready until its `cluster-reconciled` gate opens: its applied
 state has caught up to the leader's and its imposters are bound (or their

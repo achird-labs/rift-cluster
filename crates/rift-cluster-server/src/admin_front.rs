@@ -2923,6 +2923,15 @@ const CLUSTER_DOOR: &str = "invalid request JSON";
 enum Render {
     /// `GET` this loopback path after the barrier and answer with its body.
     FetchAfter { path: String, status: StatusCode },
+    /// `GET` the path after the barrier, then list its `imposters` array in `order` (#704): the
+    /// ports named there first, in that order, then any other entry as the engine listed it.
+    /// `PUT /imposters` answers in request order, as Mountebank and standalone Rift (rift#1563)
+    /// do, while `GET /imposters` stays ascending by port.
+    FetchAfterOrdered {
+        path: String,
+        status: StatusCode,
+        order: Vec<u16>,
+    },
     /// Answer with a body captured *before* the ops committed (deletes answer
     /// with what was removed).
     Captured {
@@ -3210,6 +3219,23 @@ async fn run_mutation(
                 fetched
             };
             buffered_response(status, body, content_type)?
+        }
+        Render::FetchAfterOrdered {
+            path,
+            status,
+            order,
+        } => {
+            let (fetched, content_type, body) = fetch(state, &path, host).await?;
+            if fetched.is_success() {
+                // Never the unsorted bytes on a shape it cannot read: a silently wrong order is
+                // the defect this render exists to fix.
+                let ordered = order_imposters(&body, &order)
+                    .map_err(|e| internal(&format!("render reorder: {e}")))?;
+                buffered_response(status, Bytes::from(ordered), content_type)?
+            } else {
+                tracing::warn!(%path, status = %fetched, "post-commit render read did not confirm the write");
+                buffered_response(fetched, body, content_type)?
+            }
         }
     };
 
@@ -3902,6 +3928,8 @@ async fn build_mutation(
             // fleet keeps a superset (new configs plus stale leftovers) that a
             // retry heals, instead of an empty fleet that lost everything.
             let mut keep = std::collections::BTreeSet::new();
+            // The body's ports in request order, each at its first position.
+            let mut order = Vec::new();
             let mut ops = Vec::new();
             for config in replace.imposters {
                 let Some(port) = config.port else {
@@ -3912,11 +3940,25 @@ async fn build_mutation(
                          cannot replicate",
                     ));
                 };
-                keep.insert(port);
+                if keep.insert(port) {
+                    order.push(port);
+                }
                 ops.push(ControlOp::PutImposter {
                     config: Box::new(config),
                 });
             }
+            let render = if ops.is_empty() {
+                Render::FetchAfter {
+                    path: "/imposters".to_owned(),
+                    status: StatusCode::OK,
+                }
+            } else {
+                Render::FetchAfterOrdered {
+                    path: "/imposters".to_owned(),
+                    status: StatusCode::OK,
+                    order,
+                }
+            };
             if ops.is_empty() {
                 ops.push(ControlOp::DeleteAll);
             } else {
@@ -3935,10 +3977,7 @@ async fn build_mutation(
                 admit: Admit::Content,
                 ops,
                 port: None,
-                render: Render::FetchAfter {
-                    path: "/imposters".to_owned(),
-                    status: StatusCode::OK,
-                },
+                render,
             })
         }
         Terminated::FleetNamePut => {
@@ -4225,6 +4264,38 @@ async fn build_mutation(
 /// with the stub list edited — the engine's #316 diff still patches only the
 /// touched stubs in place.
 ///
+/// List an `{"imposters": [...]}` document's entries in `order` (#704): the ports `order` names
+/// first, in that order, then every other entry in the order the document had it. Each entry is
+/// carried as its raw bytes — a `serde_json::Value` would re-sort every nested object, a stub's
+/// headers among them, since `preserve_order` is off (upstream's own #1696 reason).
+fn order_imposters(body: &[u8], order: &[u16]) -> Result<Vec<u8>, String> {
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct List<'a> {
+        #[serde(borrow)]
+        imposters: Vec<&'a serde_json::value::RawValue>,
+    }
+    #[derive(serde::Deserialize)]
+    struct Port {
+        port: Option<u16>,
+    }
+    let list: List<'_> = serde_json::from_slice(body).map_err(|e| e.to_string())?;
+    let mut ranked = Vec::with_capacity(list.imposters.len());
+    for entry in list.imposters {
+        let port = serde_json::from_str::<Port>(entry.get())
+            .map_err(|e| e.to_string())?
+            .port;
+        let rank = port
+            .and_then(|port| order.iter().position(|wanted| *wanted == port))
+            .unwrap_or(usize::MAX);
+        ranked.push((rank, entry));
+    }
+    // Stable: entries of equal rank (the unlisted ones) keep the document's own order.
+    ranked.sort_by_key(|(rank, _)| *rank);
+    let entries: Vec<&str> = ranked.iter().map(|(_, entry)| entry.get()).collect();
+    Ok(format!("{{\"imposters\":[{}]}}", entries.join(",")).into_bytes())
+}
+
 fn put_config_mutation(port: u16, config: ImposterConfig, admit: Admit) -> Mutation {
     Mutation {
         ops: vec![ControlOp::PutImposter {
@@ -7690,6 +7761,57 @@ mod tests {
                 map.get("x-api-key").map(HeaderValue::as_bytes),
                 Some(&b"app-token"[..])
             );
+        }
+    }
+
+    /// #704: `PUT /imposters` answers in request order.
+    mod imposters_order {
+        use super::*;
+
+        fn ports(bytes: &[u8]) -> Vec<u64> {
+            let value: serde_json::Value = serde_json::from_slice(bytes).expect("json");
+            value["imposters"]
+                .as_array()
+                .expect("array")
+                .iter()
+                .map(|entry| entry["port"].as_u64().expect("port"))
+                .collect()
+        }
+
+        const LISTED: &str = r#"{"imposters":[{"port":1,"z":1,"a":2},{"port":2},{"port":3}]}"#;
+
+        #[test]
+        fn the_body_order_is_honoured() {
+            let ordered = order_imposters(LISTED.as_bytes(), &[3, 1, 2]).expect("orders");
+            assert_eq!(ports(&ordered), vec![3, 1, 2]);
+        }
+
+        #[test]
+        fn a_stray_goes_last_and_an_unlisted_port_is_skipped() {
+            let ordered = order_imposters(LISTED.as_bytes(), &[3, 9, 1]).expect("orders");
+            assert_eq!(
+                ports(&ordered),
+                vec![3, 1, 2],
+                "9 was not listed; 2 is a stray"
+            );
+        }
+
+        #[test]
+        fn each_entry_keeps_its_own_bytes() {
+            let ordered = order_imposters(LISTED.as_bytes(), &[1]).expect("orders");
+            assert!(
+                String::from_utf8(ordered)
+                    .expect("utf8")
+                    .contains(r#"{"port":1,"z":1,"a":2}"#),
+                "an entry's key order is the engine's, not re-sorted"
+            );
+        }
+
+        #[test]
+        fn a_document_it_cannot_read_is_an_error_not_the_unsorted_bytes() {
+            assert!(order_imposters(br#"{"other":[]}"#, &[1]).is_err());
+            assert!(order_imposters(br#"{"imposters":[],"extra":1}"#, &[1]).is_err());
+            assert!(order_imposters(b"not json", &[1]).is_err());
         }
     }
 }

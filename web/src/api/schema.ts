@@ -19,7 +19,7 @@ export interface paths {
         get: operations["listImposters"];
         /**
          * Replace the fleet's whole imposter set
-         * @description Terminates: reconciles the fleet's configured imposters toward the given set — upserts every listed imposter, then prunes every applied port left out (`{"imposters":[]}` deletes everything). Cannot carry `If-Match` (no single record to condition a whole-set replace on); sending one answers `400`.
+         * @description Terminates: reconciles the fleet's configured imposters toward the given set — upserts every listed imposter, then prunes every applied port left out (`{"imposters":[]}` deletes everything). The response lists the body's imposters in request order, as Mountebank and standalone Rift do; `GET /imposters` stays ascending by port. Cannot carry `If-Match` (no single record to condition a whole-set replace on); sending one answers `400`.
          */
         put: operations["replaceAllImposters"];
         /**
