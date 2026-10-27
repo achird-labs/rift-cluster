@@ -13,7 +13,9 @@
  * - **`_behaviors` has three accepted spellings**: `_behaviors` as an object, `behaviors` as an
  *   object, and `behaviors` as an ARRAY of single-key objects. All three mean the same thing.
  * - **Key order inside them is preserved**, so the array spelling in particular re-emits unchanged
- *   rather than being reordered into whatever order this module happens to write fields in.
+ *   rather than being reordered into whatever order this module happens to write fields in. The
+ *   one exception is a repeat count, which under the array spelling is written as the
+ *   response-level `repeat` just before `behaviors`, where the engine writes it (rift#1582).
  * - **`_rift.fault.tcp` is a string OR an object** (`RiftTcpFault`), and the engine's own
  *   deserializer is hand-written specifically to keep the two apart and re-emit each as it came.
  *   The object form exists solely to carry `probability`, so `{type: X}` without one is not a
@@ -136,20 +138,32 @@ function renderBehaviorEntry(key: ModelledBehavior, model: BehaviorModel): Recor
 }
 
 /**
- * Render a behaviour model back to the response-level key it came from.
+ * Render a behaviour model back to the response-level keys it came from, in order.
  *
- * Returns the key name and its value, or `null` when the model carries nothing — an empty
- * `_behaviors: {}` is a key the form would otherwise invent out of a response that had none.
+ * Empty when the model carries nothing — an empty `_behaviors: {}` is a key the form would
+ * otherwise invent out of a response that had none.
+ *
+ * Under the array spelling a repeat count is written as the response-level `repeat`, never as a
+ * `{repeat}` element: Mountebank reads it only there, a config door refuses the element since
+ * rift#1582, and the engine writes it there too, just before `behaviors`.
  */
 export function renderBehaviors(
   model: BehaviorModel,
-): { key: "_behaviors" | "behaviors"; value: unknown } | null {
+): ["_behaviors" | "behaviors" | "repeat", unknown][] {
+  if (model.spelling === "behaviorsArray") {
+    const keys: ["behaviors" | "repeat", unknown][] = [];
+    if (model.repeat !== null) keys.push(["repeat", model.repeat]);
+    const entries = model.order
+      .filter((key) => key !== "repeat")
+      .map((key) => renderBehaviorEntry(key, model))
+      .filter((entry) => Object.keys(entry).length > 0);
+    if (entries.length > 0) keys.push(["behaviors", entries]);
+    return keys;
+  }
   const entries = model.order.map((key) => renderBehaviorEntry(key, model)).filter((entry) => Object.keys(entry).length > 0);
-  if (entries.length === 0) return null;
-
-  if (model.spelling === "behaviorsArray") return { key: "behaviors", value: entries };
+  if (entries.length === 0) return [];
   const merged = Object.assign({}, ...entries) as Record<string, unknown>;
-  return { key: model.spelling === "_behaviors" ? "_behaviors" : "behaviors", value: merged };
+  return [[model.spelling === "_behaviors" ? "_behaviors" : "behaviors", merged]];
 }
 
 /** Parse a single `wait` value: a number, a `{min,max}` range, or something this form refuses. */
@@ -189,6 +203,9 @@ export function parseBehaviors(
       // More than one key in an array element is a shape the engine tolerates but that this form
       // cannot re-emit without deciding how to regroup it — so it is refused, not guessed at.
       if (entries.length !== 1) return { ok: false, issues: [`${path}[${index}]`] };
+      // A `{repeat}` element after the first is an inert custom key Mountebank never reads
+      // (rift#1672). Modelling it would turn it into a live repeat count on save, so it is named.
+      if (index > 0 && entries[0]?.[0] === "repeat") return { ok: false, issues: [`${path}[${index}]`] };
       for (const entry of entries) flat.push([entry[0], entry[1]]);
     }
   } else {

@@ -148,7 +148,16 @@ const FOREIGN_VARIANTS = ["proxy", "inject"] as const;
  * an is-body key or a response-level one" can only be decided by name. This list is that decision,
  * in one place, used by both branches of `parseResponse`.
  */
-const RESPONSE_LEVEL_KEYS = ["is", "proxy", "inject", "fault", "_behaviors", "behaviors", "_rift"] as const;
+const RESPONSE_LEVEL_KEYS = [
+  "is",
+  "proxy",
+  "inject",
+  "fault",
+  "_behaviors",
+  "behaviors",
+  "repeat",
+  "_rift",
+] as const;
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -307,8 +316,7 @@ export function renderResponses(items: ResponseModel[]): unknown[] {
      */
     const level: Record<string, unknown> = {};
     if (response.behaviors !== null) {
-      const rendered = renderBehaviors(response.behaviors);
-      if (rendered !== null) level[rendered.key] = rendered.value;
+      for (const [key, value] of renderBehaviors(response.behaviors)) level[key] = value;
     }
     if (response.fault !== null) {
       const rendered = renderFault(response.fault);
@@ -470,6 +478,26 @@ function parseResponseLevel(
       const parsed = parseBehaviors(value[key], spelling, `${path}.${key}`);
       if (parsed.ok) behaviors = parsed.value;
       else issues.push(...parsed.issues);
+    }
+  }
+
+  /*
+   * The response-level `repeat` (rift#1191): where Mountebank reads a repeat count, and where the
+   * engine writes one, beside a `behaviors` ARRAY. Beside an object-spelled block Mountebank
+   * ignores the block whole (rift#1709), and beside an array that already carries a `{repeat}`
+   * element the two disagree — neither has an honest single model, so both are named.
+   */
+  if ("repeat" in value) {
+    const repeat = value.repeat;
+    if (typeof repeat !== "number") {
+      issues.push(`${path}.repeat`);
+    } else if (spelling === null) {
+      behaviors = { spelling: "behaviorsArray", order: ["repeat"], wait: { kind: "none" }, repeat };
+    } else if (spelling !== "behaviorsArray") {
+      issues.push(`${path}.repeat`, `${path}.${spelling === "_behaviors" ? "_behaviors" : "behaviors"}`);
+    } else if (behaviors !== null) {
+      if (behaviors.repeat !== null) issues.push(`${path}.repeat`, `${path}.behaviors`);
+      else behaviors = { ...behaviors, repeat, order: ["repeat", ...behaviors.order] };
     }
   }
 

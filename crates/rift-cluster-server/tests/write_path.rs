@@ -5819,3 +5819,73 @@ async fn an_imposters_document_the_engine_refuses_fails_startup() {
         "{e}"
     );
 }
+
+/// Pins D-98 for rift#1582 (#714): the cluster door refuses the behaviors shapes standalone's door
+/// refuses since that change, with the engine's own message, and nothing commits — on a create
+/// and on a stub add alike.
+#[tokio::test]
+async fn the_door_refuses_rift_1582s_behaviors_shapes_and_commits_nothing() {
+    let _serial = TEST_LOCK.lock().await;
+    let state = TempDir::new().expect("tempdir");
+    let server = compose::start(cluster_cli(&state, &["--cluster-allow-solo"]))
+        .await
+        .expect("solo cluster starts");
+    wait_ready(&server).await;
+    let admin = server.admin_addr();
+    let client = reqwest::Client::new();
+    let existing = reserve_port();
+    let created = client
+        .post(format!("http://{admin}/imposters"))
+        .json(&json!({ "port": existing, "protocol": "http", "stubs": [] }))
+        .send()
+        .await
+        .expect("post imposter");
+    assert_eq!(created.status().as_u16(), 201);
+    let before = revision(&server, existing);
+
+    for response in [
+        json!({ "is": { "body": "x" }, "behaviors": [{ "repeat": 2 }] }),
+        json!({ "is": { "body": "x" }, "behaviors": [{ "nosuch": 1 }] }),
+        json!({ "is": { "body": "x" }, "behaviors": [{ "wait": 1, "repeat": 2, "decorate": "x" }] }),
+        json!({ "is": { "body": "x" }, "_behaviors": { "repeat": 0 } }),
+    ] {
+        let port = reserve_port();
+        let refused = client
+            .post(format!("http://{admin}/imposters"))
+            .json(&json!({ "port": port, "protocol": "http",
+                "stubs": [{ "responses": [response] }] }))
+            .send()
+            .await
+            .expect("post");
+        assert_eq!(refused.status().as_u16(), 400, "{response}");
+        let text = refused.text().await.expect("body");
+        assert!(text.contains("Invalid imposter JSON: "), "{text}");
+        assert!(text.contains("bad data"), "{text}");
+        assert_eq!(
+            revision(&server, port),
+            None,
+            "nothing committed: {response}"
+        );
+
+        let refused = client
+            .post(format!("http://{admin}/imposters/{existing}/stubs"))
+            .json(&json!({ "stub": { "responses": [response] } }))
+            .send()
+            .await
+            .expect("post stub");
+        assert_eq!(refused.status().as_u16(), 400, "{response}");
+        assert!(
+            refused
+                .text()
+                .await
+                .expect("body")
+                .contains("Invalid stub JSON: ")
+        );
+        assert_eq!(
+            revision(&server, existing),
+            before,
+            "nothing committed: {response}"
+        );
+    }
+    server.shutdown().await;
+}

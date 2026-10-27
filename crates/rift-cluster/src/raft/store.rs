@@ -5906,6 +5906,58 @@ mod tests {
         engine.shutdown().await;
     }
 
+    /// Pins D-102: a behaviors shape a door refuses since rift#1582, which every earlier engine
+    /// stored, still replays from the log, passes the drive's admission check, is served, and keys
+    /// the same on every parse (#714).
+    #[tokio::test]
+    async fn behaviors_shapes_older_engines_stored_still_replay_and_serve() {
+        let engine = Arc::new(ImposterManager::new());
+        let (_td, mut sm) = fresh_sm(Some(engine.clone())).await;
+        let is = json!({ "is": { "statusCode": 200, "body": "ok" } });
+        let with = |extra: serde_json::Value| {
+            let mut response = is.clone();
+            for (key, value) in extra.as_object().expect("an object") {
+                response[key] = value.clone();
+            }
+            response
+        };
+        let shapes = [
+            with(json!({ "_behaviors": { "repeat": 0 } })),
+            with(json!({ "_behaviors": { "repeat": null } })),
+            with(json!({ "behaviors": [{ "wait": 1 }, { "repeat": 2 }] })),
+            with(json!({ "behaviors": [{ "wait": 1 }, { "nosuch": 1 }] })),
+        ];
+        for (offset, response) in shapes.into_iter().enumerate() {
+            let port = 18520 + u16::try_from(offset).expect("small");
+            let index = 1 + u64::try_from(offset).expect("small");
+            let body = json!({ "port": port, "protocol": "http", "host": "127.0.0.1",
+                "stubs": [{ "responses": [response] }] })
+            .to_string();
+            let committed =
+                crate::control::decode_committed_config(&body).expect("replay decodes it");
+            assert!(
+                rift_cluster_base::seams::admission_check(&committed).is_ok(),
+                "door-only, so the drive admits it: {body}"
+            );
+            let applied = apply_one(&mut sm, index, put_config(u128::from(index), committed)).await;
+            assert_eq!(applied, ControlResponse::applied(index), "{body}");
+            assert!(engine.get_imposter(port).is_ok(), "served: {body}");
+            assert_eq!(sm.config_refusal(port).expect("read"), None, "{body}");
+
+            let row = sm.read_config(port).expect("read").expect("committed");
+            let keys: BTreeSet<String> = (0..20)
+                .map(|_| {
+                    let config =
+                        crate::control::decode_committed_config(&row).expect("row replays");
+                    stub_key(&config.stubs[0], 0)
+                })
+                .collect();
+            assert_eq!(keys.len(), 1, "one committed row keys one way: {body}");
+        }
+        assert!(sm.apply_failures().is_empty(), "{:?}", sm.apply_failures());
+        engine.shutdown().await;
+    }
+
     /// Pins D-102: a `proxy.to` with a path, refused at admission since rift#1550 and admitted by
     /// every earlier engine, is a per-port refusal at the drive, never a decode failure: the row
     /// keeps the committed bytes, and the ports around it are served.
