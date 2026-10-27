@@ -94,8 +94,22 @@ async fn time_until_writes_resume(admin: u16, port: u16, body: &str) -> Result<D
     let started = std::time::Instant::now();
     let deadline = started + FAILOVER_WRITE_BOUND * 3;
     let mut last = String::from("no attempt completed");
+    // One logical write, retried under one `Idempotency-Key`: an attempt answered 503/504 may
+    // still commit from its parked intent, and `POST /imposters` is create-only (D-111), so an
+    // unkeyed retry of a write that did land would be answered `400 already in use`. The key makes
+    // the retry exactly-once — the committed attempt's `201` comes back from the dedup table.
+    let key = format!(
+        "writes-resume-{port}-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos())
+    );
     while std::time::Instant::now() < deadline {
-        match put_imposter(admin, port, body).await {
+        match put_imposter_with_key(admin, port, body, &key)
+            .await
+            .map(|(status, _, _)| status)
+        {
             Ok(201) => return Ok(started.elapsed()),
             Ok(503 | 504) => last = "503/504 (no leader yet)".to_owned(),
             Ok(other) => {
