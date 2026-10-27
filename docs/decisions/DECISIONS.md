@@ -2918,6 +2918,10 @@ There is no principal, no role, no binding, no quota and no tenant anywhere in t
 therefore no per-resource authorization: everyone who can administer the fleet can administer all
 of it. Isolation between teams is a deployment (two fleets), not a feature (RFC-007 §3.3).
 
+> **Amended by D-105** (2026-10-27, #708): the key may also arrive in Mountebank's `x-api-key`
+> header, read only when `Authorization` is absent; the gateway strip and the admin leg handle
+> both headers.
+
 `/healthz` and `/readyz` on the probe listener stay open — a liveness probe that needs a
 credential is a liveness probe that fails for the wrong reason — and so does the `/__rift/*`
 data-plane gateway, which upstream exempts from its own key gate for the reason the key must not
@@ -4946,4 +4950,32 @@ too, and the cluster serves that imposter as committed.
 Decode refusals now lead with standalone's label for the route (`Invalid imposter JSON`,
 `Invalid batch JSON`, `Invalid stub JSON`, `Invalid stubs JSON`); cluster-only bodies keep
 `invalid request JSON`.
+
+### D-105 — The admin key is read from `Authorization`, or from Mountebank's `x-api-key` when `Authorization` is absent; every place the front handles the key handles both headers
+
+- **Status:** active
+- **Decided:** 2026-10-27 · #708
+- **Amends:** D-73
+- **Implemented by:** #708
+- **Code:** crates/rift-cluster-server/src/admin_front.rs, crates/rift-cluster-server/tests/fleet_session.rs
+
+Upstream Rift accepts the admin key in Mountebank's `x-api-key` header as well as the raw
+`Authorization` value (rift#1565), and takes Mountebank's `--apikey` spelling of the flag. D-73 named
+`Authorization` as the one carrier, so a Mountebank client that sends `x-api-key` was answered `401`
+by a cluster and admitted by standalone Rift.
+
+**The carrier is upstream's.** When `Authorization` is present it decides alone: wrong, empty or
+unreadable is a `401`, never a fall-through to `x-api-key` or the cookie. Otherwise `x-api-key` is
+read by the same rule. The session cookie is consulted only when both are absent, and the CSRF gate
+stays on the cookie branch only. An unreadable header is a refusal, not an absence, so the front
+keeps its own selection rather than upstream's `authz::credential`, which reads it as absent.
+
+**Every place the front handles the key handles both headers.** On the `/__rift/*` gateway, an
+`x-api-key` that holds the fleet key is removed by the same raw-byte constant-time rule as
+`Authorization`, and any other value is forwarded: an app under test may send its own `x-api-key`
+to its mock. On the admin leg the client's `x-api-key` is always removed, so the loopback sees only
+the credential the front presents. Without these two, accepting the header would have let a client
+that stamps the fleet key on every call leak it into imposter journals.
+
+`POST /session` is unchanged: its key is in the body.
 

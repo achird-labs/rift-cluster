@@ -1055,9 +1055,9 @@ const CSRF_HEADER: &str = "x-rift-csrf";
 ///
 /// Two ways in, and no third:
 ///
-/// - **The key itself**, as the raw `Authorization` value — byte-identical to open-source
-///   Rift's own gate (`admin_api/server.rs`'s `api_key_matches`), constant-time, no scheme
-///   prefix to strip. Deliberately the same spelling: this front sits in front of upstream's
+/// - **The key itself**, as the raw `Authorization` value or, when that is absent, Mountebank's
+///   `x-api-key` (D-105) — byte-identical to open-source Rift's own gate
+///   (`admin_api/server.rs`'s `admin_key_accepted`), constant-time, no scheme prefix to strip. Deliberately the same spelling: this front sits in front of upstream's
 ///   listener, and a credential shape that worked against one and not the other is the kind of
 ///   split that surfaces as a mystery 401 on the loopback leg.
 /// - **A session cookie** minted from that key by `POST /session` (RFC-006 §5.3), so the browser
@@ -1085,10 +1085,10 @@ fn authenticate(state: &FrontState, req: &Request<Incoming>) -> Result<(), Respo
 
     match bearer_verdict(req.headers(), expected) {
         BearerVerdict::Accepted => Ok(()),
-        // A *wrong* `Authorization` is a refusal, never an invitation to look for a second
+        // A *wrong* key header is a refusal, never an invitation to look for a second
         // credential on the same request.
         BearerVerdict::Refused => Err(unauthorized()),
-        // Only when the caller presented no bearer at all is the cookie consulted.
+        // Only when the caller presented neither key header is the cookie consulted.
         BearerVerdict::Absent => match resolve_cookie(&node, expected, req) {
             Ok(true) => {
                 csrf_gate(req)?;
@@ -1102,10 +1102,14 @@ fn authenticate(state: &FrontState, req: &Request<Incoming>) -> Result<(), Respo
     }
 }
 
-/// What the `Authorization` header, on its own, says about a request.
+/// Mountebank's `--apikey` header (rift#1565): a second carrier of the admin key (D-105).
+const X_API_KEY: hyper::header::HeaderName = hyper::header::HeaderName::from_static("x-api-key");
+
+/// What the key headers, on their own, say about a request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BearerVerdict {
-    /// No `Authorization` header at all — the only state in which a cookie may be consulted.
+    /// Neither `Authorization` nor `x-api-key` — the only state in which a cookie may be
+    /// consulted.
     Absent,
     /// The header carries the configured key.
     Accepted,
@@ -1116,11 +1120,19 @@ enum BearerVerdict {
     Refused,
 }
 
-/// Judge the `Authorization` header alone, before any cookie is looked at. Pure, so the
+/// Judge the key headers alone, before any cookie is looked at. Pure, so the
 /// presence-versus-parseability distinction is pinned by a unit test rather than by a wire test
 /// that happens to send a well-formed header.
+///
+/// The carrier is upstream's (`authz::credential`, rift#1565): `Authorization` when present —
+/// deciding alone, so a right `x-api-key` never rescues a wrong one — else `x-api-key` (D-105).
+/// Upstream's function is not reused because it reads an unreadable header as absent, and here
+/// presence is the whole claim.
 fn bearer_verdict(headers: &hyper::HeaderMap, expected: &str) -> BearerVerdict {
-    match headers.get(hyper::header::AUTHORIZATION) {
+    match headers
+        .get(hyper::header::AUTHORIZATION)
+        .or_else(|| headers.get(&X_API_KEY))
+    {
         None => BearerVerdict::Absent,
         Some(presented) => match presented.to_str() {
             Ok(provided) if api_key_matches(provided, expected) => BearerVerdict::Accepted,
@@ -1297,8 +1309,8 @@ async fn session_login(state: &Arc<FrontState>, req: Request<Incoming>) -> Respo
         }
     };
 
-    // Byte-for-byte the same check `authenticate`'s bearer branch runs against an `Authorization`
-    // header — one comparison, one place. D-73 supersedes D-46: the `--api-key` **is** the
+    // Byte-for-byte the same check `authenticate`'s bearer branch runs against a key header —
+    // one comparison, one place. D-73 supersedes D-46: the `--api-key` **is** the
     // credential this exchange accepts, because it is the only one the fleet has.
     let Some(expected) = state.api_key.as_deref() else {
         // An open plane has no key to exchange, and minting a cookie anyway would hand the
@@ -2141,27 +2153,7 @@ async fn proxy(
     // upstream exempts that prefix from its own key gate. The gateway leg has the opposite
     // duty — see `strip_admin_bearer` and `strip_session_cookie`.
     match leg {
-        ProxyLeg::Admin => match state.api_key.as_deref().map(HeaderValue::from_str) {
-            Some(Ok(mut value)) => {
-                // The key is a secret: keep it out of `Debug` output and any header dump.
-                value.set_sensitive(true);
-                parts.headers.insert(hyper::header::AUTHORIZATION, value);
-            }
-            // An unspellable key cannot be presented, so the loopback would refuse the request
-            // with a 401 the caller cannot act on. Remove rather than forward the client's own
-            // header — a fleet whose key cannot be sent is misconfigured, and answering as
-            // though it were open would be the silent-fallback shape.
-            Some(Err(e)) => {
-                tracing::error!(error = %e, "configured --api-key is not a spellable header value");
-                parts.headers.remove(hyper::header::AUTHORIZATION);
-            }
-            // Open plane: upstream's gate is off too, so there is nothing to present. The
-            // client's own header is dropped rather than forwarded, so a caller cannot reach
-            // the loopback with a credential this front never examined.
-            None => {
-                parts.headers.remove(hyper::header::AUTHORIZATION);
-            }
-        },
+        ProxyLeg::Admin => present_fleet_key(&mut parts.headers, state.api_key.as_deref()),
         ProxyLeg::Gateway => {
             strip_admin_bearer(&mut parts.headers, state.api_key.as_deref());
             strip_session_cookie(&mut parts.headers);
@@ -2224,8 +2216,37 @@ async fn gateway(
     }
 }
 
-/// Remove an `Authorization` header that carries the fleet's configured admin key, and only
-/// that one, before the gateway leg reaches an imposter (D-73).
+/// Replace whatever credential the client sent on the admin leg with the one this front presents
+/// (D-73, D-105): the fleet key as `Authorization`, or nothing on an open plane. A client's
+/// `x-api-key` is never forwarded on any arm, so a caller cannot reach the loopback with a
+/// credential this front never examined.
+fn present_fleet_key(headers: &mut hyper::HeaderMap, api_key: Option<&str>) {
+    headers.remove(&X_API_KEY);
+    match api_key.map(HeaderValue::from_str) {
+        Some(Ok(mut value)) => {
+            // The key is a secret: keep it out of `Debug` output and any header dump.
+            value.set_sensitive(true);
+            headers.insert(hyper::header::AUTHORIZATION, value);
+        }
+        // An unspellable key cannot be presented, so the loopback would refuse the request
+        // with a 401 the caller cannot act on. Remove rather than forward the client's own
+        // header — a fleet whose key cannot be sent is misconfigured, and answering as
+        // though it were open would be the silent-fallback shape.
+        Some(Err(e)) => {
+            tracing::error!(error = %e, "configured --api-key is not a spellable header value");
+            headers.remove(hyper::header::AUTHORIZATION);
+        }
+        // Open plane: upstream's gate is off too, so there is nothing to present. The
+        // client's own header is dropped rather than forwarded, so a caller cannot reach
+        // the loopback with a credential this front never examined.
+        None => {
+            headers.remove(hyper::header::AUTHORIZATION);
+        }
+    }
+}
+
+/// Remove an `Authorization` or `x-api-key` header that carries the fleet's configured admin key,
+/// and only that one, before the gateway leg reaches an imposter (D-73, D-105).
 ///
 /// Not injecting the key is only half of "no admin credential reaches a mock". Upstream exempts
 /// `/__rift/*` from its own key gate, so a header the *client* sent was forwarded verbatim — and
@@ -2276,12 +2297,16 @@ fn strip_admin_bearer(headers: &mut hyper::HeaderMap, api_key: Option<&str>) {
     let Some(expected) = api_key.filter(|key| !key.trim().is_empty()) else {
         return;
     };
-    let carries_key = headers
-        .get_all(hyper::header::AUTHORIZATION)
-        .iter()
-        .any(|value| bool::from(value.as_bytes().ct_eq(expected.as_bytes())));
-    if carries_key {
-        headers.remove(hyper::header::AUTHORIZATION);
+    // Each carrier on its own value (D-105): an app under test may send its own `x-api-key` or
+    // bearer to its mock, and only the one holding the fleet key is the front's business.
+    for carrier in [hyper::header::AUTHORIZATION, X_API_KEY] {
+        let carries_key = headers
+            .get_all(&carrier)
+            .iter()
+            .any(|value| bool::from(value.as_bytes().ct_eq(expected.as_bytes())));
+        if carries_key {
+            headers.remove(&carrier);
+        }
     }
 }
 
@@ -7536,5 +7561,135 @@ mod tests {
             classify(&Method::PUT, "/imposters/4545/stubs/").is_none(),
             "an empty segment is no stub route, as upstream's router has it"
         );
+    }
+
+    /// Pins D-105: the admin key is read from `Authorization`, or from Mountebank's `x-api-key`
+    /// when `Authorization` is absent (rift#1565). `Authorization` decides alone when present.
+    mod x_api_key {
+        use super::*;
+
+        fn headers(pairs: &[(&'static str, &[u8])]) -> hyper::HeaderMap {
+            let mut map = hyper::HeaderMap::new();
+            for (name, value) in pairs {
+                map.append(
+                    *name,
+                    HeaderValue::from_bytes(value).expect("a legal header value"),
+                );
+            }
+            map
+        }
+
+        #[test]
+        fn x_api_key_alone_carries_the_key() {
+            let key = "the-key";
+            assert_eq!(
+                bearer_verdict(&headers(&[("x-api-key", b"the-key")]), key),
+                BearerVerdict::Accepted
+            );
+            for wrong in [&b"not-the-key"[..], b"", b"\x80k"] {
+                assert_eq!(
+                    bearer_verdict(&headers(&[("x-api-key", wrong)]), key),
+                    BearerVerdict::Refused,
+                    "{wrong:?}"
+                );
+            }
+            assert_eq!(bearer_verdict(&headers(&[]), key), BearerVerdict::Absent);
+        }
+
+        #[test]
+        fn authorization_decides_alone_when_present() {
+            let key = "the-key";
+            assert_eq!(
+                bearer_verdict(
+                    &headers(&[("authorization", b"wrong"), ("x-api-key", b"the-key")]),
+                    key
+                ),
+                BearerVerdict::Refused,
+                "a right x-api-key never rescues a wrong Authorization"
+            );
+            assert_eq!(
+                bearer_verdict(
+                    &headers(&[("authorization", b"the-key"), ("x-api-key", b"wrong")]),
+                    key
+                ),
+                BearerVerdict::Accepted
+            );
+        }
+
+        #[test]
+        fn a_blank_configured_key_refuses_through_either_header() {
+            for blank in ["", "   "] {
+                for name in ["authorization", "x-api-key"] {
+                    assert_eq!(
+                        bearer_verdict(&headers(&[(name, b"   ")]), blank),
+                        BearerVerdict::Refused,
+                        "{name} against {blank:?}"
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn the_admin_leg_presents_only_the_fleet_key() {
+            let client = || headers(&[("authorization", b"client"), ("x-api-key", b"client")]);
+
+            let mut map = client();
+            present_fleet_key(&mut map, Some("the-fleet-key"));
+            assert_eq!(
+                map.get("authorization").map(HeaderValue::as_bytes),
+                Some(&b"the-fleet-key"[..])
+            );
+            assert!(map.get("x-api-key").is_none(), "keyed plane");
+
+            let mut map = client();
+            present_fleet_key(&mut map, None);
+            assert!(map.get("authorization").is_none(), "open plane");
+            assert!(map.get("x-api-key").is_none(), "open plane");
+
+            let mut map = client();
+            present_fleet_key(&mut map, Some("not\nspellable"));
+            assert!(map.get("authorization").is_none(), "unspellable key");
+            assert!(map.get("x-api-key").is_none(), "unspellable key");
+        }
+
+        #[test]
+        fn the_gateway_strip_takes_the_fleet_key_from_either_header_and_nothing_else() {
+            let mut map = headers(&[("x-api-key", b"the-fleet-key")]);
+            strip_admin_bearer(&mut map, Some("the-fleet-key"));
+            assert!(
+                map.get("x-api-key").is_none(),
+                "the fleet key must not ride"
+            );
+
+            let mut map = headers(&[("x-api-key", b"app-token")]);
+            strip_admin_bearer(&mut map, Some("the-fleet-key"));
+            assert_eq!(
+                map.get("x-api-key").map(HeaderValue::as_bytes),
+                Some(&b"app-token"[..]),
+                "an app's own x-api-key reaches its mock"
+            );
+
+            // Independent: each header is judged on its own value.
+            let mut map = headers(&[
+                ("authorization", b"Bearer app"),
+                ("x-api-key", b"the-fleet-key"),
+            ]);
+            strip_admin_bearer(&mut map, Some("the-fleet-key"));
+            assert!(map.get("x-api-key").is_none());
+            assert_eq!(
+                map.get("authorization").map(HeaderValue::as_bytes),
+                Some(&b"Bearer app"[..])
+            );
+            let mut map = headers(&[
+                ("authorization", b"the-fleet-key"),
+                ("x-api-key", b"app-token"),
+            ]);
+            strip_admin_bearer(&mut map, Some("the-fleet-key"));
+            assert!(map.get("authorization").is_none());
+            assert_eq!(
+                map.get("x-api-key").map(HeaderValue::as_bytes),
+                Some(&b"app-token"[..])
+            );
+        }
     }
 }

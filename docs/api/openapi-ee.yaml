@@ -72,6 +72,7 @@ servers:
   - url: /
 security:
   - apiKeyAuth: []
+  - apiKeyHeader: []
 tags:
   - name: imposters
     description: Imposter and stub CRUD (config-mutating routes terminate here; runtime-state reads/writes proxy to upstream).
@@ -2983,7 +2984,18 @@ components:
         `Authorization: Bearer <key>` is sending the wrong credential and
         will be answered `401`. Compared constant-time against every
         request, terminated or proxied. With no key configured the admin
-        plane is open and this scheme is inert.
+        plane is open and this scheme is inert. When this header is present
+        it decides alone: a right `x-api-key` beside it does not help (D-105).
+    apiKeyHeader:
+      type: apiKey
+      in: header
+      name: x-api-key
+      description: >
+        Mountebank's `--apikey` header, read only when `Authorization` is
+        absent (rift#1565, D-105). Carries the same raw key. On the
+        `/__rift/*` gateway, an `x-api-key` holding the fleet key is
+        removed before the request reaches an imposter; any other value is
+        the app's own and is forwarded.
 
   parameters:
     IfMatch:

@@ -165,9 +165,12 @@ rewritten for one credential. Operating the admin plane is an operations questio
 
 ### One key, or none
 
+> **Amended by D-105** (2026-10-27, #708): the key may also be sent in Mountebank's `x-api-key`
+> header (and the flag spelled `--apikey`), read only when `Authorization` is absent.
+
 The admin plane has exactly one credential: open-source Rift's `--api-key` (`MB_APIKEY`), sent as
-the **raw** `Authorization` header value — no `Bearer ` prefix, none stripped — and compared in
-constant time. **Set ⇒ the whole admin plane is closed to that key. Unset ⇒ the plane is open**,
+the **raw** `Authorization` header value — no `Bearer ` prefix, none stripped — or, when no
+`Authorization` is sent, as Mountebank's `x-api-key`, and compared in constant time. **Set ⇒ the whole admin plane is closed to that key. Unset ⇒ the plane is open**,
 exactly as an unclustered `rift` behaves; there is no second switch and no grace window (D-73,
 superseding D-44's principal-counting rule). A blank or whitespace-only key is a misconfiguration
 and **fails closed** rather than degrading to "no auth", because a request with no `Authorization`
@@ -180,7 +183,9 @@ Two surfaces stay open regardless:
 - **`/__rift/{port}/*`**, the data-plane gateway. Upstream exempts this prefix from its own key
   gate, and the front does not merely skip the check: it must not *inject* the key on that leg
   either, because the request reaches the imposter, where an `Authorization` header would land in
-  its predicates and its recorded request log.
+  its predicates and its recorded request log. A client's own `Authorization` or `x-api-key` that
+  holds the fleet key is removed for the same reason; any other value is the app's and is
+  forwarded.
 
 There is no per-resource authorization. Whoever holds the key administers the whole fleet;
 isolation between teams is two fleets, not a feature (RFC-007 §3.3).

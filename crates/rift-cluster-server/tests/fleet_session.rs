@@ -1621,3 +1621,129 @@ async fn an_unreadable_authorization_header_is_refused_even_beside_a_valid_cooki
 
     server.shutdown().await;
 }
+
+/// Pins D-105 on the wire: Mountebank's `x-api-key` carries the admin key wherever
+/// `Authorization` would (rift#1565) — a terminated write, without a CSRF header, and a proxied
+/// read — a wrong one is refused even beside a valid cookie, and on the gateway leg the fleet key
+/// is stripped from it while an app's own `x-api-key` reaches its mock.
+#[tokio::test]
+async fn x_api_key_carries_the_admin_key_and_never_rides_the_gateway() {
+    let state = TempDir::new().expect("tempdir");
+    let server = compose::start(cluster_cli(&state, &[]))
+        .await
+        .expect("solo cluster starts");
+    wait_ready(&server).await;
+    let admin = server.admin_addr().to_string();
+    let client = reqwest::Client::new();
+    let port = reserve_port();
+
+    let created = Seen::of(
+        client
+            .post(format!("http://{admin}/imposters"))
+            .header("x-api-key", API_KEY)
+            .json(&serde_json::json!({
+                "port": port,
+                "protocol": "http",
+                "recordRequests": true,
+                "stubs": [{ "responses": [{ "is": { "statusCode": 204 } }] }],
+            }))
+            .send()
+            .await
+            .expect("create imposter"),
+    )
+    .await;
+    assert_eq!(
+        created.status, 201,
+        "a terminated write, no CSRF header: {created}"
+    );
+
+    let read = Seen::of(
+        client
+            .get(format!("http://{admin}/imposters/{port}"))
+            .header("x-api-key", API_KEY)
+            .send()
+            .await
+            .expect("proxied read"),
+    )
+    .await;
+    assert_eq!(read.status, 200, "{read}");
+
+    let refused = Seen::of(
+        client
+            .get(format!("http://{admin}/imposters/{port}"))
+            .header("authorization", "wrong")
+            .header("x-api-key", API_KEY)
+            .send()
+            .await
+            .expect("wrong authorization"),
+    )
+    .await;
+    assert_eq!(
+        refused.status, 401,
+        "Authorization decides alone: {refused}"
+    );
+
+    let login = Seen::of(
+        client
+            .post(format!("http://{admin}/session"))
+            .json(&serde_json::json!({ "apiKey": API_KEY }))
+            .send()
+            .await
+            .expect("login"),
+    )
+    .await;
+    assert_eq!(login.status, 200, "{login}");
+    let cookie = format!("rift_session={}", session_cookie(&login));
+    let seen = Seen::of(
+        client
+            .get(format!("http://{admin}/_fleet/health"))
+            .header("cookie", &cookie)
+            .header("x-api-key", "not-the-key")
+            .send()
+            .await
+            .expect("wrong x-api-key beside a cookie"),
+    )
+    .await;
+    assert_eq!(
+        seen.status, 401,
+        "a wrong x-api-key is refused, not passed over for the cookie: {seen}"
+    );
+
+    for value in [API_KEY, "app-token"] {
+        let seen = Seen::of(
+            client
+                .get(format!("http://{admin}/__rift/{port}/anything"))
+                .header("x-api-key", value)
+                .send()
+                .await
+                .expect("gateway request"),
+        )
+        .await;
+        assert_eq!(seen.status, 204, "{seen}");
+    }
+    let seen = Seen::of(
+        client
+            .get(format!("http://{admin}/imposters/{port}/savedRequests"))
+            .header("x-api-key", API_KEY)
+            .send()
+            .await
+            .expect("saved requests"),
+    )
+    .await;
+    let recorded = recorded_requests(&seen);
+    assert_eq!(
+        recorded.len(),
+        2,
+        "both gateway requests were recorded: {seen}"
+    );
+    assert!(
+        !seen.body.contains(API_KEY),
+        "the admin key reached the imposter's recorded requests: {seen}"
+    );
+    assert_eq!(recorded_header(&recorded[0], "x-api-key"), None, "{seen}");
+    let app_key = recorded_header(&recorded[1], "x-api-key")
+        .unwrap_or_else(|| panic!("an app's own x-api-key must reach its mock: {seen}"));
+    assert!(app_key.contains("app-token"), "intact: {app_key}");
+
+    server.shutdown().await;
+}
