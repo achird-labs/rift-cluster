@@ -18,7 +18,9 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use rift_cluster::stores::{ClusteredSequencer, SequencingMode, SequencingRegistry, seq_routes};
+use rift_cluster::stores::{
+    ClusteredSequencer, SequencingMode, SequencingRegistry, applying_committed_op, seq_routes,
+};
 use rift_cluster::{Authority, BridgeConfig, NodeConfig, NodeId, RaftNode};
 use rift_cluster_base::seams::{ImposterConfig, ResponseSequencer, SequenceKey};
 use tempfile::TempDir;
@@ -543,6 +545,34 @@ async fn reset_scope_clears_the_cursor_on_every_member() {
         cursors,
         vec![0, 0, 0],
         "a reset stub must cycle from the start again on every member, including the ring owner"
+    );
+
+    for member in &members {
+        member.node.shutdown().await.expect("shutdown");
+    }
+}
+
+/// Pins D-115: a reset raised while a node drives a committed op stays on that node. Every member
+/// applies the op and resets its own cursor; fanned out, the reset would move peers' cursors at
+/// moments unrelated to their own apply. The caller's own cursor is still cleared.
+#[tokio::test]
+async fn a_reset_from_an_apply_is_not_fanned_out() {
+    let _lock = TEST_LOCK.lock().await;
+    let (members, _dirs) = cluster_of(3, "local").await;
+    let stub = "stub-applied";
+    for member in &members {
+        next_on(&member.seq, stub, 3, &[1, 1, 1]).await;
+    }
+    assert_eq!(local_cursors(&members, stub).await, vec![1, 1, 1]);
+
+    applying_committed_op(async { members[0].seq.reset_scope(TEST_PORT, Some(stub)) }).await;
+
+    // Long enough for the asynchronous fan-out to have landed, were there one.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(
+        local_cursors(&members, stub).await,
+        vec![0, 1, 1],
+        "the applying node resets its own cursor and no peer's"
     );
 
     for member in &members {

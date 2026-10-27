@@ -382,7 +382,10 @@ end (upstream #611 and rift#1389, reproduced deterministically in the state
 machine against the answering stub's validated `anchor_index`, D-114). Modes are
 per request, as in Mountebank: the engine claims with the answering proxy stub's
 own mode, so one imposter can mix `proxyOnce` and `proxyAlways`, and only a
-`proxyOnce` recording leaves a marker row for later claims to find (D-114). A
+`proxyOnce` recording leaves a marker row for later claims to find (D-114). Under
+`local` sequencing the merged responses join the tail of the stub's rotating queue,
+as Mountebank serves them; under `owner` sequencing the merge is a replace, served
+in display order (D-115). A
 `proxyOnce` recording with **no** predicate generators produces no
 stub at all; its replayable response is stored in the same committed op, so
 `lookup()` answers from any node's applied state forever — that row, not a

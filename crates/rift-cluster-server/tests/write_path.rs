@@ -6329,3 +6329,126 @@ async fn a_fleet_forms_and_replicates_over_ipv6() {
     joiner.shutdown().await;
     founder.shutdown().await;
 }
+
+/// A port whose `/proxy` stub is a `proxyAlways` proxy and whose `/r` stub cycles `A, B, C`.
+fn queue_imposter(port: u16, sequencing: Option<&str>) -> serde_json::Value {
+    let mut config = json!({
+        "port": port,
+        "protocol": "http",
+        "stubs": [
+            { "id": "p", "predicates": [{ "equals": { "path": "/proxy" } }],
+              "responses": [{ "proxy": { "to": "http://127.0.0.1:9", "mode": "proxyAlways" } }] },
+            { "id": "r", "predicates": [{ "equals": { "path": "/r" } }],
+              "responses": [{ "is": { "body": "A" } }, { "is": { "body": "B" } }, { "is": { "body": "C" } }] },
+        ],
+    });
+    if let Some(mode) = sequencing {
+        config["_rift"] = json!({ "sequencing": { "mode": mode } });
+    }
+    config
+}
+
+/// Commit a `proxyAlways` recording of `U` that merges into stub `r`, as the proxy store would.
+async fn merge_u_into_r(server: &ComposedServer, port: u16) {
+    let stub: rift_cluster_base::seams::Stub = serde_json::from_value(json!({
+        "predicates": [{ "equals": { "path": "/r" } }],
+        "responses": [{ "is": { "body": "U" } }],
+    }))
+    .expect("stub parses");
+    let request = rift_cluster::ControlRequest {
+        op_id: uuid::Uuid::new_v4(),
+        principal: None,
+        issued_at_secs: 0,
+        expected_revision: None,
+        expect_absent: false,
+        op: rift_cluster::ControlOp::ProxyRecorded {
+            port,
+            sig_hash: "00000000000000ff".to_owned(),
+            resp: rift_cluster_base::seams::RecordedResponse {
+                status: 200,
+                headers: Vec::new(),
+                body: b"U".to_vec(),
+                latency_ms: None,
+                timestamp_secs: 0,
+            },
+            stub: Some(rift_cluster::RecordedStub {
+                stub: Box::new(stub),
+                placement: rift_cluster::RecordedStubPlacement::AfterProxyMerging,
+                proxy_to: "http://127.0.0.1:9".to_owned(),
+                anchor_index: Some(0),
+            }),
+        },
+    };
+    let committed = server
+        .node()
+        .expect("clustered")
+        .submit(request)
+        .await
+        .expect("the merge commits");
+    assert_eq!(committed.outcome, rift_cluster::ControlOutcome::Applied);
+}
+
+async fn serve_r(admin: std::net::SocketAddr, port: u16, times: usize) -> Vec<String> {
+    let mut bodies = Vec::new();
+    for _ in 0..times {
+        let body = reqwest::get(format!("http://{admin}/__rift/{port}/r"))
+            .await
+            .expect("gateway")
+            .text()
+            .await
+            .expect("body");
+        bodies.push(body);
+    }
+    bodies
+}
+
+/// Pins D-115: under `local` sequencing a `proxyAlways` merge that lands mid-cycle joins the tail of
+/// the stub's rotating queue, as Mountebank does (rift#1513) — `A` served, `U` merged, then
+/// `B, C, A, U` — rather than the display order a replace would serve (`B, C, U, A`).
+#[tokio::test]
+async fn a_proxy_always_merge_joins_the_queue_under_local_sequencing() {
+    let _serial = TEST_LOCK.lock().await;
+    let state = TempDir::new().expect("tempdir");
+    let server = compose::start(cluster_cli(&state, &["--cluster-allow-solo"]))
+        .await
+        .expect("solo cluster starts");
+    wait_ready(&server).await;
+    let admin = server.admin_addr();
+    let port = reserve_port();
+    let created = reqwest::Client::new()
+        .post(format!("http://{admin}/imposters"))
+        .json(&queue_imposter(port, None))
+        .send()
+        .await
+        .expect("post");
+    assert_eq!(created.status().as_u16(), 201);
+    assert_eq!(serve_r(admin, port, 1).await, ["A"]);
+    merge_u_into_r(&server, port).await;
+    assert_eq!(serve_r(admin, port, 4).await, ["B", "C", "A", "U"]);
+    server.shutdown().await;
+}
+
+/// Pins D-115's documented divergence: under `owner` sequencing the merge is a replace — display
+/// order — because building the queue would read the owner's cursor from the apply loop (D-57).
+#[tokio::test]
+async fn a_proxy_always_merge_keeps_display_order_under_owner_sequencing() {
+    let _serial = TEST_LOCK.lock().await;
+    let state = TempDir::new().expect("tempdir");
+    let server = compose::start(cluster_cli(&state, &["--cluster-allow-solo"]))
+        .await
+        .expect("solo cluster starts");
+    wait_ready(&server).await;
+    let admin = server.admin_addr();
+    let port = reserve_port();
+    let created = reqwest::Client::new()
+        .post(format!("http://{admin}/imposters"))
+        .json(&queue_imposter(port, Some("owner")))
+        .send()
+        .await
+        .expect("post");
+    assert_eq!(created.status().as_u16(), 201);
+    assert_eq!(serve_r(admin, port, 1).await, ["A"]);
+    merge_u_into_r(&server, port).await;
+    assert_eq!(serve_r(admin, port, 4).await, ["B", "C", "U", "A"]);
+    server.shutdown().await;
+}

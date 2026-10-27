@@ -83,7 +83,7 @@ use crate::control::{
     StubEditScript,
 };
 use crate::stores::flow::FlowNet;
-use crate::stores::sequencer::SequencingRegistry;
+use crate::stores::sequencer::{SequencingMode, SequencingRegistry};
 
 type StorageResult<T> = Result<T, StorageError<u64>>;
 
@@ -873,6 +873,16 @@ enum EngineAction {
     Patch {
         port: u16,
         edit: StubEditScript,
+    },
+    /// A `proxyAlways` merge into stub `id` (D-115). Under `local` sequencing the engine appends
+    /// `responses` and joins them to the tail of the stub's rotating queue, as Mountebank does
+    /// (rift#1513); under `owner` sequencing it replaces the stub with `merged` — display order —
+    /// because building the queue would read the owner's cursor from the apply loop (D-57).
+    AppendResponses {
+        port: u16,
+        id: String,
+        responses: Vec<StubResponse>,
+        merged: Box<Stub>,
     },
     /// Pause/resume in place via the upstream write-through (#817): never a
     /// wholesale replace, so the imposter's runtime state survives.
@@ -2727,6 +2737,8 @@ impl RedbStateMachine {
                         base
                     });
                 }
+                // Kept for the engine drive: a merge appends exactly these to the target's queue.
+                let appended = stub_value.responses.clone();
                 let placed = place_recorded_stub(
                     &mut config.stubs,
                     stub_value,
@@ -2760,12 +2772,11 @@ impl RedbStateMachine {
                             index: Some(index),
                         }]),
                     },
-                    PlacedRecording::MergedInto { index, id } => EngineAction::Patch {
+                    PlacedRecording::MergedInto { index, id } => EngineAction::AppendResponses {
                         port: *port,
-                        edit: control::StubEditScript(vec![control::StubEdit::ReplaceById {
-                            id,
-                            stub: config.stubs[index].clone(),
-                        }]),
+                        id,
+                        responses: appended,
+                        merged: Box::new(config.stubs[index].clone()),
                     },
                     // The merge target was a user-authored stub with no id: nothing addresses
                     // it in a patch script, so fall back to the full-sync drive — rare, and
@@ -2820,9 +2831,15 @@ impl RedbStateMachine {
             // whichever one happened to be first would be worse than the `None`
             // it replaces: wrong attribution is not a smaller error than missing
             // attribution.
-            rift_cluster_base::seams::with_principal_scope(principal, async {
-                self.drive_one(action).await;
-            })
+            // D-115: a cursor reset this drive raises stays on this node — every member applies
+            // the op and resets its own.
+            // Boxed: `drive_one`'s future is large, and two task-local scopes around it inline
+            // overflow a 2 MiB thread stack in debug builds.
+            crate::stores::sequencer::applying_committed_op(Box::pin(
+                rift_cluster_base::seams::with_principal_scope(principal, async {
+                    self.drive_one(action).await;
+                }),
+            ))
             .await;
         }
     }
@@ -3054,6 +3071,38 @@ impl RedbStateMachine {
                             port,
                             error = %e,
                             "engine refused a committed stub edit"
+                        );
+                        self.apply_failures.lock().insert(port, e.to_string());
+                    }
+                }
+            }
+            EngineAction::AppendResponses {
+                port,
+                id,
+                responses,
+                merged,
+            } => {
+                let Some(engine) = &self.engine else { return };
+                let owner = self
+                    .sequencing
+                    .as_ref()
+                    .is_some_and(|s| s.mode(port) == SequencingMode::Owner);
+                let outcome = if owner {
+                    engine.replace_stub_by_id(port, &id, *merged).await
+                } else {
+                    engine
+                        .append_stub_responses_by_id(port, &id, responses)
+                        .await
+                };
+                match outcome {
+                    Ok(()) => self.clear_drive_outcome(port),
+                    // Recorded like a refused stub edit, so the next op heals it whole.
+                    Err(e) => {
+                        tracing::error!(
+                            port,
+                            stub_id = %id,
+                            error = %e,
+                            "engine refused a committed proxyAlways append"
                         );
                         self.apply_failures.lock().insert(port, e.to_string());
                     }
