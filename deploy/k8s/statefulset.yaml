@@ -130,6 +130,12 @@ spec:
                 export RIFT_CLUSTER_ALLOW_SOLO=true
                 unset RIFT_CLUSTER_SEEDS
               fi
+              # An IPv6 pod IP must be bracketed to carry a port; an IPv4 one
+              # advertises exactly what it always has.
+              case "$POD_IP" in
+                *:*) export RIFT_CLUSTER_ADVERTISE="[$POD_IP]:4790" ;;
+                *)   export RIFT_CLUSTER_ADVERTISE="$POD_IP:4790" ;;
+              esac
               exec rift-cluster-server
           ports:
             - name: admin
@@ -145,20 +151,20 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.name
-            # --cluster-advertise takes a socket address, not a DNS name, so the
-            # pod's own IP is what it must announce. (--cluster-seeds below IS a
-            # name — that one is resolved on every join attempt.) A rescheduled
-            # pod comes back with a new IP and re-announces it on join.
+            # The pod's own IP is what --cluster-advertise announces (set in the
+            # preamble above, bracketed when IPv6). --cluster-seeds below is a
+            # name, resolved on every join attempt over every A and AAAA record.
+            # A rescheduled pod comes back with a new IP and re-announces it.
             - name: POD_IP
               valueFrom:
                 fieldRef:
                   fieldPath: status.podIP
             - name: RIFT_CLUSTER
               value: "true"
-            - name: RIFT_CLUSTER_ADVERTISE
-              value: "$(POD_IP):4790"
+            # [::] is dual-stack: IPv4 and IPv6 peers alike. On a node booted
+            # without IPv6, use 0.0.0.0:4790.
             - name: RIFT_CLUSTER_BIND
-              value: "0.0.0.0:4790"
+              value: "[::]:4790"
             # Binding the wildcard is a deliberate acknowledgment: inside a pod
             # network namespace it is the only way to accept peer traffic, and
             # the cluster port stays protected by the shared secret and by
@@ -171,8 +177,6 @@ spec:
               value: "rift-0.rift-cluster:4790"
             - name: RIFT_CLUSTER_NODE_NAME
               value: "$(POD_NAME)"
-            - name: RIFT_CLUSTER_PROBE_BIND
-              value: "0.0.0.0:2526"
             - name: RIFT_CLUSTER_LEAVE_TIMEOUT
               value: "15"
             - name: RIFT_CLUSTER_STATE_DIR

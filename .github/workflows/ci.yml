@@ -1097,6 +1097,26 @@ jobs:
             render "values-${env}" -f "${chart}/values-${env}.yaml"
           done
 
+      # #698: the chart runs on IPv4, IPv6 and dual-stack pod networks. Asserted on the rendered
+      # output, then the advertise snippet itself is RUN under `sh` for both families: a pod IP of
+      # either kind must come out as a socket address the node parses.
+      - name: The chart advertises a bracketed IPv6 pod IP and binds dual-stack
+        run: |
+          set -euo pipefail
+          helm template r deploy/helm/rift-cluster --set clusterSecret.existingSecret=ci > /tmp/ipv6.yaml
+          grep -q 'value: "\[::\]:4790"' /tmp/ipv6.yaml || { echo "FAIL: cluster bind is not [::]:4790" >&2; exit 1; }
+          if grep -q 'RIFT_CLUSTER_PROBE_BIND' /tmp/ipv6.yaml; then
+            echo "FAIL: the probe bind is pinned; it must default to every interface" >&2; exit 1
+          fi
+          sed -n '/case "\$POD_IP" in/,/esac/p' /tmp/ipv6.yaml > /tmp/advertise.sh
+          grep -q esac /tmp/advertise.sh || { echo "FAIL: no advertise case block rendered" >&2; exit 1; }
+          for pair in 'fd00::5=[fd00::5]:4790' '10.0.0.5=10.0.0.5:4790'; do
+            ip="${pair%%=*}"; want="${pair#*=}"
+            got="$(POD_IP="$ip" sh -c '. /tmp/advertise.sh; printf %s "$RIFT_CLUSTER_ADVERTISE"')"
+            [ "$got" = "$want" ] || { echo "FAIL: POD_IP=$ip advertised '$got', want '$want'" >&2; exit 1; }
+          done
+          echo "PASS"
+
       # The rule the chart exists to make unbreakable, asserted rather than trusted:
       # terminationGracePeriodSeconds must be 2 x leaveTimeoutSeconds + 10. A template edit that
       # hard-coded it back to a literal would pass every schema check above and silently reintroduce

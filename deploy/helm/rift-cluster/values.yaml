@@ -41,6 +41,12 @@ replicas: 3
 # that rule impossible to violate rather than merely documented: there is no second number to forget.
 leaveTimeoutSeconds: 15
 
+cluster:
+  # Where the cluster (Raft/RPC) port binds. `[::]` is dual-stack: it takes IPv4 and IPv6 peers, so
+  # the chart runs on IPv4, IPv6 and dual-stack pod networks alike. On a node whose kernel was booted
+  # without IPv6, `[::]` cannot bind: set `0.0.0.0:4790` there.
+  bindAddress: "[::]:4790"
+
 storage:
   # Empty means the cluster's default StorageClass. On a real cluster name one explicitly — see the
   # per-cloud examples in `values-*.yaml`, which is also where the zonal-disk caveat lives.

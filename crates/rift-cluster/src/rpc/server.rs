@@ -63,21 +63,18 @@ pub struct RpcServer {
 }
 
 impl RpcServer {
-    /// Bind the cluster port with `SO_REUSEADDR`.
+    /// Bind the cluster port through upstream's server-listener socket (#698, D-113).
     ///
     /// `SO_REUSEADDR` lets a restarting node rebind its address immediately even
     /// while connections accepted by the previous instance (which share the
     /// listener's local port) are still draining — without it, a fast restart
     /// races those sockets and fails with `EADDRINUSE`. It never permits a second
-    /// *listener* on a live port, so it does not weaken binding.
+    /// *listener* on a live port, so it does not weaken binding. An IPv6 address
+    /// is bound with `IPV6_V6ONLY` off, so `[::]:4790` also takes IPv4 peers on a
+    /// dual-stack pod network whatever the kernel's `bindv6only` default.
     pub async fn bind(addr: SocketAddr, config: RpcServerConfig) -> std::io::Result<Self> {
-        let socket = match addr {
-            SocketAddr::V4(_) => tokio::net::TcpSocket::new_v4()?,
-            SocketAddr::V6(_) => tokio::net::TcpSocket::new_v6()?,
-        };
-        socket.set_reuseaddr(true)?;
-        socket.bind(addr)?;
-        let listener = socket.listen(1024)?;
+        let listener =
+            TcpListener::from_std(rift_cluster_base::seams::bind_server_listener(addr)?)?;
         Ok(Self {
             listener,
             config: Arc::new(config),
@@ -341,6 +338,26 @@ mod tests {
                 max_retries: 0,
             },
         )
+    }
+
+    /// Pins D-113: the cluster port bound at `[::]` takes IPv4 peers, so a dual-stack pod network reaches it
+    /// over either family. Upstream's server socket turns `IPV6_V6ONLY` off explicitly; on a host
+    /// whose kernel default is already off this pins the property rather than catching its loss.
+    /// Skipped where the host has no IPv6.
+    #[tokio::test]
+    async fn an_ipv6_wildcard_bind_takes_ipv4_clients() {
+        let Ok(server) = RpcServer::bind(
+            "[::]:0".parse().expect("addr"),
+            RpcServerConfig::new(None, Router::new()),
+        )
+        .await
+        else {
+            return;
+        };
+        let port = server.local_addr().expect("bound").port();
+        tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .expect("an IPv4 client reaches the [::] cluster listener");
     }
 
     /// Pins D-96: a request named for another node is refused before any handler runs, naming both

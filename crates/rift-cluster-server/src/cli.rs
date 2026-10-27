@@ -113,14 +113,10 @@ pub struct ClusterArgs {
     )]
     pub cluster_snapshot_log_entries: Option<u64>,
 
-    /// Address for the unauthenticated /readyz and /healthz probes
-    #[arg(
-        long,
-        value_name = "ADDR",
-        default_value = "0.0.0.0:2526",
-        env = "RIFT_CLUSTER_PROBE_BIND"
-    )]
-    pub cluster_probe_bind: SocketAddr,
+    /// Address for the unauthenticated /readyz and /healthz probes [default: every interface,
+    /// IPv6 and IPv4, port 2526]
+    #[arg(long, value_name = "ADDR", env = "RIFT_CLUSTER_PROBE_BIND")]
+    pub cluster_probe_bind: Option<SocketAddr>,
 
     /// What a committed admin write waits for before its 2xx: every Ready
     /// node's applied index (read-your-write anywhere), or only the answering
@@ -262,6 +258,9 @@ pub struct EeCli {
     pub cluster: ClusterArgs,
 }
 
+/// `--cluster-probe-bind`'s port when the flag is unset.
+pub const DEFAULT_PROBE_PORT: u16 = 2526;
+
 impl EeCli {
     /// Resolve the cluster flags into a validated [`ClusterConfig`], reading the
     /// secret file if one was given.
@@ -337,6 +336,15 @@ impl EeCli {
     /// address; or the resolved address is reachable off-host with no `--api-key`
     /// while `--require-admin-auth` is set — upstream's
     /// `AdminExposurePolicy::Refuse`.
+    pub fn probe_listen(&self) -> ListenAddr {
+        // Unset is every interface with upstream's fallback (#698, D-113): `[::]` dual-stack where the
+        // host has IPv6, `0.0.0.0` where it does not — so a pod network of either family reaches
+        // the kubelet's probe, and an IPv6-less host that works today still starts.
+        self.cluster
+            .cluster_probe_bind
+            .map_or(ListenAddr::Any(DEFAULT_PROBE_PORT), ListenAddr::Exact)
+    }
+
     pub fn resolve_front_admin(&self) -> anyhow::Result<ListenAddr> {
         // The key is validated *first*, and that order is load-bearing:
         // `check_admin_exposure` takes `Some(_)` to mean a usable key only because
@@ -454,6 +462,18 @@ mod tests {
         let mut all = vec!["rift-cluster-server"];
         all.extend_from_slice(args);
         EeCli::try_parse_from(all).expect("parses")
+    }
+
+    /// Pins D-113: unset, the probe listener binds every interface with upstream's fallback, so the
+    /// kubelet reaches it on an IPv6 or a dual-stack pod network; a given address is bound exactly.
+    #[test]
+    fn probe_bind_defaults_to_every_interface() {
+        assert_eq!(front(&["--cluster"]).probe_listen(), ListenAddr::Any(2526));
+        let exact = front(&["--cluster", "--cluster-probe-bind", "127.0.0.1:0"]).probe_listen();
+        assert_eq!(
+            exact,
+            ListenAddr::Exact("127.0.0.1:0".parse().expect("addr"))
+        );
     }
 
     /// Pins D-87: the parsed command line — the cluster flags *and* the upstream flags flattened

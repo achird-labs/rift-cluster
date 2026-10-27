@@ -29,8 +29,8 @@ use rift_cluster_base::rift_http_proxy::server::ListenAddr;
 use rift_cluster_base::seams::{
     CompiledRoutes, FileSource, HttpSource, ImposterConfig, ImposterManager, OutboundTls,
     PortReservation, RunningFrontDoor, RunningServer, ScriptFileAccess, ServerBuilder,
-    ServerListener, SourceRef, SourceRegistry, TlsDefaults, bind_front_door, body_limits_from,
-    build_upstream_client, parse_uri_list,
+    ServerListener, SourceRef, SourceRegistry, TlsDefaults, bind_front_door_at, body_limits_from,
+    build_upstream_client, parse_front_door_addr, parse_uri_list,
 };
 
 use crate::admin_front::{self, AdminFront, FrontConfig};
@@ -526,10 +526,10 @@ pub async fn start_with_runtimes(
     // thing the liveness/readiness split exists to prevent. Binding here also
     // means nothing is running yet if the probe port is taken, so that failure
     // cannot orphan a listener.
-    let probe_bind = cli.cluster.cluster_probe_bind;
-    let probes = probes::bind(probe_bind, Arc::clone(&readiness))
+    let probe_listen = cli.probe_listen();
+    let probes = probes::bind(probe_listen, Arc::clone(&readiness))
         .await
-        .with_context(|| format!("binding the probe listener on {probe_bind}"))?;
+        .with_context(|| format!("binding the probe listener on {}", probe_listen.judged()))?;
 
     // The manager exists before the node so committed ops can drive it from
     // the very first apply; the data-plane server later composes around this
@@ -769,7 +769,8 @@ fn reserve_listener_ports(
         .oss
         .front_door
         .as_deref()
-        .and_then(|value| parse_front_door_addr(value).ok());
+        .and_then(|value| parse_front_door_addr(value).ok())
+        .map(|listen| listen.judged());
     [
         (Some(front_admin.judged()), ServerListener::Admin),
         (front_door, ServerListener::FrontDoor),
@@ -912,7 +913,8 @@ async fn attach_data_plane(
     // was attached before `Raft::new` and catch-up replay drives it like any
     // other commit.
     let front_door = if let Some(addr) = front_door_addr {
-        match bind_front_door(addr, Arc::clone(&manager), front_door_routes).await {
+        // A bare `--front-door` port is `ListenAddr::Any`: dual-stack, as upstream binds it (D-113).
+        match bind_front_door_at(addr, Arc::clone(&manager), front_door_routes, None).await {
             Ok(running) => Some(running),
             Err(e) => {
                 server.shutdown().await;
@@ -1292,24 +1294,6 @@ fn bootstrap_op_id(uri: &str, port: u16, digest: &str) -> uuid::Uuid {
     uuid::Uuid::new_v5(
         &uuid::Uuid::NAMESPACE_URL,
         format!("rift-cluster/bootstrap-imposter\n{uri}\n{port}\n{digest}").as_bytes(),
-    )
-}
-
-/// Parse `--front-door`'s value the same way upstream's own (private)
-/// `parse_front_door_addr` does: `HOST:PORT`, or a bare port meaning every
-/// interface. Duplicated rather than reached for, because upstream keeps it
-/// `fn`-private to `rift_http_proxy::server` — there is no seam to call
-/// through, and it is five lines.
-fn parse_front_door_addr(value: &str) -> anyhow::Result<SocketAddr> {
-    if let Ok(addr) = value.parse::<SocketAddr>() {
-        return Ok(addr);
-    }
-    if let Ok(port) = value.parse::<u16>() {
-        return Ok(SocketAddr::from(([0, 0, 0, 0], port)));
-    }
-    anyhow::bail!(
-        "--front-door '{value}' is not a valid bind address; use HOST:PORT (e.g. 0.0.0.0:8080) \
-         or a bare port number"
     )
 }
 

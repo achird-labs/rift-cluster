@@ -96,7 +96,16 @@ refusing to start (the refusal exists so a node that lost its seed list cannot
 silently form a second cluster beside the real one); and `--cluster-bind` has no
 default either, because a misconfigured node picking a cluster port for itself is
 worse than one that will not start. `--cluster-probe-bind` is **not** in the list
-on purpose — it already defaults to `0.0.0.0:2526`, so passing it changes nothing.
+on purpose — it already defaults to every interface on port 2526 (`[::]` dual-stack,
+`0.0.0.0` on a host without IPv6), so passing it changes nothing.
+
+### IPv6 and dual-stack clusters
+
+The chart and `k8s/statefulset.yaml` run unchanged on IPv4, IPv6 and dual-stack pod networks
+(#698, D-113). The cluster port binds `[::]:4790`, which takes IPv4 and IPv6 peers alike. The probe
+listener's default covers both families. The pod advertises its own IP, bracketed when it is IPv6
+(`[fd00::5]:4790`). The seed name is resolved over every A and AAAA record. On a node whose kernel
+was booted without IPv6, set `cluster.bindAddress` (or `RIFT_CLUSTER_BIND`) to `0.0.0.0:4790`.
 
 `127.0.0.1:4790` is deliberate: a solo node has no peers to reach it, so there is
 no reason to expose the cluster port at all.
