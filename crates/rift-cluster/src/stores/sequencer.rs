@@ -90,6 +90,21 @@ const RESET_PATH: &str = "/_cluster/seq/reset";
 /// caller that waits longer than this is worse off than one that cycles locally.
 const SEQ_OP_DEADLINE: Duration = Duration::from_secs(2);
 
+tokio::task_local! {
+    /// Set while the state machine drives a committed op into this node's engine (D-115). Every
+    /// member applies the op itself, so a cursor reset that op raises is this node's alone: fanned
+    /// out, it would land on a peer at an arbitrary point relative to that peer's own apply —
+    /// before it, so the peer builds no order; after it, restarting an order already serving.
+    static APPLYING_COMMITTED_OP: bool;
+}
+
+/// Run `drive` as the state machine's drive of a committed op (D-115): a cursor reset it raises is
+/// this node's alone and is not fanned out. Public for an embedder that drives an engine from its
+/// own committed log, and for the tests that pin the rule.
+pub async fn applying_committed_op<F: std::future::Future>(drive: F) -> F::Output {
+    APPLYING_COMMITTED_OP.scope(true, drive).await
+}
+
 /// How an imposter wants its response cursors kept.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -630,10 +645,20 @@ impl ResponseSequencer for ClusteredSequencer {
     /// A **backstop**, not the only mechanism (D-57): this hook also runs on every member from
     /// its own `drive_engine` when the committed config op applies, so each node normally drops
     /// its own cursors without being asked. The fan-out covers what that misses — a direct call
-    /// on one node, and a member whose engine refused the apply — and since #514 it retries and
-    /// reports rather than losing the reset silently.
+    /// on one node — and since #514 it retries and reports rather than losing the reset silently.
+    ///
+    /// **Not fanned out from an apply (D-115, amending D-57):** under [`APPLYING_COMMITTED_OP`]
+    /// every member is resetting its own cursor from its own apply of the same op, so the fan-out
+    /// would only move peers' cursors at moments unrelated to theirs. A member whose engine
+    /// refused the op keeps serving its last-known config (D-102), whose cursors are its own.
     fn reset_scope(&self, port: u16, stub_key: Option<&str>) {
         self.forget(port, stub_key);
+        if APPLYING_COMMITTED_OP
+            .try_with(|applying| *applying)
+            .unwrap_or(false)
+        {
+            return;
+        }
         let (Some(bridge), Some((node, ring))) = (self.bridge.get(), self.view()) else {
             return;
         };

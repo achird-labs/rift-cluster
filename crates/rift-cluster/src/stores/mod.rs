@@ -23,5 +23,7 @@ pub mod shard;
 pub use flow::{ClusteredFlowStoreProvider, FlowBindConfig, FlowNet, SpaceRow, flow_routes};
 pub use flow_config::{ContextScope, FlowConfig, ReadConsistency, ResolvedKnobs};
 pub use proxy::{ClusterProxyStore, ProxyBindConfig, ProxyNet, proxy_routes, proxy_sig_key};
-pub use sequencer::{ClusteredSequencer, SequencingMode, SequencingRegistry, seq_routes};
+pub use sequencer::{
+    ClusteredSequencer, SequencingMode, SequencingRegistry, applying_committed_op, seq_routes,
+};
 pub use shard::{Durability, FlowShard, ShardConfig, ShardError, Versioned};

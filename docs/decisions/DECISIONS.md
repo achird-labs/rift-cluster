@@ -1694,7 +1694,10 @@ drop as well as for `shutdown()`, so the pre-existing
 true-unless-parked.
 
 ### D-57 — A cursor reset is delivered to every member, retried, and named when it is not
-- **Status:** active
+> **Amended by D-115** (2026-10-27, #697): a reset raised while a node drives a committed op is that
+> node's alone and is not fanned out — every member resets its own from its own apply. The fan-out
+> remains the backstop for a direct call.
+- **Status:** amended
 - **Decided:** 2026-08-28 · #514 (found while verifying #504)
 - **Refines:** D-47; also D-8, D-10
 - **Implemented by:** #514
@@ -5298,4 +5301,37 @@ The chart could not run on an IPv6 pod network:
 - **Rejected:** advertising the pod's DNS name, which rewrites every member's advertise string on upgrade.
 - **Rejected:** accepting unbracketed `addr:port`, the ambiguity `UnbracketedIpv6` exists to refuse.
 - `--cluster-bind` stays required and exact. The chart's `cluster.bindAddress` defaults to `[::]:4790`, and `0.0.0.0:4790` is the setting for an IPv6-less kernel.
+
+### D-115 — A `proxyAlways` merge joins the stub's rotating queue under `local` sequencing; a reset from an apply is node-local
+
+- **Status:** active
+- **Decided:** 2026-10-27 · #697
+- **Implemented by:** #697
+- **Code:** crates/rift-cluster/src/raft/store.rs, crates/rift-cluster/src/stores/sequencer.rs
+
+A cluster node drove a `proxyAlways` merge as `ReplaceById` of the whole extended stub. A replace
+keeps the stub's cursor but drops its cycle order. So a stub that had served `A` of `A, B, C`, then
+had `U` merged in, served `B, C, U, A`. Mountebank serves `B, C, A, U`, and so does single-node rift
+since rift#1513.
+
+**Under `local` sequencing, a merge drives `ImposterManager::append_stub_responses_by_id`.** The
+engine joins the responses to the tail of the stub's queue. The drive is a local-only
+`EngineAction::AppendResponses`; no `StubEdit` variant was added, which would break the log format.
+The committed list stays in append order, as Mountebank's `toJSON` shows it.
+
+**Under `owner` sequencing the merge stays a replace, in display order.** That is a documented
+divergence. A Mountebank-faithful order would read the owner's cursor at apply time, which is an
+RPC from the apply loop (D-57's defect). Record-then-replay never reaches this case, because in
+`proxyAlways` the proxy stub matches first. A merge into an id-less authored stub is still a
+whole-set sync, a fresh cycle.
+
+**A cursor reset raised while a node drives a committed op is not fanned out** (amending D-57).
+The state machine runs each drive under `applying_committed_op`. Every member applies the op and
+resets its own cursor, so a fanned-out reset would land on a peer at an unrelated moment:
+- before the peer's own apply, the peer builds no order;
+- after it, the reset restarts an order the peer already started serving.
+
+A direct `reset_scope` call still fans out. A member whose engine refused the op keeps serving its
+last-known config (D-102), so its cursors are its own. The sequencer still counts apply-time peeks
+under `op="peek",path="local"`, once per node per recording.
 
