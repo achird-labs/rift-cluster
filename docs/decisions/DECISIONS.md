@@ -5572,3 +5572,37 @@ The bump (v0.24.0) is **not** a whole-fleet upgrade under D-98. Its other change
 (`POST /imposters/:port/stubs` no longer generates an id, which the front's own terminated door
 never did) and rift#1739 (schema attributes only).
 
+### D-122 — A shadowed proxyOnce recording replays in the cluster; the forward-and-re-record path is deferred
+
+- **Status:** active
+- **Decided:** 2026-10-27 · #715
+- **Implemented by:** #715
+- **Code:** crates/rift-cluster/src/stores/proxy.rs, crates/rift-cluster/tests/proxy_claims.rs
+
+rift#1705 makes standalone rift forward when a request reaches a `proxyOnce` stub whose signature's
+only recording sits *behind* that stub, and record afresh in front of it, as Mountebank does. The
+engine's positional check returns early for a store that publishes its stubs
+(`Imposter::recording_is_shadowed` checks `publishes_stubs()` first), and `ClusterProxyStore` does.
+So in the cluster a request reaching such a stub replays the recording. Two configurations trigger
+it: two proxy stubs with overlapping `predicateGenerators` signatures, or a proxy stub added in front
+of an existing recording, whose marker the edit keeps (D-108).
+
+**Recorded as a known divergence.** Under rift's claim contract (one recording per
+`(port, signature)`) the replay is a correct `proxyOnce` answer, and it is what standalone answered
+before #1705. It is not Mountebank's: in the overlapping-generators case the client receives another
+origin's recorded response. `DELETE /imposters/:port/savedProxyResponses` (D-117) clears it. The
+configurations are rare in record/replay setups, which usually have one catch-all proxy stub.
+
+- **Rejected:** a per-signature forget op on the log. It would be a Raft write on the request path,
+  against the SPI's "quick and synchronous" `forget_recorded`; a new op variant an older node cannot
+  decode; and D-40's rejected two-op shape (forget, then re-record).
+- **Deferred:** a superseding claim. It needs two halves:
+  - *Upstream:* replace the `publishes_stubs()` short-circuit with structural carrier
+    identification, where a carrier is a stub whose predicates equal the request's generated
+    predicates. Add a defaulted `reclaim_shadowed(port, sig, mode)` hook.
+  - *Cluster:* the HRW owner grants a superseding `Pending` over a `Recorded` marker without a Raft
+    write, and `ProxyRecorded` gains a `supersedes` flag so apply overwrites the row.
+
+  That keeps one committed op per recording, so D-40 holds. It costs a decode widening (D-106) and
+  an upstream change. Revisit if a user hits the case.
+

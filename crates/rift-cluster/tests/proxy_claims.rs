@@ -1651,3 +1651,74 @@ async fn a_clear_removes_recorded_stubs_fleet_wide() {
         .expect("clear commits");
     wait_stub_count(&members, TEST_PORT, 1).await;
 }
+
+/// Pins D-122: a proxy stub added in front of an existing recording does not make the signature
+/// record afresh, as standalone rift does since rift#1705 — the edit keeps the marker (D-108), a
+/// `proxyOnce` claim answers `AlreadyRecorded`, and the recording replays. Clearing the port's
+/// saved responses (D-117) is the way out. Turns red if the superseding-claim path is built, which
+/// is the point: changing this answer must be a decision.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_proxy_stub_added_in_front_of_a_recording_replays_it() {
+    let _lock = TEST_LOCK.lock().await;
+    let members = proxy_cluster_of(2, Duration::from_secs(30)).await;
+    install_imposter(&members, TEST_PORT, "proxyOnce").await;
+    let s = sig("/shadowed");
+    let store = store_on(&members[0]);
+    let ClaimOutcome::Claimed(token) = claim(&store, TEST_PORT, &s).await else {
+        panic!("first claim wins");
+    };
+    complete_recorded(&store, TEST_PORT, &s, token, "recorded")
+        .await
+        .expect("recording lands");
+    wait_stub_count(&members, TEST_PORT, 2).await;
+
+    let in_front: Stub = serde_json::from_value(serde_json::json!({
+        "responses": [{ "proxy": {
+            "to": "http://other-upstream.example",
+            "mode": "proxyOnce",
+            "predicateGenerators": [{ "matches": { "path": true } }],
+        } }]
+    }))
+    .expect("stub parses");
+    members[0]
+        .node
+        .submit(mint(rift_cluster::ControlOp::PatchStubs {
+            port: TEST_PORT,
+            edit: rift_cluster::StubEditScript(vec![rift_cluster::StubEdit::Add {
+                stub: in_front,
+                index: Some(0),
+            }]),
+        }))
+        .await
+        .expect("stub add commits");
+    wait_stub_count(&members, TEST_PORT, 3).await;
+
+    assert!(
+        matches!(
+            claim_as(&store, TEST_PORT, &s, ProxyMode::ProxyOnce).await,
+            ClaimOutcome::AlreadyRecorded
+        ),
+        "the shadowed recording still answers the claim"
+    );
+    let replay = lookup(&store, TEST_PORT, &s).await.expect("replayable");
+    assert_eq!(replay.body, b"recorded".to_vec());
+
+    members[1]
+        .node
+        .submit(mint(rift_cluster::ControlOp::ProxyRecordedClear {
+            port: TEST_PORT,
+        }))
+        .await
+        .expect("clear commits");
+    let deadline = Instant::now() + CONVERGE;
+    loop {
+        if let ClaimOutcome::Claimed(_) = claim(&store, TEST_PORT, &s).await {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the clear never freed the signature"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}

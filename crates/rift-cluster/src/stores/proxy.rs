@@ -972,6 +972,9 @@ fn recording_fits(
         })
 }
 
+/// The engine never calls it here for a shadowed recording either: its positional check is skipped
+/// for a publishing store, so a shadowed recording replays (D-122).
+///
 /// `forget_recorded` keeps the default no-op on purpose: the engine calls it only for a claim held
 /// by a stub *it* inserted, and with `publishes_stubs()` it inserts none — the state machine forgets
 /// a marker when its recorded stub goes (D-108).
