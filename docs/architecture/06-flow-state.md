@@ -394,6 +394,17 @@ is a fixed TTL rather than a per-imposter derivation because the recording
 seam (U-16) deliberately carries no timeout context; it only needs to sit
 comfortably above any upstream call the engine would wait for.
 
+**A shadowed recording replays here (D-122).** Since rift#1705 standalone rift
+forwards when a request reaches a `proxyOnce` stub whose signature's only
+recording sits *behind* that stub, and records afresh in front of it, as
+Mountebank does. That check is short-circuited for a store that publishes its
+stubs, and this one does, so the cluster replays the recording instead: two proxy
+stubs with overlapping `predicateGenerators` signatures, or a proxy stub added in
+front of an existing recording. It is a correct `proxyOnce` answer under the
+claim contract — one recording per `(port, signature)` — and what standalone
+answered before #1705, but not Mountebank's. `DELETE
+/imposters/:port/savedProxyResponses` (D-117) clears it.
+
 **When the arbiter cannot answer, the request fails — it is not forwarded.** The bound above
 ("1 + ownership changes in flight") holds only while *something* is serializing claims. If the
 owner is isolated, unreachable, or not yet ready, nothing is: every request for the duration of
