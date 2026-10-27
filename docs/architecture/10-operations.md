@@ -341,11 +341,15 @@ still **not built**; it is kept as the design of what it would have to look like
 > additive. A release that changes the engine's *matching*, a stub *key*, or what it *admits* is a
 > whole-fleet upgrade — see "Whole-fleet upgrades" below.
 
+> **Amended by D-106** (2026-10-27, #710): tolerating unknown fields covers new *fields* only. A
+> release whose engine widens an existing field's type (rift#1558's string `statusCode`) is a
+> whole-fleet upgrade too: an old node cannot decode a log entry that uses the wider value.
+
 One node at a time, SIGTERM-driven; the invariants that make it boring:
 protocol majors must match to join (clean refusal otherwise), gossip/RPC
 fields are additive within a major, config bodies tolerate unknown fields
 (so an old node can apply a new node's config — it reports rather than
-crashes on genuinely new required semantics), and graceful leave means no
+crashes on genuinely new required semantics; new fields only, see D-106), and graceful leave means no
 election and no ownership guess per step. Sequence cursors still reset on
 ownership moves (D-8) — schedule upgrades between test runs, stated in the
 docs rather than discovered in one.
@@ -364,6 +368,8 @@ upgraded on every node before the fleet takes config writes again:
 - **Admission** — what the engine refuses to load. A config admitted by the old engine and refused
   by the new one is not served by the new engine on its port (D-102): see "Configs the engine
   refuses" below.
+- **A decode widening** (D-106) — a field that now accepts a wider value. An old node cannot decode
+  a log entry that uses it, and that fails the whole entry, not one port.
 
 The release notes of a pin bump say which kind it is. The bump to rift `fa205d4` (#655) is all
 three: stub keys became canonical (which fixes cross-node cursor sharing and stops unrelated writes
@@ -405,7 +411,8 @@ The bump to rift **master `7161b1a`** (past v0.23.0) is all three again, and mor
   `Authorization` (use `injectHeaders`). A committed `to` with a path, or one that is not a URL, is
   refused on its port (D-102); re-`PUT` it as an origin, with `pathRewrite` if the upstream needs
   the prefix.
-- **Decode.** A `copy`/`lookup` token in `is.statusCode` (rift#1558) cannot be decoded by an older
+- **Decode (D-106).** A `copy`/`lookup` token in `is.statusCode` or `defaultResponse.statusCode`
+  (rift#1558), and a widened lookup `key.index` (rift#1582), cannot be decoded by an older
   node at all. Take no config writes until every node runs the new binary.
 - **Listeners (D-103).** With no `--host`, the admin front and host-less imposters listen dual-stack
   on `[::]`, falling back to `0.0.0.0` without IPv6. `require()` and `lookup` read only below

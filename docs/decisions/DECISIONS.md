@@ -4495,6 +4495,9 @@ and the gate opening is not covered for that node.
 - **Implemented by:** #655
 - **Code:** crates/rift-cluster/src/raft/store.rs, crates/rift-cluster/src/stores/sequencer.rs, tests/cluster-chaos/tests/scenarios.rs
 
+> **Amended by D-106** (2026-10-27, #710): a decode *widening* is a fourth whole-fleet class beside
+> matching, keys and admission.
+
 **What the bump fixed.** Before rift #1259 (first pinned here at `fa205d4`; the previous pin was
 `453191f`), the content key of a stub with no `id` was a hash of its serialization, and `Stub`
 holds `HashMap`s — predicate operations and response headers — that serialize in per-instance
@@ -4844,6 +4847,10 @@ what changes is which committed configs this engine serves.
 (upstream *loosening* a check). That window is the whole-fleet upgrade rule's (D-98); from this
 decision on, decoding is engine-independent.
 
+> **Amended by D-106** (2026-10-27, #710): independent of the engine's *admission checks* only. A
+> decode *widening* — a field that now accepts a wider type — still leaves an older binary unable to
+> read what a newer one commits, and that failure is the whole log entry.
+
 **Rejected:** carrying configs as raw JSON in the log and editing them as `Value`s (re-implements
 stub edits and recorded-stub placement untyped); running refused configs unchecked (re-opens the
 silently-wrong matching upstream closed in #1220/#1221); a preflight tool (operator surface for
@@ -4978,4 +4985,33 @@ the credential the front presents. Without these two, accepting the header would
 that stamps the fleet key on every call leak it into imposter journals.
 
 `POST /session` is unchanged: its key is in the body.
+
+### D-106 — A decode widening is a whole-fleet change: an old binary cannot read a log that holds a value only a newer engine decodes
+
+- **Status:** active
+- **Decided:** 2026-10-27 · #710
+- **Amends:** D-102, D-98
+- **Implemented by:** #710
+- **Code:** crates/rift-cluster/src/control.rs, crates/rift-cluster/src/raft/store.rs
+
+D-102 made decoding a committed config independent of the engine's *admission* checks. It cannot
+make it independent of the engine's *types*. When an upstream bump widens what a field decodes —
+rift#1558 lets `is.statusCode` and `defaultResponse.statusCode` be any string, such as a
+`${code}` token a `copy` behavior fills, and rift#1582 widens a lookup `key.index` — a node on the older binary fails to decode the first
+committed entry that uses the wider shape, wherever D-102 says such an entry is read. That failure
+is the whole entry, not one port (#657's shape): with the entry last in the log the node cannot
+start; mid-log, every whole-set drive is refused and a restarted node serves nothing; a follower
+cannot apply it on append; and a leader serving a joiner loses its Raft core.
+
+**So a widening is a fourth whole-fleet class beside D-98's matching, keys and admission.** The
+pin-bump PR lists widenings with the other three, found by reading upstream's `replay_floor.rs`
+ledger for "fewer refusals" lines, and no config write is taken until every node runs the new
+binary. (rift#1553's array-valued `query` is not one: it widens recorded requests, which stay in
+each node's own journal and never cross the log, D-74.) There is no version-gated door, for D-98's reason: no mechanism reaches the matching and key
+differences the same window already carries. The rolling-upgrade promise that config bodies
+tolerate unknown fields covers new *fields* only, never a wider value of an existing one.
+
+What the new binary itself must still do is pinned: a token `statusCode` replays and re-serializes
+as written, and a numeric string keys an id-less stub as the number it spells, so no committed
+stub's shared cursor moves at the bump.
 

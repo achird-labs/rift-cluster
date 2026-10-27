@@ -4552,6 +4552,25 @@ mod tests {
         );
     }
 
+    /// Pins D-106 where the cluster keys a stub: rift#1558 widened `statusCode` to any string, and a
+    /// numeric string must still key an id-less stub as the number it spells, or every committed
+    /// `"404"` stub's shared cursor would move at the bump.
+    #[test]
+    fn a_numeric_string_status_keys_as_the_number() {
+        let config = |status: serde_json::Value| {
+            crate::control::decode_committed_config(
+                &json!({ "port": 1, "protocol": "http",
+                    "stubs": [{ "responses": [{ "is": { "statusCode": status } }] }] })
+                .to_string(),
+            )
+            .expect("replay decodes it")
+        };
+        assert_eq!(
+            stub_key(&config(json!("404")).stubs[0], 0),
+            stub_key(&config(json!(404)).stubs[0], 0)
+        );
+    }
+
     /// The core infallibility clause: a port that cannot bind fails the *engine
     /// drive*, never the apply. The config is committed, the response is
     /// `applied`, and the failure is node status.
