@@ -6065,3 +6065,80 @@ async fn a_proxied_admin_body_under_the_cap_still_proxies() {
     );
     server.shutdown().await;
 }
+
+/// Pins D-110 at the admin front: a config under the front's 16 MiB body cap that serializes over
+/// the 8 MiB log entry bound is a `413` before anything is parked — a parked op that can never be
+/// proposed would be replayed forever — and nothing is created.
+#[tokio::test]
+async fn an_oversize_config_is_413_and_never_parked() {
+    let _serial = TEST_LOCK.lock().await;
+    let state = TempDir::new().expect("tempdir");
+    let server = compose::start(cluster_cli(&state, &["--cluster-allow-solo"]))
+        .await
+        .expect("solo cluster starts");
+    wait_ready(&server).await;
+    let admin = server.admin_addr();
+    let node = server.node().expect("clustered");
+    let parked = node.parked_intent_count().expect("count");
+    let port = reserve_port();
+    let refused = reqwest::Client::new()
+        .post(format!("http://{admin}/imposters"))
+        .json(&json!({ "port": port, "protocol": "http",
+            "stubs": [{ "responses": [{ "is": { "body": "y".repeat(9 * 1024 * 1024) } }] }] }))
+        .send()
+        .await
+        .expect("post");
+    assert_eq!(refused.status().as_u16(), 413);
+    assert!(
+        refused
+            .text()
+            .await
+            .expect("body")
+            .contains("too large to replicate")
+    );
+    assert_eq!(
+        node.parked_intent_count().expect("count"),
+        parked,
+        "nothing parked"
+    );
+    assert_eq!(revision(&server, port), None, "nothing committed");
+    server.shutdown().await;
+}
+
+/// Pins D-110 at the drainer: an intent too large to replicate — one a pre-D-110 binary could have
+/// parked — is retired on its first replay rather than replayed every sweep forever.
+#[tokio::test]
+async fn an_unreplicable_parked_intent_is_retired() {
+    let _serial = TEST_LOCK.lock().await;
+    let state = TempDir::new().expect("tempdir");
+    let server = compose::start(cluster_cli(&state, &["--cluster-allow-solo"]))
+        .await
+        .expect("solo cluster starts");
+    wait_ready(&server).await;
+    let node = server.node().expect("clustered");
+    let config: rift_cluster_base::seams::ImposterConfig = serde_json::from_value(json!({
+        "port": reserve_port(), "protocol": "http",
+        "stubs": [{ "responses": [{ "is": { "body": "z".repeat(9 * 1024 * 1024) } }] }]
+    }))
+    .expect("config parses");
+    let request = rift_cluster::ControlRequest {
+        op_id: uuid::Uuid::new_v4(),
+        principal: None,
+        issued_at_secs: 0,
+        expected_revision: None,
+        op: rift_cluster::ControlOp::PutImposter {
+            config: Box::new(config),
+        },
+    };
+    node.park_intent(&request).expect("park");
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while node.intent_parked(&request.op_id).expect("read") {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the unreplicable intent stays parked"
+        );
+        node.request_replay();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    server.shutdown().await;
+}

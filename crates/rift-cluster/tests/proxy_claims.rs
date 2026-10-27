@@ -1445,3 +1445,34 @@ async fn a_stale_guard_drop_does_not_free_the_current_claim() {
         .await
         .expect("the live claim still settles after a stale guard dropped");
 }
+
+/// Pins D-110 at the proxy store: a recording too large for one log entry is skipped before any
+/// claim RPC or submit, its claim is released so the signature is claimable again, and nothing is
+/// recorded — the engine still serves the upstream response.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_oversize_recording_is_skipped_and_released() {
+    let _lock = TEST_LOCK.lock().await;
+    let members = proxy_cluster_of(2, Duration::from_secs(30)).await;
+    install_imposter(&members, TEST_PORT, "proxyOnce").await;
+    let s = sig("/oversize");
+    let store = store_on(&members[0]);
+    let ClaimOutcome::Claimed(token) = claim(&store, TEST_PORT, &s).await else {
+        panic!("first claim wins");
+    };
+    let body = "x".repeat(2 * 1024 * 1024);
+    let refused = complete_recorded(&store, TEST_PORT, &s, token, &body).await;
+    match refused {
+        Err(ProxyStoreError::Unavailable(message)) => {
+            assert!(message.contains("over the"), "{message}");
+        }
+        other => panic!("an oversize recording must be skipped: {other:?}"),
+    }
+    assert!(
+        lookup(&store, TEST_PORT, &s).await.is_none(),
+        "nothing recorded"
+    );
+    assert!(
+        matches!(claim(&store, TEST_PORT, &s).await, ClaimOutcome::Claimed(_)),
+        "the claim was released, so the signature is claimable again"
+    );
+}

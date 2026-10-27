@@ -138,9 +138,18 @@ out-of-band transport that once carried them. What follows describes the log's
 own large-entry path (#411): it still exists and still bounds any entry the
 transport cap admits, but nothing routine takes it any more.
 
-What bounds a log entry's size is the log's own payload cap
-(`MAX_LOG_PAYLOAD_BYTES`, 10 MiB), under the transport's 32 MiB body cap. What
-bounds its *latency* is the link:
+> **Amended by D-110**
+
+What bounds a log entry's size is its **serialized** size, checked before the
+entry is proposed (`MAX_ENTRY_BYTES`, 8 MiB — a quarter of the transport's
+32 MiB body cap). `MAX_LOG_PAYLOAD_BYTES` measures only a recorded body's raw
+length, at apply, and bounds nothing on the wire. A write over the bound is
+refused where it is made: `413` at the admin front before anything is parked, a
+failed start for an `--imposters` file, a skipped recording (the client still
+gets the upstream response) at the proxy store. An entry larger than the
+transport cap would otherwise be appended on the leader and never replicate,
+stalling every write behind it until an election truncated it. What bounds its
+*latency* is the link:
 
 - A large entry commits in **`O(size / link speed)`**, not in one heartbeat.
   openraft grants each AppendEntries RPC only `heartbeat_interval` (50 ms), so
@@ -158,7 +167,9 @@ bounds its *latency* is the link:
 - A follower that refuses an over-cap batch answers `413`. The leader halves the
   batch and retries immediately rather than treating the peer as unreachable, so
   a lagging follower catching up across several large entries makes progress
-  instead of backing off forever.
+  instead of backing off forever. That holds because every single entry is
+  admitted at no more than a quarter of the cap (D-110): halving always reaches
+  a batch that fits.
 
 Before #411 none of this was true: every attempt was cut at 50 ms and restarted,
 so a 512 KiB entry took 23–548 s and anything ≥ 1 MiB never committed at all —

@@ -350,6 +350,11 @@ pub enum NodeError {
     #[error("no reachable leader: {0}")]
     Unavailable(String),
 
+    /// The write serializes over the log entry bound and was never proposed (D-110). Terminal:
+    /// unlike [`Self::Unavailable`], retrying it can never succeed.
+    #[error("write refused: {0}")]
+    EntryTooLarge(crate::control::EntryTooLarge),
+
     /// A membership change (add-learner, promote, join) failed.
     #[error("membership: {0}")]
     Membership(String),
@@ -1559,6 +1564,8 @@ impl RaftNode {
     /// does not commit; a *committed* refusal (validation, absent port) is the
     /// response's `Failed` outcome, not an error — the write itself succeeded.
     pub async fn write(&self, request: ControlRequest) -> Result<ControlResponse, NodeError> {
+        // D-110: never propose an entry that cannot replicate.
+        crate::control::admit_entry_size(&request).map_err(NodeError::EntryTooLarge)?;
         let op = request.op.kind();
         let op_id = request.op_id;
         let principal = request.principal.clone();
@@ -1614,6 +1621,9 @@ impl RaftNode {
     /// A committed refusal is still `Ok` (see [`Self::write`]); `Unavailable`
     /// means no leader could be reached at all — the no-quorum shape.
     pub async fn submit(&self, request: ControlRequest) -> Result<ControlResponse, NodeError> {
+        // D-110: refused before the local attempt and before any forward — on a follower the
+        // forward would only fail at the peer's transport cap, as a misleading `Unavailable`.
+        crate::control::admit_entry_size(&request).map_err(NodeError::EntryTooLarge)?;
         // Local first: on the leader this is the whole path, and on a follower
         // openraft's refusal carries the freshest leader hint. Cloned because
         // the original is re-serialized for each forward hop below.

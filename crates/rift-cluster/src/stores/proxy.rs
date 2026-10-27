@@ -878,6 +878,12 @@ impl ClusterProxyStore {
         resp: RecordedResponse,
         stub: Option<RecordedStub>,
     ) -> Result<(), ProxyStoreError> {
+        if let Err(e) = recording_fits(port, sig, &resp, stub.as_ref()) {
+            // Released here so the signature is claimable again; the engine still serves the
+            // upstream response, and the next request for it is proxied afresh (D-110).
+            self.release_claim(port, sig, token);
+            return Err(e);
+        }
         let bridge = self
             .net
             .bridge
@@ -947,6 +953,7 @@ impl ClusterProxyStore {
         resp: RecordedResponse,
         stub: Option<RecordedStub>,
     ) -> Result<(), ProxyStoreError> {
+        recording_fits(port, sig, &resp, stub.as_ref())?;
         let bridge = self
             .net
             .bridge
@@ -1016,6 +1023,43 @@ impl ClusterProxyStore {
             }
         }
     }
+}
+
+/// Whether a recording fits in one log entry (D-110), sized as the `ProxyRecorded` op it would
+/// commit — before any claim RPC or submit, so an oversized recording never reaches the log and
+/// never stalls replication. A refusal skips the recording only: the engine still serves the
+/// upstream response.
+fn recording_fits(
+    port: u16,
+    sig: &RequestSignature,
+    resp: &RecordedResponse,
+    stub: Option<&RecordedStub>,
+) -> Result<(), ProxyStoreError> {
+    let request = ControlRequest {
+        op_id: Uuid::nil(),
+        principal: None,
+        issued_at_secs: 0,
+        expected_revision: None,
+        op: ControlOp::ProxyRecorded {
+            port,
+            sig_hash: sig_hash(sig),
+            resp: resp.clone(),
+            stub: stub.cloned(),
+        },
+    };
+    crate::control::admit_entry_size(&request)
+        .map(|_| ())
+        .map_err(|e| {
+            tracing::warn!(
+                port,
+                sig_hash = %sig_hash(sig),
+                body_bytes = resp.body.len(),
+                serialized = e.size,
+                limit = e.limit,
+                "proxy recording skipped: too large to replicate"
+            );
+            ProxyStoreError::Unavailable(format!("proxy store: recording skipped: {e}"))
+        })
 }
 
 /// `forget_recorded` keeps the default no-op on purpose: the engine calls it only for a claim held

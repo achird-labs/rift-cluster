@@ -1652,6 +1652,13 @@ pub(crate) async fn local_write(
     request: ControlRequest,
 ) -> Result<WriteReply, RpcError> {
     use openraft::error::{ClientWriteError, RaftError};
+    // D-110's backstop for the forwarded-write route: a sender on an older binary can still
+    // forward a request under the transport cap but over the entry bound. A 413 on the wire.
+    if let Err(e) = crate::control::admit_entry_size(&request) {
+        return Err(RpcError::BodyTooLarge {
+            limit: e.limit as u64,
+        });
+    }
     match raft.client_write(request).await {
         Ok(response) => Ok(WriteReply::Done(response.data)),
         Err(RaftError::APIError(ClientWriteError::ForwardToLeader(forward))) => {
