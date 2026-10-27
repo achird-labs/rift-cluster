@@ -89,7 +89,7 @@ pub fn apply_rcfile(cli: &mut EeCli) -> anyhow::Result<Vec<String>> {
     Ok(warnings)
 }
 
-/// Write this process's PID to `--pidfile`, if one was given.
+/// Write this process's PID to `pidfile`.
 ///
 /// Called on the **serving** path only — after [`dispatch`] has answered
 /// [`AfterBootstrap::Serve`] — matching the open-source binary since upstream
@@ -97,10 +97,10 @@ pub fn apply_rcfile(cli: &mut EeCli) -> anyhow::Result<Vec<String>> {
 /// PID and then signal it, and let a transient `save` clobber a running server's
 /// file. `restart` reaches this on its fall-through, so the server it starts now
 /// owns the PID file, as it should.
-pub fn write_pidfile(cli: &EeCli) -> anyhow::Result<()> {
-    let Some(pidfile) = cli.oss.pidfile.as_ref() else {
-        return Ok(());
-    };
+///
+/// And only once the server serves (D-107, upstream rift#1657): the caller writes it after
+/// `compose::start` returns, so a tool that waits on the file never races the first request.
+pub fn write_pidfile(pidfile: &Path) -> std::io::Result<()> {
     let pid = std::process::id();
     std::fs::write(pidfile, pid.to_string())?;
     info!("Wrote PID {} to {:?}", pid, pidfile);
@@ -500,17 +500,10 @@ mod tests {
     fn pidfile_is_written() {
         let dir = TempDir::new().expect("tempdir");
         let path = dir.path().join("rift.pid");
-        let c = cli(&["--pidfile", &path.to_string_lossy()]);
-
-        write_pidfile(&c).expect("pidfile written");
+        write_pidfile(&path).expect("pidfile written");
 
         let written = std::fs::read_to_string(&path).expect("read back");
         assert_eq!(written.trim(), std::process::id().to_string());
-    }
-
-    #[test]
-    fn pidfile_absent_is_not_an_error() {
-        write_pidfile(&cli(&[])).expect("no --pidfile is not a failure");
     }
 
     /// Pins D-89: the server removes its PID file on the way out only while the

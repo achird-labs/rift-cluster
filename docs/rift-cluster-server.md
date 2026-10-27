@@ -215,6 +215,15 @@ property of the clustered composition rather than of an explicit guard.
   writes no PID file unless one was asked for.
 - `stop` with no PID file is an error; `restart` with no PID file starts fresh,
   since "end up running" is already satisfiable.
+- The file is written **only once the server serves** (D-107, rift#1657), so a
+  tool that waits on it never races the first request. Unclustered, that is once
+  the admin API and every startup imposter accept connections. Clustered, it is
+  once the node has joined, its admin front is bound and the `--imposters`
+  import has committed; whether the replicated imposters are bound locally is
+  `/readyz`'s answer, not the PID file's. A startup that fails, or is abandoned
+  on a signal, writes no file. A file that cannot be written stops the server
+  with `writing the PID file <path>`. A clustered node still joining has no
+  file yet, so stop it by signalling the process.
 - The server **removes its own PID file on the way out**, however it stops — a
   clean SIGTERM or SIGINT, or an admin plane that died — but only while the
   file still names this process, so a successor that took the file over keeps

@@ -914,6 +914,7 @@ fn with_clean_signal_mask(command: &mut std::process::Command) {
 fn a_node_signalled_while_joining_exits_promptly() {
     let dir = tempfile::TempDir::new().expect("tempdir");
     let pidfile = dir.path().join("node.pid");
+    let probes = closed_addr();
     let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_rift-cluster-server"));
     command
         .env_remove("MB_APIKEY")
@@ -928,7 +929,7 @@ fn a_node_signalled_while_joining_exits_promptly() {
             "--cluster-state-dir",
             &dir.path().join("state").to_string_lossy(),
             "--cluster-probe-bind",
-            &closed_addr(),
+            &probes,
             "--host",
             "127.0.0.1",
             "--port",
@@ -941,13 +942,13 @@ fn a_node_signalled_while_joining_exits_promptly() {
     with_clean_signal_mask(&mut command);
     let mut node = command.spawn().expect("spawn the node");
 
-    // The PID file is written just before the runtime starts; a moment later the node is
-    // inside the seed-retry loop, which an unreachable seed keeps it in for 30 s.
+    // The probe listener answers while the node joins; a moment after it is up the node is inside
+    // the seed-retry loop, which an unreachable seed keeps it in for 30 s.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
-    while !pidfile.exists() {
+    while std::net::TcpStream::connect(&probes).is_err() {
         if std::time::Instant::now() >= deadline || node.try_wait().ok().flatten().is_some() {
             let _ = node.kill();
-            panic!("the node never wrote its PID file");
+            panic!("the node's probe listener never came up on {probes}");
         }
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
@@ -956,6 +957,8 @@ fn a_node_signalled_while_joining_exits_promptly() {
         node.try_wait().expect("poll").is_none(),
         "the node must still be starting when signalled"
     );
+    // D-107: a node still joining has not started serving, so it has written no PID file.
+    assert!(!pidfile.exists(), "no PID file before startup completes");
 
     let signalled = std::time::Instant::now();
     let killed = std::process::Command::new("kill")
@@ -979,7 +982,7 @@ fn a_node_signalled_while_joining_exits_promptly() {
         Some(0),
         "a handled signal exits cleanly: {status}"
     );
-    assert!(!pidfile.exists(), "the node removes the PID file it wrote");
+    assert!(!pidfile.exists(), "an abandoned start leaves no PID file");
 }
 
 /// Pins #594 (upstream #1134) against the real binary: an unrecognised
@@ -1148,5 +1151,157 @@ fn a_keyed_clustered_front_is_not_refused_by_the_exposure_judgement() {
         stderr.contains("--cluster-allow-solo"),
         "the run must reach the later solo guard — that is what shows the judgement \
          let it through, rather than something else stopping it first: {stderr}"
+    );
+}
+
+/// Spawn an unclustered node on `admin` with `--pidfile pidfile` and any extra args.
+#[cfg(unix)]
+fn spawn_unclustered(
+    admin: &str,
+    pidfile: &std::path::Path,
+    extra: &[&str],
+    stderr: std::process::Stdio,
+) -> std::process::Child {
+    let port = admin.rsplit(':').next().expect("port").to_owned();
+    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_rift-cluster-server"));
+    command
+        .env_remove("MB_APIKEY")
+        .env_remove("RIFT_CLUSTER")
+        .args([
+            "--host",
+            "127.0.0.1",
+            "--port",
+            &port,
+            "--cluster-probe-bind",
+            &closed_addr(),
+            "--pidfile",
+            &pidfile.to_string_lossy(),
+        ])
+        .args(extra)
+        .stdout(std::process::Stdio::null())
+        .stderr(stderr);
+    with_clean_signal_mask(&mut command);
+    command.spawn().expect("spawn the node")
+}
+
+#[cfg(unix)]
+fn wait_exit(
+    node: &mut std::process::Child,
+    within: std::time::Duration,
+) -> std::process::ExitStatus {
+    let give_up = std::time::Instant::now() + within;
+    loop {
+        if let Some(status) = node.try_wait().expect("poll the node") {
+            return status;
+        }
+        if std::time::Instant::now() >= give_up {
+            let _ = node.kill();
+            let _ = node.wait();
+            panic!("the node did not exit within {within:?}");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+/// Pins D-107 (rift#1657): an unclustered node writes its PID file only once its admin port and
+/// its startup imposters accept connections, so a tool that waits on the file never races the
+/// first request. Checked at the instant the file appears, with no retry.
+#[cfg(unix)]
+#[test]
+fn the_pidfile_appears_only_once_the_admin_port_and_startup_imposters_serve() {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let pidfile = dir.path().join("node.pid");
+    let admin = closed_addr();
+    let imposter = closed_addr();
+    let imposter_port = imposter.rsplit(':').next().expect("port").to_owned();
+    let doc = dir.path().join("imposters.json");
+    std::fs::write(
+        &doc,
+        format!(r#"{{"imposters":[{{"port":{imposter_port},"protocol":"http","stubs":[]}}]}}"#),
+    )
+    .expect("write the imposters document");
+    let uri = format!("file:{}", doc.to_string_lossy());
+    let mut node = spawn_unclustered(
+        &admin,
+        &pidfile,
+        &["--imposters", &uri],
+        std::process::Stdio::null(),
+    );
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while !pidfile.exists() {
+        if std::time::Instant::now() >= deadline || node.try_wait().ok().flatten().is_some() {
+            let _ = node.kill();
+            panic!("the node never wrote its PID file");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    let admin_up = std::net::TcpStream::connect(&admin).is_ok();
+    let imposter_up = std::net::TcpStream::connect(&imposter).is_ok();
+    let _ = node.kill();
+    let _ = node.wait();
+    assert!(
+        admin_up,
+        "the PID file existed before the admin port {admin} accepted"
+    );
+    assert!(
+        imposter_up,
+        "the PID file existed before the startup imposter {imposter} accepted"
+    );
+}
+
+/// Pins D-107: a startup that fails writes no PID file — here the admin port is already taken.
+#[cfg(unix)]
+#[test]
+fn a_startup_that_fails_writes_no_pidfile() {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let pidfile = dir.path().join("node.pid");
+    let squat = std::net::TcpListener::bind("127.0.0.1:0").expect("squat a port");
+    let admin = squat.local_addr().expect("addr").to_string();
+    let mut node = spawn_unclustered(&admin, &pidfile, &[], std::process::Stdio::null());
+    // Watched while the node is alive, not only after it exits: the exit path removes a file this
+    // process wrote, so an after-the-fact check would pass even if startup had written one.
+    let give_up = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let mut seen = false;
+    let status = loop {
+        seen |= pidfile.exists();
+        if let Some(status) = node.try_wait().expect("poll the node") {
+            break status;
+        }
+        if std::time::Instant::now() >= give_up {
+            let _ = node.kill();
+            let _ = node.wait();
+            panic!("the node did not exit");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    };
+    drop(squat);
+    assert!(
+        !status.success(),
+        "a node that cannot bind its admin port must fail"
+    );
+    assert!(!seen, "a failed startup must never write a PID file");
+}
+
+/// Pins D-107: a PID file that cannot be written refuses startup with an error naming it. (That
+/// the server is shut down is not observable from outside: process exit closes its sockets too.)
+#[cfg(unix)]
+#[test]
+fn an_unwritable_pidfile_refuses_startup_naming_it() {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let pidfile = dir.path().join("missing").join("sub").join("node.pid");
+    let admin = closed_addr();
+    let mut node = spawn_unclustered(&admin, &pidfile, &[], std::process::Stdio::piped());
+    let status = wait_exit(&mut node, std::time::Duration::from_secs(30));
+    let mut stderr = String::new();
+    std::io::Read::read_to_string(&mut node.stderr.take().expect("piped stderr"), &mut stderr)
+        .expect("read stderr");
+    assert!(
+        !status.success(),
+        "an unwritable PID file must fail startup"
+    );
+    assert!(
+        stderr.contains("writing the PID file"),
+        "names the file: {stderr}"
     );
 }
