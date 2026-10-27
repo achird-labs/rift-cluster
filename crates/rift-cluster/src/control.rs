@@ -40,6 +40,15 @@ pub struct ControlRequest {
     /// inert until a client opts in.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expected_revision: Option<u64>,
+    /// Apply only if the addressed imposter does not exist: `POST /imposters`' create-only
+    /// contract (#694, D-111). `false` = unconditional; combined with `expected_revision` the op is
+    /// refused at apply.
+    ///
+    /// Skipped when `false`, so every other entry's bytes are unchanged and an older entry decodes
+    /// as `false`. Mixed-version caveat, as for `expected_revision`: a replica running a pre-#694
+    /// binary ignores this field and upserts, so the release carrying it is a whole-fleet upgrade.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub expect_absent: bool,
     pub op: ControlOp,
 }
 
@@ -879,6 +888,7 @@ mod tests {
             principal: None,
             issued_at_secs: 42,
             expected_revision: None,
+            expect_absent: false,
             op: ControlOp::DeleteImposter { port: 8080 },
         };
         let value = serde_json::to_value(&request).expect("serialize");
@@ -905,6 +915,7 @@ mod tests {
         // A conditioned envelope carries the expectation as a plain integer.
         let conditioned = ControlRequest {
             expected_revision: Some(17),
+            expect_absent: false,
             ..request
         };
         let value = serde_json::to_value(&conditioned).expect("serialize");
@@ -987,6 +998,7 @@ mod tests {
             principal: None,
             issued_at_secs: 0,
             expected_revision: None,
+            expect_absent: false,
             op: ControlOp::DeleteAll,
         };
         let value = serde_json::to_value(&request).expect("serialize");
@@ -1101,6 +1113,7 @@ mod tests {
             principal: None,
             issued_at_secs: 0,
             expected_revision: None,
+            expect_absent: false,
             op: ControlOp::ProxyRecorded {
                 port: 8080,
                 sig_hash: "00ab".to_owned(),
@@ -1138,6 +1151,37 @@ mod tests {
         assert_eq!(
             validate(&proxy_recorded_request(2 * 1024 * 1024).op),
             Ok(())
+        );
+    }
+
+    /// Pins D-111's replay compatibility: an unconditioned request carries no `expect_absent` key,
+    /// so every other entry's bytes are unchanged, and an entry written before the field decodes as
+    /// unconditional.
+    #[test]
+    fn expect_absent_is_absent_from_the_wire_unless_set() {
+        let plain = ControlRequest {
+            op_id: Uuid::nil(),
+            principal: None,
+            issued_at_secs: 7,
+            expected_revision: None,
+            expect_absent: false,
+            op: ControlOp::DeleteImposter { port: 8080 },
+        };
+        let wire = serde_json::to_value(&plain).expect("serialize");
+        assert_eq!(wire.get("expect_absent"), None, "{wire}");
+        let old: ControlRequest = serde_json::from_value(json!({
+            "op_id": Uuid::nil(), "issued_at_secs": 7, "op": { "DeleteImposter": { "port": 8080 } }
+        }))
+        .expect("a pre-#694 entry decodes");
+        assert!(!old.expect_absent);
+        assert_eq!(serde_json::to_value(&old).expect("serialize"), wire);
+        let set = ControlRequest {
+            expect_absent: true,
+            ..plain
+        };
+        assert_eq!(
+            serde_json::to_value(&set).expect("serialize")["expect_absent"],
+            json!(true)
         );
     }
 

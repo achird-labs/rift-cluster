@@ -1384,6 +1384,7 @@ fn bulky_request(port: u16, tag: &str, target_bytes: usize) -> ControlRequest {
         principal: None,
         issued_at_secs: 0,
         expected_revision: None,
+        expect_absent: false,
         op: rift_cluster::ControlOp::PutImposter {
             config: Box::new(config),
         },
@@ -1420,6 +1421,7 @@ async fn the_fleet_name_survives_a_node_restart() {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_or(0, |d| d.as_secs()),
             expected_revision: None,
+            expect_absent: false,
             op: rift_cluster::ControlOp::FleetNamePut {
                 name: "rift-prod-eu".to_owned(),
             },
@@ -1808,6 +1810,7 @@ async fn a_joiner_is_caught_up_by_a_multi_mebibyte_snapshot() {
                     principal: None,
                     issued_at_secs: 0,
                     expected_revision: None,
+                    expect_absent: false,
                     op: rift_cluster::ControlOp::FleetNamePut {
                         name: format!("snapshot-nudge-{nudges}"),
                     },
@@ -2836,6 +2839,7 @@ fn refused_put(port: u16) -> ControlRequest {
         principal: None,
         issued_at_secs: 0,
         expected_revision: None,
+        expect_absent: false,
         op: rift_cluster::ControlOp::PutImposter {
             config: Box::new(config),
         },

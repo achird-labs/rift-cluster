@@ -3588,6 +3588,7 @@ async fn a_parked_intent_replays_without_waiting_for_the_periodic_sweep() {
         principal: None,
         issued_at_secs: 0,
         expected_revision: None,
+        expect_absent: false,
         op: ControlOp::PutImposter {
             config: serde_json::from_value(minimal_imposter(port)).expect("config parses"),
         },
@@ -5362,6 +5363,7 @@ async fn a_refused_committed_config_is_named_and_the_door_still_refuses_it() {
             principal: None,
             issued_at_secs: 0,
             expected_revision: None,
+            expect_absent: false,
             op: ControlOp::PutImposter {
                 config: Box::new(config),
             },
@@ -5439,6 +5441,7 @@ async fn seed_refused(server: &ComposedServer, port: u16) {
         principal: None,
         issued_at_secs: 0,
         expected_revision: None,
+        expect_absent: false,
         op: ControlOp::PutImposter {
             config: Box::new(config),
         },
@@ -6126,6 +6129,7 @@ async fn an_unreplicable_parked_intent_is_retired() {
         principal: None,
         issued_at_secs: 0,
         expected_revision: None,
+        expect_absent: false,
         op: rift_cluster::ControlOp::PutImposter {
             config: Box::new(config),
         },
@@ -6141,4 +6145,135 @@ async fn an_unreplicable_parked_intent_is_retired() {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     server.shutdown().await;
+}
+
+fn stub_body_imposter(port: u16, body: &str) -> serde_json::Value {
+    json!({ "port": port, "protocol": "http",
+        "stubs": [{ "responses": [{ "is": { "statusCode": 200, "body": body } }] }] })
+}
+
+async fn first_stub_body(admin: std::net::SocketAddr, port: u16) -> serde_json::Value {
+    let got: serde_json::Value = reqwest::get(format!("http://{admin}/imposters/{port}"))
+        .await
+        .expect("get")
+        .json()
+        .await
+        .expect("json");
+    got["stubs"][0]["responses"][0]["is"]["body"].clone()
+}
+
+/// Pins D-111: `POST /imposters` is create-only. Over a committed port it answers standalone Rift's
+/// `400 Port N is already in use` and the first imposter stands; `POST` with `If-Match` remains a
+/// conditional replace (D-102's repair path).
+#[tokio::test]
+async fn posting_over_an_existing_port_is_refused() {
+    let _serial = TEST_LOCK.lock().await;
+    let state = TempDir::new().expect("tempdir");
+    let server = compose::start(cluster_cli(&state, &["--cluster-allow-solo"]))
+        .await
+        .expect("solo cluster starts");
+    wait_ready(&server).await;
+    let admin = server.admin_addr();
+    let port = reserve_port();
+    let client = reqwest::Client::new();
+    let post = |body: &str| {
+        client
+            .post(format!("http://{admin}/imposters"))
+            .json(&stub_body_imposter(port, body))
+    };
+
+    let created = post("A").send().await.expect("post");
+    assert_eq!(created.status().as_u16(), 201);
+    let revision = created
+        .headers()
+        .get("rift-cluster-revision")
+        .and_then(|v| v.to_str().ok())
+        .expect("revision header")
+        .to_owned();
+
+    let clash = post("B").send().await.expect("post");
+    assert_eq!(clash.status().as_u16(), 400);
+    let body: serde_json::Value = clash.json().await.expect("json");
+    assert_eq!(body["errors"][0]["type"], "bad data", "{body}");
+    assert_eq!(
+        body["errors"][0]["message"],
+        format!("Port {port} is already in use"),
+        "{body}"
+    );
+    assert_eq!(
+        first_stub_body(admin, port).await,
+        "A",
+        "the first imposter stands"
+    );
+
+    let replaced = post("C")
+        .header("if-match", revision)
+        .send()
+        .await
+        .expect("post");
+    assert_eq!(
+        replaced.status().as_u16(),
+        201,
+        "If-Match stays a conditional replace"
+    );
+    assert_eq!(first_stub_body(admin, port).await, "C");
+    server.shutdown().await;
+}
+
+/// Pins D-111: a retried create with the same `Idempotency-Key` is answered from the dedup table
+/// — `201` with the same revision — before the absent-port check could refuse it.
+#[tokio::test]
+async fn a_retried_create_is_still_201() {
+    let _serial = TEST_LOCK.lock().await;
+    let state = TempDir::new().expect("tempdir");
+    let server = compose::start(cluster_cli(&state, &["--cluster-allow-solo"]))
+        .await
+        .expect("solo cluster starts");
+    wait_ready(&server).await;
+    let admin = server.admin_addr();
+    let port = reserve_port();
+    let client = reqwest::Client::new();
+    let create = || {
+        client
+            .post(format!("http://{admin}/imposters"))
+            .header("idempotency-key", "create-once")
+            .json(&stub_body_imposter(port, "A"))
+            .send()
+    };
+    let first = create().await.expect("first");
+    let second = create().await.expect("retry");
+    assert_eq!(first.status().as_u16(), 201);
+    assert_eq!(second.status().as_u16(), 201);
+    assert_eq!(
+        first.headers().get("rift-cluster-revision"),
+        second.headers().get("rift-cluster-revision")
+    );
+    server.shutdown().await;
+}
+
+/// Pins D-111: the clash is judged by the log, not by the node that took the request. A create
+/// committed through the founder refuses an immediate create through the joiner, whatever the
+/// joiner has applied, because the joiner's op is ordered after the founder's.
+#[tokio::test]
+async fn a_create_clash_is_judged_by_the_log_not_the_receiving_node() {
+    let _serial = TEST_LOCK.lock().await;
+    let (_fs, founder, _js, joiner) = two_node_cluster().await;
+    let port = reserve_port();
+    let client = reqwest::Client::new();
+    let created = client
+        .post(format!("http://{}/imposters", founder.admin_addr()))
+        .json(&stub_body_imposter(port, "A"))
+        .send()
+        .await
+        .expect("post");
+    assert_eq!(created.status().as_u16(), 201);
+    let clash = client
+        .post(format!("http://{}/imposters", joiner.admin_addr()))
+        .json(&stub_body_imposter(port, "B"))
+        .send()
+        .await
+        .expect("post");
+    assert_eq!(clash.status().as_u16(), 400);
+    joiner.shutdown().await;
+    founder.shutdown().await;
 }

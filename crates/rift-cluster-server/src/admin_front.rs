@@ -1515,7 +1515,7 @@ async fn commit_new_session_key(
         return Err(refusal_response(&reason));
     }
     let op_id = Uuid::new_v4();
-    let request = mint(op_id, op, None);
+    let request = mint(op_id, op, Precondition::Unconditional);
     if let Err(e) = node.park_intent(&request) {
         return Err(typed_error(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -2706,6 +2706,7 @@ async fn terminate(
     };
 
     let is_batch = matches!(kind, Terminated::ReplaceAllImposters);
+    let create_only = matches!(kind, Terminated::Create);
     let mutation = match build_mutation(&state, &node, kind, &body, host.as_ref()).await {
         Ok(mutation) => mutation,
         Err(response) => return response,
@@ -2715,6 +2716,7 @@ async fn terminate(
         &node,
         mutation,
         is_batch,
+        create_only,
         host.as_ref(),
         idempotency.as_deref(),
         if_match.as_deref(),
@@ -2797,7 +2799,7 @@ async fn commit_teardown_half(
         return Err(refusal_response(&reason));
     }
     let op_id = Uuid::new_v4();
-    let request = mint(op_id, op, None);
+    let request = mint(op_id, op, Precondition::Unconditional);
     if let Err(e) = node.park_intent(&request) {
         return Err(typed_error(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -3009,6 +3011,8 @@ async fn run_mutation(
     // are labelled `imposter[{idx}]` (see `batch_indices` below). Passed by the caller that still
     // holds the `Terminated` kind.
     is_batch: bool,
+    // `POST /imposters`: create-only, judged by the state machine at the op's log position (D-111).
+    create_only: bool,
     host: Option<&HeaderValue>,
     idempotency: Option<&str>,
     if_match: Option<&str>,
@@ -3026,9 +3030,12 @@ async fn run_mutation(
     // actually stores: a single imposter, or (issue #210) the route
     // table. A mutation addressing neither is refused before anything is minted
     // or parked.
-    let expected_revision = match if_match {
-        Some(raw) => Some(parse_if_match(raw, precondition_port(&mutation)?)?),
-        None => None,
+    // `POST` with `If-Match` stays a conditional replace — the documented repair path for a
+    // committed config (D-102) — so only an unconditioned create is create-only.
+    let precondition = match if_match {
+        Some(raw) => Precondition::Revision(parse_if_match(raw, precondition_port(&mutation)?)?),
+        None if create_only => Precondition::Absent,
+        None => Precondition::Unconditional,
     };
 
     if !state.allow_injection {
@@ -3087,7 +3094,7 @@ async fn run_mutation(
         .ops
         .into_iter()
         .enumerate()
-        .map(|(index, op)| mint(op_id_for(base, index, total), op, expected_revision))
+        .map(|(index, op)| mint(op_id_for(base, index, total), op, precondition))
         .collect();
     // D-110: every op is sized before any is parked. A parked op that can never be proposed would
     // be replayed forever, and refusing them all together keeps a multi-op write atomic.
@@ -4391,7 +4398,23 @@ fn stored_config(node: &Arc<RaftNode>, port: u16) -> Result<ImposterConfig, Resp
         .map_err(|e| internal(&format!("stored config for {port}: {e}")))
 }
 
-fn mint(op_id: Uuid, op: ControlOp, expected_revision: Option<u64>) -> ControlRequest {
+/// What a minted op is conditioned on. One value, so a revision and an absence precondition cannot
+/// both be set at the door.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Precondition {
+    Unconditional,
+    /// `If-Match`: the addressed record's stored revision.
+    Revision(u64),
+    /// `POST /imposters`: the port has no imposter (D-111).
+    Absent,
+}
+
+fn mint(op_id: Uuid, op: ControlOp, precondition: Precondition) -> ControlRequest {
+    let (expected_revision, expect_absent) = match precondition {
+        Precondition::Unconditional => (None, false),
+        Precondition::Revision(revision) => (Some(revision), false),
+        Precondition::Absent => (None, true),
+    };
     // Pre-epoch clocks mint 0: only this op's dedup TTL weakens, never its
     // response (same reasoning as the node's own mint site).
     let issued_at_secs = std::time::SystemTime::now()
@@ -4409,6 +4432,7 @@ fn mint(op_id: Uuid, op: ControlOp, expected_revision: Option<u64>) -> ControlRe
         principal: None,
         issued_at_secs,
         expected_revision,
+        expect_absent,
         op,
     }
 }

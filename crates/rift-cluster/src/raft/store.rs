@@ -2239,6 +2239,52 @@ impl RedbStateMachine {
     /// `"corrupt stored record"` shape (and its 400 mapping) — corruption is
     /// not a revision conflict and must not read as one.
     #[allow(clippy::result_large_err)]
+    fn check_preconditions(
+        configs: &Table<'_, u16, &'static str>,
+        routes_revision: &Table<'_, &'static str, u64>,
+        request: &ControlRequest,
+    ) -> StorageResult<Result<(), String>> {
+        match (request.expected_revision, request.expect_absent) {
+            (None, false) => Ok(Ok(())),
+            (Some(expected), false) => {
+                Self::check_expected_revision(configs, routes_revision, &request.op, expected)
+            }
+            (None, true) => Self::check_expect_absent(configs, &request.op),
+            (Some(_), true) => Ok(Err(
+                "revision conflict: expect_absent and expected_revision cannot be combined"
+                    .to_owned(),
+            )),
+        }
+    }
+
+    /// `expect_absent` (#694, D-111): the op applies only if its imposter has no stored row, judged
+    /// here at the op's log position — never at the door, where a follower's applied state can be
+    /// stale and two concurrent creates would both pass. The refusal is upstream's
+    /// `ImposterError::PortInUse` text, which the front answers as `400 bad data`.
+    #[allow(clippy::result_large_err)]
+    fn check_expect_absent(
+        configs: &Table<'_, u16, &'static str>,
+        op: &ControlOp,
+    ) -> StorageResult<Result<(), String>> {
+        let io =
+            |e: redb::StorageError| StorageError::from(StorageIOError::write_state_machine(&e));
+        match control::precondition_target(op) {
+            Some(PreconditionTarget::Imposter(port)) => {
+                Ok(if configs.get(port).map_err(io)?.is_some() {
+                    Err(format!("Port {port} is already in use"))
+                } else {
+                    Ok(())
+                })
+            }
+            _ => Ok(Err(
+                "revision conflict: an absent-record precondition applies to single-imposter \
+                 operations only"
+                    .to_owned(),
+            )),
+        }
+    }
+
+    #[allow(clippy::result_large_err)]
     fn check_expected_revision(
         configs: &Table<'_, u16, &'static str>,
         routes_revision: &Table<'_, &'static str, u64>,
@@ -3554,27 +3600,13 @@ impl RaftStateMachine<TypeConfig> for RedbStateMachine {
 
                         let outcome = match control::validate(&request.op) {
                             Err(reason) => Err(reason),
-                            Ok(()) => match request.expected_revision {
-                                Some(expected) => match Self::check_expected_revision(
-                                    &configs,
-                                    &routes_revision,
-                                    &request.op,
-                                    expected,
-                                )? {
-                                    Err(reason) => Err(reason),
-                                    Ok(()) => Self::mutate_tables(
-                                        &mut configs,
-                                        &mut routes,
-                                        &mut routes_revision,
-                                        &mut session_key,
-                                        &mut fleet_name,
-                                        &mut proxy_recorded,
-                                        &request.op,
-                                        log_id.index,
-                                        degraded,
-                                    )?,
-                                },
-                                None => Self::mutate_tables(
+                            Ok(()) => match Self::check_preconditions(
+                                &configs,
+                                &routes_revision,
+                                &request,
+                            )? {
+                                Err(reason) => Err(reason),
+                                Ok(()) => Self::mutate_tables(
                                     &mut configs,
                                     &mut routes,
                                     &mut routes_revision,
@@ -4211,6 +4243,7 @@ mod tests {
             principal: None,
             issued_at_secs,
             expected_revision: None,
+            expect_absent: false,
             op,
         }
     }
@@ -6969,6 +7002,75 @@ mod tests {
         engine.shutdown().await;
     }
 
+    /// Pins D-111: `expect_absent` is judged inside apply, at the op's log position, so every
+    /// replica refuses an occupied port identically — with upstream's `PortInUse` words — and a
+    /// freed port admits the create again.
+    #[tokio::test]
+    async fn expect_absent_gates_apply_deterministically() {
+        let create = |op_id: u128, id: &str| ControlRequest {
+            expect_absent: true,
+            ..put(op_id, 8080, json!([{ "id": id }]))
+        };
+        let (_td, mut sm) = fresh_sm(None).await;
+        let (_td2, mut sm2) = fresh_sm(None).await;
+        for s in [&mut sm, &mut sm2] {
+            let created = s
+                .apply(vec![entry(1, create(1, "a"))])
+                .await
+                .expect("apply");
+            assert_eq!(
+                created,
+                vec![ControlResponse::applied(1)],
+                "a free port is created"
+            );
+        }
+        let refused = sm
+            .apply(vec![entry(2, create(2, "b"))])
+            .await
+            .expect("apply");
+        let refused2 = sm2
+            .apply(vec![entry(2, create(2, "b"))])
+            .await
+            .expect("apply");
+        assert_eq!(refused, refused2, "replicas must agree");
+        assert_eq!(
+            refused[0].outcome,
+            ControlOutcome::Failed {
+                reason: "Port 8080 is already in use".to_owned()
+            }
+        );
+        assert_eq!(
+            stored_stub_ids(&sm, 8080),
+            vec!["a"],
+            "the first imposter stands"
+        );
+
+        sm.apply(vec![entry(
+            3,
+            request(3, ControlOp::DeleteImposter { port: 8080 }),
+        )])
+        .await
+        .expect("delete");
+        let recreated = sm
+            .apply(vec![entry(4, create(4, "c"))])
+            .await
+            .expect("apply");
+        assert_eq!(recreated, vec![ControlResponse::applied(4)]);
+        assert_eq!(stored_stub_ids(&sm, 8080), vec!["c"]);
+
+        let both = ControlRequest {
+            expected_revision: Some(4),
+            ..create(5, "d")
+        };
+        match &sm.apply(vec![entry(5, both)]).await.expect("apply")[0].outcome {
+            ControlOutcome::Failed { reason } => {
+                assert!(reason.starts_with("revision conflict"), "{reason}");
+            }
+            other => panic!("both preconditions must be refused, got {other:?}"),
+        }
+        assert_eq!(stored_stub_ids(&sm, 8080), vec!["c"]);
+    }
+
     /// #46 gate: the expected-revision precondition is checked inside apply,
     /// so every replica computes the identical refusal from the same entry.
     #[tokio::test]
@@ -7068,6 +7170,7 @@ mod tests {
 
         let stale = |op_id: u128| ControlRequest {
             expected_revision: Some(99),
+            expect_absent: false,
             ..request(
                 op_id,
                 ControlOp::SetEnabled {
@@ -9064,6 +9167,7 @@ mod tests {
                 3,
                 ControlRequest {
                     expected_revision: Some(0),
+                    expect_absent: false,
                     ..put_routes(3, vec![test_route("clobber", 9)])
                 },
             )])

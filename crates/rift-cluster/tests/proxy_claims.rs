@@ -157,6 +157,7 @@ fn mint(op: rift_cluster::ControlOp) -> ControlRequest {
         principal: None,
         issued_at_secs: now_secs(),
         expected_revision: None,
+        expect_absent: false,
         op,
     }
 }

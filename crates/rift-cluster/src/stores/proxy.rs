@@ -427,6 +427,7 @@ impl ProxyNet {
             principal: None,
             issued_at_secs: now_secs(),
             expected_revision: None,
+            expect_absent: false,
             op: ControlOp::ProxyRecorded {
                 port: req.port,
                 sig_hash: req.sig_hash.clone(),
@@ -969,6 +970,7 @@ impl ClusterProxyStore {
                     principal: None,
                     issued_at_secs: now_secs(),
                     expected_revision: None,
+                    expect_absent: false,
                     op: ControlOp::ProxyRecorded {
                         port,
                         // proxyAlways merges by predicate equality at apply; the marker row
@@ -1040,6 +1042,7 @@ fn recording_fits(
         principal: None,
         issued_at_secs: 0,
         expected_revision: None,
+        expect_absent: false,
         op: ControlOp::ProxyRecorded {
             port,
             sig_hash: sig_hash(sig),
