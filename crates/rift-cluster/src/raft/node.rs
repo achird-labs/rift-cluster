@@ -1606,6 +1606,7 @@ impl RaftNode {
             principal: None,
             issued_at_secs,
             expected_revision: None,
+            expect_absent: false,
             op: ControlOp::PutImposter {
                 config: Box::new(config),
             },
@@ -4196,6 +4197,7 @@ mod tests {
                 principal: None,
                 issued_at_secs: 0,
                 expected_revision: None,
+                expect_absent: false,
                 op: ControlOp::PutImposter {
                     config: Box::new(imposter(8080, "never-lands")),
                 },

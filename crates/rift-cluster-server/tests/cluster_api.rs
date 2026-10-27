@@ -219,6 +219,7 @@ async fn ops_endpoint_reports_applied_pending_and_unknown() {
             principal: None,
             issued_at_secs: 0,
             expected_revision: None,
+            expect_absent: false,
             op: ControlOp::PutImposter {
                 config: serde_json::from_value(
                     serde_json::json!({ "port": 4546, "protocol": "http" }),
@@ -252,6 +253,7 @@ async fn ops_endpoint_reports_applied_pending_and_unknown() {
             principal: None,
             issued_at_secs: 0,
             expected_revision: None,
+            expect_absent: false,
             op: ControlOp::FleetNamePut {
                 name: String::new(),
             },
@@ -277,6 +279,7 @@ async fn ops_endpoint_reports_applied_pending_and_unknown() {
             principal: None,
             issued_at_secs: 0,
             expected_revision: None,
+            expect_absent: false,
             op: ControlOp::DeleteImposter { port: 4547 },
         })
         .expect("park");

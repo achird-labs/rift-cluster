@@ -1100,6 +1100,8 @@ async fn bootstrap_imposters(
                     .map(|d| d.as_secs())
                     .unwrap_or(0),
                 expected_revision: None,
+                // The bootstrap stays an upsert: a changed document re-applies on boot (D-111).
+                expect_absent: false,
                 op: ControlOp::PutImposter {
                     config: Box::new(config),
                 },

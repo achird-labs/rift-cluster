@@ -554,14 +554,15 @@ async fn the_node_rebinds_and_clears_the_failure_once_the_port_frees_up() {
 
     drop(blocker);
 
-    // Any subsequent apply re-attempts the bind. A stub edit is the cheapest way to provoke one
-    // without changing what the imposter serves.
+    // Any subsequent apply re-attempts the bind. Re-putting the same config is the cheapest way to
+    // provoke one without changing what the imposter serves — through `PUT /imposters`, the
+    // replace surface, since `POST` is create-only (D-111).
     let deadline = std::time::Instant::now() + Duration::from_secs(20);
     loop {
         Seen::of(
             reqwest::Client::new()
-                .post(format!("http://{admin}/imposters"))
-                .json(&imposter(port, "healed"))
+                .put(format!("http://{admin}/imposters"))
+                .json(&json!({ "imposters": [imposter(port, "healed")] }))
                 .send()
                 .await
                 .expect("post imposter"),

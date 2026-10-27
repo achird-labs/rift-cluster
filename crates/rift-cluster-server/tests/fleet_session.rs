@@ -85,6 +85,7 @@ async fn seed(node: &RaftNode, op_id: u128, op: ControlOp) {
             principal: None,
             issued_at_secs: 0,
             expected_revision: None,
+            expect_absent: false,
             op,
         })
         .await

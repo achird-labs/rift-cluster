@@ -24,7 +24,7 @@ export interface paths {
         put: operations["replaceAllImposters"];
         /**
          * Create a clustered imposter
-         * @description Terminates: commits a `PutImposter` op and answers `201` rendered from re-reading the just-applied state. The port must be given explicitly in the body — an auto-assigned port cannot replicate across the fleet. May answer `202` with an op id under `--cluster-admin-async`. Carries a port, so it honours `If-Match` like any other single-imposter write.
+         * @description Terminates: commits a `PutImposter` op and answers `201` rendered from re-reading the just-applied state. The port must be given explicitly in the body — an auto-assigned port cannot replicate across the fleet. May answer `202` with an op id under `--cluster-admin-async`. Create-only, as on standalone Rift and Mountebank: a port that already has an imposter answers `400` `Port N is already in use`, judged by the state machine at the op's log position, so it holds whichever node takes the request (D-111). `PUT /imposters` is the replace surface. Carries a port, so it honours `If-Match`; with `If-Match` it is a conditional replace of the imposter at that revision.
          */
         post: operations["createImposter"];
         /**

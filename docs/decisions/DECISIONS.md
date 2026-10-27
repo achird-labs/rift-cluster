@@ -5170,3 +5170,35 @@ Until #690 removes the expansion, a recordable proxied body tops out at ~1.6 MiB
 (text), and configs that serialize over 8 MiB — which the front's 16 MiB body cap used to admit — are
 refused.
 
+### D-111 — `POST /imposters` is create-only, judged by the state machine at the op's log position
+
+- **Status:** active
+- **Decided:** 2026-10-27 · #694
+- **Implemented by:** #694
+- **Code:** crates/rift-cluster/src/control.rs, crates/rift-cluster/src/raft/store.rs, crates/rift-cluster-server/src/admin_front.rs
+
+`POST /imposters` over a port that already had an imposter replaced it and answered `201`.
+Standalone Rift refuses it (`ImposterError::PortInUse`, `400 Port N is already in use`), and so does
+Mountebank. The console's create dialog already relied on the server refusing. A client that relies
+on that 400 to detect a port clash would instead silently overwrite another test's imposter, and every
+proxyOnce recording on the port with it.
+
+**`POST /imposters` refuses an occupied port.** The front mints the create with a new envelope field,
+`ControlRequest.expect_absent`. The state machine judges it at the op's log position, next to the
+`expected_revision` check: after validation and after the dedup lookup, so an `Idempotency-Key` retry
+still answers its original `201`. The refusal is upstream's words, answered `400 bad data`.
+
+- **Other surfaces are unchanged.** `POST` with `If-Match` remains a conditional replace (D-102's
+  repair path) and `PUT /imposters` remains the replace-all surface. The `--imposters` bootstrap,
+  which submits `PutImposter` itself, stays an upsert.
+- **On the wire:** the field is skipped when `false`, so every other entry is byte-identical and an
+  older entry decodes as unconditional. Both preconditions on one op are refused at apply; the door's
+  `Precondition` enum cannot mint that combination.
+- **Rejected alternatives:**
+  - A door check against local state: a follower's applied state can be stale, and two concurrent
+    creates would both pass (#683's reasoning for DELETE).
+  - `expected_revision: Some(0)` as "absent": it would give a client-visible token a second meaning
+    and change the outcome of historic `If-Match: P@0` entries.
+- **Mixed versions:** a pre-#694 replica ignores the field and upserts, so the release that carries it
+  is a whole-fleet upgrade (D-98).
+
