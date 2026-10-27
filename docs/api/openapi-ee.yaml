@@ -679,7 +679,10 @@ paths:
       - name: stubIndex
         in: path
         required: true
-        description: Zero-based position of the stub in the imposter's stub list.
+        description: >
+          Zero-based position of the stub in the imposter's stub list, as its canonical
+          decimal. Any other spelling (`01`, `+1`, `1.0`, `-1`) names no stub and is answered
+          like an out-of-range index (rift#1552).
         schema:
           type: integer
           minimum: 0
@@ -689,7 +692,8 @@ paths:
       description: >
         Terminates: index-addressed, so it commits as a full `PutImposter`
         of the stored config with that one stub replaced. Answers `404`
-        if `stubIndex` is out of range.
+        `bad data` (Mountebank's `'stubIndex' must be a valid integer…`) if
+        `stubIndex` names no current stub, judged before the body is read.
       tags: [imposters]
       x-rift-origin: ee
       parameters:
@@ -725,7 +729,9 @@ paths:
         '403':
           $ref: '#/components/responses/Forbidden'
         '404':
-          description: No such imposter on this port, or no such stub index.
+          description: >
+            No such imposter on this port (`no such resource`), or a `stubIndex`
+            that names no current stub (`bad data`, Mountebank's message).
           content:
             application/json:
               schema:
@@ -745,7 +751,8 @@ paths:
       summary: Delete the stub at an index
       description: >
         Terminates: index-addressed, commits as a full `PutImposter` with
-        that stub removed. Answers `404` if `stubIndex` is out of range.
+        that stub removed. Answers `404` `bad data` if `stubIndex` names no
+        current stub.
       tags: [imposters]
       x-rift-origin: ee
       parameters:
@@ -773,7 +780,9 @@ paths:
         '403':
           $ref: '#/components/responses/Forbidden'
         '404':
-          description: No such imposter on this port, or no such stub index.
+          description: >
+            No such imposter on this port (`no such resource`), or a `stubIndex`
+            that names no current stub (`bad data`, Mountebank's message).
           content:
             application/json:
               schema:
@@ -806,7 +815,9 @@ paths:
         '403':
           $ref: '#/components/responses/Forbidden'
         '404':
-          description: No such imposter on this port, or no such stub index.
+          description: >
+            No such imposter on this port (`no such resource`), or a `stubIndex`
+            that names no current stub (`bad data`, Mountebank's message).
           content:
             application/json:
               schema:

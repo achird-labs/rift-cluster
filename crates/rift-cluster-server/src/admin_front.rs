@@ -453,8 +453,10 @@ pub(crate) enum Terminated {
     DeleteImposter(u16),
     AddStub(u16),
     ReplaceStubs(u16),
-    ReplaceStubAt(u16, usize),
-    DeleteStubAt(u16, usize),
+    /// The index segment as written: the front judges it as upstream does (rift#1552), which a
+    /// pre-parsed number could not, since `01` and `1` parse alike.
+    ReplaceStubAt(u16, String),
+    DeleteStubAt(u16, String),
     ReplaceStubById(u16, String),
     DeleteStubById(u16, String),
     SetEnabled(u16, bool),
@@ -670,14 +672,13 @@ pub(crate) fn classify(method: &Method, path: &str) -> Option<Terminated> {
             Method::DELETE => Some(Terminated::DeleteStubById(port, (*id).to_owned())),
             _ => None,
         },
-        [_, "stubs", index] => {
-            let index: usize = index.parse().ok()?;
-            match *method {
-                Method::PUT => Some(Terminated::ReplaceStubAt(port, index)),
-                Method::DELETE => Some(Terminated::DeleteStubAt(port, index)),
-                _ => None,
-            }
-        }
+        // Every segment, as upstream routes it (`StubByIndex(String)`): one that names no current
+        // stub is answered here with Mountebank's 404, not proxied or read as a nearby number.
+        [_, "stubs", index] if !index.is_empty() => match *method {
+            Method::PUT => Some(Terminated::ReplaceStubAt(port, (*index).to_owned())),
+            Method::DELETE => Some(Terminated::DeleteStubAt(port, (*index).to_owned())),
+            _ => None,
+        },
         _ => None,
     }
 }
@@ -4034,20 +4035,18 @@ async fn build_mutation(
             config.stubs = replace.stubs;
             Ok(put_config_mutation(port, config, Admit::Content))
         }
+        // Upstream's order (rift#1552): the imposter, then the index, then the body — so an index
+        // that names no stub is a 404 whatever the body holds.
         Terminated::ReplaceStubAt(port, index) => {
-            let stub: Stub = parse(body, STUB_DOOR)?;
             let mut config = stored_config(node, port)?;
-            if index >= config.stubs.len() {
-                return Err(stub_index_missing(index));
-            }
+            let index = stub_position(&index, config.stubs.len()).ok_or_else(bad_stub_index)?;
+            let stub: Stub = parse(body, STUB_DOOR)?;
             config.stubs[index] = stub;
             Ok(put_config_mutation(port, config, Admit::Content))
         }
         Terminated::DeleteStubAt(port, index) => {
             let mut config = stored_config(node, port)?;
-            if index >= config.stubs.len() {
-                return Err(stub_index_missing(index));
-            }
+            let index = stub_position(&index, config.stubs.len()).ok_or_else(bad_stub_index)?;
             config.stubs.remove(index);
             // Commits as a whole-config put, but it only removes: exempt, so it can strip the
             // stub a refused config is refused for (D-104).
@@ -4753,11 +4752,25 @@ fn refusal_response(reason: &str) -> Response<FrontBody> {
     }
 }
 
-fn stub_index_missing(index: usize) -> Response<FrontBody> {
+/// Mountebank's words for an index that names no current stub, as upstream's handler answers.
+const STUB_INDEX_MESSAGE: &str = "'stubIndex' must be a valid integer, representing the array \
+                                  index position of the stub to replace";
+
+/// A stub index as Mountebank and upstream read one (rift#1552): the canonical decimal of an
+/// existing position. `01`, `+1`, `-0`, `1.0`, an overflow and an out-of-range number name no
+/// stub. Upstream's own helper is crate-private, so this is a copy; the test table is upstream's.
+fn stub_position(raw: &str, len: usize) -> Option<usize> {
+    // Domain-optional parse: a segment that is not a decimal names no position.
+    let n: usize = raw.parse().ok()?;
+    (n.to_string() == raw && n < len).then_some(n)
+}
+
+/// Mountebank's `404 bad data` for an index that names no current position.
+fn bad_stub_index() -> Response<FrontBody> {
     typed_error(
         StatusCode::NOT_FOUND,
-        ErrorKind::NoSuchResource,
-        &format!("no stub at index {index}"),
+        ErrorKind::BadData,
+        STUB_INDEX_MESSAGE,
     )
 }
 
@@ -7464,5 +7477,64 @@ mod tests {
             });
             assert_eq!(admission_refusal(&op, Some("not json")), None);
         }
+    }
+
+    /// rift#1552 / #707: only the canonical decimal of an existing position names a stub, as
+    /// upstream's `stub_position` and Mountebank read one. The table is upstream's own.
+    #[test]
+    fn stub_position_accepts_only_a_canonical_existing_position() {
+        assert_eq!(stub_position("0", 2), Some(0));
+        assert_eq!(stub_position("1", 2), Some(1));
+        for raw in [
+            "2",
+            "5",
+            "01",
+            "00",
+            "+1",
+            "-0",
+            "-1",
+            "1.0",
+            " 1",
+            "abc",
+            "length",
+            "",
+            "18446744073709551616",
+        ] {
+            assert_eq!(stub_position(raw, 2), None, "{raw:?}");
+        }
+        assert_eq!(stub_position("0", 0), None);
+    }
+
+    /// #707: every PUT/DELETE on `stubs/{segment}` terminates with the raw segment, so the front
+    /// judges it as upstream does; before, a non-decimal segment fell through to the proxy and
+    /// `01`/`+1` were silently read as stub 1. GET stays proxied, and `by-id` still wins.
+    #[test]
+    fn every_stub_index_segment_terminates_with_its_raw_spelling() {
+        for raw in ["0", "01", "+1", "abc", "-1", "1.0"] {
+            let path = format!("/imposters/4545/stubs/{raw}");
+            assert!(
+                matches!(
+                    classify(&Method::PUT, &path),
+                    Some(Terminated::ReplaceStubAt(4545, ref seen)) if seen == raw
+                ),
+                "PUT {path}"
+            );
+            assert!(
+                matches!(
+                    classify(&Method::DELETE, &path),
+                    Some(Terminated::DeleteStubAt(4545, ref seen)) if seen == raw
+                ),
+                "DELETE {path}"
+            );
+            assert!(classify(&Method::GET, &path).is_none(), "GET {path}");
+        }
+        assert!(matches!(
+            classify(&Method::PUT, "/imposters/4545/stubs/by-id/x"),
+            Some(Terminated::ReplaceStubById(4545, _))
+        ));
+        assert!(
+            classify(&Method::PUT, "/imposters/4545/stubs/").is_none(),
+            "an empty segment is no stub route, as upstream's router has it"
+        );
     }
 }
