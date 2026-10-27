@@ -342,6 +342,7 @@ stateDiagram-v2
     Pending --> Recorded : complete(token) —<br/>only AFTER the recorded stub's<br/>config write is acknowledged
     Pending --> Unclaimed : release(token) on upstream failure<br/>· or deadline expiry (fixed TTL, default 60 s)
     Recorded --> [*] : replicated fact —<br/>all future hits replay locally
+    Recorded --> Unclaimed : its recorded stub removed or changed<br/>(PatchStubs / PutImposter apply, D-108)<br/>· imposter delete · savedProxyResponses clear
 
     note right of Pending
         Pending is owner-local and dies with
