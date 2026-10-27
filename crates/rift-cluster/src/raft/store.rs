@@ -6020,7 +6020,8 @@ mod tests {
 
     /// Pins D-102: a behaviors shape a door refuses since rift#1582, which every earlier engine
     /// stored, still replays from the log, passes the drive's admission check, is served, and keys
-    /// the same on every parse (#714).
+    /// the same on every parse (#714). Pins D-98 for rift#1672 (#717) too: a stored element-level
+    /// `repeat` replays and keys stably, though it no longer counts as the response's repeat.
     #[tokio::test]
     async fn behaviors_shapes_older_engines_stored_still_replay_and_serve() {
         let engine = Arc::new(ImposterManager::new());
@@ -6038,6 +6039,9 @@ mod tests {
             with(json!({ "_behaviors": { "repeat": null } })),
             with(json!({ "behaviors": [{ "wait": 1 }, { "repeat": 2 }] })),
             with(json!({ "behaviors": [{ "wait": 1 }, { "nosuch": 1 }] })),
+            // rift#1672 (#717): an element-level `repeat` beside a behavior is now an inert custom
+            // key, not the response's repeat count — still a shape the log may hold.
+            with(json!({ "behaviors": [{ "wait": 1, "repeat": 3 }] })),
         ];
         for (offset, response) in shapes.into_iter().enumerate() {
             let port = 18520 + u16::try_from(offset).expect("small");

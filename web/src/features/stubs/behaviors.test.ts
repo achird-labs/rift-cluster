@@ -98,6 +98,15 @@ describe("AC1 — wait and repeat round-trip in whichever of the three spellings
     expect(projected.kind).toBe("rawOnly");
   });
 
+  it("keeps an element-level repeat beside a behavior raw-only (rift#1672)", () => {
+    // `[{wait, repeat}]`: the repeat is an inert custom key there, never the response's count, so
+    // the form must not read it as one.
+    const projected = projectResponses({
+      responses: [{ is: { statusCode: 200 }, behaviors: [{ wait: 1, repeat: 3 }] }],
+    });
+    expect(projected.kind).toBe("rawOnly");
+  });
+
   it("names a response-level repeat that is not a number", () => {
     for (const repeat of [null, "2"]) {
       expect(projectResponses({ responses: [{ is: { statusCode: 200 }, repeat }] }).kind).toBe("rawOnly");
