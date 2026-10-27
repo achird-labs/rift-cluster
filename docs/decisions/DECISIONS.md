@@ -3070,6 +3070,10 @@ it is a deployment rule: **the hostname serving the console must not also serve 
 (`docs/architecture/10-operations.md` §`POST /session`).
 
 ### D-74 — Verification is per node: the request journal is upstream's own, `numberOfRequests` is the answering node's count, and `Rift-Cluster-Partial` is stamped only on reads that genuinely fan out
+> **Amended by D-123** (2026-10-27, #687): retention is no longer upstream's
+> `MAX_RECORDED_REQUESTS = 10_000` per port. Since rift#1458 it is `--journal-max-bytes` per imposter,
+> oldest evicted first, and a body larger than the budget is recorded with `_bodyOmitted: true`. It is
+> still upstream's own journal.
 
 - **Status:** amended
 - **Decided:** 2026-09-08 · RFC-007 §3.2 · #552
@@ -5605,4 +5609,41 @@ configurations are rare in record/replay setups, which usually have one catch-al
 
   That keeps one committed op per recording, so D-40 holds. It costs a decode widening (D-106) and
   an upstream change. Revisit if a user hits the case.
+
+### D-123 — A clustered node honours rift's body ceiling, body budget and journal budget; the chart sizes them to the pod
+
+- **Status:** active
+- **Decided:** 2026-10-27 · #687 (implemented by #718)
+- **Implemented by:** #718, #687
+- **Code:** crates/rift-cluster-server/src/compose.rs, deploy/helm/rift-cluster/values.yaml, deploy/helm/rift-cluster/templates/statefulset.yaml, crates/rift-cluster-server/tests/manager_parity.rs
+
+rift#1439 and #1441 replace the engine's fixed caps (10 MiB data plane, 10 MiB proxy response,
+64 MiB admin, 10 000 journal entries) with `--max-body-size`, `--body-memory-budget` and
+`--journal-max-bytes`. The defaults are sized for Mountebank parity: 512 MiB, 1 GiB and 768 MiB
+per imposter. Upstream applies them only to the manager its own `ServerBuilder` builds. A clustered
+node injects its own, so before #718 it parsed the flags and silently ran the defaults, which
+exceed a 1Gi pod by themselves.
+
+**`cluster_manager` mirrors both builder calls** (`with_body_limits(body_limits_from(...))`,
+`with_journal_max_bytes(...)`) from the same flags, with upstream's own validation, as D-103 mirrors
+upstream's other manager defaults. `manager_parity.rs` requires both calls.
+
+**The chart sizes them to the pod** through `RIFT_MAX_BODY_SIZE`, `RIFT_BODY_MEMORY_BUDGET` and
+`RIFT_JOURNAL_MAX_BYTES`, from `limits`:
+
+| Profile | Body ceiling | Body budget | Journal budget |
+|---|---|---|---|
+| 1Gi (default) | 64 MiB | 256 MiB | 64 MiB |
+| `values-onprem.yaml` (2Gi) | 128 MiB | 512 MiB | 128 MiB |
+
+- The budget is 25% of the pod and admits four max-size bodies at once. The ceiling equals
+  rift's old admin cap, so no admin body that worked before starts failing.
+- The journal budget is per **recording** imposter and outside the body budget, so N recording
+  imposters cost up to N × the budget. 64 MiB was kept over a tighter 32 MiB because it holds
+  thousands of typical requests. A body over the budget is still recorded, flagged `_bodyOmitted`.
+
+These limits protect one node (D-71). The admin plane's own bound is D-109 (16 MiB at the front),
+and the Raft log's is D-110 (8 MiB per serialized entry). The sizing is not yet backed by a measured
+RSS profile of a ~1000-imposter fleet under concurrent max-size bodies; record those numbers here
+when they exist, and lower the budget, not the ceiling, if they do not fit.
 

@@ -520,3 +520,16 @@ fn cluster_manager_registers_the_sequencer() {
         "without a registered sequencer the engine would persist and resume cursors per node"
     );
 }
+
+/// Pins D-123: a clustered node runs the operator's body ceiling, body budget and journal budget,
+/// not upstream's Mountebank-parity defaults — `cluster_manager` makes both builder calls.
+#[test]
+fn cluster_manager_mirrors_the_body_and_journal_limits() {
+    let calls = builder_calls(&cluster_manager_body());
+    for call in ["with_body_limits", "with_journal_max_bytes"] {
+        assert!(
+            calls.contains(call),
+            "{call} missing from cluster_manager: {calls:?}"
+        );
+    }
+}
