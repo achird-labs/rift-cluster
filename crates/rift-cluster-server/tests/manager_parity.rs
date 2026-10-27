@@ -510,3 +510,13 @@ fn a_new_upstream_call_would_be_caught() {
          does not make"
     );
 }
+
+/// Pins D-8 / D-47 by mechanism: `cluster_manager` registers a sequencer, which is what keeps the
+/// engine's datadir cursor file (rift#1603) from being written or resumed on a cluster node.
+#[test]
+fn cluster_manager_registers_the_sequencer() {
+    assert!(
+        builder_calls(&cluster_manager_body()).contains("with_sequencer"),
+        "without a registered sequencer the engine would persist and resume cursors per node"
+    );
+}
