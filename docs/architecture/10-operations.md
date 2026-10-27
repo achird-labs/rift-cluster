@@ -391,10 +391,15 @@ The bump to rift **master `7161b1a`** (past v0.23.0) is all three again, and mor
   once.
 - **Matching.** Repeated query, form and header keys and JSON body predicates follow Mountebank's
   array, null and number rules (rift#1553, #1630).
-- **Admission.** A path in `proxy.to`, a response with two types or none, text predicates on a
+- **Admission.** A path in `proxy.to` or a `to` that is not a URL, a response with two types or none, text predicates on a
   binary-mode imposter and door-only behavior shapes are refused (rift#1550, #1551, #1578, #1582).
 - **Responses.** A `_behaviors` block beside `behaviors` or a top-level `repeat` is ignored, as in
-  Mountebank (rift#1709); old nodes still run it.
+  Mountebank (rift#1709); old nodes still run it. A proxy forwards to `to`'s origin plus the
+  request's own path and query (rift#1550; `defaultForward` keeps its base path): a stored `to`
+  that carried a query or userinfo no longer sends it, and userinfo is no longer sent as
+  `Authorization` (use `injectHeaders`). A committed `to` with a path, or one that is not a URL, is
+  refused on its port (D-102); re-`PUT` it as an origin, with `pathRewrite` if the upstream needs
+  the prefix.
 - **Decode.** A `copy`/`lookup` token in `is.statusCode` (rift#1558) cannot be decoded by an older
   node at all. Take no config writes until every node runs the new binary.
 - **Listeners (D-103).** With no `--host`, the admin front and host-less imposters listen dual-stack

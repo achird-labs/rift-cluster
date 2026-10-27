@@ -5887,6 +5887,55 @@ mod tests {
         engine.shutdown().await;
     }
 
+    /// Pins D-102: a `proxy.to` with a path, refused at admission since rift#1550 and admitted by
+    /// every earlier engine, is a per-port refusal at the drive, never a decode failure: the row
+    /// keeps the committed bytes, and the ports around it are served.
+    #[tokio::test]
+    async fn a_committed_proxy_to_with_a_path_refuses_only_its_own_port() {
+        let engine = Arc::new(ImposterManager::new());
+        let (_td, mut sm) = fresh_sm(Some(engine.clone())).await;
+        apply_one(&mut sm, 1, put(1, 18515, json!([{ "id": "a" }]))).await;
+
+        let body = json!({
+            "port": 18516,
+            "protocol": "http",
+            "host": "127.0.0.1",
+            "stubs": [{ "id": "p", "responses": [{ "proxy": { "to": "http://h/x" } }] }],
+        })
+        .to_string();
+        assert!(
+            serde_json::from_str::<ImposterConfig>(&body).is_err(),
+            "precondition: this engine's door refuses a path in proxy.to"
+        );
+        let committed =
+            crate::control::decode_committed_config(&body).expect("replay still decodes it");
+        let applied = apply_one(&mut sm, 2, put_config(2, committed)).await;
+        assert_eq!(applied, ControlResponse::applied(2), "the log commits it");
+
+        assert!(
+            engine.get_imposter(18515).is_ok(),
+            "the other port is served"
+        );
+        assert!(
+            engine.get_imposter(18516).is_err(),
+            "the refused config is not served"
+        );
+        let reason = sm.config_refusal(18516).expect("read").expect("refused");
+        assert_eq!(reason, "proxy.to must not contain a path '/x'");
+        let row = sm.read_config(18516).expect("read").expect("row");
+        let row: serde_json::Value = serde_json::from_str(&row).expect("the row is JSON");
+        assert_eq!(
+            row["stubs"][0]["responses"][0]["proxy"]["to"], "http://h/x",
+            "the committed `to` is kept as written"
+        );
+
+        apply_one(&mut sm, 3, put(3, 18517, json!([{ "id": "c" }]))).await;
+        assert!(engine.get_imposter(18517).is_ok(), "a later put is served");
+        assert!(sm.apply_failures().is_empty(), "{:?}", sm.apply_failures());
+
+        engine.shutdown().await;
+    }
+
     /// Pins D-102 (#657): a refused config committed over a live imposter does not tear it down —
     /// the port keeps serving its last-known config, the invariant the whole-set refusal existed
     /// for — while the table records what the fleet committed.

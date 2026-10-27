@@ -1012,6 +1012,22 @@ mod tests {
         let config = decode_committed_config(&body).expect("replay decodes it");
         assert_eq!(config.stubs.len(), 1);
         assert_eq!(config.stubs[0].id.as_deref(), Some("b"));
+        // rift#1550: a path in `proxy.to`, or a `to` that is no URL, is a door-and-admission
+        // refusal that every earlier engine admitted, so it must replay.
+        for (to, door) in [
+            ("http://h/x", "proxy.to must not contain a path '/x'"),
+            ("not a url", "proxy.to is not a valid URL: not a url"),
+        ] {
+            let body = json!({ "port": 8080, "protocol": "http",
+                "stubs": [{ "responses": [{ "proxy": { "to": to } }] }] })
+            .to_string();
+            let refused = serde_json::from_str::<ImposterConfig>(&body)
+                .expect_err("the door refuses it")
+                .to_string();
+            assert!(refused.contains(door), "{refused}");
+            let config = decode_committed_config(&body).expect("replay decodes it");
+            assert_eq!(config.stubs.len(), 1, "{to}");
+        }
     }
 
     #[test]
