@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { formatQuery, page, readLog } from "./source.ts";
+import { formatQuery, missingBodyNote, page, readLog } from "./source.ts";
 
 describe("readLog", () => {
   it("reads the bare array the endpoint serves", () => {
@@ -52,5 +52,22 @@ describe("formatQuery", () => {
   it("says (none) for an empty or missing query", () => {
     expect(formatQuery({})).toBe("(none)");
     expect(formatQuery(undefined)).toBe("(none)");
+  });
+});
+
+describe("missingBodyNote", () => {
+  // rift#1584: the only way `body` is absent is a declared gzip/br body that did not decode.
+  it("names the encoding that did not decode, reading the header case-insensitively", () => {
+    expect(missingBodyNote({ "Content-Encoding": "br" })).toBe(
+      "Body not recorded: it did not decode as br",
+    );
+    expect(missingBodyNote({ "content-encoding": ["gzip"] })).toBe(
+      "Body not recorded: it did not decode as gzip",
+    );
+  });
+
+  it("falls back to a neutral note when no encoding was declared (an older journal)", () => {
+    expect(missingBodyNote({ accept: "*/*" })).toBe("No body recorded");
+    expect(missingBodyNote(undefined)).toBe("No body recorded");
   });
 });

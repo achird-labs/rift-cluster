@@ -1054,7 +1054,7 @@ export interface components {
         };
         /**
          * @description One request an imposter recorded, exactly as the engine serializes it (upstream `rift-mock-core::imposter::types::RecordedRequest`). Non-exhaustive.
-         *     Three fields do not follow the obvious Rust-to-JSON mapping, and each one has bitten a client. `_mode` keeps its leading underscore — an explicit serde rename that overrides the struct's camelCase rule — and is omitted entirely for a text body, so `binary` is the only value that ever reaches the wire. `body` is absent when the request carried none. And a `headers` value is a **bare string** when the header carried a single value, an array only when it carried several; a key whose value list is empty is dropped rather than emitted as `[]`.
+         *     Three fields do not follow the obvious Rust-to-JSON mapping, and each one has bitten a client. `_mode` keeps its leading underscore — an explicit serde rename that overrides the struct's camelCase rule — and is omitted entirely for a text body, so `binary` is the only value that ever reaches the wire. A request that sent no body records `body: ""`; `body` is absent only when a declared gzip/br body did not decode (rift#1584). And a `headers` value is a **bare string** when the header carried a single value, an array only when it carried several; a key whose value list is empty is dropped rather than emitted as `[]`.
          */
         RecordedRequest: {
             /**
@@ -1074,7 +1074,7 @@ export interface components {
             headers: {
                 [key: string]: string | string[];
             };
-            /** @description The request body, absent when there was none. Base64-encoded when `_mode` is `binary`; UTF-8 text otherwise. */
+            /** @description The request body: `""` when the request sent none, decoded when it arrived as gzip/br that decodes, and absent only when the request declared `Content-Encoding: gzip` or `br` and the body did not decode (Mountebank's undefined body, rift#1584). Base64-encoded when `_mode` is `binary`; UTF-8 text otherwise. */
             body?: string;
             /** @description The client's address without its port, derived from `requestFrom` as Mountebank prints `request.ip` (rift#1602). Absent when `requestFrom` is not an address. */
             ip?: string;
