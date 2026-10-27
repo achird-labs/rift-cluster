@@ -869,6 +869,11 @@ enum EngineAction {
         /// What the put restarts after its reconcile (D-116).
         restart: Option<control::Restart>,
     },
+    /// Clear the port's saved proxy responses on this node's engine (D-117): the same filter the
+    /// apply ran on the committed row, plus every surviving stub's cycle restarted.
+    ClearProxyResponses {
+        port: u16,
+    },
     /// A restart a degraded node runs after its whole-set `Sync` (D-116), which cannot carry one.
     /// `stubs` is the committed list the restart refers to.
     Restart {
@@ -2845,10 +2850,45 @@ impl RedbStateMachine {
             }
             ControlOp::ProxyRecordedClear { port } => {
                 // Clearing an empty table is a no-op, not a failure — idempotent like every
-                // delete here. Recorded *stubs* stay: they are imposter config, deleted
-                // through the stub-edit surfaces, which forget their own markers (D-108).
+                // delete here.
                 proxy_recorded.retain(|(p, _), _| p != *port).map_err(io)?;
-                Ok(Ok(Vec::new()))
+                // D-117: the recorded responses go too, filtered here against the committed row
+                // rather than at the door, so no recording committed in between is lost.
+                let mut record: StoredImposter = match configs.get(*port).map_err(io)? {
+                    None => return Ok(Ok(Vec::new())),
+                    Some(guard) => match serde_json::from_str(guard.value()) {
+                        Ok(record) => record,
+                        // A clear is a reset: a row that will not decode keeps today's
+                        // markers-only clear rather than refusing it.
+                        Err(e) => {
+                            tracing::error!(port = *port, error = %e, "corrupt stored record; cleared its markers only");
+                            return Ok(Ok(Vec::new()));
+                        }
+                    },
+                };
+                let mut config = match control::decode_committed_config(record.config.get()) {
+                    Ok(config) => config,
+                    Err(e) => {
+                        tracing::error!(port = *port, error = %e, "corrupt stored config; cleared its markers only");
+                        return Ok(Ok(Vec::new()));
+                    }
+                };
+                if control::strip_proxy_responses(&mut config.stubs) {
+                    record.config = to_raw_value(&config)
+                        .map_err(|e| StorageIOError::write_state_machine(&e))?;
+                    record.revision = index;
+                    let value = serde_json::to_string(&record)
+                        .map_err(|e| StorageIOError::write_state_machine(&e))?;
+                    configs.insert(*port, value.as_str()).map_err(io)?;
+                    crate::metrics::config_applied(*port, index);
+                }
+                // Always driven, even when nothing was stripped: restarting every cycle is part of
+                // the clear. A node that cannot drive this port incrementally syncs first.
+                let clear = EngineAction::ClearProxyResponses { port: *port };
+                if degraded || rift_cluster_base::seams::admission_check(&config).is_err() {
+                    return Ok(Ok(vec![Self::sync_action(configs)?, clear]));
+                }
+                Ok(Ok(vec![clear]))
             }
         }
     }
@@ -3139,6 +3179,15 @@ impl RedbStateMachine {
                         );
                         self.apply_failures.lock().insert(port, e.to_string());
                     }
+                }
+            }
+            EngineAction::ClearProxyResponses { port } => {
+                let Some(engine) = &self.engine else { return };
+                // Logged, never an apply failure: the committed row is already filtered, and a
+                // recorded failure would degrade this node into whole-set drives for a miss that
+                // is only a cursor restart and this node's view of the stubs.
+                if let Err(e) = engine.clear_proxy_responses(port).await {
+                    tracing::error!(port, error = %e, "could not clear saved proxy responses on this node");
                 }
             }
             EngineAction::Restart {
@@ -7504,6 +7553,77 @@ mod tests {
             marker(&sm, 8080, H2).is_some(),
             "a marker whose stub survives is kept"
         );
+    }
+
+    /// The triage's six shapes for a clear: a cluster recording, a marked `proxyAlways` append to an
+    /// authored stub, a legacy unmarked `recordedFrom` stub, an all-marked stub, a string
+    /// `_proxyResponseTime` (not a mark) and a plain authored stub.
+    fn clear_fixture() -> serde_json::Value {
+        json!([
+            { "id": "proxy-recorded-00000000000000a1",
+              "responses": [{ "is": { "body": "a", "_proxyResponseTime": 5 } }] },
+            { "id": "authored",
+              "responses": [{ "is": { "body": "b" } }, { "is": { "body": "b-rec", "_proxyResponseTime": 3 } }] },
+            { "id": "legacy", "recordedFrom": "http://u.example",
+              "responses": [{ "is": { "body": "c" } }] },
+            { "id": "all-marked",
+              "responses": [{ "is": { "body": "d1", "_proxyResponseTime": 1 } },
+                            { "is": { "body": "d2", "_proxyResponseTime": 2 } }] },
+            { "id": "string-time", "responses": [{ "is": { "body": "e", "_proxyResponseTime": "7" } }] },
+            { "id": "plain", "responses": [{ "is": { "body": "f" } }] },
+        ])
+    }
+
+    /// Pins D-117: a clear strips the committed config exactly as the engine's own
+    /// `clear_proxy_responses` strips its live stubs — one fixture, both filters, the same result —
+    /// so a change to upstream's rule turns this red at the bump.
+    #[tokio::test]
+    async fn a_clear_strips_the_committed_config_as_the_engine_does() {
+        let engine = Arc::new(ImposterManager::new());
+        let (_td, mut sm) = fresh_sm(Some(engine.clone())).await;
+        sm.apply(vec![entry(1, put(1, 18617, clear_fixture()))])
+            .await
+            .expect("put");
+        sm.apply(vec![entry(
+            2,
+            request(2, ControlOp::ProxyRecordedClear { port: 18617 }),
+        )])
+        .await
+        .expect("clear");
+
+        let committed = stored(&sm, 18617).stubs;
+        let ids: Vec<_> = committed.iter().filter_map(|s| s.id.clone()).collect();
+        assert_eq!(ids, ["authored", "string-time", "plain"]);
+        assert_eq!(
+            committed[0].responses.len(),
+            1,
+            "the marked append is stripped"
+        );
+        assert_eq!(
+            serde_json::to_value(&committed).expect("serialize"),
+            serde_json::to_value(engine.get_imposter(18617).expect("live").get_stubs())
+                .expect("serialize"),
+            "the committed row and the engine agree"
+        );
+        engine.shutdown().await;
+    }
+
+    /// Pins D-117: a clear with nothing to strip leaves the row and its revision alone, as upstream
+    /// persists only a changed stub set.
+    #[tokio::test]
+    async fn a_clear_with_nothing_to_strip_keeps_the_revision() {
+        let (_td, mut sm) = fresh_sm(None).await;
+        sm.apply(vec![entry(1, put(1, 8080, json!([{ "id": "plain" }])))])
+            .await
+            .expect("put");
+        let before = sm.read_config(8080).expect("read");
+        sm.apply(vec![entry(
+            2,
+            request(2, ControlOp::ProxyRecordedClear { port: 8080 }),
+        )])
+        .await
+        .expect("clear");
+        assert_eq!(sm.read_config(8080).expect("read"), before, "unchanged row");
     }
 
     // ---- D-114 (#682): a recording is placed relative to the stub that answered ----

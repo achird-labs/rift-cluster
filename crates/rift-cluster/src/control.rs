@@ -206,11 +206,11 @@ pub enum ControlOp {
         #[serde(deserialize_with = "deserialize_replayed")]
         stub: Option<RecordedStub>,
     },
-    /// Delete every recorded-proxy marker for a port (#226) — the clustered half of
-    /// `DELETE /imposters/:port/savedProxyResponses`. Recorded *stubs* are imposter config
-    /// and are deleted through the stub-edit surfaces — which forget their own markers at
-    /// apply (D-108); this op clears the whole claim table, stub-less recordings included, so
-    /// every signature records afresh.
+    /// `DELETE /imposters/:port/savedProxyResponses` (#226, D-117): forget every recorded-proxy
+    /// marker for the port, so every signature records afresh, and strip proxy-recorded responses
+    /// from its committed stubs as standalone rift's clear does ([`strip_proxy_responses`]) —
+    /// filtered at apply, so a recording committed just before the clear is cleared and one
+    /// committed after it is kept. Each node then restarts every surviving stub's cycle.
     ProxyRecordedClear {
         port: u16,
     },
@@ -296,6 +296,28 @@ pub struct SessionKey {
 /// Bytes in a session-signing key. 32 is HMAC-SHA256's block-optimal size — longer buys nothing,
 /// shorter weakens it.
 pub const SESSION_KEY_BYTES: usize = 32;
+
+/// Strip proxy-recorded responses from a stub list, as clearing saved proxy responses does (D-117):
+/// a response whose `is` carries a numeric `_proxyResponseTime` is removed, a stub left with none
+/// is dropped, and an unmarked stub that still names `recordedFrom` — a recording made before the
+/// mark existed (rift#1239) — is dropped whole. Returns whether anything was removed.
+///
+/// A literal transliteration of rift's `Imposter::clear_proxy_responses` filter, which runs on the
+/// live stub vector and cannot be reused over committed config — keep the two in step; a parity
+/// test runs both over one fixture.
+pub fn strip_proxy_responses(stubs: &mut Vec<Stub>) -> bool {
+    let before = stubs.len();
+    let mut stripped_any = false;
+    stubs.retain_mut(|stub| {
+        if !stub.responses.iter().any(|r| r.is_recorded()) {
+            return stub.recorded_from.is_none();
+        }
+        stripped_any = true;
+        stub.responses.retain(|r| !r.is_recorded());
+        !stub.responses.is_empty()
+    });
+    stripped_any || stubs.len() != before
+}
 
 /// The largest *raw* recorded body a [`ControlOp::ProxyRecorded`] may carry, checked at apply.
 ///

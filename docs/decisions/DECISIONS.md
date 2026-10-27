@@ -873,7 +873,10 @@ carried but not acted on. The fleet-wide form is `port → JournalCursor` with i
 *Rejected:* a scalar cursor — it cannot name a position across writers.
 
 ### D-40 — proxyOnce is Pending/Recorded with one committed op and a fixed claim TTL
-- **Status:** active
+> **Amended by D-117** (2026-10-27, #702): `ProxyRecordedClear` no longer keeps recorded stubs —
+> it strips proxy-recorded responses from the port's committed config at apply, as standalone
+> rift's clear does, and each node restarts the surviving cycles.
+- **Status:** amended
 - **Decided:** 2026-08 · #226 (RFC-001 §7.5.3 as built)
 - **Amends:** RFC-001 §7.5.3
 - **Code:** crates/rift-cluster/src/stores/proxy.rs, crates/rift-cluster/src/control.rs
@@ -5384,4 +5387,41 @@ rejected because it runs on one node, outside the log, and the journal is per no
 
 **Residual:** the shard clear bypasses upstream's scenario stamping, so a conditional GET's
 `Last-Modified` may not move after a `PUT /imposters` reset.
+
+### D-117 — Clearing saved proxy responses strips recorded responses from the committed config at apply, as standalone rift's clear does
+
+- **Status:** active
+- **Decided:** 2026-10-27 · #702
+- **Implemented by:** #702
+- **Code:** crates/rift-cluster/src/control.rs, crates/rift-cluster/src/raft/store.rs, crates/rift-cluster-server/src/admin_front.rs
+
+`DELETE /imposters/:port/savedProxyResponses` committed `ProxyRecordedClear`. It cleared only the
+exactly-once markers and deliberately kept recorded stubs. Since rift#1239 and rift#1519,
+standalone rift's clear does three more things:
+- it removes every response whose `is` carries a numeric `_proxyResponseTime`, including
+  `proxyAlways` appends to authored stubs;
+- it drops a stub left empty, and an unmarked legacy `recordedFrom` stub;
+- it restarts every surviving cycle.
+
+**The clear stays one op and filters at apply.** In the same transaction as the marker purge, the
+arm replay-decodes the port's row and runs `strip_proxy_responses`, a transliteration of the
+engine's filter. It writes the row with a new revision only when something was stripped, matching
+upstream's "persist only a changed set". Each node then drives
+`ImposterManager::clear_proxy_responses`. That call runs the same filter on its live stubs and
+restarts every cycle; it is driven even when nothing was stripped. A degraded node, or one that
+refuses the port, syncs first. A parity test runs both filters over one fixture.
+
+**Rejected:**
+- A door-side filtered `PutImposter`: a recording committed between the door's read and the put
+  would be overwritten.
+- A new op variant: older nodes could not decode it.
+
+A row that will not decode keeps the markers-only clear and never refuses it. Recorded requests are
+kept, as upstream keeps them.
+
+**Residuals:**
+- A pre-bump `proxyAlways` response merged into an authored stub carries no mark and survives the
+  clear, the same residual upstream documents for an old datadir.
+- An old-engine node that re-serializes a row drops the marks from its own row.
+- The release carrying this changes an op's apply semantics, so it is a whole-fleet upgrade (D-98).
 

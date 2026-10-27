@@ -466,9 +466,9 @@ pub(crate) enum Terminated {
     /// which cleared nothing the fleet's claim table holds. Its one-time sibling, the
     /// `savedRequests` clear, went the other way with D-74 (#552): the journal is per node again,
     /// so that DELETE is an ordinary proxied route and no longer terminates here.
-    /// Recorded *stubs* stay, deliberately — they are imposter config, deleted through
-    /// the stub-edit surfaces; this clears the exactly-once markers so signatures record
-    /// afresh. There is no GET on this path to leave proxied: upstream dispatches DELETE only
+    /// Since D-117 it clears what standalone rift's does: the exactly-once markers, so signatures
+    /// record afresh, and the proxy-recorded responses in the port's committed stubs, filtered at
+    /// apply; every node then restarts the surviving cycles. There is no GET on this path to leave proxied: upstream dispatches DELETE only
     /// here, so a GET is a 404 (corrected in #575 — this used to claim a proxied listing).
     ClearSavedProxyResponses(u16),
     /// `DELETE /imposters/{port}/spaces/{flow}` (issue #537, D-69): a space teardown has two
@@ -4331,8 +4331,8 @@ async fn build_mutation(
                 },
             })
         }
-        // `DELETE /imposters/{port}/savedProxyResponses` (issue #226): one committed op deletes
-        // the port's exactly-once markers fleet-wide, and every node's stale completion-cache
+        // `DELETE /imposters/{port}/savedProxyResponses` (issue #226, D-117): one committed op deletes
+        // the port's exactly-once markers and recorded responses fleet-wide, and every node's stale completion-cache
         // entries retire against the applied state (`completed_lookup`'s revision check) — no
         // fan-out, nothing a partitioned peer can miss forever. This is the one clear on this
         // front that still commits; the `savedRequests` clear is the local engine's own again

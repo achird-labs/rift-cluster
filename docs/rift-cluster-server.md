@@ -763,7 +763,7 @@ table exists so an operator reading here does not conclude they are absent.
 | `GET /openapi.json` | this contract, served by the binary that implements it |
 | `POST /admin/imposters/{port}/try` | send a sample request to the imposter from the admin origin and answer what it answered — the console's Send button |
 | `GET /imposters/{port}/spaces`, `DELETE /imposters/{port}/spaces/{flowId}`, `POST …/spaces/{flowId}/stubs` | list, tear down and add stubs to a correlated-isolation space — a flow's own state slice and its own stubs, replicated (#374, #537, D-69) |
-| `DELETE /imposters/{port}/savedProxyResponses` | terminated, not proxied: one Raft op deleting the fleet's exactly-once recording markers, so every signature records afresh on every node (#226) |
+| `DELETE /imposters/{port}/savedProxyResponses` | terminated, not proxied: one Raft op deleting the fleet's exactly-once recording markers, so every signature records afresh on every node (#226), and the proxy-recorded responses in the imposter's stubs, as standalone Rift's clear does (D-117) |
 
 ## The clustered admin write path
 
