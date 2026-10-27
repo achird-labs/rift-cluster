@@ -200,17 +200,25 @@ pub enum ControlOp {
 pub struct RecordedStub {
     pub stub: Box<Stub>,
     pub placement: RecordedStubPlacement,
-    /// `proxy.to` of the proxy stub the recording came from — the anchor
-    /// [`placement`](Self::placement) is resolved against at apply.
+    /// `proxy.to` of the proxy stub the recording came from — locates the anchor when
+    /// [`anchor_index`](Self::anchor_index) does not (D-114).
     pub proxy_to: String,
+    /// Index of the stub that answered when the recording was made (rift#1389), read from the
+    /// engine's live list — so it may be stale by the time the op applies. Apply validates it
+    /// against `proxy_to` before trusting it (D-114). Absent on entries written before #682, which
+    /// decode as `None` and place by `proxy_to` alone; skipped when `None`, so those bytes stay
+    /// as they were.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anchor_index: Option<usize>,
 }
 
 /// Where a recorded stub lands relative to its proxy stub — the engine's own semantics
 /// (upstream `StubPlacement`, rift#911), mirrored here so the wire format is ours.
 ///
 /// `BeforeProxy` (proxyOnce): the recording matches first next time. `AfterProxyMerging`
-/// (proxyAlways): the proxy keeps running; responses merge into an existing stub with
-/// structurally equal non-empty predicates (upstream #611) instead of duplicating it.
+/// (proxyAlways): the proxy keeps running; responses merge into the first stub after the anchor
+/// with structurally equal predicates, an empty list included (upstream #611, rift#1389), or
+/// the stub is appended at the end.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum RecordedStubPlacement {
@@ -1128,6 +1136,7 @@ mod tests {
                     stub: Box::new(stub),
                     placement: RecordedStubPlacement::BeforeProxy,
                     proxy_to: "http://u.example".to_owned(),
+                    anchor_index: None,
                 }),
             },
         }
@@ -1182,6 +1191,25 @@ mod tests {
         assert_eq!(
             serde_json::to_value(&set).expect("serialize")["expect_absent"],
             json!(true)
+        );
+    }
+
+    /// Pins D-114's replay compatibility: a recorded stub written before #682 has no
+    /// `anchor_index` and decodes as `None`; `None` writes no key, so those bytes are unchanged.
+    #[test]
+    fn a_recorded_stub_without_anchor_index_decodes() {
+        let old: RecordedStub = serde_json::from_value(json!({
+            "stub": { "responses": [{ "is": { "body": "r" } }] },
+            "placement": "beforeProxy",
+            "proxy_to": "http://u.example"
+        }))
+        .expect("a pre-#682 recorded stub decodes");
+        assert_eq!(old.anchor_index, None);
+        assert_eq!(
+            serde_json::to_value(&old)
+                .expect("serialize")
+                .get("anchor_index"),
+            None
         );
     }
 

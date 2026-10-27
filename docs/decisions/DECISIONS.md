@@ -5231,3 +5231,47 @@ lift upstream's own reservation of the same port.
 - **Not yet reserved:** the Raft/RPC and probe ports. Upstream's `ServerListener` has no honest label
   for them, and that label is what an operator reads in the failure.
 
+### D-114 — A proxied request is gated by its own stub's mode; a recording is placed relative to the stub that answered
+
+- **Status:** active
+- **Decided:** 2026-10-27 · #682
+- **Implemented by:** #682
+- **Code:** crates/rift-cluster/src/stores/proxy.rs, crates/rift-cluster/src/raft/store.rs, crates/rift-cluster/src/control.rs
+
+`ClusterProxyStore` used to resolve one proxy mode per **port**, from the first proxy stub in the
+applied config, and dispatch `try_claim`, `release_claim`, `record` and `complete` on it. The engine
+now claims per request through `try_claim_as(port, sig, mode)`, using the answering stub's own mode
+(rift#1387), and places a recording relative to the stub that answered (`StubPublication::anchor_index`,
+rift#1389). On a port that mixed modes, the cluster went wrong in three ways:
+- it lost a `proxyAlways` recording as a stale settle;
+- it wedged a `proxyOnce` signature on a skipped release;
+- it placed recordings by the old first-proxy, non-empty-predicate, insert-after-proxy rules.
+
+**Gating is per request, dispatched on the token.**
+- `try_claim_as` arbitrates a `proxyOnce` request.
+- It grants a `proxyAlways` request a token carrying an `UNGATED` bit (upstream `LocalProxyStore`'s
+  bit). `mint_token` clears that bit on every gated token.
+- `release_claim`, `record` and `complete` read the bit, never a mode from config.
+- `try_claim` defaults to `proxyOnce`, upstream's default.
+- The port-mode cache and its parser are gone. A mode-less proxy therefore follows the engine's
+  `proxyOnce` default with nothing of the cluster's own left to drift.
+
+**Only a `proxyOnce` recording writes a marker row.** A port can mix modes, and a `proxyAlways` row
+would answer a later `proxyOnce` claim for the same signature `AlreadyRecorded`, replaying a
+response no `proxyOnce` stub recorded. Upstream keeps the two apart for the same reason.
+
+**Placement is a pure function of the stub list and the op**, so every replica places identically.
+- **The anchor:**
+  - `RecordedStub.anchor_index` if that stub still proxies to `proxy_to`;
+  - else the first stub at or after it that does (a committed `proxyOnce` insert shifts it right);
+  - else the first stub proxying to `proxy_to`.
+- **`proxyOnce`:** inserted at the anchor, or at the end with no anchor.
+- **`proxyAlways`:** merged into the first stub after the anchor with structurally equal
+  predicates, an empty list included, or appended at the end.
+- **Compatibility:** `anchor_index` is `#[serde(default)]` and skipped when `None`, so entries
+  written before this decode and place by `proxy_to` alone.
+
+**Whole-fleet (D-98).** An old and a new node applying the same `ProxyRecorded` produce different
+configs and marker rows, so the release carrying this is a whole-fleet upgrade. D-40 and D-66 are
+unchanged: only `proxyOnce` arbitrates, and only it refuses.
+
