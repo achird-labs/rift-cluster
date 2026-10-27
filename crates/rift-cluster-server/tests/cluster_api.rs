@@ -225,6 +225,7 @@ async fn ops_endpoint_reports_applied_pending_and_unknown() {
                     serde_json::json!({ "port": 4546, "protocol": "http" }),
                 )
                 .expect("config parses"),
+                restart: None,
             },
         })
         .await

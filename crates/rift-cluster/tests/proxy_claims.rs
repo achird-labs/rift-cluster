@@ -190,6 +190,7 @@ async fn install_imposter(members: &[ProxyMember], port: u16, mode: &str) {
         .node
         .submit(mint(rift_cluster::ControlOp::PutImposter {
             config: Box::new(proxy_imposter(port, mode)),
+            restart: None,
         }))
         .await
         .expect("imposter commits");

@@ -866,6 +866,15 @@ enum EngineAction {
     Sync(DesiredSet),
     Put {
         config: Box<ImposterConfig>,
+        /// What the put restarts after its reconcile (D-116).
+        restart: Option<control::Restart>,
+    },
+    /// A restart a degraded node runs after its whole-set `Sync` (D-116), which cannot carry one.
+    /// `stubs` is the committed list the restart refers to.
+    Restart {
+        port: u16,
+        restart: control::Restart,
+        stubs: Vec<Stub>,
     },
     Delete {
         port: u16,
@@ -2204,6 +2213,7 @@ impl RedbStateMachine {
             return vec![EngineAction::Put {
                 // A clone: the caller still writes the row from it.
                 config: Box::new(config.clone()),
+                restart: None,
             }];
         }
         vec![action]
@@ -2391,7 +2401,7 @@ impl RedbStateMachine {
         let io =
             |e: redb::StorageError| StorageError::from(StorageIOError::write_state_machine(&e));
         match op {
-            ControlOp::PutImposter { config } => {
+            ControlOp::PutImposter { config, restart } => {
                 // `validate` guaranteed the port; a missing one here means a
                 // caller skipped validation, and a deterministic refusal is the
                 // safe answer.
@@ -2446,16 +2456,59 @@ impl RedbStateMachine {
                         }
                     }
                 }
+                // D-116: restarting the imposter's runtime state restarts its saved proxyOnce
+                // responses too — upstream's `restart_runtime_state` clears its store, but here the
+                // replay source is the committed marker. A stub-less marker lives as long as its
+                // imposter's runtime state; one with a recorded stub in the new config lives as
+                // long as that stub (D-108), so it stays.
+                if *restart == Some(control::Restart::Imposter) {
+                    let stub_less: Vec<String> = proxy_recorded
+                        .range((port, "")..)
+                        .map_err(io)?
+                        .map(|row| {
+                            row.map(|(key, _)| {
+                                let (p, hash) = key.value();
+                                (p, hash.to_owned())
+                            })
+                        })
+                        .take_while(|row| row.as_ref().map_or(true, |(p, _)| *p == port))
+                        .filter_map(|row| match row {
+                            Ok((_, hash)) => {
+                                let kept = config.stubs.iter().any(|s| {
+                                    s.id.as_deref().and_then(recorded_sig_hash)
+                                        == Some(hash.as_str())
+                                });
+                                (!kept).then_some(Ok(hash))
+                            }
+                            Err(e) => Some(Err(e)),
+                        })
+                        .collect::<Result<_, _>>()
+                        .map_err(io)?;
+                    for sig_hash in &stub_less {
+                        proxy_recorded
+                            .remove((port, sig_hash.as_str()))
+                            .map_err(io)?;
+                    }
+                }
                 configs.insert(port, value.as_str()).map_err(io)?;
                 crate::metrics::config_applied(port, index);
                 // D-99: one port's drive, unless something on this node is failing — then the
                 // whole set, so the drive re-attempts what failed (D-81's heal) as it always has.
                 if degraded {
-                    return Ok(Ok(vec![Self::sync_action(configs)?]));
+                    let mut actions = vec![Self::sync_action(configs)?];
+                    if let Some(restart) = restart {
+                        actions.push(EngineAction::Restart {
+                            port,
+                            restart: *restart,
+                            stubs: config.stubs.clone(),
+                        });
+                    }
+                    return Ok(Ok(actions));
                 }
                 // A clone: the op is borrowed from the committed entry.
                 Ok(Ok(vec![EngineAction::Put {
                     config: config.clone(),
+                    restart: *restart,
                 }]))
             }
             ControlOp::PatchStubs { port, edit } => {
@@ -2994,7 +3047,7 @@ impl RedbStateMachine {
             // D-99: `Sync`'s bookkeeping, scoped to the one port. Nothing else is in the report, and
             // nothing else's recorded failure may be reaped — this node had none when the op was
             // applied, or the arm would have emitted a `Sync`.
-            EngineAction::Put { config } => {
+            EngineAction::Put { config, restart } => {
                 let Some(engine) = &self.engine else { return };
                 // The arm refused a port-less config before it committed, so this is unreachable;
                 // if it ever is reached, say so rather than drop a committed config quietly.
@@ -3019,11 +3072,23 @@ impl RedbStateMachine {
                 if let Some(sequencing) = &self.sequencing {
                     sequencing.set(port, &config);
                 }
+                // Kept for the restart: `apply_one` consumes the config.
+                let stubs = restart.is_some().then(|| config.stubs.clone());
                 match engine.apply_one(*config).await {
                     // No flow-state clear: `apply_one` deletes nothing but a replace's own
                     // teardown, and a port the tables still name keeps its state through a failed
                     // re-create (#567) — the same filter `Sync` applies, with `{port}` desired.
-                    Ok(report) => self.record_report(&report, ReportScope::Port(port)),
+                    Ok(report) => {
+                        self.record_report(&report, ReportScope::Port(port));
+                        // D-116, upstream's skip rule: an imposter this drive created, replaced
+                        // or failed is already fresh, or not there to restart.
+                        let fresh = report.created.contains(&port)
+                            || report.replaced.contains(&port)
+                            || report.failed.iter().any(|(p, _)| *p == port);
+                        if let (Some(restart), Some(stubs), false) = (restart, stubs, fresh) {
+                            self.restart(engine, port, restart, stubs).await;
+                        }
+                    }
                     Err(e) => {
                         tracing::error!(port, error = %e, "engine refused a committed config");
                         self.apply_failures.lock().insert(port, e.to_string());
@@ -3076,6 +3141,14 @@ impl RedbStateMachine {
                     }
                 }
             }
+            EngineAction::Restart {
+                port,
+                restart,
+                stubs,
+            } => {
+                let Some(engine) = &self.engine else { return };
+                self.restart(engine, port, restart, stubs).await;
+            }
             EngineAction::AppendResponses {
                 port,
                 id,
@@ -3121,6 +3194,49 @@ impl RedbStateMachine {
                      (the front door keeps its last-known-good table)"
                 );
             }
+        }
+    }
+
+    /// Restart what a committed replace restarts on this node, after its reconcile (D-116) — as
+    /// Mountebank's replace would. `stubs` is the committed list, which the engine's live list
+    /// equals at this point of the log, so a stub is re-put with identical content and only its
+    /// cycle restarts. A failure is logged and not recorded as an apply failure: the config did
+    /// apply, and a recorded failure would degrade this node into whole-set drives for a
+    /// runtime-only miss.
+    async fn restart(
+        &self,
+        engine: &ImposterManager,
+        port: u16,
+        restart: control::Restart,
+        stubs: Vec<Stub>,
+    ) {
+        let outcome = match restart {
+            control::Restart::StubAt { index } => match stubs.into_iter().nth(index) {
+                Some(stub) => engine.replace_stub(port, index, stub).await,
+                None => {
+                    tracing::error!(port, index, "a committed stub restart names no stub");
+                    return;
+                }
+            },
+            control::Restart::AllStubs => engine.replace_stubs(port, stubs).await,
+            control::Restart::Imposter => {
+                let restarted = engine.restart_runtime_state(port);
+                // The clustered flow store is not the engine's built-in one, which is all
+                // `restart_runtime_state` clears: this node's shard of the imposter's flows goes
+                // here, as a delete's does (#565).
+                self.clear_imposter_state([port]).await;
+                restarted
+            }
+            control::Restart::Unknown => {
+                tracing::warn!(
+                    port,
+                    "a committed restart this build does not know; not applied"
+                );
+                return;
+            }
+        };
+        if let Err(e) = outcome {
+            tracing::error!(port, error = %e, "could not restart a replaced imposter's runtime state");
         }
     }
 
@@ -4360,6 +4476,7 @@ mod tests {
             op_id,
             ControlOp::PutImposter {
                 config: Box::new(config(port, stubs)),
+                restart: None,
             },
         )
     }
@@ -4377,6 +4494,7 @@ mod tests {
             op_id,
             ControlOp::PutImposter {
                 config: Box::new(config),
+                restart: None,
             },
         )
     }
@@ -4395,6 +4513,7 @@ mod tests {
             op_id,
             ControlOp::PutImposter {
                 config: Box::new(config),
+                restart: None,
             },
         )
     }
@@ -4477,6 +4596,7 @@ mod tests {
                 ControlOp::PutImposter {
                     config: serde_json::from_value(json!({ "port": 1, "protocol": "smtp" }))
                         .expect("parses"),
+                    restart: None,
                 },
             )
         };
@@ -4722,6 +4842,7 @@ mod tests {
         // fresh parse of a document that lists every key in a different order.
         let again = ControlOp::PutImposter {
             config: Box::new(multi_key_config_reordered(A)),
+            restart: None,
         };
         apply_one(&mut sm, index, request(u128::from(index), again)).await;
 
@@ -5587,6 +5708,7 @@ mod tests {
                 issued,
                 ControlOp::PutImposter {
                     config: Box::new(config(8080, json!([]))),
+                    restart: None,
                 },
             )
         };
@@ -6040,6 +6162,7 @@ mod tests {
             op_id,
             ControlOp::PutImposter {
                 config: Box::new(config),
+                restart: None,
             },
         )
     }
@@ -6873,6 +6996,7 @@ mod tests {
             principal: None,
             action: super::EngineAction::Put {
                 config: Box::new(duplicate_ids),
+                restart: None,
             },
         }])
         .await;
@@ -7041,6 +7165,7 @@ mod tests {
                 u128::from(port),
                 ControlOp::PutImposter {
                     config: Box::new(config),
+                    restart: None,
                 },
             )
         };
@@ -7327,6 +7452,60 @@ mod tests {
         ));
     }
 
+    /// Pins D-116: a put that restarts the imposter forgets its stub-less proxyOnce markers — the
+    /// replay source upstream's `restart_runtime_state` clears — and keeps a marker whose recorded
+    /// stub is in the new config, which lives as long as that stub (D-108). A plain put keeps both.
+    #[tokio::test]
+    async fn an_imposter_restart_forgets_only_stub_less_markers() {
+        let (_td, mut sm) = fresh_sm(None).await;
+        let recorded_id = format!("{}{H2}", super::RECORDED_STUB_ID_PREFIX);
+        let with_recorded = || {
+            config(
+                8080,
+                json!([
+                    { "id": recorded_id, "responses": [{ "is": { "body": "r" } }] },
+                    { "responses": [{ "proxy": { "to": "http://u.example", "mode": "proxyOnce" } }] },
+                ]),
+            )
+        };
+        let put = |op_id: u128, restart: Option<crate::control::Restart>| {
+            request(
+                op_id,
+                ControlOp::PutImposter {
+                    config: Box::new(with_recorded()),
+                    restart,
+                },
+            )
+        };
+        sm.apply(vec![
+            entry(1, put(1, None)),
+            entry(2, proxy_recorded(2, 8080, H1, "stub-less", None)),
+            entry(3, proxy_recorded(3, 8080, H2, "stubbed", None)),
+        ])
+        .await
+        .expect("apply");
+        sm.apply(vec![entry(4, put(4, None))]).await.expect("apply");
+        assert!(
+            marker(&sm, 8080, H1).is_some(),
+            "a plain put keeps a stub-less marker"
+        );
+        sm.apply(vec![entry(
+            5,
+            put(5, Some(crate::control::Restart::Imposter)),
+        )])
+        .await
+        .expect("apply");
+        assert_eq!(
+            marker(&sm, 8080, H1),
+            None,
+            "the restart forgets the stub-less marker"
+        );
+        assert!(
+            marker(&sm, 8080, H2).is_some(),
+            "a marker whose stub survives is kept"
+        );
+    }
+
     // ---- D-114 (#682): a recording is placed relative to the stub that answered ----
 
     fn placed_stub(value: serde_json::Value) -> super::Stub {
@@ -7492,6 +7671,7 @@ mod tests {
                 1,
                 ControlOp::PutImposter {
                     config: Box::new(proxy_imposter_config(8080)),
+                    restart: None,
                 },
             ),
         )])
@@ -7612,6 +7792,7 @@ mod tests {
             op_id,
             ControlOp::PutImposter {
                 config: Box::new(config),
+                restart: None,
             },
         )
     }
@@ -8016,6 +8197,7 @@ mod tests {
                 1,
                 ControlOp::PutImposter {
                     config: Box::new(proxy_imposter_config(8080)),
+                    restart: None,
                 },
             ),
         )
@@ -8049,6 +8231,7 @@ mod tests {
                 1,
                 ControlOp::PutImposter {
                     config: Box::new(proxy_imposter_config(8080)),
+                    restart: None,
                 },
             ),
         )
@@ -8432,6 +8615,7 @@ mod tests {
                         op,
                         ControlOp::PutImposter {
                             config: Box::new(bulky_config(port, tag, 4 * 1024 * 1024)),
+                            restart: None,
                         },
                     ),
                 )])
@@ -8522,6 +8706,7 @@ mod tests {
                     1,
                     ControlOp::PutImposter {
                         config: Box::new(big),
+                        restart: None,
                     },
                 ),
             )])
@@ -8586,6 +8771,7 @@ mod tests {
                 1,
                 ControlOp::PutImposter {
                     config: Box::new(heavy),
+                    restart: None,
                 },
             ),
         )
@@ -8639,6 +8825,7 @@ mod tests {
                 1,
                 ControlOp::PutImposter {
                     config: Box::new(committed),
+                    restart: None,
                 },
             ),
         )
@@ -8708,6 +8895,7 @@ mod tests {
                 1,
                 ControlOp::PutImposter {
                     config: Box::new(proxy_imposter_config(8080)),
+                    restart: None,
                 },
             ),
         )
@@ -8914,6 +9102,7 @@ mod tests {
                 2,
                 ControlOp::PutImposter {
                     config: Box::new(big),
+                    restart: None,
                 },
             ),
         )
@@ -8955,6 +9144,7 @@ mod tests {
                 2,
                 ControlOp::PutImposter {
                     config: Box::new(big),
+                    restart: None,
                 },
             ),
         )

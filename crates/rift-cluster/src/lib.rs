@@ -34,8 +34,8 @@ pub use bridge::{Bridge, BridgeConfig, CallerClass};
 pub use config::{ClusterConfig, ConfigError, RuntimeTopology};
 pub use control::{
     ControlOp, ControlOutcome, ControlRequest, ControlResponse, PreconditionTarget, RecordedStub,
-    RecordedStubPlacement, SESSION_KEY_BYTES, SessionKey, SessionKeyHex, StubEdit, StubEditScript,
-    precondition_target,
+    RecordedStubPlacement, Restart, SESSION_KEY_BYTES, SessionKey, SessionKeyHex, StubEdit,
+    StubEditScript, precondition_target,
 };
 pub use decorate::ClusterDecorator;
 pub use pull_on_miss::PullOnMissInterceptor;

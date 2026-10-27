@@ -3591,6 +3591,7 @@ async fn a_parked_intent_replays_without_waiting_for_the_periodic_sweep() {
         expect_absent: false,
         op: ControlOp::PutImposter {
             config: serde_json::from_value(minimal_imposter(port)).expect("config parses"),
+            restart: None,
         },
     };
     node.park_intent(&request).expect("park the intent");
@@ -4538,9 +4539,11 @@ async fn a_recreated_imposter_starts_its_scenario_from_scratch_on_every_node() {
     founder.shutdown().await;
 }
 
-/// Pins D-5: replacing an imposter's config on the same port — changed stubs,
-/// through the replicated `PUT /imposters` — is a config change, not a delete,
-/// and does not reset its scenario on any node. Only a delete clears.
+/// Pins D-5: reconciling an imposter's config on the same port — changed stubs,
+/// through the replicated `PUT /imposters?reconcile=true` — is a config change, not
+/// a delete, and does not reset its scenario on any node. Only a delete clears; a
+/// plain `PUT /imposters` restarts the state on purpose (D-116, pinned by
+/// `put_imposters_restarts_scenario_state`).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn replacing_an_imposters_stubs_keeps_its_scenario_state() {
     let _serial = TEST_LOCK.lock().await;
@@ -4573,7 +4576,7 @@ async fn replacing_an_imposters_stubs_keeps_its_scenario_state() {
             "responses": [{ "is": { "statusCode": 200, "body": "pong" } }],
         }));
     let replaced = client
-        .put(format!("http://{founder_admin}/imposters"))
+        .put(format!("http://{founder_admin}/imposters?reconcile=true"))
         .json(&json!({ "imposters": [replacement] }))
         .send()
         .await
@@ -5366,6 +5369,7 @@ async fn a_refused_committed_config_is_named_and_the_door_still_refuses_it() {
             expect_absent: false,
             op: ControlOp::PutImposter {
                 config: Box::new(config),
+                restart: None,
             },
         })
         .await
@@ -5444,6 +5448,7 @@ async fn seed_refused(server: &ComposedServer, port: u16) {
         expect_absent: false,
         op: ControlOp::PutImposter {
             config: Box::new(config),
+            restart: None,
         },
     })
     .await
@@ -6132,6 +6137,7 @@ async fn an_unreplicable_parked_intent_is_retired() {
         expect_absent: false,
         op: rift_cluster::ControlOp::PutImposter {
             config: Box::new(config),
+            restart: None,
         },
     };
     node.park_intent(&request).expect("park");
@@ -6450,5 +6456,194 @@ async fn a_proxy_always_merge_keeps_display_order_under_owner_sequencing() {
     assert_eq!(serve_r(admin, port, 1).await, ["A"]);
     merge_u_into_r(&server, port).await;
     assert_eq!(serve_r(admin, port, 4).await, ["B", "C", "U", "A"]);
+    server.shutdown().await;
+}
+
+async fn serve(admin: std::net::SocketAddr, port: u16, path: &str) -> String {
+    reqwest::get(format!("http://{admin}/__rift/{port}{path}"))
+        .await
+        .expect("gateway")
+        .text()
+        .await
+        .expect("body")
+}
+
+/// Stub `s` on `/s` cycles `A, B, C`; stub `t` on `/t` cycles `X, Y`.
+fn cycling_stubs() -> serde_json::Value {
+    json!([
+        { "id": "s", "predicates": [{ "equals": { "path": "/s" } }],
+          "responses": [{ "is": { "body": "A" } }, { "is": { "body": "B" } }, { "is": { "body": "C" } }] },
+        { "id": "t", "predicates": [{ "equals": { "path": "/t" } }],
+          "responses": [{ "is": { "body": "X" } }, { "is": { "body": "Y" } }] },
+    ])
+}
+
+async fn solo_with_cycling_imposter(
+    state: &TempDir,
+) -> (ComposedServer, std::net::SocketAddr, u16) {
+    let server = compose::start(cluster_cli(state, &["--cluster-allow-solo"]))
+        .await
+        .expect("solo cluster starts");
+    wait_ready(&server).await;
+    let admin = server.admin_addr();
+    let port = reserve_port();
+    let created = reqwest::Client::new()
+        .post(format!("http://{admin}/imposters"))
+        .json(&json!({ "port": port, "protocol": "http", "recordRequests": true, "stubs": cycling_stubs() }))
+        .send()
+        .await
+        .expect("post");
+    assert_eq!(created.status().as_u16(), 201);
+    (server, admin, port)
+}
+
+/// Pins D-116 (rift#1515): `PUT /imposters/:port/stubs/:index` restarts that stub's cycle, as
+/// Mountebank's `overwriteAtIndex` does — identical content included — and keeps every other's.
+#[tokio::test]
+async fn replacing_a_stub_at_its_index_restarts_its_cycle() {
+    let _serial = TEST_LOCK.lock().await;
+    let state = TempDir::new().expect("tempdir");
+    let (server, admin, port) = solo_with_cycling_imposter(&state).await;
+    assert_eq!(serve(admin, port, "/s").await, "A");
+    assert_eq!(serve(admin, port, "/t").await, "X");
+    let replaced = reqwest::Client::new()
+        .put(format!("http://{admin}/imposters/{port}/stubs/0"))
+        .json(&cycling_stubs()[0])
+        .send()
+        .await
+        .expect("put");
+    assert_eq!(replaced.status().as_u16(), 200);
+    assert_eq!(
+        serve(admin, port, "/s").await,
+        "A",
+        "the replaced stub starts over"
+    );
+    assert_eq!(
+        serve(admin, port, "/t").await,
+        "Y",
+        "the other stub keeps its place"
+    );
+    server.shutdown().await;
+}
+
+/// Pins D-116: `PUT /imposters/:port/stubs` restarts every stub's cycle, as Mountebank's
+/// `overwriteAll` does.
+#[tokio::test]
+async fn replacing_all_stubs_restarts_every_cycle() {
+    let _serial = TEST_LOCK.lock().await;
+    let state = TempDir::new().expect("tempdir");
+    let (server, admin, port) = solo_with_cycling_imposter(&state).await;
+    assert_eq!(serve(admin, port, "/s").await, "A");
+    assert_eq!(serve(admin, port, "/t").await, "X");
+    let replaced = reqwest::Client::new()
+        .put(format!("http://{admin}/imposters/{port}/stubs"))
+        .json(&json!({ "stubs": cycling_stubs() }))
+        .send()
+        .await
+        .expect("put");
+    assert_eq!(replaced.status().as_u16(), 200);
+    assert_eq!(serve(admin, port, "/s").await, "A");
+    assert_eq!(serve(admin, port, "/t").await, "X");
+    server.shutdown().await;
+}
+
+/// Pins D-116 (rift#1518): `PUT /imposters` gives every kept imposter a fresh runtime state — its
+/// response cycles and its recorded requests — as Mountebank recreates them; `?reconcile=true`
+/// keeps it; any other value is refused by name.
+#[tokio::test]
+async fn put_imposters_restarts_runtime_state_unless_reconciling() {
+    let _serial = TEST_LOCK.lock().await;
+    let state = TempDir::new().expect("tempdir");
+    let (server, admin, port) = solo_with_cycling_imposter(&state).await;
+    let body = json!({ "imposters": [
+        { "port": port, "protocol": "http", "recordRequests": true, "stubs": cycling_stubs() }
+    ] });
+    let client = reqwest::Client::new();
+    let requests = || async {
+        let got: serde_json::Value = reqwest::get(format!("http://{admin}/imposters/{port}"))
+            .await
+            .expect("get")
+            .json()
+            .await
+            .expect("json");
+        got["numberOfRequests"].as_u64().unwrap_or(0)
+    };
+
+    assert_eq!(serve(admin, port, "/s").await, "A");
+    let kept = client
+        .put(format!("http://{admin}/imposters?reconcile=true"))
+        .json(&body)
+        .send()
+        .await
+        .expect("put");
+    assert_eq!(kept.status().as_u16(), 200);
+    assert_eq!(
+        serve(admin, port, "/s").await,
+        "B",
+        "?reconcile=true keeps the cycle"
+    );
+    assert!(requests().await > 0, "?reconcile=true keeps the journal");
+
+    let restarted = client
+        .put(format!("http://{admin}/imposters"))
+        .json(&body)
+        .send()
+        .await
+        .expect("put");
+    assert_eq!(restarted.status().as_u16(), 200);
+    assert_eq!(requests().await, 0, "the journal starts over");
+    assert_eq!(serve(admin, port, "/s").await, "A", "the cycle starts over");
+
+    let refused = client
+        .put(format!("http://{admin}/imposters?reconcile=yes"))
+        .json(&body)
+        .send()
+        .await
+        .expect("put");
+    assert_eq!(refused.status().as_u16(), 400);
+    assert!(refused.text().await.expect("body").contains("reconcile"));
+    server.shutdown().await;
+}
+
+/// Pins D-116: `PUT /imposters` also restarts the clustered flow store's scenario state, which
+/// upstream's `restart_runtime_state` does not reach — the scenario is back at `Started`.
+#[tokio::test]
+async fn put_imposters_restarts_scenario_state() {
+    let _serial = TEST_LOCK.lock().await;
+    let state = TempDir::new().expect("tempdir");
+    let server = compose::start(cluster_cli(&state, &["--cluster-allow-solo"]))
+        .await
+        .expect("solo cluster starts");
+    wait_ready(&server).await;
+    let admin = server.admin_addr();
+    let port = reserve_port();
+    let config = scenario_imposter(port, None);
+    let client = reqwest::Client::new();
+    let created = client
+        .post(format!("http://{admin}/imposters"))
+        .json(&config)
+        .send()
+        .await
+        .expect("post");
+    assert_eq!(created.status().as_u16(), 201);
+    let pay = || async {
+        reqwest::Client::new()
+            .post(format!("http://{admin}/__rift/{port}/pay"))
+            .send()
+            .await
+            .expect("pay")
+            .status()
+            .as_u16()
+    };
+    assert_eq!(pay().await, 200);
+    assert_eq!(pay().await, 409, "the scenario has moved on");
+    let replaced = client
+        .put(format!("http://{admin}/imposters"))
+        .json(&json!({ "imposters": [config] }))
+        .send()
+        .await
+        .expect("put");
+    assert_eq!(replaced.status().as_u16(), 200);
+    assert_eq!(pay().await, 200, "the scenario is back at Started");
     server.shutdown().await;
 }

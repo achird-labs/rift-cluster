@@ -1387,6 +1387,7 @@ fn bulky_request(port: u16, tag: &str, target_bytes: usize) -> ControlRequest {
         expect_absent: false,
         op: rift_cluster::ControlOp::PutImposter {
             config: Box::new(config),
+            restart: None,
         },
     }
 }
@@ -2842,6 +2843,7 @@ fn refused_put(port: u16) -> ControlRequest {
         expect_absent: false,
         op: rift_cluster::ControlOp::PutImposter {
             config: Box::new(config),
+            restart: None,
         },
     }
 }

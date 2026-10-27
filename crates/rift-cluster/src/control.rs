@@ -52,6 +52,23 @@ pub struct ControlRequest {
     pub op: ControlOp,
 }
 
+/// What a [`ControlOp::PutImposter`] restarts on each node after its reconcile, as Mountebank's
+/// replace would (D-116). Internally tagged with a catch-all, so a kind a newer build writes
+/// decodes here as [`Restart::Unknown`] instead of failing the entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum Restart {
+    /// `PUT /imposters/:port/stubs/:index`: that stub's response cycle (`overwriteAtIndex`).
+    StubAt { index: usize },
+    /// `PUT /imposters/:port/stubs`: every stub's response cycle (`overwriteAll`).
+    AllStubs,
+    /// `PUT /imposters`: the imposter's whole runtime state (rift#1518).
+    Imposter,
+    /// A kind written by a newer build: applied as no restart.
+    #[serde(other)]
+    Unknown,
+}
+
 /// Application-level operation carried by the Raft log (ADR-001 §4.1).
 ///
 /// **Removing a variant is a log-format break, and #546, #549, #550 and #552 each took
@@ -90,6 +107,12 @@ pub enum ControlOp {
         // whatever engine reads it. The door admits; see `decode_committed_config`.
         #[serde(deserialize_with = "deserialize_replayed")]
         config: Box<ImposterConfig>,
+        /// Runtime state this put restarts on every node, beyond what the reconcile keeps (D-116,
+        /// rift#1515, rift#1518). Absent on every entry written before it, and on every create and
+        /// bootstrap put; skipped when `None`, so those bytes are unchanged. An older node ignores
+        /// it and applies the put as a reconcile.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        restart: Option<Restart>,
     },
     PatchStubs {
         port: u16,
@@ -465,7 +488,7 @@ impl ControlResponse {
 /// only on the op itself, never on per-node state.
 pub fn validate(op: &ControlOp) -> Result<(), String> {
     match op {
-        ControlOp::PutImposter { config } => validate_replicable_config(config),
+        ControlOp::PutImposter { config, .. } => validate_replicable_config(config),
         ControlOp::PatchStubs { .. }
         | ControlOp::DeleteImposter { .. }
         | ControlOp::DeleteAll
@@ -673,7 +696,7 @@ pub fn precondition_target(op: &ControlOp) -> Option<PreconditionTarget> {
     match op {
         // `config.port` is validated to be present before this ever matters,
         // but a `None` here must still yield `None`, not a bogus target.
-        ControlOp::PutImposter { config } => config.port.map(PreconditionTarget::Imposter),
+        ControlOp::PutImposter { config, .. } => config.port.map(PreconditionTarget::Imposter),
         ControlOp::PatchStubs { port, .. }
         | ControlOp::DeleteImposter { port }
         | ControlOp::SetEnabled { port, .. } => Some(PreconditionTarget::Imposter(*port)),
@@ -935,7 +958,13 @@ mod tests {
     #[test]
     fn every_variant_tag_is_stable() {
         let cases: Vec<(ControlOp, &str)> = vec![
-            (ControlOp::PutImposter { config: config(1) }, "PutImposter"),
+            (
+                ControlOp::PutImposter {
+                    config: config(1),
+                    restart: None,
+                },
+                "PutImposter",
+            ),
             (
                 ControlOp::PatchStubs {
                     port: 1,
@@ -1025,6 +1054,7 @@ mod tests {
         let ok = [
             ControlOp::PutImposter {
                 config: config(8080),
+                restart: None,
             },
             ControlOp::PatchStubs {
                 port: 8080,
@@ -1213,6 +1243,36 @@ mod tests {
         );
     }
 
+    /// Pins D-116's wire shape: a put with no restart writes no `restart` key, so every other
+    /// put's bytes are unchanged; a restart is internally tagged; and a kind a newer build writes
+    /// decodes as `Unknown` rather than failing the entry.
+    #[test]
+    fn a_put_restart_is_absent_unless_set_and_tolerates_newer_kinds() {
+        let plain = ControlOp::PutImposter {
+            config: serde_json::from_value(json!({ "port": 1, "protocol": "http" }))
+                .expect("parses"),
+            restart: None,
+        };
+        let wire = serde_json::to_value(&plain).expect("serialize");
+        assert_eq!(wire["PutImposter"].get("restart"), None, "{wire}");
+        assert_eq!(
+            serde_json::to_value(Restart::StubAt { index: 2 }).expect("serialize"),
+            json!({ "kind": "stubAt", "index": 2 })
+        );
+        let newer: ControlOp = serde_json::from_value(json!({ "PutImposter": {
+            "config": { "port": 1, "protocol": "http" },
+            "restart": { "kind": "somethingNew" }
+        } }))
+        .expect("a newer restart kind decodes");
+        assert!(matches!(
+            newer,
+            ControlOp::PutImposter {
+                restart: Some(Restart::Unknown),
+                ..
+            }
+        ));
+    }
+
     /// Pins D-106: rift#1558 widened `statusCode` to any string, so a committed token status
     /// decodes through `decode_committed_config` (the same `deserialize_replayed` a log entry
     /// uses) and re-serializes `statusCode` as the same string.
@@ -1233,6 +1293,7 @@ mod tests {
     fn validate_rejects_a_config_without_an_explicit_port() {
         let op = ControlOp::PutImposter {
             config: serde_json::from_value(json!({ "protocol": "http" })).expect("parses"),
+            restart: None,
         };
         let err = validate(&op).expect_err("auto-assign cannot replicate");
         assert!(err.contains("port"), "{err}");
@@ -1246,6 +1307,7 @@ mod tests {
         let op = ControlOp::PutImposter {
             config: serde_json::from_value(json!({ "port": 0, "protocol": "http" }))
                 .expect("parses"),
+            restart: None,
         };
         let err = validate(&op).expect_err("port 0 is auto-assign");
         assert!(err.contains("explicit port"), "{err}");
@@ -1256,6 +1318,7 @@ mod tests {
         let op = ControlOp::PutImposter {
             config: serde_json::from_value(json!({ "port": 1, "protocol": "smtp" }))
                 .expect("parses"),
+            restart: None,
         };
         let err = validate(&op).expect_err("protocol outside http/https");
         assert!(err.contains("protocol"), "{err}");
@@ -1273,6 +1336,7 @@ mod tests {
                 ],
             }))
             .expect("parses"),
+            restart: None,
         };
         let err = validate(&op).expect_err("duplicate ids corrupt the stub-key diff");
         assert!(err.contains('a'), "{err}");
@@ -1593,7 +1657,7 @@ mod tests {
         let op: ControlOp =
             serde_json::from_value(old).expect("a pre-#550 entry's extra `tenant` key is ignored");
         match op {
-            ControlOp::PutImposter { config } => assert_eq!(config.port, Some(4545)),
+            ControlOp::PutImposter { config, .. } => assert_eq!(config.port, Some(4545)),
             other => panic!("expected PutImposter, got {other:?}"),
         }
 
@@ -1644,7 +1708,10 @@ mod tests {
         }
 
         let survivors = vec![
-            ControlOp::PutImposter { config: config(1) },
+            ControlOp::PutImposter {
+                config: config(1),
+                restart: None,
+            },
             ControlOp::PatchStubs {
                 port: 1,
                 edit: StubEditScript(vec![]),

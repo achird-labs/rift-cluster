@@ -1609,6 +1609,7 @@ impl RaftNode {
             expect_absent: false,
             op: ControlOp::PutImposter {
                 config: Box::new(config),
+                restart: None,
             },
         })
         .await
@@ -4200,6 +4201,7 @@ mod tests {
                 expect_absent: false,
                 op: ControlOp::PutImposter {
                     config: Box::new(imposter(8080, "never-lands")),
+                    restart: None,
                 },
             })
             .await

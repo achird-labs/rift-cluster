@@ -1160,6 +1160,7 @@ async fn bootstrap_imposters(
                 expect_absent: false,
                 op: ControlOp::PutImposter {
                     config: Box::new(config),
+                    restart: None,
                 },
             };
             // Refused here, before the write, so a config that could never apply does not occupy

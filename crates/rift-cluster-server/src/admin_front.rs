@@ -71,8 +71,8 @@ use hyper_util::client::legacy::Client;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use rand::RngCore;
 use rift_cluster::control::{
-    self, ControlOp, ControlRequest, PreconditionTarget, SessionKeyHex, StubEdit, StubEditScript,
-    decode_committed_config,
+    self, ControlOp, ControlRequest, PreconditionTarget, Restart, SessionKeyHex, StubEdit,
+    StubEditScript, decode_committed_config,
 };
 use rift_cluster::decorate::{
     HEADER_BIND_FAILURES, HEADER_OP_ID, HEADER_PARTIAL, HEADER_REVISION, HEADER_WARNINGS,
@@ -703,6 +703,21 @@ fn query_param<'q>(query: Option<&'q str>, name: &str) -> Option<&'q str> {
             _ if pair == name => Some(""),
             _ => None,
         })
+}
+
+/// `PUT /imposters`'s `?reconcile=` (rift#1518), read as upstream's private `reconcile_param` reads
+/// it: absent or `false` restarts every kept imposter's runtime state as Mountebank's replace does;
+/// `true` keeps it, the reconcile-only behaviour; anything else is refused by name.
+fn reconcile_param(query: Option<&str>) -> Result<bool, String> {
+    match query_param(query, "reconcile").map(percent_decode) {
+        None => Ok(false),
+        Some(Some(value)) if value == "true" => Ok(true),
+        Some(Some(value)) if value == "false" => Ok(false),
+        Some(other) => Err(format!(
+            "Invalid query parameter reconcile={:?}: expected true or false",
+            other.unwrap_or_default()
+        )),
+    }
 }
 
 /// Whether `c` is a C0 control or `DEL` — the characters an operator never means to put in a
@@ -2669,6 +2684,18 @@ async fn terminate(
     // caller's own credential is deliberately not carried forward: the render re-read below
     // presents the fleet's configured `--api-key` instead (see `fetch`), for the same reason
     // `proxy` does.
+    // `PUT /imposters` restarts every kept imposter's runtime state unless `?reconcile=true`
+    // (D-116, rift#1518) — read before the body, so a bad value is refused without reading it.
+    let reconcile = if matches!(kind, Terminated::ReplaceAllImposters) {
+        match reconcile_param(req.uri().query()) {
+            Ok(reconcile) => reconcile,
+            Err(message) => {
+                return typed_error(StatusCode::BAD_REQUEST, ErrorKind::BadData, &message);
+            }
+        }
+    } else {
+        false
+    };
     let host = req.headers().get("host").cloned();
     let idempotency = req
         .headers()
@@ -2707,10 +2734,17 @@ async fn terminate(
 
     let is_batch = matches!(kind, Terminated::ReplaceAllImposters);
     let create_only = matches!(kind, Terminated::Create);
-    let mutation = match build_mutation(&state, &node, kind, &body, host.as_ref()).await {
+    let mut mutation = match build_mutation(&state, &node, kind, &body, host.as_ref()).await {
         Ok(mutation) => mutation,
         Err(response) => return response,
     };
+    if is_batch && !reconcile {
+        for op in &mut mutation.ops {
+            if let ControlOp::PutImposter { restart, .. } = op {
+                *restart = Some(Restart::Imposter);
+            }
+        }
+    }
     match run_mutation(
         &state,
         &node,
@@ -3979,6 +4013,7 @@ async fn build_mutation(
             Ok(Mutation {
                 ops: vec![ControlOp::PutImposter {
                     config: Box::new(config),
+                    restart: None,
                 }],
                 port: Some(port),
                 render: Render::FetchAfter {
@@ -4013,6 +4048,7 @@ async fn build_mutation(
                 }
                 ops.push(ControlOp::PutImposter {
                     config: Box::new(config),
+                    restart: None,
                 });
             }
             let render = if ops.is_empty() {
@@ -4165,7 +4201,13 @@ async fn build_mutation(
             let replace: ReplaceStubsBody = parse(body, STUBS_DOOR)?;
             let mut config = stored_config(node, port)?;
             config.stubs = replace.stubs;
-            Ok(put_config_mutation(port, config, Admit::Content))
+            // Mountebank's `overwriteAll`: every stub's cycle restarts (D-116).
+            Ok(put_config_mutation(
+                port,
+                config,
+                Admit::Content,
+                Some(Restart::AllStubs),
+            ))
         }
         // Upstream's order (rift#1552): the imposter, then the index, then the body — so an index
         // that names no stub is a 404 whatever the body holds.
@@ -4174,7 +4216,13 @@ async fn build_mutation(
             let index = stub_position(&index, config.stubs.len()).ok_or_else(bad_stub_index)?;
             let stub: Stub = parse(body, STUB_DOOR)?;
             config.stubs[index] = stub;
-            Ok(put_config_mutation(port, config, Admit::Content))
+            // Mountebank's `overwriteAtIndex`: that stub's cycle restarts (D-116, rift#1515).
+            Ok(put_config_mutation(
+                port,
+                config,
+                Admit::Content,
+                Some(Restart::StubAt { index }),
+            ))
         }
         Terminated::DeleteStubAt(port, index) => {
             let mut config = stored_config(node, port)?;
@@ -4182,7 +4230,7 @@ async fn build_mutation(
             config.stubs.remove(index);
             // Commits as a whole-config put, but it only removes: exempt, so it can strip the
             // stub a refused config is refused for (D-104).
-            Ok(put_config_mutation(port, config, Admit::Nothing))
+            Ok(put_config_mutation(port, config, Admit::Nothing, None))
         }
         Terminated::ReplaceStubById(port, id) => {
             let stub: Stub = parse(body, STUB_DOOR)?;
@@ -4364,10 +4412,16 @@ fn order_imposters(body: &[u8], order: &[u16]) -> Result<Vec<u8>, String> {
     Ok(format!("{{\"imposters\":[{}]}}", entries.join(",")).into_bytes())
 }
 
-fn put_config_mutation(port: u16, config: ImposterConfig, admit: Admit) -> Mutation {
+fn put_config_mutation(
+    port: u16,
+    config: ImposterConfig,
+    admit: Admit,
+    restart: Option<Restart>,
+) -> Mutation {
     Mutation {
         ops: vec![ControlOp::PutImposter {
             config: Box::new(config),
+            restart,
         }],
         port: Some(port),
         render: Render::FetchAfter {
@@ -4728,7 +4782,7 @@ fn admit_op(
 ///   to refuse the edit that may repair it.
 fn admission_refusal(op: &ControlOp, stored: Option<&str>) -> Option<String> {
     match op {
-        ControlOp::PutImposter { config } => admission_check(config).err(),
+        ControlOp::PutImposter { config, .. } => admission_check(config).err(),
         ControlOp::PatchStubs { edit, .. } => {
             if !edit.0.iter().any(StubEdit::adds_content) {
                 return None;
@@ -6461,6 +6515,7 @@ mod tests {
         .expect("config parses");
         let mut op = ControlOp::PutImposter {
             config: Box::new(config),
+            restart: None,
         };
 
         let err = resolve_op_scripts(&mut op, &node, &ScriptBaseDir::Unconfigured, Some(1))
@@ -6476,6 +6531,17 @@ mod tests {
 
     /// #57: a script that resolution left inline but the engine cannot parse is
     /// refused with upstream's message, and the batch variant names the index.
+    /// Pins D-116: `?reconcile=` reads as upstream's `reconcile_param` does — upstream's own cases.
+    #[test]
+    fn reconcile_param_reads_as_upstream() {
+        assert_eq!(reconcile_param(None), Ok(false));
+        assert_eq!(reconcile_param(Some("reconcile=true")), Ok(true));
+        assert_eq!(reconcile_param(Some("other=1&reconcile=false")), Ok(false));
+        let refused = reconcile_param(Some("reconcile=yes")).expect_err("a typo is refused");
+        assert!(refused.contains("reconcile"), "{refused}");
+        assert!(reconcile_param(Some("reconcile=")).is_err());
+    }
+
     #[tokio::test]
     async fn validation_refuses_unparseable_resolved_scripts() {
         let broken = |port: u16| -> ControlOp {
@@ -6495,6 +6561,7 @@ mod tests {
                     }))
                     .expect("config parses"),
                 ),
+                restart: None,
             }
         };
 
@@ -7520,6 +7587,7 @@ mod tests {
         fn put(config: ImposterConfig) -> ControlOp {
             ControlOp::PutImposter {
                 config: Box::new(config),
+                restart: None,
             }
         }
 
