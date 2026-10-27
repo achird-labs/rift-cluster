@@ -1,5 +1,5 @@
 /** @vitest-environment jsdom */
-import { cleanup, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { type ReactNode, useState } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -564,3 +564,45 @@ describe("the one-line summary of a response list (AC7 feeds on this)", () => {
     expect(describeResponseList([])).toBe("carries no responses");
   });
 });
+
+describe("#735 — repeat accepts only what the engine admits", () => {
+  const withRepeat = (repeat: number) =>
+    response(200, { behaviors: { spelling: "_behaviors", order: ["repeat"], wait: { kind: "none" }, repeat } });
+
+  it.each(["0", "-1", "1.5", "4294967296", "1e10"])(
+    "does not propose a repeat of %s and shows the engine's message",
+    (typed) => {
+      const { onChange } = mount([withRepeat(3)]);
+      fireEvent.change(screen.getByLabelText("Repeat count for response 1"), { target: { value: typed } });
+      expect(onChange).not.toHaveBeenCalled();
+      expect(screen.getByTestId("response-repeat-error-0").textContent).toBe(
+        '"repeat" field must be an integer greater than 0',
+      );
+    },
+  );
+
+  it.each([1, 4294967295])("accepts %s and writes it as the response's repeat", (count) => {
+    const { last } = mount([response(200)]);
+    fireEvent.change(screen.getByLabelText("Repeat count for response 1"), { target: { value: String(count) } });
+    expect(last()?.[0]?.behaviors?.repeat).toBe(count);
+    expect(renderResponses(last() ?? [])).toEqual([{ is: { statusCode: 200 }, _behaviors: { repeat: count } }]);
+  });
+
+  it("clears the error once a valid count is typed", () => {
+    const { last } = mount([withRepeat(3)]);
+    const input = screen.getByLabelText("Repeat count for response 1");
+    fireEvent.change(input, { target: { value: "0" } });
+    expect(screen.queryByTestId("response-repeat-error-0")).not.toBeNull();
+    fireEvent.change(input, { target: { value: "2" } });
+    expect(screen.queryByTestId("response-repeat-error-0")).toBeNull();
+    expect(last()?.[0]?.behaviors?.repeat).toBe(2);
+  });
+
+  it("renders the input with min 1 and step 1", () => {
+    mount([response(200)]);
+    const input = screen.getByLabelText("Repeat count for response 1");
+    expect(input.getAttribute("min")).toBe("1");
+    expect(input.getAttribute("step")).toBe("1");
+  });
+});
+

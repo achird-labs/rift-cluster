@@ -41,8 +41,7 @@ import {
   parseResponseFault,
   parseRiftTcpFault,
   renderBehaviors,
-  renderFault,
-} from "./behaviors.ts";
+  renderFault, isEngineRepeat } from "./behaviors.ts";
 
 /**
  * One header line. `value` is whatever JSON the document carried — usually a string, sometimes a
@@ -520,7 +519,8 @@ function parseResponseLevel(
    */
   if ("repeat" in value) {
     const repeat = value.repeat;
-    if (typeof repeat !== "number") {
+    // A count the engine would refuse is shown raw, never modelled (see `isEngineRepeat`).
+    if (typeof repeat !== "number" || !isEngineRepeat(repeat)) {
       issues.push(`${path}.repeat`);
     } else if (spelling === null) {
       behaviors = { spelling: "behaviorsArray", order: ["repeat"], wait: { kind: "none" }, repeat };

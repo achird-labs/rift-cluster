@@ -3,8 +3,10 @@ import { type ReactNode, useId, useState } from "react";
 import {
   FAULT_KINDS,
   type BehaviorModel,
+  REPEAT_NOT_POSITIVE,
   type WaitModel,
   canonicalFaultKind,
+  isEngineRepeat,
 } from "./behaviors.ts";
 import {
   DEFAULT_STATUS_CODE,
@@ -288,8 +290,8 @@ function ResponseCard({
     onChange({ ...item, behaviors: { ...behaviors, wait: nextWait } });
   };
 
-  const onRepeatChange = (raw: string): void => {
-    if (raw === "") {
+  const onRepeatChange = (repeat: number | null): void => {
+    if (repeat === null) {
       if (item.behaviors === null) return;
       onChange({
         ...item,
@@ -301,15 +303,13 @@ function ResponseCard({
       });
       return;
     }
-    const parsed = Number(raw);
-    if (!Number.isFinite(parsed)) return;
     const base: BehaviorModel =
       item.behaviors ?? { spelling: "_behaviors", order: [], wait: { kind: "none" }, repeat: null };
     onChange({
       ...item,
       behaviors: {
         ...base,
-        repeat: parsed,
+        repeat,
         order: base.order.includes("repeat") ? base.order : [...base.order, "repeat"],
       },
     });
@@ -546,15 +546,12 @@ function ResponseCard({
           </>
         ) : null}
 
-        <div className="field">
-          <label htmlFor={`${uid}-repeat`}>Repeat count for response {n}</label>
-          <input
-            id={`${uid}-repeat`}
-            type="number"
-            value={item.behaviors?.repeat ?? ""}
-            onChange={(event) => onRepeatChange(event.target.value)}
-          />
-        </div>
+        <RepeatField
+          index={index}
+          responseNumber={n}
+          value={item.behaviors?.repeat ?? null}
+          onChange={onRepeatChange}
+        />
         <p className="muted">
           This response is served this many times before the cycle advances to the next response.
         </p>
@@ -644,6 +641,69 @@ function ResponseCard({
  * distinguishes the two cases that matter: our own edit coming back (keep the operator's text,
  * whitespace and all) versus the body being changed from outside, in the raw JSON pane (adopt it).
  */
+/**
+ * A response's repeat count. Proposes only a count the engine admits ([`isEngineRepeat`]); a value it
+ * would refuse — `0`, a negative, a fraction, anything above `u32::MAX` — proposes nothing, keeps the
+ * last good count in the document and shows the engine's own message, as [`JsonBodyField`] does
+ * for a body that does not parse. Empty clears the repeat. The box's text is local so a refused
+ * value stays visible while the operator corrects it, and resyncs when the count changes from
+ * outside.
+ */
+function RepeatField({
+  index,
+  responseNumber,
+  value,
+  onChange,
+}: {
+  index: number;
+  responseNumber: number;
+  value: number | null;
+  onChange: (repeat: number | null) => void;
+}): ReactNode {
+  const uid = useId();
+  const [localText, setLocalText] = useState<string | null>(null);
+  const [lastEmitted, setLastEmitted] = useState<number | null>(value);
+  if (value !== lastEmitted) {
+    setLastEmitted(value);
+    setLocalText(null);
+  }
+  const text = localText ?? (value === null ? "" : String(value));
+  const refused = localText !== null && localText !== "" && !isEngineRepeat(Number(localText));
+
+  const handleChange = (next: string): void => {
+    setLocalText(next);
+    if (next === "") {
+      setLastEmitted(null);
+      onChange(null);
+      return;
+    }
+    const parsed = Number(next);
+    if (!isEngineRepeat(parsed)) return;
+    setLastEmitted(parsed);
+    onChange(parsed);
+  };
+
+  return (
+    <div className="field">
+      <label htmlFor={`${uid}-repeat`}>Repeat count for response {responseNumber}</label>
+      <input
+        id={`${uid}-repeat`}
+        type="number"
+        min={1}
+        step={1}
+        inputMode="numeric"
+        value={text}
+        onChange={(event) => handleChange(event.target.value)}
+      />
+      {refused ? (
+        <p className="error" data-testid={`response-repeat-error-${index}`}>
+          {REPEAT_NOT_POSITIVE}
+        </p>
+      ) : null}
+    </div>
+  );
+}
+
 function JsonBodyField({
   index,
   responseNumber,
