@@ -165,7 +165,7 @@ rewritten for one credential. Operating the admin plane is an operations questio
 
 ### One key, or none
 
-> **Amended by D-105** (2026-10-27, #708): the key may also be sent in Mountebank's `x-api-key`
+> **Amended by D-105** (2026-10-26, #708): the key may also be sent in Mountebank's `x-api-key`
 > header (and the flag spelled `--apikey`), read only when `Authorization` is absent.
 
 The admin plane has exactly one credential: open-source Rift's `--api-key` (`MB_APIKEY`), sent as
@@ -341,7 +341,7 @@ still **not built**; it is kept as the design of what it would have to look like
 > additive. A release that changes the engine's *matching*, a stub *key*, or what it *admits* is a
 > whole-fleet upgrade — see "Whole-fleet upgrades" below.
 
-> **Amended by D-106** (2026-10-27, #710): tolerating unknown fields covers new *fields* only. A
+> **Amended by D-106** (2026-10-26, #710): tolerating unknown fields covers new *fields* only. A
 > release whose engine widens an existing field's type (rift#1558's string `statusCode`) is a
 > whole-fleet upgrade too: an old node cannot decode a log entry that uses the wider value.
 

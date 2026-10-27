@@ -18,8 +18,9 @@
 //!   Recorded fact is already on consensus.
 //! - **Replay.** Steady-state replay never consults this store: the recorded stub is in
 //!   replicated config and matches ahead of the proxy stub on every node. `lookup()` covers
-//!   the stub-less recording (its replay source forever) and the commit→apply window (from
-//!   the owner's completion cache).
+//!   the stub-less recording (its replay source until its imposter is deleted or cleared) and
+//!   the commit→apply window (from the owner's completion cache). A recorded marker is forgot
+//!   at apply when its recorded stub is removed or changed (D-108).
 //! - **Modes.** The store is manager-scoped, so it resolves each port's proxy mode from
 //!   applied config. `proxyOnce` runs the claim machinery; `proxyAlways` grants formality
 //!   tokens and publishes every recording as a merge op (the engine skips local insertion for
@@ -1017,6 +1018,9 @@ impl ClusterProxyStore {
     }
 }
 
+/// `forget_recorded` keeps the default no-op on purpose: the engine calls it only for a claim held
+/// by a stub *it* inserted, and with `publishes_stubs()` it inserts none — the state machine forgets
+/// a marker when its recorded stub goes (D-108).
 impl ProxyRecordingStore for ClusterProxyStore {
     /// D-66: under `proxyOnce` this store **is** the exactly-once arbiter, so a failure to
     /// obtain a claim answer refuses the request rather than degrading it. Upstream's

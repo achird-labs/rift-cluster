@@ -875,6 +875,9 @@ carried but not acted on. The fleet-wide form is `port → JournalCursor` with i
 - **Amends:** RFC-001 §7.5.3
 - **Code:** crates/rift-cluster/src/stores/proxy.rs, crates/rift-cluster/src/control.rs
 
+> **Amended by D-108** (2026-10-26, #681, #689): a `Recorded` marker now ends when its recorded stub
+> is removed or changed, and only then (or on an imposter delete or a clear).
+
 A `Pending` claim is owner-local (`KeyClass::Proxy`, HRW over `(port, signature)`) and dies with
 its owner; `Recorded` and its replayable stub are one `ControlOp::ProxyRecorded`, so there is no
 crash window between the recording and the config write. The claim TTL is a fixed 60 s — U-16
@@ -2850,6 +2853,12 @@ per-imposter digests would avoid it and give up the property above (a removed im
 the others' identities unchanged, hiding that the document moved at all); a bootstrap document is
 edited at deploy time, so the trade goes this way.
 
+> **Amended by D-108** (2026-10-26, #689): a re-applied `PutImposter` is not a delete-then-recreate —
+> the engine reconciles in place unless an imposter-level field differs — and it no longer drops every
+> marker on the port. It forgets the markers whose recorded stub the document removes or changes;
+> a bootstrap document carries no recorded stubs, so every stub-bearing recording there can still be
+> recorded again, while a stub-less recording survives the re-apply.
+
 *The bootstrap waits, bounded, for a leader — immediately before its first submit, not on entry.*
 `RaftNode::submit` answers `Unavailable` at once when no leader is visible, and a joiner — or any
 node in a fleet cold-starting together — is composed inside exactly that window. The bootstrap
@@ -2918,7 +2927,7 @@ There is no principal, no role, no binding, no quota and no tenant anywhere in t
 therefore no per-resource authorization: everyone who can administer the fleet can administer all
 of it. Isolation between teams is a deployment (two fleets), not a feature (RFC-007 §3.3).
 
-> **Amended by D-105** (2026-10-27, #708): the key may also arrive in Mountebank's `x-api-key`
+> **Amended by D-105** (2026-10-26, #708): the key may also arrive in Mountebank's `x-api-key`
 > header, read only when `Authorization` is absent; the gateway strip and the admin leg handle
 > both headers.
 
@@ -3975,7 +3984,7 @@ decision, not a side effect of a pin bump.
 - **Refines:** D-33, D-88
 - **Code:** crates/rift-cluster-server/src/main.rs, crates/rift-cluster-server/src/bootstrap.rs, crates/rift-cluster-server/src/compose.rs, crates/rift-cluster-server/tests/cli.rs
 
-> **Amended by D-107** (2026-10-27, #716): the PID file is written once startup has returned, never
+> **Amended by D-107** (2026-10-26, #716): the PID file is written once startup has returned, never
 > before; a start that fails or is abandoned writes none.
 
 **The gap.** D-33 promises that without `--cluster` this binary behaves as `rift` does. rift#1155
@@ -4498,7 +4507,7 @@ and the gate opening is not covered for that node.
 - **Implemented by:** #655
 - **Code:** crates/rift-cluster/src/raft/store.rs, crates/rift-cluster/src/stores/sequencer.rs, tests/cluster-chaos/tests/scenarios.rs
 
-> **Amended by D-106** (2026-10-27, #710): a decode *widening* is a fourth whole-fleet class beside
+> **Amended by D-106** (2026-10-26, #710): a decode *widening* is a fourth whole-fleet class beside
 > matching, keys and admission.
 
 **What the bump fixed.** Before rift #1259 (first pinned here at `fa205d4`; the previous pin was
@@ -4850,7 +4859,7 @@ what changes is which committed configs this engine serves.
 (upstream *loosening* a check). That window is the whole-fleet upgrade rule's (D-98); from this
 decision on, decoding is engine-independent.
 
-> **Amended by D-106** (2026-10-27, #710): independent of the engine's *admission checks* only. A
+> **Amended by D-106** (2026-10-26, #710): independent of the engine's *admission checks* only. A
 > decode *widening* — a field that now accepts a wider type — still leaves an older binary unable to
 > read what a newer one commits, and that failure is the whole log entry.
 
@@ -4964,7 +4973,7 @@ Decode refusals now lead with standalone's label for the route (`Invalid imposte
 ### D-105 — The admin key is read from `Authorization`, or from Mountebank's `x-api-key` when `Authorization` is absent; every place the front handles the key handles both headers
 
 - **Status:** active
-- **Decided:** 2026-10-27 · #708
+- **Decided:** 2026-10-26 · #708
 - **Amends:** D-73
 - **Implemented by:** #708
 - **Code:** crates/rift-cluster-server/src/admin_front.rs, crates/rift-cluster-server/tests/fleet_session.rs
@@ -4992,7 +5001,7 @@ that stamps the fleet key on every call leak it into imposter journals.
 ### D-106 — A decode widening is a whole-fleet change: an old binary cannot read a log that holds a value only a newer engine decodes
 
 - **Status:** active
-- **Decided:** 2026-10-27 · #710
+- **Decided:** 2026-10-26 · #710
 - **Amends:** D-102, D-98
 - **Implemented by:** #710
 - **Code:** crates/rift-cluster/src/control.rs, crates/rift-cluster/src/raft/store.rs
@@ -5021,7 +5030,7 @@ stub's shared cursor moves at the bump.
 ### D-107 — The PID file is written once the server serves, never before; a start that fails writes none
 
 - **Status:** active
-- **Decided:** 2026-10-27 · #716
+- **Decided:** 2026-10-26 · #716
 - **Refines:** D-89, D-33
 - **Implemented by:** #716
 - **Code:** crates/rift-cluster-server/src/main.rs, crates/rift-cluster-server/src/bootstrap.rs, crates/rift-cluster-server/tests/cli.rs
@@ -5051,4 +5060,55 @@ to stop a node mid-join; D-89 abandons the start cleanly.
 node can stay unreconciled indefinitely, and then `stop` could not find it. Writing it inside
 `compose::start` — that is an embedding seam, the same reason upstream keeps the write out of
 `ServerBuilder::start`.
+
+### D-108 — A recorded proxyOnce marker lives as long as its recorded stub; a stub-less one as long as its imposter
+
+- **Status:** active
+- **Decided:** 2026-10-26 · #681, #689
+- **Amends:** D-40, D-72
+- **Implemented by:** #681, #689
+- **Code:** crates/rift-cluster/src/raft/store.rs, crates/rift-cluster/src/stores/proxy.rs, crates/rift-cluster/src/control.rs
+
+`ClusterProxyStore` publishes recorded stubs through the log (`publishes_stubs()`), so the engine
+never holds a recording's claim locally and never calls `forget_recorded` for it (rift#1386): when a
+recorded stub goes, forgetting has to happen in the cluster, at apply. Before this, two arms got it
+wrong in opposite directions. A `PatchStubs` that deleted or rewrote a recorded stub kept its marker,
+so the signature replayed a recording no stub served any more. A `PutImposter` over an existing port
+dropped every marker on it, including the stub-less recordings whose row is their only replay
+source, so any whole-config write (an index edit, `PUT …/stubs`, `PUT /imposters`, a bootstrap
+re-apply) made them forward again.
+
+**The rule.** A marker `h` whose recording carries a stub lives as long as that stub: the *newest*
+stub of the `proxy-recorded-{h}` family (base id rank 0, `-r{n}` rank `n`, below). A `PatchStubs` or
+a `PutImposter` that leaves no stub of that id with equal content — compared as JSON values, so an identical stub
+re-sent with its maps in another order is not a change — forgets `h` in the same apply, and the
+signature is claimed and recorded afresh. A move, an identical replace, and an edit to any other
+stub forget nothing. A stub-less marker lives as long as its imposter: `DeleteImposter`,
+`DeleteAll` and `ProxyRecordedClear` drop it, and nothing else does. Every input — the stored config
+before the op, the op, the marker table — is replicated state, so every replica decides the same.
+
+**Re-recordings take a distinct, higher-ranked id.** An edit that changes a recorded stub but keeps
+its id forgets `h`, and the next request re-records `h`; a second stub with the same id would be
+refused by the engine's drive. So a recording made while any stub of `h` exists is given
+`proxy-recorded-{h}-r{index}`, the applying log index — deterministic, unique, and ranked above every
+older stub of `h`. The marker follows that newest stub: deleting or editing a stale, already-forgotten
+stub of `h` leaves the live recording's marker alone, or requests sharing `h` that the new stub does
+not match would forward again.
+
+A put over a port whose stored config will not decode cannot be diffed: it forgets the port's
+markers (one re-forward each) rather than refuse the write that repairs the row.
+
+**Divergences, stated.** Upstream's `PUT …/stubs` builds every stub afresh and forgets every claim,
+even on an identical round-trip; the cluster keeps them. That is observable only when an identical
+recorded stub is placed *behind* its proxy stub: the cluster replays, upstream re-forwards. Upstream's
+`PUT /imposters` also clears stub-less recordings when an imposter-level field changes or most stubs
+change (a `pub(crate)` heuristic); the cluster does not copy a threshold that drifts with every bump,
+and `DELETE …/savedProxyResponses` is the explicit reset.
+
+**Upgrade.** An apply-semantics change, not a format one: no new op, field, table or snapshot
+change. While versions are mixed, an old node keeps a marker a new node forgot (or drops ones it
+keeps), and when that node owns the signature it replays the old recording — pre-fix behaviour, not a
+new wrong one — until the port is next deleted or cleared, or a snapshot is installed. Recordings
+orphaned by a by-id delete before this release can no longer be told apart from stub-less ones: clear
+`savedProxyResponses` on proxyOnce ports that were edited by id.
 

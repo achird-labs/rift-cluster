@@ -531,8 +531,8 @@ export function usePromoteRecording(): UseMutationResult<CommitOutcome, Error, S
  * Discard everything a recording has captured so far, without touching the proxy stub itself — the
  * imposter keeps recording; only what it has captured up to now is cleared.
  *
- * `DELETE .../savedProxyResponses` is not terminated by the admin front — it proxies upstream to
- * the embedded engine's own admin API.
+ * `DELETE .../savedProxyResponses` is terminated by the admin front and commits a
+ * `ProxyRecordedClear`, so it clears the fleet's recordings, not just this node's.
  */
 export function useDiscardRecording(): UseMutationResult<CommitOutcome, Error, { port: number }> {
   const client = useQueryClient();

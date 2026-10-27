@@ -176,8 +176,9 @@ pub enum ControlOp {
     },
     /// Delete every recorded-proxy marker for a port (#226) — the clustered half of
     /// `DELETE /imposters/:port/savedProxyResponses`. Recorded *stubs* are imposter config
-    /// and are deleted through the stub-edit surfaces; this op clears the claim table so
-    /// signatures record afresh.
+    /// and are deleted through the stub-edit surfaces — which forget their own markers at
+    /// apply (D-108); this op clears the whole claim table, stub-less recordings included, so
+    /// every signature records afresh.
     ProxyRecordedClear {
         port: u16,
     },

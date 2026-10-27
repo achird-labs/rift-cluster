@@ -160,6 +160,62 @@ enum PlacedRecording {
     MergedAnonymous,
 }
 
+/// The id a published recording's stub is given, `proxy-recorded-{sig_hash}` (D-108).
+const RECORDED_STUB_ID_PREFIX: &str = "proxy-recorded-";
+
+/// The signature hash a recorded stub's id names — `proxy-recorded-{h}`, or `proxy-recorded-{h}-r{n}`
+/// for a re-recording (D-108). `None` for any other id.
+fn recorded_sig_hash(id: &str) -> Option<&str> {
+    recorded_id(id).map(|(hash, _)| hash)
+}
+
+/// A recorded stub id's signature hash and its rank: `0` for the base id, `n` for `-r{n}`. The
+/// suffix is the applying log index, so the highest rank is the newest recording of that hash.
+fn recorded_id(id: &str) -> Option<(&str, u64)> {
+    let rest = id.strip_prefix(RECORDED_STUB_ID_PREFIX)?;
+    let (hash, rank) = match rest.split_once("-r") {
+        Some((hash, n)) if !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()) => {
+            (hash, n.parse().ok()?)
+        }
+        Some(_) => return None,
+        None => (rest, 0),
+    };
+    let lower_hex = |b: u8| b.is_ascii_digit() || (b'a'..=b'f').contains(&b);
+    (!hash.is_empty() && hash.bytes().all(lower_hex)).then_some((hash, rank))
+}
+
+/// The signature hashes whose recorded stub an edit removed or changed (D-108). The marker of `h`
+/// belongs to the *newest* stub of the `proxy-recorded-{h}` family — the highest rank — so only
+/// that stub's removal or change forgets it: deleting a stale, already-forgotten stub of `h` must
+/// not drop the marker of the recording that replaced it. Compared as JSON values, so neither field
+/// order nor map order can make an identical stub read as changed. A move, an identical replace,
+/// and an edit to any other stub forget nothing.
+fn orphaned_recordings(before: &[Stub], after: &[Stub]) -> serde_json::Result<BTreeSet<String>> {
+    let mut newest: BTreeMap<&str, (u64, &Stub)> = BTreeMap::new();
+    for stub in before {
+        if let Some((hash, rank)) = stub.id.as_deref().and_then(recorded_id)
+            && newest.get(hash).is_none_or(|(seen, _)| rank > *seen)
+        {
+            newest.insert(hash, (rank, stub));
+        }
+    }
+    let mut orphaned = BTreeSet::new();
+    for (hash, (_, stub)) in newest {
+        let value = serde_json::to_value(stub)?;
+        let mut kept = false;
+        for candidate in after.iter().filter(|s| s.id == stub.id) {
+            if serde_json::to_value(candidate)? == value {
+                kept = true;
+                break;
+            }
+        }
+        if !kept {
+            orphaned.insert(hash.to_owned());
+        }
+    }
+    Ok(orphaned)
+}
+
 /// Deterministically place a recorded stub in a config's stub list — the state-machine
 /// transliteration of upstream's `insert_or_append_proxy_stub`
 /// (`rift-mock-core/src/imposter/core/proxy.rs`), which operates on the live `StubState`
@@ -2274,13 +2330,47 @@ impl RedbStateMachine {
                 };
                 let value = serde_json::to_string(&stored)
                     .map_err(|e| StorageIOError::write_state_machine(&e))?;
+                // D-108: a recorded marker lives as long as its recorded stub. A put forgets the
+                // markers whose `proxy-recorded-{h}` stub it removes or changes, judged against
+                // the config it replaces; a stub-less marker, and one whose stub survives, is
+                // kept. Read before the insert below overwrites the row.
+                let has_markers = proxy_recorded
+                    .range((port, "")..)
+                    .map_err(io)?
+                    .next()
+                    .transpose()
+                    .map_err(io)?
+                    .is_some_and(|(key, _)| key.value().0 == port);
+                if has_markers {
+                    let before = configs.get(port).map_err(io)?.map(|guard| {
+                        serde_json::from_str::<StoredImposter>(guard.value())
+                            .map_err(|e| e.to_string())
+                            .and_then(|record| {
+                                control::decode_committed_config(record.config.get())
+                                    .map_err(|e| e.to_string())
+                            })
+                    });
+                    match before {
+                        Some(Ok(before)) => {
+                            let orphaned = orphaned_recordings(&before.stubs, &config.stubs)
+                                .map_err(|e| StorageIOError::write_state_machine(&e))?;
+                            for sig_hash in &orphaned {
+                                proxy_recorded
+                                    .remove((port, sig_hash.as_str()))
+                                    .map_err(io)?;
+                            }
+                        }
+                        // No row: nothing can own a marker here, so dropping is a no-op. A row
+                        // that will not decode cannot be diffed; forgetting costs one re-forward,
+                        // and refusing the put would refuse the write that repairs the row.
+                        None => proxy_recorded.retain(|(p, _), _| p != port).map_err(io)?,
+                        Some(Err(e)) => {
+                            tracing::error!(port, error = %e, "corrupt stored config; forgetting its recordings");
+                            proxy_recorded.retain(|(p, _), _| p != port).map_err(io)?;
+                        }
+                    }
+                }
                 configs.insert(port, value.as_str()).map_err(io)?;
-                // A replace is a new imposter in the recording sense (#226): the old
-                // config's recorded stubs are gone from the stub list this put installs,
-                // and a surviving marker row would answer `AlreadyRecorded` with the *old*
-                // upstream's response — so the markers die with the config they described,
-                // exactly as they do on `DeleteImposter`.
-                proxy_recorded.retain(|(p, _), _| p != port).map_err(io)?;
                 crate::metrics::config_applied(port, index);
                 // D-99: one port's drive, unless something on this node is failing — then the
                 // whole set, so the drive re-attempts what failed (D-81's heal) as it always has.
@@ -2317,6 +2407,7 @@ impl RedbStateMachine {
                     }
                 };
                 let was_admitted = rift_cluster_base::seams::admission_check(&config).is_ok();
+                let before = config.stubs.clone();
                 if let Err(reason) = control::apply_edit(&mut config.stubs, edit) {
                     return Ok(Err(reason));
                 }
@@ -2326,6 +2417,15 @@ impl RedbStateMachine {
                 let value = serde_json::to_string(&record)
                     .map_err(|e| StorageIOError::write_state_machine(&e))?;
                 configs.insert(*port, value.as_str()).map_err(io)?;
+                // D-108: an edit that removes or changes a recorded stub forgets its marker, in
+                // this same apply, so the signature is claimed and recorded afresh.
+                let orphaned = orphaned_recordings(&before, &config.stubs)
+                    .map_err(|e| StorageIOError::write_state_machine(&e))?;
+                for sig_hash in &orphaned {
+                    proxy_recorded
+                        .remove((*port, sig_hash.as_str()))
+                        .map_err(io)?;
+                }
                 crate::metrics::config_applied(*port, index);
                 Ok(Ok(Self::edit_drive(
                     *port,
@@ -2547,7 +2647,19 @@ impl RedbStateMachine {
                     // Addressable identity: the engine drive replaces a merged stub by id, and
                     // a later proxyAlways merge into this stub needs the same handle. Derived
                     // from the sig-hash so every replica assigns the identical id.
-                    stub_value.id = Some(format!("proxy-recorded-{sig_hash}"));
+                    let base = format!("{RECORDED_STUB_ID_PREFIX}{sig_hash}");
+                    // D-108: once an edit has forgotten `sig_hash` but kept a stub of its family,
+                    // the re-recording takes the applying log index as a suffix — deterministic,
+                    // unique, and ranked above every older stub of `sig_hash`, so the marker
+                    // follows the newest recording and only its removal forgets it.
+                    let taken = config.stubs.iter().any(|s| {
+                        s.id.as_deref().and_then(recorded_sig_hash) == Some(sig_hash.as_str())
+                    });
+                    stub_value.id = Some(if taken {
+                        format!("{base}-r{index}")
+                    } else {
+                        base
+                    });
                 }
                 let placed = place_recorded_stub(
                     &mut config.stubs,
@@ -2598,7 +2710,7 @@ impl RedbStateMachine {
             ControlOp::ProxyRecordedClear { port } => {
                 // Clearing an empty table is a no-op, not a failure — idempotent like every
                 // delete here. Recorded *stubs* stay: they are imposter config, deleted
-                // through the stub-edit surfaces (#226's documented split).
+                // through the stub-edit surfaces, which forget their own markers (D-108).
                 proxy_recorded.retain(|(p, _), _| p != *port).map_err(io)?;
                 Ok(Ok(Vec::new()))
             }
@@ -7075,6 +7187,433 @@ mod tests {
 
     fn marker(sm: &RedbStateMachine, port: u16, sig_hash: &str) -> Option<String> {
         sm.proxy_recorded_resp(port, sig_hash).expect("read marker")
+    }
+
+    // ---- D-108 (#681, #689): a recorded marker lives as long as its recorded stub ----
+
+    const H1: &str = "00000000000000a1";
+    const H2: &str = "00000000000000b2";
+    const H3: &str = "00000000000000c3";
+
+    fn stored(sm: &RedbStateMachine, port: u16) -> ImposterConfig {
+        crate::control::decode_committed_config(
+            &sm.read_config(port).expect("read").expect("committed"),
+        )
+        .expect("decodes")
+    }
+
+    fn stub_ids(sm: &RedbStateMachine, port: u16) -> Vec<String> {
+        stored(sm, port)
+            .stubs
+            .iter()
+            .filter_map(|s| s.id.clone())
+            .collect()
+    }
+
+    fn patch(op_id: u128, port: u16, step: crate::control::StubEdit) -> ControlRequest {
+        request(
+            op_id,
+            ControlOp::PatchStubs {
+                port,
+                edit: crate::control::StubEditScript(vec![step]),
+            },
+        )
+    }
+
+    fn put_req(op_id: u128, config: ImposterConfig) -> ControlRequest {
+        request(
+            op_id,
+            ControlOp::PutImposter {
+                config: Box::new(config),
+            },
+        )
+    }
+
+    fn before_proxy(body: &str) -> Option<crate::control::RecordedStub> {
+        Some(recorded_stub(
+            body,
+            crate::control::RecordedStubPlacement::BeforeProxy,
+        ))
+    }
+
+    /// A proxyOnce imposter with a static stub first, `h1` recorded with a stub, `h2` stub-less.
+    async fn recorded_port(sm: &mut RedbStateMachine) {
+        let mut config = proxy_imposter_config(8080);
+        let static_stub: super::Stub = serde_json::from_value(json!({
+            "id": "static",
+            "predicates": [{ "equals": { "path": "/static" } }],
+            "responses": [{ "is": { "body": "static" } }]
+        }))
+        .expect("stub");
+        config.stubs.insert(0, static_stub);
+        apply_one(sm, 1, put_req(1, config)).await;
+        apply_one(
+            sm,
+            2,
+            proxy_recorded(2, 8080, H1, "one", before_proxy("one")),
+        )
+        .await;
+        apply_one(sm, 3, proxy_recorded(3, 8080, H2, "two", None)).await;
+        assert!(marker(sm, 8080, H1).is_some() && marker(sm, 8080, H2).is_some());
+    }
+
+    /// Pins D-108: deleting a recorded stub by id forgets its marker, and only its marker.
+    #[tokio::test]
+    async fn deleting_a_recorded_stub_by_id_drops_its_marker() {
+        let (_td, mut sm) = fresh_sm(None).await;
+        recorded_port(&mut sm).await;
+        apply_one(
+            &mut sm,
+            4,
+            patch(
+                4,
+                8080,
+                crate::control::StubEdit::DeleteById {
+                    id: format!("proxy-recorded-{H1}"),
+                },
+            ),
+        )
+        .await;
+        assert_eq!(
+            marker(&sm, 8080, H1),
+            None,
+            "its stub is gone, so is the marker"
+        );
+        assert!(
+            marker(&sm, 8080, H2).is_some(),
+            "a stub-less marker is untouched"
+        );
+    }
+
+    /// Pins D-108: a by-id replace forgets the marker only when it changes the stub.
+    #[tokio::test]
+    async fn replacing_a_recorded_stub_with_new_content_drops_its_marker_and_an_identical_replace_keeps_it()
+     {
+        let (_td, mut sm) = fresh_sm(None).await;
+        recorded_port(&mut sm).await;
+        let id = format!("proxy-recorded-{H1}");
+        let same = stored(&sm, 8080)
+            .stubs
+            .into_iter()
+            .find(|s| s.id.as_deref() == Some(id.as_str()))
+            .expect("recorded stub");
+        apply_one(
+            &mut sm,
+            4,
+            patch(
+                4,
+                8080,
+                crate::control::StubEdit::ReplaceById {
+                    id: id.clone(),
+                    stub: same.clone(),
+                },
+            ),
+        )
+        .await;
+        assert!(
+            marker(&sm, 8080, H1).is_some(),
+            "an identical replace keeps it"
+        );
+
+        let mut changed = same;
+        changed.predicates = serde_json::from_value(json!([{ "equals": { "path": "/other" } }]))
+            .expect("predicates");
+        apply_one(
+            &mut sm,
+            5,
+            patch(
+                5,
+                8080,
+                crate::control::StubEdit::ReplaceById { id, stub: changed },
+            ),
+        )
+        .await;
+        assert_eq!(marker(&sm, 8080, H1), None, "a changed replace forgets it");
+    }
+
+    /// Pins D-108: a move, or deleting some other stub, keeps the marker.
+    #[tokio::test]
+    async fn moving_or_deleting_another_stub_keeps_the_marker() {
+        let (_td, mut sm) = fresh_sm(None).await;
+        recorded_port(&mut sm).await;
+        apply_one(
+            &mut sm,
+            4,
+            patch(4, 8080, crate::control::StubEdit::Move { from: 1, to: 0 }),
+        )
+        .await;
+        assert!(marker(&sm, 8080, H1).is_some(), "a move keeps it");
+        apply_one(
+            &mut sm,
+            5,
+            patch(
+                5,
+                8080,
+                crate::control::StubEdit::DeleteById {
+                    id: "static".to_owned(),
+                },
+            ),
+        )
+        .await;
+        assert!(marker(&sm, 8080, H1).is_some(), "a sibling delete keeps it");
+        assert!(marker(&sm, 8080, H2).is_some(), "the stub-less marker too");
+    }
+
+    /// Pins D-108's id guard: after a changed replace forgets `h`, re-recording `h` must not
+    /// produce a second stub with the same id; it takes a log-index suffix, and that suffixed
+    /// stub's delete still forgets `h`.
+    #[tokio::test]
+    async fn a_re_recording_after_a_replace_takes_a_distinct_id_and_its_delete_forgets_it() {
+        let (_td, mut sm) = fresh_sm(None).await;
+        recorded_port(&mut sm).await;
+        let id = format!("proxy-recorded-{H1}");
+        let mut changed = stored(&sm, 8080)
+            .stubs
+            .into_iter()
+            .find(|s| s.id.as_deref() == Some(id.as_str()))
+            .expect("recorded stub");
+        changed.predicates = serde_json::from_value(json!([{ "equals": { "path": "/other" } }]))
+            .expect("predicates");
+        apply_one(
+            &mut sm,
+            4,
+            patch(
+                4,
+                8080,
+                crate::control::StubEdit::ReplaceById { id, stub: changed },
+            ),
+        )
+        .await;
+        assert_eq!(marker(&sm, 8080, H1), None);
+
+        apply_one(
+            &mut sm,
+            5,
+            proxy_recorded(5, 8080, H1, "again", before_proxy("again")),
+        )
+        .await;
+        let ids = stub_ids(&sm, 8080);
+        let unique: BTreeSet<&String> = ids.iter().collect();
+        assert_eq!(unique.len(), ids.len(), "no duplicate ids: {ids:?}");
+        let suffixed = format!("proxy-recorded-{H1}-r5");
+        assert!(ids.contains(&suffixed), "{ids:?}");
+        assert!(marker(&sm, 8080, H1).is_some());
+
+        apply_one(
+            &mut sm,
+            6,
+            patch(
+                6,
+                8080,
+                crate::control::StubEdit::DeleteById { id: suffixed },
+            ),
+        )
+        .await;
+        assert_eq!(
+            marker(&sm, 8080, H1),
+            None,
+            "the suffixed id is in the family"
+        );
+    }
+
+    /// Pins D-108's ownership rule: once `h` has a stale edited stub and a newer re-recording, the
+    /// marker belongs to the newer one — deleting the stale stub keeps it, deleting the newer one
+    /// forgets it. Ranked by the log-index suffix, never by position.
+    #[tokio::test]
+    async fn deleting_a_stale_stub_of_a_re_recorded_signature_keeps_the_live_marker() {
+        let (_td, mut sm) = fresh_sm(None).await;
+        recorded_port(&mut sm).await;
+        let base = format!("proxy-recorded-{H1}");
+        let mut changed = stored(&sm, 8080)
+            .stubs
+            .into_iter()
+            .find(|s| s.id.as_deref() == Some(base.as_str()))
+            .expect("recorded stub");
+        changed.predicates = serde_json::from_value(json!([{ "equals": { "path": "/other" } }]))
+            .expect("predicates");
+        apply_one(
+            &mut sm,
+            4,
+            patch(
+                4,
+                8080,
+                crate::control::StubEdit::ReplaceById {
+                    id: base.clone(),
+                    stub: changed,
+                },
+            ),
+        )
+        .await;
+        apply_one(
+            &mut sm,
+            5,
+            proxy_recorded(5, 8080, H1, "again", before_proxy("again")),
+        )
+        .await;
+        assert!(marker(&sm, 8080, H1).is_some());
+
+        apply_one(
+            &mut sm,
+            6,
+            patch(6, 8080, crate::control::StubEdit::DeleteById { id: base }),
+        )
+        .await;
+        assert!(
+            marker(&sm, 8080, H1).is_some(),
+            "the stale stub's delete must not drop the live recording's marker"
+        );
+
+        let live = format!("proxy-recorded-{H1}-r5");
+        apply_one(
+            &mut sm,
+            7,
+            patch(7, 8080, crate::control::StubEdit::DeleteById { id: live }),
+        )
+        .await;
+        assert_eq!(
+            marker(&sm, 8080, H1),
+            None,
+            "the live stub's delete forgets it"
+        );
+    }
+
+    #[test]
+    fn recorded_sig_hash_parses_only_the_family() {
+        assert_eq!(
+            super::recorded_sig_hash("proxy-recorded-00ab"),
+            Some("00ab")
+        );
+        assert_eq!(
+            super::recorded_sig_hash("proxy-recorded-00ab-r17"),
+            Some("00ab")
+        );
+        assert_eq!(super::recorded_sig_hash("proxy-recorded-00ab-r17-r3"), None);
+        for not_family in [
+            "proxy-recorded-",
+            "proxy-recorded-xyz",
+            "proxy-recorded-00ab-r",
+            "proxy-recorded-00ab-rx",
+            "proxy-recorded-00AB",
+            "static",
+            "recorded-00ab",
+        ] {
+            assert_eq!(super::recorded_sig_hash(not_family), None, "{not_family}");
+        }
+    }
+
+    /// Pins D-108 (#689): a whole-config put over an existing port keeps a stub-less marker.
+    #[tokio::test]
+    async fn a_put_over_an_existing_port_keeps_a_stub_less_marker() {
+        let (_td, mut sm) = fresh_sm(None).await;
+        recorded_port(&mut sm).await;
+        let mut config = stored(&sm, 8080);
+        config.stubs.remove(0);
+        apply_one(&mut sm, 4, put_req(4, config)).await;
+        assert!(
+            marker(&sm, 8080, H2).is_some(),
+            "a stub-less marker survives a put"
+        );
+        assert!(marker(&sm, 8080, H1).is_some(), "its stub is still there");
+    }
+
+    /// Pins D-108 (#689): a put that omits one recorded stub forgets exactly that marker.
+    #[tokio::test]
+    async fn a_put_that_omits_a_recorded_stub_forgets_only_its_marker() {
+        let (_td, mut sm) = fresh_sm(None).await;
+        recorded_port(&mut sm).await;
+        apply_one(
+            &mut sm,
+            4,
+            proxy_recorded(4, 8080, H3, "three", before_proxy("three")),
+        )
+        .await;
+        let mut config = stored(&sm, 8080);
+        let gone = format!("proxy-recorded-{H1}");
+        config
+            .stubs
+            .retain(|s| s.id.as_deref() != Some(gone.as_str()));
+        apply_one(&mut sm, 6, put_req(6, proxy_imposter_config(9090))).await;
+        apply_one(&mut sm, 7, proxy_recorded(7, 9090, H1, "elsewhere", None)).await;
+        apply_one(&mut sm, 8, put_req(8, config)).await;
+        assert_eq!(marker(&sm, 8080, H1), None);
+        assert!(marker(&sm, 8080, H2).is_some());
+        assert!(marker(&sm, 8080, H3).is_some());
+        assert!(
+            marker(&sm, 9090, H1).is_some(),
+            "another port's marker is untouched"
+        );
+    }
+
+    /// Pins D-108's fallback: a put over a row that will not decode cannot be diffed, so it forgets
+    /// the port's markers — and still applies, because it is the write that repairs the row.
+    #[tokio::test]
+    async fn a_put_over_a_corrupt_row_applies_and_forgets_the_ports_markers() {
+        let (_td, mut sm) = fresh_sm(None).await;
+        recorded_port(&mut sm).await;
+        let config = stored(&sm, 8080);
+        sm.inject_raw_config(8080, "{ not a stored record");
+        let applied = apply_one(&mut sm, 4, put_req(4, config)).await;
+        assert_eq!(applied.outcome, ControlOutcome::Applied);
+        assert_eq!(marker(&sm, 8080, H1), None);
+        assert_eq!(marker(&sm, 8080, H2), None);
+    }
+
+    /// Pins D-108 (#689): what `GET` then `PUT` sends — the stored config through JSON and back,
+    /// with a header-heavy recorded stub — keeps every marker. Compared as JSON values, so map
+    /// order cannot matter.
+    #[tokio::test]
+    async fn a_json_round_tripped_put_keeps_its_recorded_markers() {
+        let (_td, mut sm) = fresh_sm(None).await;
+        recorded_port(&mut sm).await;
+        let mut heavy = recorded_stub("hdrs", crate::control::RecordedStubPlacement::BeforeProxy);
+        heavy.stub = Box::new(
+            serde_json::from_value(json!({
+                "predicates": [{ "equals": { "path": "/h" } }],
+                "responses": [{ "is": { "statusCode": 200, "body": "h", "headers": {
+                    "A": "1", "B": "2", "C": "3", "D": "4", "E": "5", "F": "6" } } }]
+            }))
+            .expect("stub"),
+        );
+        apply_one(&mut sm, 4, proxy_recorded(4, 8080, H3, "h", Some(heavy))).await;
+        let text = sm.read_config(8080).expect("read").expect("row");
+        let round: ImposterConfig =
+            serde_json::from_value(serde_json::from_str::<serde_json::Value>(&text).expect("json"))
+                .expect("parses");
+        apply_one(&mut sm, 5, put_req(5, round)).await;
+        for h in [H1, H2, H3] {
+            assert!(marker(&sm, 8080, h).is_some(), "{h} survives a round trip");
+        }
+    }
+
+    /// Pins D-108 (#689): a put that changes a recorded stub forgets it, and the re-recording
+    /// takes a suffixed id rather than a duplicate.
+    #[tokio::test]
+    async fn a_put_that_changes_a_recorded_stub_forgets_it_and_the_re_recording_takes_a_suffixed_id()
+     {
+        let (_td, mut sm) = fresh_sm(None).await;
+        recorded_port(&mut sm).await;
+        let mut config = stored(&sm, 8080);
+        let id = format!("proxy-recorded-{H1}");
+        let recorded = config
+            .stubs
+            .iter_mut()
+            .find(|s| s.id.as_deref() == Some(id.as_str()))
+            .expect("recorded stub");
+        recorded.predicates = serde_json::from_value(json!([{ "equals": { "path": "/edited" } }]))
+            .expect("predicates");
+        apply_one(&mut sm, 4, put_req(4, config)).await;
+        assert_eq!(marker(&sm, 8080, H1), None);
+
+        apply_one(
+            &mut sm,
+            5,
+            proxy_recorded(5, 8080, H1, "again", before_proxy("again")),
+        )
+        .await;
+        let ids = stub_ids(&sm, 8080);
+        let unique: BTreeSet<&String> = ids.iter().collect();
+        assert_eq!(unique.len(), ids.len(), "no duplicate ids: {ids:?}");
+        assert!(ids.contains(&format!("proxy-recorded-{H1}-r5")), "{ids:?}");
     }
 
     /// Recordings die with their imposter — the purge `ClusterProxyStore::clear`'s doc
