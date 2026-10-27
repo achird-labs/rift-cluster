@@ -533,3 +533,14 @@ fn cluster_manager_mirrors_the_body_and_journal_limits() {
         );
     }
 }
+
+/// Pins D-124: a cluster node gives the engine no datadir — `cluster_manager` builds it with
+/// `with_datadir(None)`, so no `{port}.json`, `.cursors` or `.requests.jsonl` is ever written.
+#[test]
+fn cluster_manager_gives_the_engine_no_datadir() {
+    let body = cluster_manager_body();
+    assert!(
+        body.contains("with_datadir(None)"),
+        "cluster_manager must build the engine without a datadir"
+    );
+}

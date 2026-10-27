@@ -824,6 +824,11 @@ async fn attach_data_plane(
     let scripts_dir = cli.oss.scripts_dir.clone();
     cli.oss.host = Some("127.0.0.1".to_owned());
     cli.oss.port = 0;
+    // D-124: `--datadir` has anchored the cluster state directory (`cluster_state_dir()`, read
+    // before the node started) and does nothing else under `--cluster`. Cleared so upstream's
+    // `ServerBuilder` neither loads `{port}.json` files into the engine nor starts the datadir
+    // flusher: the Raft log is the only store of configs, and recorded requests stay in memory.
+    cli.oss.datadir = None;
     // **`cli.oss.api_key` is deliberately left in place** (#550, D-73). Before tenancy was
     // removed this was cleared here: upstream's `ServerBuilder` gates the loopback admin on a raw
     // compare of `Authorization` against `--api-key`, and with per-principal keys a principal's
@@ -1531,7 +1536,10 @@ fn cluster_manager(
 
     // D-121: no script-scheduling knob is set here; pool size, affinity and timeouts are the
     // engine's, as standalone has them.
-    let manager = ImposterManager::with_datadir(cli.oss.datadir.clone())
+    // D-124: no datadir — the engine writes no `{port}.json`, `.cursors` (rift#1603) or
+    // `.requests.jsonl` (rift#1608), and reads none back. Kept as a `with_datadir` call so the
+    // builder list stays aligned with upstream's (`manager_parity.rs`).
+    let manager = ImposterManager::with_datadir(None)
         // Upstream's own manager names `network(--scripts-dir)`: `require()` and `lookup` read only
         // below `--scripts-dir`, and nothing at all without it (upstream #1611). One fleet-wide
         // access, because the cluster has no tenant to vary it by (D-73); the files are read on

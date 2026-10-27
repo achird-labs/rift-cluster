@@ -3669,8 +3669,9 @@ async fn a_configfile_is_refused_under_cluster() {
 /// This pins behaviour that is already correct rather than fixing a defect.
 /// #85 reported `--datadir` as a second spelling of the `--configfile` hazard;
 /// it is not, measured on this tree. A datadir imposter is never loaded, bound,
-/// or listed under `--cluster`, and the operator's `{port}.json` is left
-/// untouched — while the identical fixture on a non-cluster server loads,
+/// or listed under `--cluster`, not loaded by a reload, and the operator's `{port}.json` is left
+/// untouched while the node runs and after it stops (D-124) — while the identical fixture on a
+/// non-cluster server loads,
 /// lists and serves, so the fixture is valid and the difference is real.
 ///
 /// Refusing the flag would be wrong regardless: it legitimately anchors the
@@ -3728,7 +3729,49 @@ async fn a_datadir_loads_no_imposters_under_cluster() {
         "the cluster state directory must still be usable"
     );
 
+    // D-124: upstream's `POST /admin/reload` re-reads the config source it was started with. With
+    // `--datadir` handed through, it would load `7302.json` into this node's engine alone — a
+    // local-only imposter beside the Raft log. Asked of the engine directly, so nothing in front of
+    // it can mask the answer.
+    let reloaded = reqwest::Client::new()
+        .post(format!(
+            "http://{}/admin/reload",
+            server.engine_admin_addr()
+        ))
+        .send()
+        .await
+        .expect("reload");
+    let engine: serde_json::Value =
+        reqwest::get(format!("http://{}/imposters", server.engine_admin_addr()))
+            .await
+            .expect("engine list")
+            .json()
+            .await
+            .expect("json");
+    assert!(
+        engine["imposters"].as_array().is_none_or(Vec::is_empty),
+        "a reload ({}) must not load the datadir into one node's engine: {engine}",
+        reloaded.status()
+    );
+
+    // D-124: the operator's file is not loaded, rewritten or unlinked — at start, or at a
+    // graceful stop (whose manager shutdown deletes every datadir file the engine owns).
+    let planted = serde_json::json!({ "port": 7302, "protocol": "http" }).to_string();
+    assert_eq!(
+        std::fs::read_to_string(data.path().join("7302.json"))
+            .ok()
+            .as_deref(),
+        Some(planted.as_str()),
+        "the operator's datadir file is untouched while the node runs"
+    );
     server.shutdown().await;
+    assert_eq!(
+        std::fs::read_to_string(data.path().join("7302.json"))
+            .ok()
+            .as_deref(),
+        Some(planted.as_str()),
+        "the operator's datadir file is untouched after a graceful stop"
+    );
 }
 
 /// C5 (#188): the editor's whole `If-Match` story starts from a read.
@@ -7107,4 +7150,134 @@ async fn a_key_repeated_across_stubs_is_admitted_once_per_request() {
         .expect("post");
     assert_eq!(created.status().as_u16(), 201, "{:?}", created.text().await);
     server.shutdown().await;
+}
+
+/// Pins D-124: a cluster node gives the engine no datadir, so a `recordRequests` imposter's
+/// requests stay in memory (D-74) — no `<port>.json` and no `<port>.requests.jsonl` (rift#1608)
+/// lands beside the Raft state, even after the engine's 1 s flush period.
+#[tokio::test]
+async fn a_cluster_node_writes_nothing_to_the_datadir() {
+    let _serial = TEST_LOCK.lock().await;
+    let data = TempDir::new().expect("tempdir");
+    let dd = data.path().to_string_lossy().into_owned();
+    let state = TempDir::new().expect("tempdir");
+    let server = compose::start(cluster_cli(
+        &state,
+        &["--cluster-allow-solo", "--datadir", &dd],
+    ))
+    .await
+    .expect("solo cluster starts");
+    wait_ready(&server).await;
+    let admin = server.admin_addr();
+    let port = reserve_port();
+    let created = reqwest::Client::new()
+        .post(format!("http://{admin}/imposters"))
+        .json(
+            &json!({ "port": port, "protocol": "http", "recordRequests": true,
+            "stubs": [{ "responses": [{ "is": { "body": "ok" } }] }] }),
+        )
+        .send()
+        .await
+        .expect("post");
+    assert_eq!(created.status().as_u16(), 201);
+    for _ in 0..4 {
+        reqwest::get(format!("http://{admin}/__rift/{port}/x"))
+            .await
+            .expect("serve");
+    }
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    for file in [format!("{port}.json"), format!("{port}.requests.jsonl")] {
+        assert!(
+            !data.path().join(&file).exists(),
+            "a cluster node must not write {file} to the datadir"
+        );
+    }
+    server.shutdown().await;
+}
+
+/// Pins D-124 with D-8: per-node runtime state resets on restart — a `<port>.requests.jsonl` left
+/// in the datadir (a crash's residue) is not restored into the journal.
+#[tokio::test]
+async fn recorded_requests_do_not_survive_a_restart() {
+    let _serial = TEST_LOCK.lock().await;
+    let data = TempDir::new().expect("tempdir");
+    let dd = data.path().to_string_lossy().into_owned();
+    let state = TempDir::new().expect("tempdir");
+    let cli = || cluster_cli(&state, &["--cluster-allow-solo", "--datadir", &dd]);
+    let port = reserve_port();
+    let server = compose::start(cli()).await.expect("solo cluster starts");
+    wait_ready(&server).await;
+    let admin = server.admin_addr();
+    let created = reqwest::Client::new()
+        .post(format!("http://{admin}/imposters"))
+        .json(
+            &json!({ "port": port, "protocol": "http", "recordRequests": true,
+            "stubs": [{ "responses": [{ "is": { "body": "ok" } }] }] }),
+        )
+        .send()
+        .await
+        .expect("post");
+    assert_eq!(created.status().as_u16(), 201);
+    for _ in 0..2 {
+        reqwest::get(format!("http://{admin}/__rift/{port}/x"))
+            .await
+            .expect("serve");
+    }
+    server.shutdown().await;
+
+    // A crashed node's residue — the engine's own `{port}.json` and `{port}.requests.jsonl` —
+    // produced by a standalone node on a scratch datadir (it writes both; a graceful stop deletes
+    // them, so they are copied while it runs) and planted here. Independent of the behaviour
+    // pinned: the cluster node writes neither under D-124.
+    let scratch = TempDir::new().expect("tempdir");
+    let standalone = compose::start(
+        EeCli::try_parse_from([
+            "rift-cluster-server",
+            "--port",
+            "0",
+            "--metrics-port",
+            "0",
+            "--datadir",
+            &scratch.path().to_string_lossy(),
+        ])
+        .expect("parses"),
+    )
+    .await
+    .expect("standalone starts");
+    let created = reqwest::Client::new()
+        .post(format!("http://{}/imposters", standalone.admin_addr()))
+        .json(
+            &json!({ "port": port, "protocol": "http", "recordRequests": true,
+            "stubs": [{ "responses": [{ "is": { "body": "ok" } }] }] }),
+        )
+        .send()
+        .await
+        .expect("post");
+    assert_eq!(created.status().as_u16(), 201);
+    for _ in 0..2 {
+        reqwest::get(format!("http://127.0.0.1:{port}/x"))
+            .await
+            .expect("serve");
+    }
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    for file in [format!("{port}.json"), format!("{port}.requests.jsonl")] {
+        std::fs::copy(scratch.path().join(&file), data.path().join(&file))
+            .unwrap_or_else(|e| panic!("the standalone engine wrote {file}: {e}"));
+    }
+    standalone.shutdown().await;
+
+    let restarted = compose::start(cli()).await.expect("restarts");
+    wait_ready(&restarted).await;
+    let read: serde_json::Value = reqwest::get(format!(
+        "http://{}/imposters/{port}",
+        restarted.admin_addr()
+    ))
+    .await
+    .expect("get")
+    .json()
+    .await
+    .expect("json");
+    assert_eq!(read["requests"], json!([]), "{read}");
+    assert_eq!(read["numberOfRequests"], json!(0), "{read}");
+    restarted.shutdown().await;
 }
