@@ -5202,3 +5202,32 @@ still answers its original `201`. The refusal is upstream's words, answered `400
 - **Mixed versions:** a pre-#694 replica ignores the field and upserts, so the release that carries it
   is a whole-fleet upgrade (D-98).
 
+### D-112 — A node's own listener ports are reserved on its engine before the first drive; an imposter on one is a bind failure on that node, never an admission refusal
+
+- **Status:** active
+- **Decided:** 2026-10-27 · #711
+- **Implemented by:** #711
+- **Code:** crates/rift-cluster-server/src/compose.rs, crates/rift-cluster-base/src/lib.rs
+
+rift#1557 lets a server reserve its own listener ports on its `ImposterManager`, so no imposter
+shares a port with them. On macOS an imposter can bind beside a listener through `SO_REUSEADDR`, and
+the two then split the port's traffic. Upstream reserves the ports it binds itself (the core loopback
+admin, metrics, the front door), but only after binding them. A clustered node drives its engine
+while it catches up on the log, which is earlier than that. A joiner whose `--front-door` port
+already held a committed imposter had the port taken by catch-up, and the front door's bind then
+aborted startup.
+
+**The node reserves the ports of its admin front, front door and metrics endpoint before `Raft::new`.**
+A kernel-chosen admin port is reserved once it is bound. The reservations are held until the end of
+`ComposedServer::shutdown`, because release is not reference-counted and dropping them early would
+lift upstream's own reservation of the same port.
+
+- **Under `serve_unbound`,** an imposter on a reserved port is registered with no listener. It is
+  reported as a bind failure whose reason names the listener (D-81). It still serves through the
+  gateway and the front door, and the write commits with §7.4.6's local warning.
+- **The front does not pre-refuse.** Listener ports are per node (`--port`, `--front-door`,
+  `--metrics-port` can differ between nodes), so a refusal at admission would make a replicated
+  write's success depend on which node took it.
+- **Not yet reserved:** the Raft/RPC and probe ports. Upstream's `ServerListener` has no honest label
+  for them, and that label is what an operator reads in the failure.
+

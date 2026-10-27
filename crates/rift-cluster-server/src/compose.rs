@@ -28,8 +28,9 @@ use rift_cluster::{
 use rift_cluster_base::rift_http_proxy::server::ListenAddr;
 use rift_cluster_base::seams::{
     CompiledRoutes, FileSource, HttpSource, ImposterConfig, ImposterManager, OutboundTls,
-    RunningFrontDoor, RunningServer, ScriptFileAccess, ServerBuilder, SourceRef, SourceRegistry,
-    TlsDefaults, bind_front_door, body_limits_from, build_upstream_client, parse_uri_list,
+    PortReservation, RunningFrontDoor, RunningServer, ScriptFileAccess, ServerBuilder,
+    ServerListener, SourceRef, SourceRegistry, TlsDefaults, bind_front_door, body_limits_from,
+    build_upstream_client, parse_uri_list,
 };
 
 use crate::admin_front::{self, AdminFront, FrontConfig};
@@ -182,6 +183,10 @@ pub struct ComposedServer {
     /// The cluster state directory, when clustering is on: where a confirmed
     /// departure is recorded so the next start knows to rejoin (issue #72).
     state_dir: Option<PathBuf>,
+    /// This node's own listener ports, reserved on the engine so no imposter takes one (D-112).
+    /// Released last in [`Self::shutdown`]: release is not reference-counted, so dropping these
+    /// while a listener still runs would also lift upstream's own reservation of the same port.
+    listener_ports: Vec<PortReservation>,
 }
 
 impl ComposedServer {
@@ -297,6 +302,7 @@ impl ComposedServer {
             // unrelated-looking "state dir locked".
             tracing::error!(error = %e, "cluster node shutdown reported an error");
         }
+        drop(self.listener_ports);
     }
 
     /// A graceful leave (RFC-001 §7.1.2): fail readiness first so the balancer
@@ -451,6 +457,7 @@ pub async fn start_with_runtimes(
             readiness: Arc::new(Readiness::awaiting([])),
             leave_timeout: Duration::ZERO,
             state_dir: None,
+            listener_ports: Vec::new(),
         });
     }
 
@@ -580,6 +587,9 @@ pub async fn start_with_runtimes(
             return Err(e.context("building the clustered imposter manager"));
         }
     };
+    // D-112: before `Raft::new`, whose replay drives the engine, so no replayed imposter can take
+    // a port this node's own listeners are about to bind.
+    let mut listener_ports = reserve_listener_ports(&manager, &cli, &front_admin);
 
     // The front door's compiled route table (issue #131): created before the
     // node for the same reason `flow_net`/`pull_on_miss` are — the state
@@ -692,6 +702,7 @@ pub async fn start_with_runtimes(
     // `start` is an embedding seam that callers retry, so a failure must not
     // leave the cluster port bound or the redb state dir locked — it would fail
     // the retry too, with an error that hides the real cause.
+    let front_admin_port = front_admin.judged().port();
     match attach_data_plane(
         cli,
         front_admin,
@@ -705,21 +716,33 @@ pub async fn start_with_runtimes(
     )
     .await
     {
-        Ok((server, front, front_door, reconciler)) => Ok(ComposedServer {
-            server,
-            probes: Some(probes),
-            front: Some(front),
-            front_door,
-            reconciler: Some(reconciler),
-            intent_replayer: Some(spawn_intent_replayer(Arc::clone(&node))),
-            node: Some(node),
-            cluster_addr: Some(cluster_addr),
-            manager: Some(manager),
-            flow_net: Some(flow_net),
-            readiness,
-            leave_timeout,
-            state_dir: Some(state_dir),
-        }),
+        Ok((server, front, front_door, reconciler)) => {
+            // A kernel-chosen admin port could not collide at its bind, but later explicit
+            // imposters must still stay off it (D-112).
+            if front_admin_port == 0 {
+                listener_ports.push(PortReservation::new(
+                    &manager,
+                    &[front.local_addr()],
+                    ServerListener::Admin,
+                ));
+            }
+            Ok(ComposedServer {
+                server,
+                probes: Some(probes),
+                front: Some(front),
+                front_door,
+                reconciler: Some(reconciler),
+                intent_replayer: Some(spawn_intent_replayer(Arc::clone(&node))),
+                node: Some(node),
+                cluster_addr: Some(cluster_addr),
+                manager: Some(manager),
+                flow_net: Some(flow_net),
+                readiness,
+                leave_timeout,
+                state_dir: Some(state_dir),
+                listener_ports,
+            })
+        }
         Err(e) => {
             probes.shutdown().await;
             if let Err(e) = node.shutdown().await {
@@ -728,6 +751,37 @@ pub async fn start_with_runtimes(
             Err(e)
         }
     }
+}
+
+/// Reserve this node's own configured listener ports on its engine (D-112): the public admin
+/// front, the front door and the metrics endpoint. A `0` is skipped — the kernel's choice is
+/// reserved once it is known. The Raft/RPC and probe listeners are not reserved: upstream's
+/// `ServerListener` has no honest label for them, and the label is what an operator reads in the
+/// bind failure.
+fn reserve_listener_ports(
+    manager: &Arc<ImposterManager>,
+    cli: &EeCli,
+    front_admin: &ListenAddr,
+) -> Vec<PortReservation> {
+    // A malformed `--front-door` is refused by name where it is bound; reserving nothing for it
+    // here changes no outcome.
+    let front_door = cli
+        .oss
+        .front_door
+        .as_deref()
+        .and_then(|value| parse_front_door_addr(value).ok());
+    [
+        (Some(front_admin.judged()), ServerListener::Admin),
+        (front_door, ServerListener::FrontDoor),
+        (
+            Some(SocketAddr::from(([0, 0, 0, 0], cli.oss.metrics_port))),
+            ServerListener::Metrics,
+        ),
+    ]
+    .into_iter()
+    .filter_map(|(addr, by)| addr.filter(|a| a.port() != 0).map(|a| (a, by)))
+    .map(|(addr, by)| PortReservation::new(manager, &[addr], by))
+    .collect()
 }
 
 /// Join the cluster, then compose and start the open-source data plane on top of

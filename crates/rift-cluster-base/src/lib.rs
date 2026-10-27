@@ -83,9 +83,13 @@ pub mod seams {
     /// change, which is what turns an event stream into an attributed one. It is
     /// `#[non_exhaustive]`, so an embedder builds one from [`Default`] and
     /// assigns — a struct literal will not compile outside upstream.
+    ///
+    /// [`PortReservation`] and [`ServerListener`] are rift#1557's: a server listener's port, held
+    /// on the manager so no imposter takes it. The cluster reserves its own listeners' ports with
+    /// them before the first drive (D-112).
     pub use rift_mock_core::imposter::{
         ApplyReport, EventContext, ImposterEvent, ImposterEventListener, ImposterManager,
-        TlsDefaults, stub_key,
+        PortReservation, ServerListener, TlsDefaults, stub_key,
     };
 
     /// Pluggable admin-API authorization (U-9, upstream #854) and the
@@ -414,6 +418,9 @@ mod tests {
         let _: fn() -> LocalSequencer = LocalSequencer::default;
         let _: fn() -> LocalJournal = LocalJournal::default;
         let _: fn() -> ImposterManager = ImposterManager::new;
+        // rift#1557's listener reservations (D-112).
+        _named::<PortReservation>();
+        _named::<ServerListener>();
         let _: &dyn FlowStore = &NoOpFlowStore;
 
         // Value types that cross the seam boundary.
