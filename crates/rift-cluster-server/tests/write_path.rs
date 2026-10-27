@@ -6647,3 +6647,91 @@ async fn put_imposters_restarts_scenario_state() {
     assert_eq!(pay().await, 200, "the scenario is back at Started");
     server.shutdown().await;
 }
+
+/// Stub `s` cycling `A, B, C` on every path.
+fn cursor_imposter(port: u16) -> serde_json::Value {
+    json!({ "port": port, "protocol": "http", "stubs": [{
+        "id": "s",
+        "responses": [{ "is": { "body": "A" } }, { "is": { "body": "B" } }, { "is": { "body": "C" } }]
+    }] })
+}
+
+/// Pins D-8 / D-47: response cursors live only in the cluster's sequencer, so the engine's datadir
+/// cursor file (rift#1603) is never written on a cluster node — its flusher runs, but does nothing
+/// while a sequencer is registered.
+#[tokio::test]
+async fn a_cluster_node_writes_no_cursor_file() {
+    let _serial = TEST_LOCK.lock().await;
+    let state = TempDir::new().expect("tempdir");
+    let datadir = TempDir::new().expect("tempdir");
+    let dd = datadir.path().to_string_lossy().into_owned();
+    let server = compose::start(cluster_cli(
+        &state,
+        &["--cluster-allow-solo", "--datadir", &dd],
+    ))
+    .await
+    .expect("solo cluster starts");
+    wait_ready(&server).await;
+    let admin = server.admin_addr();
+    let port = reserve_port();
+    let created = reqwest::Client::new()
+        .post(format!("http://{admin}/imposters"))
+        .json(&cursor_imposter(port))
+        .send()
+        .await
+        .expect("post");
+    assert_eq!(created.status().as_u16(), 201);
+    for _ in 0..4 {
+        reqwest::get(format!("http://{admin}/__rift/{port}/x"))
+            .await
+            .expect("serve");
+    }
+    // More than upstream's 1 s cursor flush period: a flusher that wrote would have by now.
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    assert!(
+        !datadir.path().join(format!("{port}.cursors")).exists(),
+        "a cluster node must not write the engine's cursor file"
+    );
+    server.shutdown().await;
+}
+
+/// Pins D-8: a restart resets cursors — a `<port>.cursors` left in the datadir is not resumed on a
+/// cluster node.
+#[tokio::test]
+async fn a_planted_cursor_file_is_not_resumed() {
+    let _serial = TEST_LOCK.lock().await;
+    let state = TempDir::new().expect("tempdir");
+    let datadir = TempDir::new().expect("tempdir");
+    let dd = datadir.path().to_string_lossy().into_owned();
+    let cli = || cluster_cli(&state, &["--cluster-allow-solo", "--datadir", &dd]);
+    let port = reserve_port();
+    let server = compose::start(cli()).await.expect("solo cluster starts");
+    wait_ready(&server).await;
+    let created = reqwest::Client::new()
+        .post(format!("http://{}/imposters", server.admin_addr()))
+        .json(&cursor_imposter(port))
+        .send()
+        .await
+        .expect("post");
+    assert_eq!(created.status().as_u16(), 201);
+    server.shutdown().await;
+
+    std::fs::write(
+        datadir.path().join(format!("{port}.cursors")),
+        json!({ "version": 1, "stubs": [{ "key": "s", "response": 2, "repeat": 0 }] }).to_string(),
+    )
+    .expect("plant the cursor file");
+    let restarted = compose::start(cli()).await.expect("restarts");
+    wait_ready(&restarted).await;
+    let first = reqwest::get(format!("http://{}/__rift/{port}/x", restarted.admin_addr()))
+        .await
+        .expect("serve")
+        .text()
+        .await
+        .expect("body");
+    assert_eq!(
+        first, "A",
+        "the cycle starts over; nothing is resumed from the datadir"
+    );
+    restarted.shutdown().await;
+}

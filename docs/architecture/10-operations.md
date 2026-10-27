@@ -417,6 +417,9 @@ The bump to rift **master `7161b1a`** (past v0.23.0) is all three again, and mor
 - **Listeners (D-103).** With no `--host`, the admin front and host-less imposters listen dual-stack
   on `[::]`, falling back to `0.0.0.0` without IPv6. `require()` and `lookup` read only below
   `--scripts-dir`, on whichever node serves the request: mount the same files on every node.
+- **Cursor file (D-8, D-47).** `<port>.cursors` (rift#1603) is never written or resumed on a cluster
+  node, even with `--datadir`: the cluster's sequencer owns response cursors, and a restart
+  resets them.
 
 **Before a whole-fleet upgrade of a fleet that keeps its state directory**, export the imposters and
 load them into the new engine, and fix or delete anything it refuses. `rift-lint` is not a
