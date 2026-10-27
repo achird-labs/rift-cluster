@@ -5889,3 +5889,58 @@ async fn the_door_refuses_rift_1582s_behaviors_shapes_and_commits_nothing() {
     }
     server.shutdown().await;
 }
+
+/// #704: `PUT /imposters` answers in request order, as Mountebank and standalone Rift (rift#1563)
+/// do — the answer used to be the engine's ascending `GET` re-fetch — while `GET /imposters`
+/// stays ascending by port.
+#[tokio::test]
+async fn put_imposters_answers_in_request_order_and_get_stays_ascending() {
+    let _serial = TEST_LOCK.lock().await;
+    let state = TempDir::new().expect("tempdir");
+    let server = compose::start(cluster_cli(&state, &["--cluster-allow-solo"]))
+        .await
+        .expect("solo cluster starts");
+    wait_ready(&server).await;
+    let admin = server.admin_addr();
+    let client = reqwest::Client::new();
+    let mut ports = [reserve_port(), reserve_port(), reserve_port()];
+    ports.sort_unstable();
+    let [a, b, c] = ports;
+
+    let put = client
+        .put(format!("http://{admin}/imposters"))
+        .json(&json!({ "imposters": [
+            { "port": c, "protocol": "http" },
+            { "port": a, "protocol": "http" },
+            { "port": b, "protocol": "http" }
+        ] }))
+        .send()
+        .await
+        .expect("put");
+    assert_eq!(put.status().as_u16(), 200);
+    let answered: serde_json::Value = put.json().await.expect("json");
+    let order: Vec<u64> = answered["imposters"]
+        .as_array()
+        .expect("array")
+        .iter()
+        .map(|i| i["port"].as_u64().expect("port"))
+        .collect();
+    assert_eq!(order, vec![u64::from(c), u64::from(a), u64::from(b)]);
+
+    let listed: serde_json::Value = client
+        .get(format!("http://{admin}/imposters"))
+        .send()
+        .await
+        .expect("get")
+        .json()
+        .await
+        .expect("json");
+    let ascending: Vec<u64> = listed["imposters"]
+        .as_array()
+        .expect("array")
+        .iter()
+        .map(|i| i["port"].as_u64().expect("port"))
+        .collect();
+    assert_eq!(ascending, vec![u64::from(a), u64::from(b), u64::from(c)]);
+    server.shutdown().await;
+}

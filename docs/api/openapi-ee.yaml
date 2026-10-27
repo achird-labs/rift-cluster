@@ -172,6 +172,9 @@ paths:
         Terminates: reconciles the fleet's configured imposters toward the
         given set — upserts every listed imposter, then prunes every
         applied port left out (`{"imposters":[]}` deletes everything).
+        The response lists the body's imposters in request order, as
+        Mountebank and standalone Rift do; `GET /imposters` stays ascending
+        by port.
         Cannot carry `If-Match` (no single record to condition a whole-set
         replace on); sending one answers `400`.
       tags: [imposters]
