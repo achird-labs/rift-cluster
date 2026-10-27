@@ -133,6 +133,9 @@ The entry stays `amended` rather than `superseded` because its surviving claim i
 built the system: config travels as a body on the log, not as a gossip digest.
 
 ### D-5 — Two-level, order-aware reconcile (LCS edit script) on top of by-id/positional stub CRUD
+> **Amended by D-116** (2026-10-27, #696, #701): a `PutImposter` that carries a `restart` restarts
+> that runtime state on every node after its reconcile — one stub's cycle, every stub's, or the
+> whole imposter's — as Mountebank's replace does; one without keeps its state as before.
 > **Amended by D-99** (2026-10-03, #651): a `PutImposter` or `DeleteImposter` drives only its own
 > port on a node with no recorded failure; the whole-set level-2 reconcile is kept for startup,
 > snapshot install, `DeleteAll`, the anonymous-merge recording and a degraded node.
@@ -5334,4 +5337,51 @@ resets its own cursor, so a fanned-out reset would land on a peer at an unrelate
 A direct `reset_scope` call still fans out. A member whose engine refused the op keeps serving its
 last-known config (D-102), so its cursors are its own. The sequencer still counts apply-time peeks
 under `op="peek",path="local"`, once per node per recording.
+
+### D-116 — An admin replace restarts what Mountebank's replace restarts; the committed put carries it, and each node applies it after its reconcile
+
+- **Status:** active
+- **Decided:** 2026-10-27 · #696, #701
+- **Implemented by:** #696, #701
+- **Code:** crates/rift-cluster/src/control.rs, crates/rift-cluster/src/raft/store.rs, crates/rift-cluster-server/src/admin_front.rs
+
+The stub-replace routes and `PUT /imposters` commit `PutImposter`, and each node drives it by
+reconcile, which keeps runtime state for anything unchanged. Standalone rift restarts that state, as
+Mountebank does:
+- **`PUT …/stubs/:index`** restarts that stub's cycle (rift#1515, `overwriteAtIndex`). The cluster
+  kept it, even when the stub's content changed under an `id`.
+- **`PUT …/stubs`** restarts every stub's cycle (`overwriteAll`).
+- **`PUT /imposters`** gives every kept imposter a fresh runtime state (rift#1518): cycles and
+  cursors, recorded requests, saved `proxyOnce` responses, injection state, flow and scenario state.
+
+**The put carries what it restarts.** `PutImposter` gains an optional `restart`:
+- `StubAt { index }`, `AllStubs` or `Imposter`, internally tagged, with a `#[serde(other)] Unknown`;
+- skipped when `None`, so every other put is byte-identical, and an older node ignores it and
+  reconciles.
+
+A new `ControlOp` variant was rejected: an older node could not decode it. A door-side reset was
+rejected because it runs on one node, outside the log, and the journal is per node (D-74).
+
+**Each node restarts after its own reconcile,** skipping an imposter it created, replaced or failed
+(upstream's rule):
+- `StubAt` re-puts that stub through `replace_stub`; `AllStubs` uses `replace_stubs`. The content
+  is identical, so only cycles restart.
+- `Imposter` calls `restart_runtime_state` and also clears this node's shard of the imposter's
+  flows. The clustered flow store is not the engine's built-in one, which is all upstream's call
+  clears.
+- In the same apply transaction, `Imposter` forgets the port's **stub-less** proxyOnce markers, the
+  replay source upstream's call clears. A marker whose recorded stub is in the new config lives as
+  long as that stub (D-108).
+- A degraded node runs the restart after its whole-set sync.
+- A failure is logged, never recorded as an apply failure: the config did apply.
+
+**Scope.**
+- `?reconcile=true` keeps `PUT /imposters` reconcile-only, read as upstream reads it, and any other
+  value is a `400`.
+- `POST /imposters`, a stub delete, the `--imposters` bootstrap (which re-submits on boot) and
+  `RaftNode::put_imposter` never restart.
+- Each owner resets its own cursor as it applies; D-115 keeps peers from resetting it again.
+
+**Residual:** the shard clear bypasses upstream's scenario stamping, so a conditional GET's
+`Last-Modified` may not move after a `PUT /imposters` reset.
 

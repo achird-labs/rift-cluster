@@ -179,7 +179,10 @@ paths:
         applied port left out (`{"imposters":[]}` deletes everything).
         The response lists the body's imposters in request order, as
         Mountebank and standalone Rift do; `GET /imposters` stays ascending
-        by port.
+        by port. Every imposter the body keeps gets a fresh runtime state on
+        every node — response cycles, recorded requests, saved `proxyOnce`
+        responses, injection and flow/scenario state — as Mountebank
+        recreates them (D-116); `?reconcile=true` keeps that state.
         Cannot carry `If-Match` (no single record to condition a whole-set
         replace on); sending one answers `400`.
       tags: [imposters]
@@ -187,6 +190,14 @@ paths:
       parameters:
         - $ref: '#/components/parameters/IdempotencyKey'
         - $ref: '#/components/parameters/CsrfHeader'
+        - name: reconcile
+          in: query
+          required: false
+          description: >
+            `true` keeps every kept imposter's runtime state (reconcile only);
+            absent or `false` restarts it. Any other value is a `400`.
+          schema:
+            type: boolean
       requestBody:
         required: true
         content:
@@ -594,7 +605,9 @@ paths:
       description: >
         Terminates: reads the stored config, replaces its `stubs`, and
         commits the whole config as a `PutImposter` (there is no by-id
-        spelling for a whole-list replace in the op set).
+        spelling for a whole-list replace in the op set). Every stub's
+        response cycle restarts on every node, as Mountebank's
+        `overwriteAll` does (D-116).
       tags: [imposters]
       x-rift-origin: ee
       parameters:
@@ -700,7 +713,9 @@ paths:
       summary: Replace the stub at an index
       description: >
         Terminates: index-addressed, so it commits as a full `PutImposter`
-        of the stored config with that one stub replaced. Answers `404`
+        of the stored config with that one stub replaced. That stub's
+        response cycle restarts on every node, identical content included,
+        as Mountebank's `overwriteAtIndex` does (D-116). Answers `404`
         `bad data` (Mountebank's `'stubIndex' must be a valid integer…`) if
         `stubIndex` names no current stub, judged before the body is read.
       tags: [imposters]

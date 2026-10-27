@@ -19,7 +19,7 @@ export interface paths {
         get: operations["listImposters"];
         /**
          * Replace the fleet's whole imposter set
-         * @description Terminates: reconciles the fleet's configured imposters toward the given set — upserts every listed imposter, then prunes every applied port left out (`{"imposters":[]}` deletes everything). The response lists the body's imposters in request order, as Mountebank and standalone Rift do; `GET /imposters` stays ascending by port. Cannot carry `If-Match` (no single record to condition a whole-set replace on); sending one answers `400`.
+         * @description Terminates: reconciles the fleet's configured imposters toward the given set — upserts every listed imposter, then prunes every applied port left out (`{"imposters":[]}` deletes everything). The response lists the body's imposters in request order, as Mountebank and standalone Rift do; `GET /imposters` stays ascending by port. Every imposter the body keeps gets a fresh runtime state on every node — response cycles, recorded requests, saved `proxyOnce` responses, injection and flow/scenario state — as Mountebank recreates them (D-116); `?reconcile=true` keeps that state. Cannot carry `If-Match` (no single record to condition a whole-set replace on); sending one answers `400`.
          */
         put: operations["replaceAllImposters"];
         /**
@@ -125,7 +125,7 @@ export interface paths {
         get: operations["listStubs"];
         /**
          * Replace an imposter's whole stub list
-         * @description Terminates: reads the stored config, replaces its `stubs`, and commits the whole config as a `PutImposter` (there is no by-id spelling for a whole-list replace in the op set).
+         * @description Terminates: reads the stored config, replaces its `stubs`, and commits the whole config as a `PutImposter` (there is no by-id spelling for a whole-list replace in the op set). Every stub's response cycle restarts on every node, as Mountebank's `overwriteAll` does (D-116).
          */
         put: operations["replaceStubs"];
         /**
@@ -155,7 +155,7 @@ export interface paths {
         get: operations["getStubAt"];
         /**
          * Replace the stub at an index
-         * @description Terminates: index-addressed, so it commits as a full `PutImposter` of the stored config with that one stub replaced. Answers `404` `bad data` (Mountebank's `'stubIndex' must be a valid integer…`) if `stubIndex` names no current stub, judged before the body is read.
+         * @description Terminates: index-addressed, so it commits as a full `PutImposter` of the stored config with that one stub replaced. That stub's response cycle restarts on every node, identical content included, as Mountebank's `overwriteAtIndex` does (D-116). Answers `404` `bad data` (Mountebank's `'stubIndex' must be a valid integer…`) if `stubIndex` names no current stub, judged before the body is read.
          */
         put: operations["replaceStubAt"];
         post?: never;
@@ -1713,7 +1713,10 @@ export interface operations {
     };
     replaceAllImposters: {
         parameters: {
-            query?: never;
+            query?: {
+                /** @description `true` keeps every kept imposter's runtime state (reconcile only); absent or `false` restarts it. Any other value is a `400`. */
+                reconcile?: boolean;
+            };
             header?: {
                 /** @description Client-chosen retry key for a mutating request. Mints a deterministic op id (a v5 derivation when the value is not itself a UUID) so a retried request with the same key dedups to the original committed response instead of re-applying. exists. A keyed retry against an op that committed a `409` (revision conflict) dedups to that same `409` — the key does not make the conflict retryable. A client that wants to proceed after a `409` must rebase against the current state and retry with a *fresh* Idempotency-Key, not the one that produced the conflict. */
                 "Idempotency-Key"?: components["parameters"]["IdempotencyKey"];
