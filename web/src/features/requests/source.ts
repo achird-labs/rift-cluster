@@ -77,6 +77,25 @@ export function headerValues(value: unknown): string[] {
 }
 
 /**
+ * What to say when a recorded request carries no `body` at all.
+ *
+ * Since rift#1584 a request that sent no body records `""`, and `body` is absent only when the
+ * request declared `Content-Encoding: gzip` or `br` and the body did not decode — Mountebank's
+ * undefined body. "(no body)" would tell the operator the client sent nothing, when it sent
+ * something the engine could not read. Without the header (an older journal) the note stays
+ * neutral.
+ */
+export function missingBodyNote(headers: Record<string, unknown> | undefined): string {
+  const encoding = Object.entries(headers ?? {}).find(
+    ([name]) => name.toLowerCase() === "content-encoding",
+  );
+  const value = encoding === undefined ? undefined : headerValues(encoding[1])[0];
+  return value === undefined || value === ""
+    ? "No body recorded"
+    : `Body not recorded: it did not decode as ${value}`;
+}
+
+/**
  * A recorded query, one `name=value` line per value. A key sent once is a string and a repeated
  * key an array of its values in request order (rift#1553), so a repeated key prints on several
  * lines — never as `k=a,b`, the comma-joined form the engine no longer means.

@@ -838,6 +838,38 @@ describe("the header shapes the engine actually emits", () => {
     expect((await screen.findByTestId("request-detail")).textContent).toContain("Body (base64)");
   });
 
+  // rift#1584: `body` is absent only when a declared gzip/br body did not decode — a request that
+  // sent no body records `""`. "(no body)" would hide that the client did send one.
+  it("says an undecodable gzip body was not recorded, rather than that there was none", async () => {
+    stubFetch({
+      ...THREE_NODE,
+      [REQUESTS]: { json: [recorded({ headers: { "Content-Encoding": "gzip" } })] },
+    });
+    renderInApp(<RequestLog port={PORT} />);
+
+    await waitFor(() => expect(screen.getAllByTestId("request-row").length).toBe(1));
+    await userEvent.setup().click(screen.getByTestId("request-open"));
+    const detail = await screen.findByTestId("request-detail");
+    expect(screen.getByTestId("request-body-note").textContent).toBe(
+      "Body not recorded: it did not decode as gzip",
+    );
+    expect(detail.textContent).not.toContain("(no body)");
+  });
+
+  it("shows an empty body as an empty payload, with no note", async () => {
+    stubFetch({
+      ...THREE_NODE,
+      [REQUESTS]: { json: [recorded({ body: "" })] },
+    });
+    renderInApp(<RequestLog port={PORT} />);
+
+    await waitFor(() => expect(screen.getAllByTestId("request-row").length).toBe(1));
+    await userEvent.setup().click(screen.getByTestId("request-open"));
+    await screen.findByTestId("request-detail");
+    expect(screen.queryByTestId("request-body-note")).toBeNull();
+    expect(screen.getByTestId("request-body").textContent).toBe("");
+  });
+
   it("leaves a text body unlabelled, which is how absence of _mode reads", async () => {
     // Guards the guard: if the label were unconditional the test above would pass for the wrong
     // reason. A text body omits `_mode` entirely rather than sending "text".

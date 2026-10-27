@@ -13,7 +13,12 @@ import { Confirm, Empty, ErrorNote, Ident, Truncated } from "../components/primi
 import type { MatchOutcome, OutcomeView } from "../features/requests/diagnostics.ts";
 import { describeOutcome } from "../features/requests/diagnostics.ts";
 import type { RecordedRequest } from "../features/requests/source.ts";
-import { formatQuery, headerValues, page } from "../features/requests/source.ts";
+import {
+  formatQuery,
+  headerValues,
+  missingBodyNote,
+  page,
+} from "../features/requests/source.ts";
 import {
   type FieldSelection,
   defaultSelection,
@@ -505,7 +510,15 @@ function Row({
                     entirely, so `binary` is the only value that ever arrives. */}
                 <dt>{request._mode === "binary" ? "Body (base64)" : "Body"}</dt>
                 <dd>
-                  <pre className="payload">{request.body ?? "(no body)"}</pre>
+                  {request.body === undefined ? (
+                    <p className="muted" data-testid="request-body-note">
+                      {missingBodyNote(request.headers)}
+                    </p>
+                  ) : (
+                    <pre className="payload" data-testid="request-body">
+                      {request.body}
+                    </pre>
+                  )}
                 </dd>
               </div>
             </dl>
