@@ -149,6 +149,7 @@ const SM_PROXY_RECORDED_TABLE: TableDefinition<(u16, &str), &str> =
 
 /// What [`place_recorded_stub`] did, carrying exactly what the engine drive needs to
 /// reproduce it against the live stub vector.
+#[derive(Debug)]
 enum PlacedRecording {
     /// The stub was inserted whole at `index`.
     Inserted { index: usize },
@@ -216,42 +217,63 @@ fn orphaned_recordings(before: &[Stub], after: &[Stub]) -> serde_json::Result<BT
     Ok(orphaned)
 }
 
-/// Deterministically place a recorded stub in a config's stub list — the state-machine
-/// transliteration of upstream's `insert_or_append_proxy_stub`
-/// (`rift-mock-core/src/imposter/core/proxy.rs`), which operates on the live `StubState`
-/// vector and cannot be reused over serialized config. Keep the two in step: the position
-/// rules — `proxyOnce` inserts *before* the proxy stub so the recording matches first,
-/// `proxyAlways` merges into an existing stub with structurally equal non-empty predicates
-/// *after* it (upstream #611) or inserts after — are engine semantics this apply reproduces,
-/// not policy of its own. A missing proxy stub degrades to appending at the end, exactly as
-/// upstream's `unwrap_or(stubs.len())` does.
+/// Deterministically place a recorded stub in a config's stub list — the state-machine form of
+/// upstream's `insert_or_append_proxy_stub` (`rift-mock-core/src/imposter/core/proxy.rs`), which
+/// operates on the live `StubState` vector and cannot be reused over serialized config. A pure
+/// function of the stub list and the op, so every replica places identically (D-114).
+///
+/// **The anchor** is the stub the recording is placed relative to:
+/// - `anchor_index`, if that stub still proxies to `proxy_to`;
+/// - else the first stub at or after `anchor_index` that does — the index was read from the
+///   engine's list when the request was served, and a recording committed since then is almost
+///   always a `proxyOnce` stub inserted *before* its proxy, which shifts the anchor right;
+/// - else the first stub proxying to `proxy_to`; else none.
+///
+/// The residual miss — two proxy stubs to one `to` with the index shifted past a non-proxy stub —
+/// is the cluster's form of upstream's own "a publisher applying out of order may find it off by
+/// one" caveat on `StubPublication::anchor_index`.
+///
+/// **Placement**, engine semantics this apply reproduces (rift#1389):
+/// - `BeforeProxy` (`proxyOnce`): insert at the anchor, so the recording matches first; with no
+///   anchor, at the end.
+/// - `AfterProxyMerging` (`proxyAlways`): merge into the first stub after the anchor (from the
+///   start with no anchor) whose predicates are structurally equal — an empty list included, as
+///   Mountebank merges — else append at the end.
 fn place_recorded_stub(
     stubs: &mut Vec<Stub>,
     stub: Stub,
     placement: control::RecordedStubPlacement,
     proxy_to: &str,
+    anchor_index: Option<usize>,
 ) -> PlacedRecording {
-    let proxy_idx = stubs
-        .iter()
-        .position(|s| {
-            s.responses
+    let proxies_to = |s: &Stub| {
+        s.responses
+            .iter()
+            .any(|r| matches!(r, StubResponse::Proxy { proxy, .. } if proxy.to == proxy_to))
+    };
+    let anchor = anchor_index
+        .and_then(|from| {
+            stubs
                 .iter()
-                .any(|r| matches!(r, StubResponse::Proxy { proxy, .. } if proxy.to == proxy_to))
+                .enumerate()
+                .skip(from)
+                .find(|(_, s)| proxies_to(s))
+                .map(|(i, _)| i)
         })
-        .unwrap_or(stubs.len());
+        .or_else(|| stubs.iter().position(proxies_to));
     match placement {
         control::RecordedStubPlacement::BeforeProxy => {
-            stubs.insert(proxy_idx, stub);
-            PlacedRecording::Inserted { index: proxy_idx }
+            let index = anchor.unwrap_or(stubs.len());
+            stubs.insert(index, stub);
+            PlacedRecording::Inserted { index }
         }
         control::RecordedStubPlacement::AfterProxyMerging => {
+            let from = anchor.map_or(0, |a| a + 1);
             let merged_idx = stubs
                 .iter()
                 .enumerate()
-                .skip(proxy_idx + 1)
-                .find(|(_, existing)| {
-                    existing.predicates == stub.predicates && !existing.predicates.is_empty()
-                })
+                .skip(from)
+                .find(|(_, existing)| existing.predicates == stub.predicates)
                 .map(|(idx, _)| idx);
             match merged_idx {
                 Some(idx) => {
@@ -262,11 +284,9 @@ fn place_recorded_stub(
                     }
                 }
                 None => {
-                    let insert_index = (proxy_idx + 1).min(stubs.len());
-                    stubs.insert(insert_index, stub);
-                    PlacedRecording::Inserted {
-                        index: insert_index,
-                    }
+                    let index = stubs.len();
+                    stubs.push(stub);
+                    PlacedRecording::Inserted { index }
                 }
             }
         }
@@ -2712,6 +2732,7 @@ impl RedbStateMachine {
                     stub_value,
                     recorded.placement,
                     &recorded.proxy_to,
+                    recorded.anchor_index,
                 );
                 record.config =
                     to_raw_value(&config).map_err(|e| StorageIOError::write_state_machine(&e))?;
@@ -2721,10 +2742,15 @@ impl RedbStateMachine {
                 configs.insert(*port, value.as_str()).map_err(io)?;
                 // Both facts land in this one apply transaction — the marker row is written
                 // only alongside the stub mutation, so "recorded but stub-less" is
-                // unrepresentable by construction (#226).
-                proxy_recorded
-                    .insert((*port, sig_hash.as_str()), resp_json.as_str())
-                    .map_err(io)?;
+                // unrepresentable by construction (#226). Only for a `proxyOnce` recording: a
+                // port can mix modes (D-114), and a `proxyAlways` row would answer a later
+                // `proxyOnce` claim for the same signature `AlreadyRecorded` and replay a
+                // response no `proxyOnce` stub recorded — upstream keeps the two apart too.
+                if !merging {
+                    proxy_recorded
+                        .insert((*port, sig_hash.as_str()), resp_json.as_str())
+                        .map_err(io)?;
+                }
                 crate::metrics::config_applied(*port, index);
                 let action = match placed {
                     PlacedRecording::Inserted { index } => EngineAction::Patch {
@@ -7239,6 +7265,7 @@ mod tests {
             *recorded.stub,
             recorded.placement,
             &recorded.proxy_to,
+            None,
         );
         assert!(
             matches!(placed, super::PlacedRecording::Inserted { index: 1 }),
@@ -7249,6 +7276,209 @@ mod tests {
             &stubs[2].responses[0],
             super::StubResponse::Proxy { .. }
         ));
+    }
+
+    // ---- D-114 (#682): a recording is placed relative to the stub that answered ----
+
+    fn placed_stub(value: serde_json::Value) -> super::Stub {
+        serde_json::from_value(value).expect("stub parses")
+    }
+
+    fn proxy_to_u(id: &str) -> serde_json::Value {
+        json!({ "id": id, "responses": [{ "proxy": { "to": "http://u.example" } }] })
+    }
+
+    /// Each stub as its id, else its first `is` body — the order a placement produced.
+    fn shape(stubs: &[super::Stub]) -> Vec<String> {
+        stubs
+            .iter()
+            .map(|s| {
+                s.id.clone().unwrap_or_else(|| {
+                    let v = serde_json::to_value(s).expect("serialize");
+                    v["responses"][0]["is"]["body"]
+                        .as_str()
+                        .unwrap_or("?")
+                        .to_owned()
+                })
+            })
+            .collect()
+    }
+
+    fn place(
+        stubs: serde_json::Value,
+        new: serde_json::Value,
+        placement: crate::control::RecordedStubPlacement,
+        anchor: Option<usize>,
+    ) -> (Vec<String>, super::PlacedRecording) {
+        let mut stubs = config(8080, stubs).stubs;
+        let placed = super::place_recorded_stub(
+            &mut stubs,
+            placed_stub(new),
+            placement,
+            "http://u.example",
+            anchor,
+        );
+        (shape(&stubs), placed)
+    }
+
+    /// Pins D-114: a valid `anchor_index` is the anchor — a `proxyOnce` recording goes before the
+    /// proxy stub that answered, not the first one to the same `to`.
+    #[test]
+    fn a_recording_goes_before_the_proxy_that_answered() {
+        let (order, _) = place(
+            json!([proxy_to_u("A"), proxy_to_u("B")]),
+            json!({ "responses": [{ "is": { "body": "new" } }] }),
+            crate::control::RecordedStubPlacement::BeforeProxy,
+            Some(1),
+        );
+        assert_eq!(order, ["A", "new", "B"]);
+    }
+
+    /// Pins D-114: an `anchor_index` a later insert shifted onto a non-proxy stub is followed
+    /// forward to the proxy that answered — not taken raw, and not replaced by the first proxy.
+    #[test]
+    fn a_shifted_anchor_is_found_by_scanning_forward() {
+        let (order, _) = place(
+            json!([
+                { "responses": [{ "is": { "body": "rec" } }] },
+                proxy_to_u("A"),
+                { "id": "other", "responses": [{ "is": { "body": "other" } }] },
+                proxy_to_u("B"),
+            ]),
+            json!({ "responses": [{ "is": { "body": "new" } }] }),
+            crate::control::RecordedStubPlacement::BeforeProxy,
+            Some(2),
+        );
+        assert_eq!(order, ["rec", "A", "other", "new", "B"]);
+    }
+
+    /// Pins D-114 (rift#1389): `proxyAlways` merges into an equal-predicate stub after the anchor
+    /// even when both predicate lists are empty, as Mountebank does.
+    #[test]
+    fn proxy_always_merges_into_an_empty_predicate_stub() {
+        let (order, placed) = place(
+            json!([proxy_to_u("P"), { "id": "catch", "responses": [{ "is": { "body": "c" } }] }]),
+            json!({ "responses": [{ "is": { "body": "new" } }] }),
+            crate::control::RecordedStubPlacement::AfterProxyMerging,
+            Some(0),
+        );
+        assert_eq!(order, ["P", "catch"]);
+        assert!(
+            matches!(placed, super::PlacedRecording::MergedInto { index: 1, ref id } if id == "catch"),
+            "{placed:?}"
+        );
+    }
+
+    /// Pins D-114 (rift#1389): a `proxyAlways` recording with no equal-predicate stub after the
+    /// anchor is appended at the end, not inserted right after the proxy.
+    #[test]
+    fn an_unmerged_proxy_always_recording_is_appended_at_the_end() {
+        let (order, placed) = place(
+            json!([
+                proxy_to_u("P"),
+                { "id": "x", "predicates": [{ "equals": { "path": "/x" } }],
+                  "responses": [{ "is": { "body": "x" } }] },
+            ]),
+            json!({ "predicates": [{ "equals": { "path": "/y" } }],
+                    "responses": [{ "is": { "body": "new" } }] }),
+            crate::control::RecordedStubPlacement::AfterProxyMerging,
+            Some(0),
+        );
+        assert_eq!(order, ["P", "x", "new"]);
+        assert!(matches!(
+            placed,
+            super::PlacedRecording::Inserted { index: 2 }
+        ));
+    }
+
+    /// Pins D-114: with no anchor and no proxy stub, `proxyOnce` goes last and `proxyAlways`
+    /// merges from the start.
+    #[test]
+    fn with_no_anchor_once_goes_last_and_always_merges_from_the_start() {
+        let pred = json!([{ "equals": { "path": "/p" } }]);
+        let existing =
+            json!([{ "id": "s", "predicates": pred, "responses": [{ "is": { "body": "s" } }] }]);
+        let new = json!({ "predicates": pred, "responses": [{ "is": { "body": "new" } }] });
+        let (once, _) = place(
+            existing.clone(),
+            new.clone(),
+            crate::control::RecordedStubPlacement::BeforeProxy,
+            None,
+        );
+        assert_eq!(once, ["s", "new"]);
+        let (always, placed) = place(
+            existing,
+            new,
+            crate::control::RecordedStubPlacement::AfterProxyMerging,
+            None,
+        );
+        assert_eq!(always, ["s"]);
+        assert!(matches!(
+            placed,
+            super::PlacedRecording::MergedInto { index: 0, .. }
+        ));
+    }
+
+    /// Pins D-114: an `anchor_index` past the end falls back to the first proxy to `proxy_to`.
+    #[test]
+    fn an_anchor_past_the_end_falls_back_to_the_first_proxy() {
+        let (order, _) = place(
+            json!([proxy_to_u("P")]),
+            json!({ "responses": [{ "is": { "body": "new" } }] }),
+            crate::control::RecordedStubPlacement::BeforeProxy,
+            Some(9),
+        );
+        assert_eq!(order, ["new", "P"]);
+    }
+
+    /// Pins D-114: a `proxyAlways` recording writes no marker row — a port can mix modes, and a
+    /// row would answer a later `proxyOnce` claim for the signature `AlreadyRecorded`. A
+    /// `proxyOnce` recording still writes one.
+    #[tokio::test]
+    async fn a_proxy_always_recording_writes_no_marker() {
+        let (_td, mut sm) = fresh_sm(None).await;
+        sm.apply(vec![entry(
+            1,
+            request(
+                1,
+                ControlOp::PutImposter {
+                    config: Box::new(proxy_imposter_config(8080)),
+                },
+            ),
+        )])
+        .await
+        .expect("put");
+        let always = proxy_recorded(
+            2,
+            8080,
+            H1,
+            "always",
+            Some(recorded_stub(
+                "always",
+                crate::control::RecordedStubPlacement::AfterProxyMerging,
+            )),
+        );
+        sm.apply(vec![entry(2, always)]).await.expect("apply");
+        assert_eq!(
+            marker(&sm, 8080, H1),
+            None,
+            "no marker for a proxyAlways recording"
+        );
+        let once = proxy_recorded(
+            3,
+            8080,
+            H2,
+            "once",
+            Some(recorded_stub(
+                "once",
+                crate::control::RecordedStubPlacement::BeforeProxy,
+            )),
+        );
+        sm.apply(vec![entry(3, once)]).await.expect("apply");
+        assert!(
+            marker(&sm, 8080, H2).is_some(),
+            "a proxyOnce recording keeps its marker"
+        );
     }
 
     fn recorded_stub(
@@ -7265,6 +7495,7 @@ mod tests {
             ),
             placement,
             proxy_to: "http://u.example".to_owned(),
+            anchor_index: None,
         }
     }
 

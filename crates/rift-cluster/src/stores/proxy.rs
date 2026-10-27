@@ -21,13 +21,13 @@
 //!   the stub-less recording (its replay source until its imposter is deleted or cleared) and
 //!   the commit→apply window (from the owner's completion cache). A recorded marker is forgot
 //!   at apply when its recorded stub is removed or changed (D-108).
-//! - **Modes.** The store is manager-scoped, so it resolves each port's proxy mode from
-//!   applied config. `proxyOnce` runs the claim machinery; `proxyAlways` grants formality
-//!   tokens and publishes every recording as a merge op (the engine skips local insertion for
-//!   every mode once `publishes_stubs()` is true — losing proxyAlways publication would be a
-//!   silent regression, not a scope cut); `proxyTransparent` never records *responses*, as
-//!   upstream, but still publishes generator-built stubs — upstream gates stub generation on
-//!   `predicateGenerators`, not mode, and this store is the sole publisher.
+//! - **Modes are per request (D-114).** The engine claims through `try_claim_as` with the mode of
+//!   the proxy stub that answered (rift#1387), as Mountebank does: one imposter can mix modes. A
+//!   `proxyOnce` request runs the claim machinery; a `proxyAlways` one is granted an ungated
+//!   formality token ([`UNGATED`], upstream `LocalProxyStore`'s bit) and its recording is published
+//!   as a merge op (the engine skips local insertion once `publishes_stubs()` is true, so this
+//!   store is the sole publisher). `release_claim`, `record` and `complete` dispatch on that bit,
+//!   never on a mode resolved from config. `proxyTransparent` claims nothing and records nothing.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -35,11 +35,10 @@ use std::sync::{Arc, OnceLock, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rift_cluster_base::seams::{
-    BackendUnavailable, ClaimOutcome, ClaimToken, ProxyRecordingStore, ProxyStoreError,
+    BackendUnavailable, ClaimOutcome, ClaimToken, ProxyMode, ProxyRecordingStore, ProxyStoreError,
     RecordedResponse, RequestSignature, StubPlacement, StubPublication,
 };
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use uuid::Uuid;
 use xxhash_rust::xxh64::xxh64;
 
@@ -80,14 +79,10 @@ const SUBMIT_DEADLINE: Duration = Duration::from_secs(8);
 /// upstream call bounded by ownership changes.
 const COMPLETE_CACHE_TTL: Duration = Duration::from_secs(120);
 
-/// How long a resolved mode for a port is trusted before re-reading applied
-/// config. Modes change only when an imposter is replaced — rare — while `try_claim` runs
-/// per proxied request on the data plane; 2 s keeps the table read off the hot path without
-/// letting a replaced imposter's mode linger meaningfully. A request in flight *across* a
-/// mode flip can dispatch its claim and its settle under different modes; the mismatched
-/// half degrades to a released-or-stale claim (self-healing at the claim TTL), never to a
-/// wrong recording — and the replace itself purges the port's markers at apply.
-const MODE_CACHE_TTL: Duration = Duration::from_secs(2);
+/// Set on the token of a claim that does not gate (`proxyAlways`), so `release_claim`, `record`
+/// and `complete` tell the two kinds of claim apart from the token alone (D-114) — upstream
+/// `LocalProxyStore`'s `UNGATED`. [`ProxyNet::mint_token`] keeps it off every gated token.
+const UNGATED: u64 = 1 << 63;
 
 /// Attempts per owner op across a `Fenced`/`NotOwner` redirect: the first dispatch plus one
 /// rebuild against the fresh ring. A membership that moves twice inside one op is churn to
@@ -122,21 +117,6 @@ fn now_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_secs())
-}
-
-/// A port's proxy mode, as the store dispatches on it. Parsed from the applied config's
-/// proxy response rather than imported from upstream: the wire strings are the contract.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PortMode {
-    Once,
-    Always,
-    Transparent,
-}
-
-#[derive(Clone)]
-struct PortIdentity {
-    mode: PortMode,
-    resolved_at: Instant,
 }
 
 struct PendingClaim {
@@ -182,7 +162,6 @@ pub struct ProxyNet {
     pending: parking_lot::Mutex<HashMap<(u16, String), PendingClaim>>,
     /// Recordings this owner committed, kept until the fleet has surely applied them.
     completed: parking_lot::Mutex<HashMap<(u16, String), CachedRecording>>,
-    mode_cache: parking_lot::Mutex<HashMap<u16, PortIdentity>>,
     next_token: AtomicU64,
 }
 
@@ -202,7 +181,6 @@ impl ProxyNet {
             claim_ttl: OnceLock::new(),
             pending: parking_lot::Mutex::new(HashMap::new()),
             completed: parking_lot::Mutex::new(HashMap::new()),
-            mode_cache: parking_lot::Mutex::new(HashMap::new()),
             next_token: AtomicU64::new(seed),
         })
     }
@@ -259,32 +237,9 @@ impl ProxyNet {
     }
 
     fn mint_token(&self) -> u64 {
-        self.next_token.fetch_add(1, Ordering::SeqCst)
-    }
-
-    /// Resolve a port's proxy mode from applied config, through a short TTL cache.
-    fn port_identity(&self, port: u16) -> Result<PortIdentity, ProxyStoreError> {
-        if let Some(hit) = self.mode_cache.lock().get(&port)
-            && hit.resolved_at.elapsed() < MODE_CACHE_TTL
-        {
-            return Ok(hit.clone());
-        }
-        let (node, _ring) = self.view().map_err(ProxyStoreError::Unavailable)?;
-        let config_json = node
-            .get_imposter(port)
-            .map_err(|e| ProxyStoreError::Unavailable(format!("proxy store: {e}")))?
-            .ok_or_else(|| {
-                ProxyStoreError::Unavailable(format!(
-                    "proxy store: no applied imposter on port {port}"
-                ))
-            })?;
-        let mode = parse_proxy_mode(&config_json);
-        let identity = PortIdentity {
-            mode,
-            resolved_at: Instant::now(),
-        };
-        self.mode_cache.lock().insert(port, identity.clone());
-        Ok(identity)
+        // The seed is wall-clock nanos, below 2^63 until 2262 — but a gated token must never
+        // read as ungated whatever the seed, so the bit is cleared rather than assumed clear.
+        self.next_token.fetch_add(1, Ordering::SeqCst) & !UNGATED
     }
 
     // -- owner-side handlers (invoked locally or via the routes below) -------
@@ -554,7 +509,6 @@ impl ProxyNet {
     fn clear_local(&self, port: u16) {
         self.pending.lock().retain(|(p, _), _| *p != port);
         self.completed.lock().retain(|(p, _), _| *p != port);
-        self.mode_cache.lock().remove(&port);
     }
 
     /// Resolve the owner of `key` on the current ring.
@@ -564,17 +518,6 @@ impl ProxyNet {
     }
 }
 
-/// The first proxy response's `mode` in a config, read the way upstream's `ProxyResponse::mode`
-/// reads it: trimmed and lowercased, and an empty or absent `mode` is `proxyOnce` — Mountebank's
-/// default, and the engine's since rift#1314 (v0.21.0); before that it was transparent, and this
-/// mirrored it (#682). An unknown mode is refused at the engine's admission, so it can only
-/// arrive in a config an older engine committed; it stays transparent here, the answer that
-/// neither gates traffic nor records. No proxy stub at all means transparent. Divergence here is
-/// a cluster node treating an imposter differently from single-node rift, which is precisely the
-/// fidelity #226's acceptance forbids.
-///
-/// Still per *port* — the first proxy stub decides for the whole imposter. Upstream decides per
-/// request since rift#1387 (`try_claim_as`); adopting that is the rest of #682.
 /// Turn a claim-path failure into the refusing form (D-66) and count it.
 ///
 /// Mirrors `stores/flow.rs::unavailable`, with one deliberate difference: the flow store splits
@@ -599,40 +542,6 @@ fn refused(e: ProxyStoreError) -> ProxyStoreError {
         feature: "proxyOnce",
         detail: e.to_string(),
     })
-}
-
-fn parse_proxy_mode(config_json: &str) -> PortMode {
-    let config = match serde_json::from_str::<Value>(config_json) {
-        Ok(config) => config,
-        Err(e) => {
-            // The stored string is exactly what the apply path wrote after a successful
-            // round-trip, so failing to parse it is a storage-integrity signal, not an
-            // absent-field domain case (that one is the quiet fallthrough below).
-            // Transparent is the fail-closed degraded answer: it forwards and never
-            // records, so a corrupt config can neither gate traffic nor replay wrong
-            // data — and it must not be silent.
-            tracing::error!(
-                error = %e,
-                "corrupt applied config; treating proxy mode as transparent"
-            );
-            return PortMode::Transparent;
-        }
-    };
-    let mode = config["stubs"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|stub| stub["responses"].as_array())
-        .flatten()
-        .find_map(|resp| {
-            resp.get("proxy")
-                .map(|proxy| proxy["mode"].as_str().unwrap_or("").trim().to_lowercase())
-        });
-    match mode.as_deref() {
-        Some("proxyonce" | "") => PortMode::Once,
-        Some("proxyalways") => PortMode::Always,
-        _ => PortMode::Transparent,
-    }
 }
 
 enum OwnerRefusal {
@@ -1011,18 +920,12 @@ impl ClusterProxyStore {
         resp: RecordedResponse,
         recorded: RecordedStub,
     ) -> Result<(), ProxyStoreError> {
-        let identity = self.net.port_identity(port)?;
-        match identity.mode {
-            PortMode::Once => self.blocking_settle(port, &sig, token, resp, Some(recorded)),
-            // proxyAlways and proxyTransparent both publish without a claim. Transparent
-            // never records *responses*, but the engine's stub generation is gated on
-            // `predicateGenerators`, not mode — a transparent imposter with generators
-            // gets its stub inserted upstream, and with `publishes_stubs()` making this
-            // store the sole publisher, dropping it here would be the silent regression
-            // the module doc forbids for proxyAlways, applied to the third mode.
-            PortMode::Always | PortMode::Transparent => {
-                self.blocking_publish_unclaimed(port, &sig, resp, Some(recorded))
-            }
+        // Dispatched on the token the engine was granted, not on a mode read from config: one
+        // imposter can mix modes (D-114).
+        if token.value() & UNGATED != 0 {
+            self.blocking_publish_unclaimed(port, &sig, resp, Some(recorded))
+        } else {
+            self.blocking_settle(port, &sig, token, resp, Some(recorded))
         }
     }
 }
@@ -1085,18 +988,27 @@ impl ProxyRecordingStore for ClusterProxyStore {
         port: u16,
         sig: &RequestSignature,
     ) -> Result<ClaimOutcome, ProxyStoreError> {
-        // Fail closed *before* the mode is known: an unresolved port identity cannot prove this
-        // port does not gate, and the only ways to reach it while serving traffic are a node
-        // mid-shutdown or a cache miss racing a delete — both "not now", never "go ahead".
-        let identity = self.net.port_identity(port).map_err(refused)?;
-        match identity.mode {
-            PortMode::Once => self.blocking_claim(port, sig).map_err(refused),
-            // proxyAlways / proxyTransparent never gate — the claim is a formality so the
-            // caller path is uniform, exactly as `LocalProxyStore` answers. Nothing is being
-            // arbitrated, so there is nothing to refuse.
-            PortMode::Always | PortMode::Transparent => Ok(ClaimOutcome::Claimed(ClaimToken::new(
-                self.net.mint_token(),
-            ))),
+        // The engine claims through `try_claim_as`; a caller with no mode gets upstream's
+        // default, `proxyOnce` — the gated one, so nothing is let through unarbitrated.
+        self.try_claim_as(port, sig, ProxyMode::ProxyOnce)
+    }
+
+    /// D-114: gated by the mode of the proxy stub that answered (rift#1387), not by a mode
+    /// resolved for the whole port. A `proxyOnce` request runs the claim machinery; a
+    /// `proxyAlways` (or `proxyTransparent`, which the engine never claims for) one is granted an
+    /// [`UNGATED`] formality token, as `LocalProxyStore` answers — nothing is arbitrated, so there
+    /// is nothing to refuse.
+    fn try_claim_as(
+        &self,
+        port: u16,
+        sig: &RequestSignature,
+        mode: ProxyMode,
+    ) -> Result<ClaimOutcome, ProxyStoreError> {
+        match mode {
+            ProxyMode::ProxyOnce => self.blocking_claim(port, sig).map_err(refused),
+            ProxyMode::ProxyAlways | ProxyMode::ProxyTransparent => Ok(ClaimOutcome::Claimed(
+                ClaimToken::new(self.net.mint_token() | UNGATED),
+            )),
         }
     }
 
@@ -1112,36 +1024,15 @@ impl ProxyRecordingStore for ClusterProxyStore {
     /// - **It cannot panic.** A panic here during unwinding is a second panic, which aborts the
     ///   process rather than failing one request — so every arm below returns.
     ///
-    /// What the caller pays is *not* one flat [`CLAIM_OP_DEADLINE`]: `port_identity` below may
-    /// miss its 2 s cache and take a synchronous config read first, and an abandoned request is
-    /// by nature a slow one, so that miss is the common case here. The bound is therefore one
-    /// config read plus one bridge call, not 2 s.
+    /// What the caller pays is one bridge call, bounded by [`CLAIM_OP_DEADLINE`].
     ///
-    /// Non-`proxyOnce` modes return before the bridge is touched: their claim is a formality that
+    /// An [`UNGATED`] token returns before the bridge is touched: its claim is a formality that
     /// was never registered on an owner, so releasing it would be a fleet round trip for nothing.
     ///
     /// Deliberately *not* fire-and-forget, which upstream's SPI recommends for a store that
     /// releases over the network — D-90 records that divergence and its reason.
     fn release_claim(&self, port: u16, sig: &RequestSignature, token: ClaimToken) {
-        let identity = match self.net.port_identity(port) {
-            Ok(identity) => identity,
-            Err(e) => {
-                // Reached by more than one cause, and they heal differently. An imposter delete
-                // or replace purges the port's claims on every node as each applies it
-                // (`clear_local`), so the owner's entry goes whether or not this release lands.
-                // The others — this node mid-shutdown, no applied membership yet, a storage read
-                // that failed — purge nothing, and there the claim TTL remains what frees the
-                // signature, exactly as in the RPC-failure arm below.
-                tracing::warn!(
-                    port,
-                    sig_hash = %sig_hash(sig),
-                    error = %e,
-                    "proxy claim release skipped: port identity unresolved"
-                );
-                return;
-            }
-        };
-        if identity.mode != PortMode::Once {
+        if token.value() & UNGATED != 0 {
             return;
         }
         let Some(bridge) = self.net.bridge.get() else {
@@ -1196,16 +1087,15 @@ impl ProxyRecordingStore for ClusterProxyStore {
         token: ClaimToken,
         resp: RecordedResponse,
     ) -> Result<(), ProxyStoreError> {
-        let identity = self.net.port_identity(port)?;
-        match identity.mode {
-            // A stub-less proxyOnce recording: the consensus row is the replay source.
-            PortMode::Once => self.blocking_settle(port, &sig, token, resp, None),
+        if token.value() & UNGATED != 0 {
             // proxyAlways with no generated stub publishes nothing: there is no stub to
             // replicate and the mode never replays from `lookup`. Upstream's in-memory
             // response list exists to feed later stub generation, which the clustered
             // store does not model — documented in Ch.6 §proxyOnce.
-            PortMode::Always | PortMode::Transparent => Ok(()),
+            return Ok(());
         }
+        // A stub-less proxyOnce recording: the consensus row is the replay source.
+        self.blocking_settle(port, &sig, token, resp, None)
     }
 
     fn complete(
@@ -1234,6 +1124,7 @@ impl ProxyRecordingStore for ClusterProxyStore {
                     stub: Box::new(publication.stub.clone()),
                     placement,
                     proxy_to: publication.proxy_to.to_owned(),
+                    anchor_index: publication.anchor_index,
                 },
             ),
             None => self.record(port, sig, token, resp),
@@ -1245,16 +1136,14 @@ impl ProxyRecordingStore for ClusterProxyStore {
     }
 
     fn lookup(&self, port: u16, sig: &RequestSignature) -> Option<RecordedResponse> {
-        // Fail closed on a port whose applied config cannot be resolved — the same guard
-        // `try_claim` opens with, and for the same reason: a port the store cannot identify
-        // has no recording to replay and no owner worth asking for one.
-        self.net.port_identity(port).ok()?;
+        // Fail closed on a port with no applied imposter, or one this node cannot read: it has no
+        // recording to replay and no owner worth asking for one.
+        let (node, _) = self.net.view().ok()?;
+        node.get_imposter(port).ok()??;
         let hash = sig_hash(sig);
         // Local applied state first: after the op applies everywhere this answers with no
         // RPC, and after the recorded stub applies the engine stops asking altogether.
-        if let Ok((node, _)) = self.net.view()
-            && let Ok(Some(json)) = node.proxy_recorded(port, &hash)
-        {
+        if let Ok(Some(json)) = node.proxy_recorded(port, &hash) {
             match serde_json::from_str(&json) {
                 Ok(resp) => return Some(resp),
                 Err(e) => {
@@ -1311,51 +1200,5 @@ impl ProxyRecordingStore for ClusterProxyStore {
     /// against the applied state, so purges converge with the log.
     fn clear(&self, port: u16) {
         self.net.clear_local(port);
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Pins the mirror of upstream's mode parse: a mode-less proxy stub round-trips as
-    /// `"mode": ""`, and since rift#1314 upstream reads empty and absent as `proxyOnce`
-    /// (Mountebank's default; #682). Reading them as transparent would forward every request a
-    /// single node replays — the single-node divergence #226's fidelity gate forbids.
-    #[test]
-    fn proxy_mode_parsing_mirrors_upstream_extract_proxy_mode() {
-        let with_mode = |mode: &str| {
-            format!(
-                r#"{{"port":1,"protocol":"http","stubs":[{{"responses":[{{"proxy":{{"to":"http://u","mode":"{mode}"}}}}]}}]}}"#
-            )
-        };
-        assert_eq!(parse_proxy_mode(&with_mode("proxyOnce")), PortMode::Once);
-        assert_eq!(parse_proxy_mode(&with_mode("PROXYONCE")), PortMode::Once);
-        assert_eq!(
-            parse_proxy_mode(&with_mode("proxyAlways")),
-            PortMode::Always
-        );
-        assert_eq!(
-            parse_proxy_mode(&with_mode("proxyTransparent")),
-            PortMode::Transparent
-        );
-        assert_eq!(parse_proxy_mode(&with_mode("")), PortMode::Once);
-        assert_eq!(
-            parse_proxy_mode(&with_mode(" proxyAlways ")),
-            PortMode::Always
-        );
-        assert_eq!(
-            parse_proxy_mode(&with_mode("somethingElse")),
-            PortMode::Transparent
-        );
-
-        let mode_less =
-            r#"{"port":1,"protocol":"http","stubs":[{"responses":[{"proxy":{"to":"http://u"}}]}]}"#;
-        assert_eq!(parse_proxy_mode(mode_less), PortMode::Once);
-
-        let no_proxy_stub = r#"{"port":1,"protocol":"http","stubs":[]}"#;
-        assert_eq!(parse_proxy_mode(no_proxy_stub), PortMode::Transparent);
-
-        assert_eq!(parse_proxy_mode("not json"), PortMode::Transparent);
     }
 }

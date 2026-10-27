@@ -60,9 +60,10 @@ pub mod seams {
     /// publication half (`StubPlacement`, `StubPublication`, the recorded
     /// types) is what a *publishing* store (#226, upstream #910/#911) consumes:
     /// `complete()` hands it the built stub, and `publishes_stubs()` makes the
-    /// store the sole publisher.
+    /// store the sole publisher. [`ProxyMode`] is what the engine claims with
+    /// (`try_claim_as`, rift#1387): the mode of the proxy stub that answered.
     pub use rift_mock_core::recording::{
-        ClaimOutcome, ClaimToken, LocalProxyStore, ProxyRecordingStore, ProxyStoreError,
+        ClaimOutcome, ClaimToken, LocalProxyStore, ProxyMode, ProxyRecordingStore, ProxyStoreError,
         RecordedResponse, RequestSignature, StubPlacement, StubPublication,
     };
 

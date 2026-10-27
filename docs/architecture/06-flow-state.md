@@ -376,9 +376,14 @@ Two ordering subtleties carry the correctness:
 
 Recordings themselves (multi-response proxy modes) append through the config
 write path like any stub mutation, so they inherit R1/R3/R4 wholesale —
-`proxyAlways` merges into the existing recorded stub at apply (the upstream
-#611 structural-equality rule, reproduced deterministically in the state
-machine). A `proxyOnce` recording with **no** predicate generators produces no
+`proxyAlways` merges into the first stub after the one that answered whose
+predicates are structurally equal, an empty list included, or is appended at the
+end (upstream #611 and rift#1389, reproduced deterministically in the state
+machine against the answering stub's validated `anchor_index`, D-114). Modes are
+per request, as in Mountebank: the engine claims with the answering proxy stub's
+own mode, so one imposter can mix `proxyOnce` and `proxyAlways`, and only a
+`proxyOnce` recording leaves a marker row for later claims to find (D-114). A
+`proxyOnce` recording with **no** predicate generators produces no
 stub at all; its replayable response is stored in the same committed op, so
 `lookup()` answers from any node's applied state forever — that row, not a
 config stub, is the replay source for the stub-less case. The claim deadline

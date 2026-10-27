@@ -31,7 +31,7 @@ use rift_cluster::{
     RecordedStubPlacement,
 };
 use rift_cluster_base::seams::{
-    BackendUnavailable, ClaimOutcome, ClaimToken, ImposterConfig, ProxyRecordingStore,
+    BackendUnavailable, ClaimOutcome, ClaimToken, ImposterConfig, ProxyMode, ProxyRecordingStore,
     ProxyStoreError, RecordedResponse, RequestSignature, Stub,
 };
 use tempfile::TempDir;
@@ -262,6 +262,19 @@ async fn claim(store: &Arc<ClusterProxyStore>, port: u16, s: &RequestSignature) 
         .expect("join")
 }
 
+async fn claim_as(
+    store: &Arc<ClusterProxyStore>,
+    port: u16,
+    s: &RequestSignature,
+    mode: ProxyMode,
+) -> ClaimOutcome {
+    let store = Arc::clone(store);
+    let s = s.clone();
+    tokio::task::spawn_blocking(move || store.try_claim_as(port, &s, mode).expect("claim answers"))
+        .await
+        .expect("join")
+}
+
 async fn try_claim_raw(
     store: &Arc<ClusterProxyStore>,
     port: u16,
@@ -295,6 +308,7 @@ async fn complete_recorded(
                 stub: Box::new(stub),
                 placement: RecordedStubPlacement::BeforeProxy,
                 proxy_to: "http://upstream.example".to_owned(),
+                anchor_index: None,
             },
         )
     })
@@ -919,10 +933,12 @@ async fn proxy_always_merges_responses_fleet_wide() {
     let store_b = store_on(&members[1]);
 
     // proxyAlways never gates: every claim is granted (a formality token).
-    let ClaimOutcome::Claimed(t1) = claim(&store_a, TEST_PORT, &s).await else {
+    let ClaimOutcome::Claimed(t1) = claim_as(&store_a, TEST_PORT, &s, ProxyMode::ProxyAlways).await
+    else {
         panic!("proxyAlways always grants");
     };
-    let ClaimOutcome::Claimed(t2) = claim(&store_b, TEST_PORT, &s).await else {
+    let ClaimOutcome::Claimed(t2) = claim_as(&store_b, TEST_PORT, &s, ProxyMode::ProxyAlways).await
+    else {
         panic!("proxyAlways always grants concurrently");
     };
 
@@ -943,6 +959,7 @@ async fn proxy_always_merges_responses_fleet_wide() {
                         stub: Box::new(stub),
                         placement: RecordedStubPlacement::AfterProxyMerging,
                         proxy_to: "http://upstream.example".to_owned(),
+                        anchor_index: None,
                     },
                 )
             })
@@ -1152,11 +1169,18 @@ async fn proxy_always_never_refuses_on_an_isolated_owner() {
         try_claim_raw(&store, TEST_PORT, &once_sig).await,
         "proxyOnce on the isolated owner",
     );
-    // The claim under test: proxyAlways grants regardless.
+    // The claim under test: proxyAlways grants regardless — claimed as the engine claims, with
+    // the answering stub's mode (D-114).
     assert!(
         matches!(
-            try_claim_raw(&store, always_port, &sig("/always-partitioned")).await,
-            Ok(ClaimOutcome::Claimed(_))
+            claim_as(
+                &store,
+                always_port,
+                &sig("/always-partitioned"),
+                ProxyMode::ProxyAlways
+            )
+            .await,
+            ClaimOutcome::Claimed(_)
         ),
         "proxyAlways gates nothing, so a partition must not stop it recording"
     );
@@ -1475,5 +1499,105 @@ async fn an_oversize_recording_is_skipped_and_released() {
     assert!(
         matches!(claim(&store, TEST_PORT, &s).await, ClaimOutcome::Claimed(_)),
         "the claim was released, so the signature is claimable again"
+    );
+}
+
+/// Pins D-114: each request is gated by its own proxy stub's mode (rift#1387), not by one mode
+/// resolved for the port. On a `proxyAlways` port a `proxyOnce` request is still arbitrated, and a
+/// `proxyAlways` request is granted an ungated token every time.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn each_request_is_gated_by_its_own_mode() {
+    let _lock = TEST_LOCK.lock().await;
+    let members = proxy_cluster_of(2, Duration::from_secs(30)).await;
+    install_imposter(&members, TEST_PORT, "proxyAlways").await;
+    let store = store_on(&members[0]);
+    let s = sig("/mixed");
+
+    assert!(matches!(
+        claim_as(&store, TEST_PORT, &s, ProxyMode::ProxyOnce).await,
+        ClaimOutcome::Claimed(_)
+    ));
+    assert!(
+        matches!(
+            claim_as(&store, TEST_PORT, &s, ProxyMode::ProxyOnce).await,
+            ClaimOutcome::InFlight
+        ),
+        "a proxyOnce request is arbitrated whatever the port's first proxy stub says"
+    );
+    for _ in 0..2 {
+        let ClaimOutcome::Claimed(token) =
+            claim_as(&store, TEST_PORT, &s, ProxyMode::ProxyAlways).await
+        else {
+            panic!("a proxyAlways request is always granted");
+        };
+        assert_ne!(
+            token.value() & (1 << 63),
+            0,
+            "an ungated token carries the bit"
+        );
+    }
+}
+
+/// Pins D-114: an ungated recording publishes as a merge whatever the port's first proxy stub
+/// is — dispatched on the token, not on a mode resolved from config, which would settle it against
+/// an owner claim that does not exist and drop it as stale.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_ungated_recording_publishes_on_a_proxy_once_port() {
+    let _lock = TEST_LOCK.lock().await;
+    let members = proxy_cluster_of(2, Duration::from_secs(30)).await;
+    install_imposter(&members, TEST_PORT, "proxyOnce").await;
+    let store = store_on(&members[0]);
+    let s = sig("/always-on-once");
+    let ClaimOutcome::Claimed(token) =
+        claim_as(&store, TEST_PORT, &s, ProxyMode::ProxyAlways).await
+    else {
+        panic!("a proxyAlways request is always granted");
+    };
+    let store2 = Arc::clone(&store);
+    let s2 = s.clone();
+    tokio::task::spawn_blocking(move || {
+        store2.complete_recorded(
+            TEST_PORT,
+            s2,
+            token,
+            resp("always"),
+            RecordedStub {
+                stub: Box::new(generated_stub("/always-on-once", "always")),
+                placement: RecordedStubPlacement::AfterProxyMerging,
+                proxy_to: "http://upstream.example".to_owned(),
+                anchor_index: Some(0),
+            },
+        )
+    })
+    .await
+    .expect("join")
+    .expect("the ungated recording publishes");
+    wait_stub_count(&members, TEST_PORT, 2).await;
+}
+
+/// Pins D-114: releasing a gated claim frees the signature on a port whose first proxy stub is
+/// `proxyAlways` — the release dispatches on the token, so it is not skipped as a formality.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn releasing_a_gated_claim_on_a_proxy_always_port_frees_the_signature() {
+    let _lock = TEST_LOCK.lock().await;
+    let members = proxy_cluster_of(2, Duration::from_secs(30)).await;
+    install_imposter(&members, TEST_PORT, "proxyAlways").await;
+    let store = store_on(&members[0]);
+    let s = sig("/release");
+    let ClaimOutcome::Claimed(token) = claim_as(&store, TEST_PORT, &s, ProxyMode::ProxyOnce).await
+    else {
+        panic!("first claim wins");
+    };
+    let store2 = Arc::clone(&store);
+    let s2 = s.clone();
+    tokio::task::spawn_blocking(move || store2.release_claim(TEST_PORT, &s2, token))
+        .await
+        .expect("join");
+    assert!(
+        matches!(
+            claim_as(&store, TEST_PORT, &s, ProxyMode::ProxyOnce).await,
+            ClaimOutcome::Claimed(_)
+        ),
+        "the released signature is claimable again"
     );
 }
