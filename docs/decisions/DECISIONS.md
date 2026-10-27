@@ -5541,3 +5541,34 @@ about 3.0–3.4 MiB.
   move.
 - Downgrade is unsupported: an old binary logs new-shape rows as corrupt and does not replay them.
 
+### D-121 — The cluster does not tune Mountebank-style script scheduling; it is the engine's, as standalone has it
+
+- **Status:** active
+- **Decided:** 2026-10-27 · #720, #728
+- **Implemented by:** #720
+- **Code:** crates/rift-cluster-server/src/compose.rs, crates/rift-cluster-server/tests/mb_script_interleave.rs
+
+rift#1678 (rift v0.24.0) runs Mountebank-style hooks (`inject`, async `decorate`) on per-worker event
+loops with imposter affinity. A run waiting on a timer or a promise holds no worker and no lock, and
+an imposter's runs share one live `state` that interleaves at `await`s, as in Mountebank. Before it,
+a sleeping run parked one of the 4–16 pool workers for its whole `timeoutMs`, so about sixteen
+sleeping injects stalled every hook on the node (#728).
+
+**The cluster adds nothing to that.** Pool size, imposter affinity, the per-worker realm cap and
+`_rift.scriptEngine.timeoutMs` are the engine's, exactly as standalone has them:
+- the door does not cap `timeoutMs`;
+- the node does not partition the pool between imposters;
+- there is no knob to mirror, so `cluster_manager` is unchanged (D-103).
+
+With one administrator (D-73) there is no trust boundary between imposters for a cap or a partition
+to defend. A CPU-bound runaway delays the imposters sharing its worker until the engine's loop cap
+throws. That is the engine's trade, and better than Mountebank, which stalls everything.
+
+The realm cap never evicts on a node: realms are keyed by `ScriptFileAccess`, and a node builds
+exactly one, `network(--scripts-dir)`. Revisit only if upstream adds a scheduling knob, in which case
+`manager_parity.rs` fires.
+
+The bump (v0.24.0) is **not** a whole-fleet upgrade under D-98. Its other changes are rift#1740
+(`POST /imposters/:port/stubs` no longer generates an id, which the front's own terminated door
+never did) and rift#1739 (schema attributes only).
+

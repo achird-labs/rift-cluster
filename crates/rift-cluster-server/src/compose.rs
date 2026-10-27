@@ -1529,6 +1529,8 @@ fn cluster_manager(
     let journal_max_bytes = std::num::NonZeroUsize::new(cli.oss.journal_max_bytes)
         .context("--journal-max-bytes must be at least 1")?;
 
+    // D-121: no script-scheduling knob is set here; pool size, affinity and timeouts are the
+    // engine's, as standalone has them.
     let manager = ImposterManager::with_datadir(cli.oss.datadir.clone())
         // Upstream's own manager names `network(--scripts-dir)`: `require()` and `lookup` read only
         // below `--scripts-dir`, and nothing at all without it (upstream #1611). One fleet-wide
