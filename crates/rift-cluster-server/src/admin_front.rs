@@ -1945,24 +1945,79 @@ fn carry_over_headers(response: &mut Response<FrontBody>, previous: &hyper::Head
 /// tidiness: rift-verify reads it there to drive correlated isolation, so rewriting it in EE would
 /// break rift-verify against an EE cluster, which is what this repo's `parity` job exists to catch.
 ///
-/// Not *byte*-identical: the document round-trips through `serde_json::Value` without
-/// `preserve_order`, so key order comes out normalised. This is the only rewrite the
-/// single-imposter read goes through since D-74 (#552) removed the `numberOfRequests` fleet-sum
-/// decoration, and no consumer depends on key order.
+/// **Every member outside `_rift` passes through byte for byte, in document order** (#730). Since
+/// rift#1606 standalone Rift answers `stubs[].responses[].is.headers` in document order and
+/// `requests[].headers` in request order, and since rift#1602 `query` in JS key order; a round
+/// trip through `serde_json::Value` (no `preserve_order`) sorted every nested map, so this read was
+/// the one place the cluster's answer diverged on order. Only `_rift` is parsed, and its own keys
+/// may normalise — nothing orders them.
 fn rewrite_flow_state_resolved(bytes: &[u8], knobs: &ResolvedKnobs) -> Result<Vec<u8>, String> {
-    let mut doc: serde_json::Value = serde_json::from_slice(bytes)
-        .map_err(|e| format!("the imposter body was not JSON: {e}"))?;
-    let map = doc
-        .as_object_mut()
-        .ok_or_else(|| "the imposter body was not a JSON object".to_owned())?;
-    let rift = map
-        .entry("_rift")
-        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
-    let rift = rift
-        .as_object_mut()
-        .ok_or_else(|| "the imposter body's `_rift` was not a JSON object".to_owned())?;
-    rift.insert("flowStateResolved".to_owned(), knobs.to_json());
-    serde_json::to_vec(&doc).map_err(|e| e.to_string())
+    use serde_json::value::{RawValue, to_raw_value};
+    let members = match serde_json::from_slice::<OrderedMembers>(bytes) {
+        Ok(OrderedMembers(members)) => members,
+        Err(e) if e.is_data() => return Err("the imposter body was not a JSON object".to_owned()),
+        Err(e) => return Err(format!("the imposter body was not JSON: {e}")),
+    };
+    let decorate = |rift: Option<&RawValue>| -> Result<Box<RawValue>, String> {
+        let mut rift: serde_json::Map<String, serde_json::Value> = match rift {
+            Some(raw) => serde_json::from_str(raw.get())
+                .map_err(|_| "the imposter body's `_rift` was not a JSON object".to_owned())?,
+            None => serde_json::Map::new(),
+        };
+        rift.insert("flowStateResolved".to_owned(), knobs.to_json());
+        to_raw_value(&rift).map_err(|e| e.to_string())
+    };
+    let mut decorated = false;
+    let mut out = Vec::with_capacity(bytes.len() + 128);
+    out.push(b'{');
+    for (index, (key, value)) in members.iter().enumerate() {
+        if index > 0 {
+            out.push(b',');
+        }
+        out.extend(serde_json::to_vec(key).map_err(|e| e.to_string())?);
+        out.push(b':');
+        if key == "_rift" {
+            out.extend(decorate(Some(value))?.get().as_bytes());
+            decorated = true;
+        } else {
+            out.extend(value.get().as_bytes());
+        }
+    }
+    if !decorated {
+        if !members.is_empty() {
+            out.push(b',');
+        }
+        out.extend(br#""_rift":"#);
+        out.extend(decorate(None)?.get().as_bytes());
+    }
+    out.push(b'}');
+    Ok(out)
+}
+
+/// A JSON object's members in document order, each value kept as its raw text.
+struct OrderedMembers(Vec<(String, Box<serde_json::value::RawValue>)>);
+
+impl<'de> Deserialize<'de> for OrderedMembers {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Members;
+        impl<'de> serde::de::Visitor<'de> for Members {
+            type Value = OrderedMembers;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a JSON object")
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut members = Vec::new();
+                while let Some(member) = map.next_entry()? {
+                    members.push(member);
+                }
+                Ok(OrderedMembers(members))
+            }
+        }
+        deserializer.deserialize_map(Members)
+    }
 }
 
 /// The three published `_rift` knobs for one imposter, read from the applied config (issue #370).
@@ -5740,6 +5795,42 @@ mod tests {
         assert!(rewrite_flow_state_resolved(b"[1,2,3]", &default_knobs()).is_err());
         // `_rift` present but not an object is equally undecoratable.
         assert!(rewrite_flow_state_resolved(br#"{"_rift":"nope"}"#, &default_knobs()).is_err());
+    }
+
+    /// #730: the flow-state decoration keeps every member outside `_rift` in document order — stub
+    /// `is.headers` and `requests[].headers` included — as standalone Rift answers them (rift#1606).
+    #[test]
+    fn the_flow_state_decoration_keeps_every_member_in_document_order() {
+        let body = br#"{"protocol":"http","port":4545,"stubs":[{"responses":[{"is":{"headers":{"X-Zeta":"1","X-Alpha":"2"}}}]}],"requests":[{"headers":{"User-Agent":"t","Accept":"*/*"}}],"_rift":{"flowState":{"backend":"inmemory"}}}"#;
+        let out = String::from_utf8(
+            rewrite_flow_state_resolved(body, &default_knobs()).expect("decorates"),
+        )
+        .expect("utf-8");
+        let at = |needle: &str| {
+            out.find(needle)
+                .unwrap_or_else(|| panic!("{needle} in {out}"))
+        };
+        assert!(at("\"protocol\"") < at("\"port\""), "{out}");
+        assert!(
+            at("X-Zeta") < at("X-Alpha"),
+            "stub headers in document order: {out}"
+        );
+        assert!(
+            at("User-Agent") < at("Accept"),
+            "request headers in request order: {out}"
+        );
+        assert!(out.contains("\"flowStateResolved\""), "{out}");
+        assert!(
+            out.contains("\"flowState\":{\"backend\":\"inmemory\"}"),
+            "{out}"
+        );
+        let without =
+            rewrite_flow_state_resolved(br#"{"port":1}"#, &default_knobs()).expect("decorates");
+        let without: serde_json::Value = serde_json::from_slice(&without).expect("json");
+        assert!(
+            without["_rift"]["flowStateResolved"].is_object(),
+            "{without}"
+        );
     }
 
     #[test]

@@ -410,6 +410,9 @@ The bump to rift **master `7161b1a`** (past v0.23.0) is all three again, and mor
   nothing (rift#1585).
 - **Admission.** A path in `proxy.to` or a `to` that is not a URL, a response with two types or none, text predicates on a
   binary-mode imposter and door-only behavior shapes are refused (rift#1550, #1551, #1578, #1582).
+- **Header order.** Request and response headers keep their order (rift#1606): `is`/`inject`
+  headers go out, and stub and journal headers print back, as written or as sent. Old nodes answer
+  them in a different order until every node runs the new binary.
 - **Responses.** A `_behaviors` block beside `behaviors` or a top-level `repeat` is ignored, as in
   Mountebank (rift#1709); old nodes still run it. A proxy forwards to `to`'s origin plus the
   request's own path and query (rift#1550; `defaultForward` keeps its base path): a stored `to`

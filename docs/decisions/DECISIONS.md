@@ -4576,7 +4576,9 @@ or `copy` where it used to select nothing (rift#1585).
 `matches`/`jsonpath`/`xpath` on a binary-mode imposter (rift#1578) and door-only behavior shapes
 (rift#1582) are refused; D-102 refuses only their ports on replay. **Response behaviour** changes with no change
 to stored bytes: a `_behaviors` block beside `behaviors` (a `null` one included) or a top-level
-`repeat` is now ignored, as Mountebank ignores it (rift#1709), so a mixed fleet runs it on old nodes only. One change is a **decode**
+`repeat` is now ignored, as Mountebank ignores it (rift#1709), so a mixed fleet runs it on old nodes only;
+request and response headers keep their order (rift#1606), so old nodes answer `is`/`inject` and
+journal headers in a different order than new ones. One change is a **decode**
 widening rather than an admission one: a `copy`/`lookup` token in `is.statusCode` (rift#1558)
 decodes only on the new engine, so a mixed fleet in which a new leader commits one leaves an old
 follower unable to apply that log entry (#710). Hence writes stay paused until every node runs the
