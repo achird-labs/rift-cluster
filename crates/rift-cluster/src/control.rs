@@ -257,16 +257,74 @@ pub struct SessionKey {
 /// shorter weakens it.
 pub const SESSION_KEY_BYTES: usize = 32;
 
-/// The largest payload a single [`ControlOp`] may carry into the log.
+/// The largest *raw* recorded body a [`ControlOp::ProxyRecorded`] may carry, checked at apply.
 ///
-/// A bound on what a *log entry* carries, which is a fleet-wide liability: every replica stores
-/// it and every snapshot copies it. It sits under the cluster transport's own cap, so a payload
-/// that passes here still has to fit on the wire.
+/// **Not** the bound on a log entry's size: it measures the raw body, which serializes to 4.4–4.9×
+/// its length on the log, and it runs in [`validate`] — at apply, after the entry is already in the
+/// log. The entry bound is [`MAX_ENTRY_BYTES`], enforced at admission (D-110). This one stays as it
+/// was, deterministic on every replica, so committed entries apply the same everywhere.
 ///
 /// Until #549 this also bounded a `SourcePullResult`'s config set (where it matched upstream's
 /// 10 MB fetch cap); with the source ops gone, the only op that can carry a payload of any size
 /// is [`ControlOp::ProxyRecorded`]'s recorded response body.
 pub const MAX_LOG_PAYLOAD_BYTES: usize = 10 * 1024 * 1024;
+
+/// The largest a [`ControlRequest`] may be **serialized**, checked before it is proposed (D-110).
+///
+/// An entry larger than the cluster transport's 32 MiB body cap is appended to the leader's log but
+/// can never replicate: every AppendEntries carrying it is refused, openraft retries it forever, and
+/// every write behind it stalls until an election truncates it. 8 MiB keeps a single-entry append at
+/// a quarter of that cap, so the 413-halving always reaches a batch that fits, and matches the size
+/// `MIN_REPLICATION_BYTES_PER_SEC` was already sized for.
+pub const MAX_ENTRY_BYTES: usize = 8 * 1024 * 1024;
+
+const _: () = assert!(MAX_ENTRY_BYTES * 4 <= crate::rpc::DEFAULT_MAX_BODY_BYTES as usize);
+
+/// A request whose serialized size is over [`MAX_ENTRY_BYTES`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("log entry is {size} bytes serialized, over the {limit}-byte log entry bound")]
+pub struct EntryTooLarge {
+    /// The request's serialized size.
+    pub size: usize,
+    /// [`MAX_ENTRY_BYTES`].
+    pub limit: usize,
+}
+
+/// Admit `request` by its serialized size — the encoding the log store and AppendEntries use —
+/// measured without allocating it. Admission only: never at apply and never at decode, so an entry
+/// already committed always replays (D-110, D-102).
+///
+/// # Errors
+///
+/// [`EntryTooLarge`] when the request serializes to more than [`MAX_ENTRY_BYTES`].
+pub fn admit_entry_size(request: &ControlRequest) -> Result<usize, EntryTooLarge> {
+    struct Counter(usize);
+    impl std::io::Write for Counter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0 += buf.len();
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut counter = Counter(0);
+    // A `ControlRequest` holds nothing serde can refuse (no non-string map keys, no NaN); were that
+    // ever to change, an unmeasurable request is refused rather than admitted unbounded.
+    if serde_json::to_writer(&mut counter, request).is_err() {
+        return Err(EntryTooLarge {
+            size: usize::MAX,
+            limit: MAX_ENTRY_BYTES,
+        });
+    }
+    if counter.0 > MAX_ENTRY_BYTES {
+        return Err(EntryTooLarge {
+            size: counter.0,
+            limit: MAX_ENTRY_BYTES,
+        });
+    }
+    Ok(counter.0)
+}
 
 /// Longest a fleet name ([`ControlOp::FleetNamePut`]) may be, in `char`s. A cap exists so the
 /// name stays chrome-sized wherever it renders (a top bar, a members-list column); 128
@@ -1029,6 +1087,58 @@ mod tests {
             let config = decode_committed_config(&body).expect("replay decodes it");
             assert_eq!(config.stubs.len(), 1, "{to}");
         }
+    }
+
+    fn proxy_recorded_request(body_bytes: usize) -> ControlRequest {
+        // `x` serializes as `120,` in the body's integer array, and once more as text in the stub.
+        let body = "x".repeat(body_bytes);
+        let stub: Stub = serde_json::from_value(json!({
+            "responses": [{ "is": { "body": body } }]
+        }))
+        .expect("stub parses");
+        ControlRequest {
+            op_id: Uuid::nil(),
+            principal: None,
+            issued_at_secs: 0,
+            expected_revision: None,
+            op: ControlOp::ProxyRecorded {
+                port: 8080,
+                sig_hash: "00ab".to_owned(),
+                resp: RecordedResponse {
+                    status: 200,
+                    headers: Vec::new(),
+                    body: body.into_bytes(),
+                    latency_ms: None,
+                    timestamp_secs: 0,
+                },
+                stub: Some(RecordedStub {
+                    stub: Box::new(stub),
+                    placement: RecordedStubPlacement::BeforeProxy,
+                    proxy_to: "http://u.example".to_owned(),
+                }),
+            },
+        }
+    }
+
+    /// Pins D-110: a log entry is bounded by its serialized size, not its raw body. A 2 MiB body
+    /// is far under the raw bound and serializes to about 10 MiB, over the 8 MiB entry bound.
+    #[test]
+    fn an_entry_is_bounded_by_its_serialized_size_not_its_raw_body() {
+        let big = proxy_recorded_request(2 * 1024 * 1024);
+        let refused = admit_entry_size(&big).expect_err("2 MiB raw serializes over 8 MiB");
+        assert!(refused.size > MAX_ENTRY_BYTES, "{refused}");
+        assert_eq!(refused.limit, MAX_ENTRY_BYTES);
+        assert!(admit_entry_size(&proxy_recorded_request(1024 * 1024)).is_ok());
+    }
+
+    /// Pins D-110 (and D-102): the bound is admission, never apply — `validate`, which every
+    /// replica runs at apply, admits the same oversize entry, so a committed one always replays.
+    #[test]
+    fn the_entry_bound_is_admission_not_apply() {
+        assert_eq!(
+            validate(&proxy_recorded_request(2 * 1024 * 1024).op),
+            Ok(())
+        );
     }
 
     /// Pins D-106: rift#1558 widened `statusCode` to any string, so a committed token status

@@ -1111,6 +1111,12 @@ async fn bootstrap_imposters(
                     "--imposters {uri}: imposter on port {port} is not replicable: {reason}"
                 );
             }
+            // D-110: the one door with no body cap of its own.
+            if let Err(e) = rift_cluster::control::admit_entry_size(&request) {
+                anyhow::bail!(
+                    "--imposters {uri}: imposter on port {port} is too large to replicate: {e}"
+                );
+            }
             if !leader_awaited {
                 await_bootstrap_leader(node).await?;
                 leader_awaited = true;
@@ -1619,6 +1625,14 @@ async fn drain_parked_intents(node: &RaftNode) {
             Err(e @ NodeError::Unavailable(_)) => {
                 tracing::warn!(%op_id, error = %e, "no quorum; intents stay parked for the next sweep");
                 return;
+            }
+            // D-110: an intent too large to replicate can never be proposed, so it is retired
+            // rather than replayed forever — reachable only for an intent a pre-D-110 binary parked.
+            Err(e @ NodeError::EntryTooLarge(_)) => {
+                tracing::error!(%op_id, error = %e, "parked intent can never replicate; dropping it");
+                if let Err(e) = node.unpark_intent(&op_id) {
+                    tracing::error!(%op_id, error = %e, "could not unpark an unreplicable intent");
+                }
             }
             Err(e) => {
                 tracing::error!(%op_id, error = %e, "replay failed for this intent; continuing");

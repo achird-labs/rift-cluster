@@ -5134,3 +5134,39 @@ gateway is not an admin route: it keeps the engine's cap.
 A proxied admin body between 16 MiB and the engine's ceiling is now refused where it used to reach the
 engine; no verify, flow-state or scenario body comes near that size.
 
+### D-110 — A log entry is bounded by its serialized size at admission (8 MiB), never at apply or decode
+
+- **Status:** active
+- **Decided:** 2026-10-26 · #686
+- **Implemented by:** #686
+- **Code:** crates/rift-cluster/src/control.rs, crates/rift-cluster/src/raft/node.rs, crates/rift-cluster/src/raft/network.rs, crates/rift-cluster/src/stores/proxy.rs, crates/rift-cluster-server/src/admin_front.rs, crates/rift-cluster-server/src/compose.rs
+
+Nothing bounded a `ControlRequest`'s serialized size before `client_write`. An entry over the
+transport's 32 MiB body cap is appended to the leader's log and can never replicate: every follower
+answers 413, openraft resends it forever, and every write behind it stalls until an election
+truncates it — measured at ~14 s of fleet-wide write stall and a forced leader change. The proxy store
+reaches that from ordinary traffic: a `ProxyRecorded` entry carries the body as a JSON integer array
+and again in the generated stub, 4.4–4.9× the raw body, so a ~6.5 MiB upstream body is enough.
+`MAX_LOG_PAYLOAD_BYTES` gated nothing: it measures the raw body, at apply.
+
+**Every proposal is sized by its serialized form before it is proposed, against `MAX_ENTRY_BYTES`
+(8 MiB).** 8 MiB keeps a single-entry append at a quarter of the transport cap, so the 413-halving
+always reaches a batch that fits (D-23's large-entry finding), and is the size
+`MIN_REPLICATION_BYTES_PER_SEC` was already sized for. A const assertion ties it to the cap.
+
+- **Admission only.** The check never runs at apply or decode, where it would diverge a
+  mixed-version fleet and refuse committed entries on replay (D-102's rule). `MAX_LOG_PAYLOAD_BYTES`
+  stays exactly as it was.
+- **Where:** `RaftNode::write` and `submit` (before the local attempt and any forward), and the
+  forwarded-write route (413 on the wire, for an older sender). `NodeError::EntryTooLarge` is
+  terminal, never `Unavailable`.
+- **Proposers refuse it where they stand:** the admin front sizes every minted op before parking any
+  (413 `RequestTooLarge`, so nothing is parked to be replayed forever and a multi-op write stays
+  atomic); `--imposters` fails the start; the drainer retires a parked intent that can never be
+  proposed; the proxy store skips the recording before any claim RPC, releases the claim, and warns —
+  the client still gets the upstream response. No counter (D-71).
+
+Until #690 removes the expansion, a recordable proxied body tops out at ~1.6 MiB (binary) to ~1.8 MiB
+(text), and configs that serialize over 8 MiB — which the front's 16 MiB body cap used to admit — are
+refused.
+

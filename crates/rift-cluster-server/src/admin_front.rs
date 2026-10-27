@@ -3089,6 +3089,17 @@ async fn run_mutation(
         .enumerate()
         .map(|(index, op)| mint(op_id_for(base, index, total), op, expected_revision))
         .collect();
+    // D-110: every op is sized before any is parked. A parked op that can never be proposed would
+    // be replayed forever, and refusing them all together keeps a multi-op write atomic.
+    for request in &requests {
+        if let Err(e) = control::admit_entry_size(request) {
+            return Err(typed_error(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                ErrorKind::RequestTooLarge,
+                &format!("the write is too large to replicate: {e}"),
+            ));
+        }
+    }
     for request in &requests {
         if let Err(e) = node.park_intent(request) {
             // Refusing is the only honest answer: R4's promise is exactly that

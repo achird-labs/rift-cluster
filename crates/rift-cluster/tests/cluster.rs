@@ -17,8 +17,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use rift_cluster::{
-    ADMIT_CURRENCY_WAIT, Authority, BarrierOutcome, ControlRequest, NodeConfig, NodeId, RaftNode,
-    ReadyProbe, Router,
+    ADMIT_CURRENCY_WAIT, Authority, BarrierOutcome, ControlRequest, NodeConfig, NodeError, NodeId,
+    RaftNode, ReadyProbe, Router,
 };
 use tempfile::TempDir;
 
@@ -1510,7 +1510,17 @@ async fn a_leadership_change_under_load_never_panics_a_replication_worker() {
         .await
         .expect("leader");
     // The outcome of the write is deliberately not asserted: under this load it may park or
-    // fail with "not the leader" until #431 lands. The panic count is the claim.
+    // fail with "not the leader" until #431 lands. The panic count is the claim — so the entry must
+    // still be admitted by D-110's bound, or this pin would go vacuous without failing.
+    assert!(
+        rift_cluster::control::admit_entry_size(&bulky_request(
+            19501,
+            "big",
+            8 * 1024 * 1024 - 1_100
+        ))
+        .is_ok(),
+        "the panic pin's entry must fit under MAX_ENTRY_BYTES"
+    );
     let _ = tokio::time::timeout(
         Duration::from_secs(30),
         cluster.leader().expect("leader").submit(bulky_request(
@@ -2925,4 +2935,47 @@ async fn a_joiner_replays_a_refused_config_and_the_leader_survives() {
 
     joiner.shutdown().await.ok();
     leader.shutdown().await.ok();
+}
+
+/// Pins D-110: an entry over the serialized bound is refused before it is proposed — on the leader
+/// and on a follower alike, as the terminal `EntryTooLarge` and never as `Unavailable` — so it never
+/// reaches a log, the leader keeps leadership, and the next write commits.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_oversize_write_never_reaches_the_log() {
+    let mut cluster = TestCluster::start(3).await;
+    let leader_id = cluster
+        .wait_for_leader(LEADER_DEADLINE)
+        .await
+        .expect("leader");
+    let big = || bulky_request(19601, "huge", 9 * 1024 * 1024);
+
+    let leader = cluster.leader().expect("leader");
+    assert!(
+        matches!(leader.submit(big()).await, Err(NodeError::EntryTooLarge(_))),
+        "the leader refuses it before proposing"
+    );
+    let follower = cluster
+        .live()
+        .find(|n| n.id() != leader_id)
+        .expect("a follower");
+    assert!(
+        matches!(
+            follower.submit(big()).await,
+            Err(NodeError::EntryTooLarge(_))
+        ),
+        "a follower refuses it before forwarding"
+    );
+    assert_eq!(
+        cluster.leader().map(RaftNode::id),
+        Some(leader_id),
+        "no election"
+    );
+    let small = cluster
+        .leader()
+        .expect("leader")
+        .submit(bulky_request(19602, "small", 1024))
+        .await
+        .expect("a small write commits");
+    assert_eq!(small.outcome, rift_cluster::ControlOutcome::Applied);
+    cluster.shutdown_all().await;
 }
